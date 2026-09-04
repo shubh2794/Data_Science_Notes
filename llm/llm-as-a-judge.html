@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · LLM-as-a-Judge</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>LLM-as-a-Judge</h1>
+      <p>Human evaluation is the gold standard but slow and expensive; string-overlap metrics are cheap but blind to meaning. Putting a strong model in the rater's seat — an <b>autorater</b> — buys scale, if you control for the ways it is systematically wrong.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">LLMs &amp; Generative AI</span>
+        <span class="pill">Evaluation</span>
+        <span class="pill">Autoraters</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="overview" data-nav="Why judge with an LLM?">
+      <h3><span class="idx">01</span> Why judge with an LLM?</h3>
+      <p class="lede">Open-ended generation broke the old evaluation loop. There is no single correct answer to compare against, so the reference-matching metrics that carried machine translation and summarisation for two decades stopped measuring anything useful.</p>
+      <h4>The gap the judge fills</h4>
+      <ul class="notes">
+        <li>Overlap metrics (see <a href="../nlp/evaluation-metrics.html">Evaluation Metrics</a>) score <i>n</i>-gram agreement with a reference. A correct answer phrased differently scores low; a fluent wrong answer that reuses the reference's words scores high.</li>
+        <li>Human raters judge what actually matters — correctness, helpfulness, tone, instruction-following — but a careful pairwise rating costs minutes and money, which rules out running the eval on every commit.</li>
+        <li>A capable model given an explicit rubric sits in between: it reads meaning like a human and runs like a metric, cheap enough to gate a deploy and fast enough to sit inside a training loop.</li>
+      </ul>
+      <div class="formula"><span class="lbl">what a judge computes</span><span class="eq">J : ( instruction , response [ , reference ] , rubric ) → score  or  preference</span>
+<span class="eq">score ∈ {1…5}</span>   <span class="eq">preference ∈ { A ≻ B , B ≻ A , tie }</span></div>
+      <div class="callout"><b>One sentence:</b> a judge is a rubric-following stand-in for a human rater — powerful, cheap, and biased in known, correctable ways.</div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="modes" data-nav="Modes of judging">
+      <h3><span class="idx">02</span> Modes of judging</h3>
+      <p class="lede">Three axes: how many responses the judge sees at once, whether it has a gold answer, and whether it emits a number or a choice. The combination determines both reliability and what you can do with the output.</p>
+      <table class="cmp">
+        <tr><th>Mode</th><th>Input</th><th>Output</th><th>Strength</th><th>Weakness</th></tr>
+        <tr><td>Pointwise scoring</td><td>One response + rubric</td><td>Score on a scale</td><td>Absolute, aggregatable, dashboard-friendly</td><td>Scale drifts between runs and models</td></tr>
+        <tr><td>Pairwise preference</td><td>Two responses</td><td>Winner or tie</td><td>Most reliable; feeds reward models</td><td>O(n²) comparisons; needs order control</td></tr>
+        <tr><td>Reference-guided</td><td>Response + gold answer</td><td>Score or verdict</td><td>Anchored, much less drift</td><td>Requires gold answers to exist</td></tr>
+        <tr><td>Reference-free</td><td>Response + criteria only</td><td>Score or verdict</td><td>Works on open-ended tasks</td><td>Most exposed to style bias</td></tr>
+        <tr><td>Rubric checklist</td><td>Response + yes/no items</td><td>Items passed</td><td>Auditable, low variance</td><td>Only as good as the checklist</td></tr>
+      </table>
+      <h4>Why pairwise usually wins</h4>
+      <ul class="notes">
+        <li>Relative judgements are easier than calibrated absolute ones — for models as for people. "Is B better than A?" needs no shared notion of what a 4 means, which is exactly the notion that drifts across prompts, sessions, and model versions.</li>
+        <li>Pairwise verdicts also convert cleanly into a scalar ranking. Fit a latent strength <code>s</code> per system under a Bradley–Terry model and you get an Elo-style leaderboard from win/loss records alone — the same functional form a reward model uses.</li>
+      </ul>
+      <div class="formula"><span class="lbl">pairwise → latent scores (Bradley–Terry)</span><span class="eq">P( A ≻ B ) = σ( s<sub>A</sub> − s<sub>B</sub> ) = 1 / ( 1 + e<sup>−(s<sub>A</sub>−s<sub>B</sub>)</sup> )</span>
+<span class="eq">fit  s  by maximising  ∑<sub>(w,l)</sub> log σ( s<sub>w</sub> − s<sub>l</sub> )</span>   <span class="eq">⟵ identical to the reward-model loss</span></div>
+      <div class="callout">Use <b>checklists</b> when the criteria are objective, <b>pairwise</b> when comparing systems, and <b>pointwise</b> only when you need an absolute number you will re-anchor regularly.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="how" data-nav="Designing the judge prompt">
+      <h3><span class="idx">03</span> Designing the judge prompt</h3>
+      <p class="lede">A judge is a prompt, and most judge failures are prompt failures. Four design choices do nearly all the work.</p>
+      <h4>Decompose the rubric</h4>
+      <ul class="notes">
+        <li>"Rate the quality 1–5" collapses several independent dimensions into one number the judge resolves arbitrarily. Split into named criteria — factual correctness, instruction-following, completeness, safety, format — and score each, then aggregate with weights <i>you</i> choose rather than weights the model invented.</li>
+        <li>Define every scale point in words. A 3 that means "mostly correct with one minor omission" is reproducible; a 3 that means "okay" is not.</li>
+      </ul>
+      <h4>Reason first, then commit</h4>
+      <ul class="notes">
+        <li>Ask for a short analysis <i>before</i> the verdict. If the verdict comes first, the reasoning becomes a post-hoc rationalisation of an already-sampled token, and quality drops.</li>
+        <li>The written rationale is also the audit trail: when the judge disagrees with a human, the rationale tells you whether the rubric or the judge was at fault.</li>
+      </ul>
+      <h4>Anchor and structure</h4>
+      <ul class="notes">
+        <li><b>Few-shot anchors</b> — two or three graded examples per scale point pin the scale far more effectively than adjectives, and are the cheapest fix for score drift.</li>
+        <li><b>Structured output</b> — force a schema (<code>{criterion: score, rationale, verdict}</code>) so results parse deterministically and a missing field is an error rather than a silent zero.</li>
+        <li>Keep <b>temperature low</b> and, where the stakes justify it, sample the judge <code>k</code> times and take the majority verdict.</li>
+      </ul>
+      <div class="callout">Treat the judge prompt as versioned code. Change it and every historical score becomes incomparable — so pin it, and re-run the calibration set whenever it moves.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="biases" data-nav="The biases (and a live one)">
+      <h3><span class="idx">04</span> The biases (and a live one)</h3>
+      <p class="lede">Judges are not noisy-but-unbiased raters. Their errors are <b>systematic</b>, which is worse: averaging over more examples does not make them go away.</p>
+
+      <div class="viz" id="viz-judge">
+        <div class="vhead">
+          <span class="vtitle">Position bias can flip the verdict</span>
+          <span class="vhint">Two answers of similar true quality; the judge adds a bias toward the first-shown one</span>
+        </div>
+        <div class="controls">
+          <label>position bias <input type="range" id="jd-bias" min="0" max="1" step="0.05" value="0.4"></label>
+          <button class="btn ghost" id="jd-swap">Swap order</button>
+        </div>
+        <svg id="jd-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Interactive diagram: Position bias can flip the verdict"></svg>
+        <div class="readout" aria-live="polite" id="jd-read"></div>
+      </div>
+
+      <h4>The catalogue</h4>
+      <ul class="notes">
+        <li><b>Position bias</b> — a systematic preference for whichever candidate appears first (sometimes last). It is the easiest to measure: present both orders and count how often the verdict survives the swap.</li>
+        <li><b>Verbosity bias</b> — longer answers are rated better at equal content, because length correlates with thoroughness in the judge's training data. This one is dangerous in a training loop: optimising against a verbose-biased judge produces a verbose model.</li>
+        <li><b>Self-preference</b> — a judge scores text from its own model family higher, plausibly because that text is more probable under it. Generating and grading with the same model inflates results.</li>
+        <li><b>Style over substance</b> — confident tone, tidy markdown, headings, and plausible-looking citations lift scores independently of correctness. A judge is a good reader of form and a mediocre checker of facts.</li>
+        <li><b>Compression at the ends</b> — pointwise judges cluster on 3s and 4s and rarely use the extremes, so real differences get squeezed out of the scale.</li>
+      </ul>
+      <div class="formula"><span class="lbl">measuring position bias</span><span class="eq">consistency = (1/N) ∑<sub>i</sub> 1[ verdict(A,B)<sub>i</sub> = verdict(B,A)<sub>i</sub> ]</span>
+<span class="eq">consistency ≈ 1 ⟹ order-invariant</span>   <span class="eq">consistency ≈ 0.5 ⟹ the judge is reading position, not content</span></div>
+      <div class="callout">Every bias here is a <b>direction</b>, not noise. Report swap-consistency and mean response length alongside win rate, or you will not see them.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="mitigations" data-nav="Controlling the biases">
+      <h3><span class="idx">05</span> Controlling the biases</h3>
+      <p class="lede">Each bias has a specific, cheap countermeasure. Applied together they turn an unreliable rater into a usable instrument.</p>
+      <h4>Randomise and average</h4>
+      <ul class="notes">
+        <li><b>Swap-and-average:</b> judge both orderings and average the two verdicts. Cases that disagree are recorded as ties rather than coin-flips, which removes position bias by construction and simultaneously surfaces the genuinely ambiguous pairs.</li>
+        <li><b>Self-consistency:</b> sample the judge several times and take the majority. This cuts variance but not bias — do it in addition to swapping, never instead of it.</li>
+      </ul>
+      <h4>Constrain and anchor</h4>
+      <ul class="notes">
+        <li><b>Length controls:</b> either normalise for length in the analysis, or add an explicit rubric line stating that concise complete answers are preferred to padded ones. Length-controlled win rates are now standard on serious leaderboards.</li>
+        <li><b>Reference answers</b> pull the verdict toward content and away from style, and <b>checklists</b> convert a vague preference into a set of yes/no facts that are hard to charm.</li>
+        <li><b>Juries:</b> average several judges from <i>different</i> model families. This is the only real fix for self-preference, and it also smooths any one model's idiosyncratic rubric reading.</li>
+      </ul>
+      <div class="formula"><span class="lbl">order-debiased pairwise score</span><span class="eq">win(A) = ½ · [ 1[ J(A,B) = A ] + 1[ J(B,A) = A ] ]</span>   <span class="eq">∈ { 0 , ½ , 1 }</span>
+<span class="lbl">jury of m judges</span><span class="eq">score = (1/m) ∑<sub>j=1..m</sub> score<sub>j</sub></span>   <span class="eq">⟵ different families, not m samples of one</span></div>
+      <div class="callout">Swap-and-average plus a jury of two or three different families removes most of the measurable bias for roughly 4–6× the judging cost — still orders of magnitude below human raters.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="agreement" data-nav="Agreement with humans">
+      <h3><span class="idx">06</span> Agreement with humans</h3>
+      <p class="lede">A judge is only worth what it correlates with. Before trusting one at scale, measure it against human labels on a held-out set — and measure the humans against each other too.</p>
+      <h4>Which statistic to use</h4>
+      <ul class="notes">
+        <li>For <b>categorical verdicts</b> (A / B / tie), raw agreement overstates quality because chance agreement is high with three classes. Cohen's <code>κ</code> subtracts the agreement expected from the marginals.</li>
+        <li>For <b>ordinal scores</b>, use Spearman's <code>ρ</code> or Kendall's <code>τ</code> on ranks rather than Pearson correlation — judges compress the scale, so rank order survives even when the absolute numbers do not.</li>
+        <li>Correlate at the level you will <i>act</i> on. System-level correlation (does the judge rank models the way humans do?) is usually high; example-level correlation is much lower, so a judge that reliably picks the better model may still be unreliable on any single response.</li>
+      </ul>
+      <div class="formula"><span class="lbl">Cohen's kappa — agreement above chance</span><span class="eq">κ = ( p<sub>o</sub> − p<sub>e</sub> ) / ( 1 − p<sub>e</sub> )</span>   <span class="eq">p<sub>o</sub> = observed agreement</span>   <span class="eq">p<sub>e</sub> = ∑<sub>c</sub> p<sub>1</sub>(c) · p<sub>2</sub>(c)</span>
+<span class="lbl">Spearman rank correlation</span><span class="eq">ρ = 1 − 6 ∑<sub>i</sub> d<sub>i</sub>² / ( n ( n² − 1 ) )</span>   <span class="eq">d<sub>i</sub> = rank difference on item i</span></div>
+      <h4>The ceiling</h4>
+      <ul class="notes">
+        <li>Human raters disagree with each other constantly on open-ended quality. That <b>inter-annotator agreement is the ceiling</b>: a judge matching humans about as often as two humans match each other is doing as well as the task allows.</li>
+        <li>So report the human–human baseline next to the judge–human number. A κ that looks mediocre in the abstract may be at parity with the humans it is replacing.</li>
+      </ul>
+      <div class="callout">Validate on a stratified sample that includes the hard cases. A judge calibrated only on obvious wins looks excellent and tells you nothing about the pairs you actually care about.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="uses" data-nav="Where judges are used">
+      <h3><span class="idx">07</span> Where judges are used</h3>
+      <p class="lede">Judging shows up in four distinct roles, and the reliability bar rises sharply as you move down the list.</p>
+      <h4>Measurement</h4>
+      <ul class="notes">
+        <li><b>Regression tests in CI:</b> a fixed prompt set plus a pinned judge catches quality drops from a prompt edit, a model upgrade, or a retrieval change before users do.</li>
+        <li><b>Leaderboards and A/B tests:</b> arena-style pairwise judging converts head-to-head battles into rankings via the Bradley–Terry fit from §02.</li>
+      </ul>
+      <h4>Training signal</h4>
+      <ul class="notes">
+        <li><b>Preference data:</b> judge-generated preferences substitute for human labels when training reward models or running direct preference methods — see <a href="policy-preference-optimization.html">Policy &amp; Preference Optimization</a>. This is the highest-stakes use, because the policy will optimise against every bias the judge has.</li>
+        <li><b>Rejection sampling and data filtering:</b> generate many candidates, keep the ones a judge scores highest, and fine-tune on those. Cheaper and safer than full preference training, and it fails gracefully.</li>
+      </ul>
+      <h4>Runtime</h4>
+      <ul class="notes">
+        <li><b>Guardrails:</b> a judge screens outputs against policy before they ship, or checks a claim against retrieved evidence — see <a href="hallucination-factuality.html">Hallucination &amp; Factuality</a>. Here latency is on the critical path, so a small distilled judge usually beats a frontier one.</li>
+        <li><b>Agent self-critique:</b> a judge step inside a plan-act-observe loop decides whether to accept, retry, or escalate — cheap when it is a verifier, dangerous when it is the same model grading its own plan.</li>
+      </ul>
+      <div class="callout">Offline measurement tolerates a noisy judge. Training signal does not: a systematic judge bias becomes a systematic model behaviour.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="alternatives" data-nav="Judges vs metrics vs humans">
+      <h3><span class="idx">08</span> Judges vs metrics vs humans</h3>
+      <p class="lede">A judge is not a replacement for the other two — it is the middle rung of a ladder you climb as the stakes rise.</p>
+      <table class="cmp">
+        <tr><th>Method</th><th>Cost / item</th><th>Latency</th><th>Sees meaning?</th><th>Reproducible?</th><th>Best for</th></tr>
+        <tr><td>Exact match / F1</td><td>~0</td><td>ms</td><td>No</td><td>Perfectly</td><td>Closed-form answers, extraction</td></tr>
+        <tr><td>Overlap (BLEU/ROUGE)</td><td>~0</td><td>ms</td><td>No — surface <i>n</i>-grams</td><td>Perfectly</td><td>Tasks with tight references</td></tr>
+        <tr><td>Embedding similarity</td><td>Very low</td><td>ms</td><td>Partly — semantics, not truth</td><td>Yes (pinned model)</td><td>Paraphrase-tolerant matching</td></tr>
+        <tr><td>LLM judge</td><td>Low</td><td>~1 s</td><td>Yes</td><td>Only if prompt + model pinned</td><td>Open-ended quality, at scale</td></tr>
+        <tr><td>Human rater</td><td>High</td><td>Minutes–days</td><td>Yes</td><td>Noisy; needs several raters</td><td>Ground truth, calibration, high stakes</td></tr>
+      </table>
+      <h4>Cost, latency, and drift</h4>
+      <ul class="notes">
+        <li>A judge call costs roughly one extra generation — and reason-then-verdict prompts are long, so budget for the rationale tokens. Swap-and-average doubles it; a three-model jury with swapping is six calls per item.</li>
+        <li>Distil where volume is high: fine-tune a small model on a strong judge's verdicts and run it for a fraction of the cost. Accept a small agreement drop for a large throughput gain.</li>
+        <li><b>Pin the judge model and version.</b> A silently upgraded judge shifts every score, and you will read it as a change in your system rather than in your instrument.</li>
+      </ul>
+      <div class="callout">Cheap metrics for what they can measure, judges for everything open-ended, humans for the calibration set that keeps the judges honest. See also <a href="../machine-learning/model-evaluation.html">Model Evaluation</a>.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="takeaways" data-nav="Pitfalls &amp; what to remember">
+      <h3><span class="idx">09</span> Pitfalls &amp; what to remember</h3>
+      <p class="lede">Autoraters fail quietly. The output is always a confident number, so a broken judge looks exactly like a working one until you check it against people.</p>
+      <h4>Pitfalls</h4>
+      <ul class="notes">
+        <li><b>Never validated against humans.</b> Without an agreement number the score is a vibe with decimal places.</li>
+        <li><b>Grading with the generator.</b> Same model or family on both sides inflates results through self-preference.</li>
+        <li><b>Optimising against the judge.</b> Used as a training reward, a judge is a proxy that will be gamed — verbosity and formatting go up, substance does not.</li>
+        <li><b>Unpinned prompt or model.</b> Scores across time become incomparable the moment either changes.</li>
+        <li><b>One order only.</b> Reporting pairwise win rates without swapping bakes position bias straight into the headline number.</li>
+        <li><b>Judging what a checker could verify.</b> If code can be run, tests can be executed, or an answer can be string-matched, do that instead — a deterministic verifier beats a judge every time.</li>
+      </ul>
+      <h4>What to remember</h4>
+      <ul class="notes">
+        <li><b>Pairwise beats pointwise;</b> reason-then-verdict beats verdict-only; explicit rubrics beat adjectives.</li>
+        <li><b>Biases are systematic</b> — position, verbosity, self-preference, style — so correct them structurally, not by averaging.</li>
+        <li><b>Measure agreement with κ and ρ</b>, and compare it against the human–human ceiling, not against 1.0.</li>
+        <li><b>Raise the bar with the stakes:</b> noisy is fine for dashboards, not for reward signal.</li>
+        <li>Feeds <a href="policy-preference-optimization.html">preference optimization</a> and <a href="hallucination-factuality.html">factuality checks</a>; complements <a href="../nlp/evaluation-metrics.html">Evaluation Metrics</a> and <a href="../machine-learning/model-evaluation.html">Model Evaluation</a>.</li>
+      </ul>
+      <div class="callout"><b>The instrument rule:</b> a judge is a measuring device. Calibrate it, pin it, and never let the thing being measured be optimised directly against it without a second, independent check.</div>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+(function(){
+  const C={accent:"#2dd4bf",a2:"#ffb454",good:"#4ade80",bad:"#f87171",ink:"#e6e9ef",muted:"#9aa3b2",line:"#2a2f3a"};
+  const svg=d3.select("#jd-svg"),W=640,H=250;
+  const qa=0.62, qb=0.66;   // true quality; B is actually slightly better
+  let firstIsA=true;
+  function draw(){
+    svg.selectAll("*").remove();
+    const bias=+d3.select("#jd-bias").property("value");
+    // judge score = true quality + bias toward whichever is shown first
+    const sa=qa + (firstIsA?bias:0);
+    const sb=qb + (firstIsA?0:bias);
+    const order = firstIsA? [["A",qa,sa,true],["B",qb,sb,false]] : [["B",qb,sb,false],["A",qa,sa,true]];
+    svg.append("text").attr("x",24).attr("y",26).attr("fill",C.muted).attr("font-size",11).text("shown to judge in this order ↓   (B is truly a bit better)");
+    const top=46, bh=150, slot=180, scale=bh;
+    order.forEach((o,i)=>{
+      const x=60+i*220;
+      // true quality (faint) and judged score (solid)
+      svg.append("rect").attr("x",x).attr("y",top+bh-o[1]*scale).attr("width",60).attr("height",o[1]*scale).attr("rx",4).attr("fill","#3a4150").attr("fill-opacity",.5);
+      svg.append("rect").attr("x",x+66).attr("y",top+bh-o[2]*scale).attr("width",60).attr("height",o[2]*scale).attr("rx",4).attr("fill",o[3]?"#5b9cff":"#c084fc");
+      svg.append("text").attr("x",x+63).attr("y",top+bh+18).attr("text-anchor","middle").attr("fill",o[3]?"#5b9cff":"#c084fc").attr("font-size",12).attr("font-weight",600).text("Answer "+o[0]+(i===0?"  (1st)":"  (2nd)"));
+      svg.append("text").attr("x",x+30).attr("y",top+bh-o[1]*scale-6).attr("text-anchor","middle").attr("font-size",9).attr("fill",C.muted).text("true");
+      svg.append("text").attr("x",x+96).attr("y",top+bh-o[2]*scale-6).attr("text-anchor","middle").attr("font-size",9).attr("fill",C.ink).text("judged");
+    });
+    svg.append("line").attr("x1",40).attr("y1",top+bh).attr("x2",W-40).attr("y2",top+bh).attr("stroke","#3a4150");
+    const winner = sa>sb?"A":"B";
+    const correct = winner==="B"; // B truly better
+    d3.select("#jd-read").html(`judge picks <b style="color:${winner==='A'?'#5b9cff':'#c084fc'}">Answer ${winner}</b> — ${correct?'<span style="color:#4ade80">✓ matches true quality</span>':'<span style="color:#f87171">✗ wrong: position bias flipped it</span>'} · swap the order or lower the bias`);
+  }
+  d3.select("#jd-bias").on("input",draw);
+  d3.select("#jd-swap").on("click",()=>{ firstIsA=!firstIsA; draw(); });
+  draw();
+})();
+</script>
+</body>
+</html>

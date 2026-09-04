@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Monitoring &amp; Drift</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Monitoring &amp; Drift</h1>
+      <p>A model is trained on a frozen snapshot of the world; production keeps moving. Monitoring is the standing instrumentation that watches inputs, predictions, and outcomes to catch the moment the deployed model stops being valid — ideally before it becomes a business loss.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">MLOps &amp; Deployment</span>
+        <span class="pill">Distribution shift</span>
+        <span class="pill">Production reliability</span>
+      </div>
+    </header>
+
+    <section class="topic" id="core">
+      <h3><span class="idx">01</span> The core problem: a frozen map of a moving world</h3>
+      <ul class="notes">
+        <li>Training data is a finite <b>map</b>; the real world is effectively infinite and keeps changing. The map goes stale even when nothing in your code breaks — this staleness is <b>drift</b>.</li>
+        <li>A model learns a joint distribution <code>P(X, Y)</code>. The clean way to name drift is by <b>which factor of the decomposition moves</b>: the input distribution <code>P(X)</code>, the outcome mix <code>P(Y)</code>, or the rule connecting them <code>P(Y|X)</code>.</li>
+        <li><b>Real vs virtual drift</b> is the distinction that makes monitoring hard. Real drift moves the decision boundary and degrades accuracy; virtual drift moves only the inputs without changing the correct answer — the model may still be right even though its inputs look unfamiliar. <b>Input statistics alone cannot tell the two apart.</b></li>
+      </ul>
+      <div class="formula"><span class="eq">P(X, Y) = P(Y|X) · P(X) = P(X|Y) · P(Y)</span></div>
+      <div class="formula">
+        <span class="eq">covariate / data drift:</span>  <span class="eq">P(X) ≠ P′(X),</span>   <span class="eq">P(Y|X) = P′(Y|X)</span><br>
+        <span class="eq">label / prior drift:</span>     <span class="eq">P(Y) ≠ P′(Y),</span>   <span class="eq">P(X|Y) = P′(X|Y)</span><br>
+        <span class="eq">concept drift:</span>           <span class="eq">P(Y|X) ≠ P′(Y|X),</span>   <span class="eq">P(X) = P′(X)</span><br>
+        <span class="eq">dataset shift:</span>           <span class="eq">both P(X) and P(Y|X) move</span>
+      </div>
+    </section>
+
+    <section class="topic" id="taxonomy">
+      <h3><span class="idx">02</span> Drift taxonomy</h3>
+      <ul class="notes">
+        <li><b>Covariate / data drift — <code>P(X)</code> changes, <code>P(Y|X)</code> stable.</b> Inputs look different but the input→output rule still holds. A new product launch shifts the query mix; a sensor is recalibrated. Detectable <i>now</i> from inputs alone, but often benign.</li>
+        <li><b>Label / prior drift — <code>P(Y)</code> changes.</b> The outcome mix shifts: the fraud rate jumps, the spam ratio climbs. Equivalent to <code>P(X|Y)</code> staying fixed while the class balance moves. It silently breaks any model whose calibration assumed the old base rate.</li>
+        <li><b>Concept drift — <code>P(Y|X)</code> changes.</b> The spooky one: <i>same input, different correct answer</i>. House prices during a shock, "good investment" after a rate move. Nothing about the inputs looks off, so you usually catch it only via outcomes or business metrics — never input statistics.</li>
+        <li><b>Dataset shift</b> = both <code>P(X)</code> and <code>P(Y|X)</code> move at once.</li>
+      </ul>
+      <ul class="notes">
+        <li><b>Temporal shapes</b> dictate the detection window:
+          <b>sudden</b> (a pipeline change or product launch — abrupt step),
+          <b>gradual</b> (a slow taste/behaviour shift where old and new concepts overlap for a while),
+          <b>incremental</b> (a steady ramp through intermediate states),
+          <b>recurring / seasonal</b> (weekday vs weekend, holidays — comes back on a cycle).</li>
+        <li>A detector tuned for a sudden step will lag on gradual drift; a window shorter than the seasonal cycle will mistake every Monday for drift. <b>Match the window to the shape.</b></li>
+      </ul>
+    </section>
+
+    <section class="topic" id="why">
+      <h3><span class="idx">03</span> Why deployed models degrade — and why it's usually not the model</h3>
+      <ul class="notes">
+        <li><b>Non-ML causes dominate real incidents.</b> A study of 96 ML-pipeline failures over 15 years found 60 were non-ML: dependency breaks, wrong-version deploys, hardware/server failures, train–serve skew, and schema/units changes. The most common "drift" alert is a broken upstream pipeline, not a decaying model.</li>
+        <li><b>Train–serve skew</b> is the classic trap: a feature computed one way offline and another way online (different default fills, time zones, unit conversions) makes the model see inputs it was never trained on — indistinguishable from drift at the metric level until you trace it.</li>
+        <li><b>ML-specific causes:</b> covariate / label / concept drift, edge cases, bad data collection, and degenerate feedback loops where the model's own outputs reshape its future inputs.</li>
+        <li class="lbl">A practitioner observation, repeated across monitoring teams, holds that a large fraction — often quoted around ~80% — of <i>detected</i> drifts trace back to human or pipeline error rather than genuine model decay. Treat this as a directional, anecdotal figure, not a controlled result. Its operational implication is solid regardless: <b>route alerts to root-cause triage, not to auto-retrain.</b></li>
+      </ul>
+    </section>
+
+    <section class="topic" id="metrics">
+      <h3><span class="idx">04</span> Detection math — distribution distances</h3>
+      <p class="lede">Bin a feature into shared bins; pᵢ is the current share and qᵢ the reference share in bin i. These metrics quantify how far the live distribution has moved from training.</p>
+
+      <div class="formula"><span class="eq">PSI = ∑ᵢ (pᵢ − qᵢ) · ln(pᵢ / qᵢ)</span>     <span class="lbl">(0.1 = watch · 0.25 = act)</span></div>
+      <ul class="notes">
+        <li><b>Population Stability Index</b> is effectively a <i>symmetrized</i> KL — the round-trip relative entropy. Thresholds of thumb: <code>PSI &lt; 0.1</code> → no meaningful shift; <code>0.1 ≤ PSI &lt; 0.25</code> → moderate, watch; <code>PSI ≥ 0.25</code> → major shift, investigate. (Some teams act at 0.2.) Because it is a distance and not a p-value, it is <b>sample-size stable</b>.</li>
+      </ul>
+
+      <div class="formula"><span class="eq">D<sub>KL</sub>(P ‖ Q) = ∑ᵢ pᵢ · ln(pᵢ / qᵢ)</span>     <span class="lbl">(asymmetric · 0 = identical · → ∞ if any qᵢ = 0)</span></div>
+      <ul class="notes">
+        <li><b>Kullback–Leibler divergence</b> is asymmetric — <code>D<sub>KL</sub>(P‖Q) ≠ D<sub>KL</sub>(Q‖P)</code> — and unbounded; it blows up to infinity wherever <code>qᵢ = 0</code> while <code>pᵢ &gt; 0</code>. In practice you floor empty bins with a tiny ε to keep it finite.</li>
+      </ul>
+
+      <div class="formula"><span class="eq">JSD(P ‖ Q) = ½ · D<sub>KL</sub>(P ‖ M) + ½ · D<sub>KL</sub>(Q ‖ M),</span>   <span class="eq">M = ½(P + Q)</span></div>
+      <ul class="notes">
+        <li><b>Jensen–Shannon divergence</b> is the symmetric, smoothed, always-finite cousin of KL. The <b>JS distance</b> is √JSD; a common drift line is ≈ 0.1. Its range depends on the log base: <code>[0, ln 2]</code> in nats (natural log) or <code>[0, 1]</code> in bits (log₂) — the bound is stated both ways here precisely because the base matters and is easy to get wrong.</li>
+      </ul>
+
+      <div class="formula"><span class="eq">D = sup<sub>x</sub> |F₁(x) − F₂(x)|</span>     <span class="lbl">(Kolmogorov–Smirnov: max gap between empirical CDFs)</span></div>
+      <ul class="notes">
+        <li><b>KS two-sample statistic</b> is nonparametric and one-dimensional: the largest vertical gap between two empirical CDFs. It returns a p-value, which is exactly why it is dangerous at scale (see §06).</li>
+      </ul>
+
+      <div class="formula"><span class="eq">W₁(P, Q) = ∫₀¹ |F⁻¹<sub>P</sub>(u) − F⁻¹<sub>Q</sub>(u)| du</span>   <span class="eq">=</span>   <span class="eq">∫ |F<sub>P</sub>(x) − F<sub>Q</sub>(x)| dx</span></div>
+      <ul class="notes">
+        <li><b>Wasserstein-1 (earth-mover's) distance</b> reports the <i>magnitude</i> of the shift in the feature's own units (often normalized by σ; drift line ≈ 0.1 σ). It is the pragmatic default for high-dimensional and embedding spaces.</li>
+      </ul>
+
+      <div class="formula"><span class="eq">χ² = ∑ᵢ (Oᵢ − Eᵢ)² / Eᵢ</span>     <span class="lbl">(categorical homogeneity: observed vs expected counts)</span></div>
+      <div class="formula"><span class="eq">MMD²(P, Q) = E[k(x, x′)] + E[k(y, y′)] − 2·E[k(x, y)]</span>     <span class="lbl">(kernel two-sample, multivariate)</span></div>
+      <ul class="notes">
+        <li><b>Chi-square</b> is the standard test for categorical features. <b>Maximum Mean Discrepancy</b> is a kernel two-sample test that handles multivariate data directly — common in research, rarely the production default.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="detector">
+      <h3><span class="idx">05</span> Interactive drift detector</h3>
+      <p class="lede">A fixed reference distribution (training) and a live current distribution. Drag the mean and spread of the live window and watch PSI, KL, JS distance, and KS-D update on the same shared bins. Then flip the sample-size toggle to feel the KS trap.</p>
+
+      <div class="viz" id="viz-drift">
+        <div class="vhead">
+          <span class="vtitle">Reference vs current distribution</span>
+          <span class="vhint">PSI ≥ 0.25 → drift · 0.1 → watch · KS fires on tiny shifts at large n</span>
+        </div>
+        <div class="controls">
+          <label>shift mean (Δμ in σ) <span id="dr-mu-v" class="lbl"></span>
+            <input id="dr-mu" type="range" min="-3" max="3" step="0.05" value="0">
+          </label>
+          <label>widen spread (σ ratio) <span id="dr-sd-v" class="lbl"></span>
+            <input id="dr-sd" type="range" min="0.5" max="3" step="0.05" value="1">
+          </label>
+          <label>sample size n
+            <select id="dr-n"><option value="1000">1k (small)</option><option value="100000">100k (big stream)</option></select>
+          </label>
+        </div>
+        <svg id="dr-svg" width="640" height="240" viewBox="0 0 640 240" role="img" aria-label="Interactive diagram: Reference vs current distribution"></svg>
+        <div id="dr-state" style="margin-top:10px;font-weight:600;font-size:14px;"></div>
+        <div class="readout" aria-live="polite" id="dr-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="streaming">
+      <h3><span class="idx">06</span> Streaming detectors — watching the error stream directly</h3>
+      <ul class="notes">
+        <li><b>Page–Hinkley</b> is a CUSUM-style sequential test for a mean shift. With <code>xₜ</code> the observed value, <code>x̄ₜ</code> the running mean, and <code>δ</code> a tolerance:</li>
+      </ul>
+      <div class="formula"><span class="eq">mₜ = ∑<sub>i≤t</sub> (xᵢ − x̄ᵢ − δ),</span>   <span class="eq">Mₜ = min<sub>i≤t</sub> mᵢ,</span>   <span class="eq">alarm when (mₜ − Mₜ) &gt; λ</span></div>
+      <ul class="notes">
+        <li><b>DDM (Drift Detection Method)</b> watches the online error rate <code>pₜ</code> with standard deviation <code>sₜ = √(pₜ(1−pₜ)/t)</code>, tracking the running minimum <code>(p_min + s_min)</code>:</li>
+      </ul>
+      <div class="formula">
+        <span class="eq">warning when</span>  <span class="eq">pₜ + sₜ ≥ p_min + 2·s_min</span><br>
+        <span class="eq">drift</span>   <span class="eq">when</span>  <span class="eq">pₜ + sₜ ≥ p_min + 3·s_min</span>
+      </div>
+      <ul class="notes">
+        <li class="lbl">The 2σ / 3σ warning and drift constants are the canonical formulation; exact factors vary by implementation. Treat them as the standard version, not the only one.</li>
+        <li><b>ADWIN (Adaptive Windowing)</b> keeps a window <code>W</code>, splits it into an older sub-window <code>W₀</code> and a recent <code>W₁</code>, and declares drift — dropping <code>W₀</code> — when the means diverge past a cut derived from a Hoeffding bound at confidence δ:</li>
+      </ul>
+      <div class="formula"><span class="eq">|mean(W₀) − mean(W₁)| &gt; ε<sub>cut</sub>,</span>   <span class="eq">ε<sub>cut</sub> from a Hoeffding bound at confidence δ</span></div>
+
+      <div class="viz" id="viz-stream">
+        <div class="vhead">
+          <span class="vtitle">Sequential alarm — the warning → drift two-stage sequence</span>
+          <span class="vhint">An error stream crosses the 2σ warning band, then the 3σ drift band</span>
+        </div>
+        <div class="controls">
+          <label><button id="st-run" type="button">▶ run stream</button></label>
+          <label><button id="st-reset" type="button">↺ reset</button></label>
+        </div>
+        <svg id="st-svg" width="640" height="220" viewBox="0 0 640 220" role="img" aria-label="Interactive diagram: Sequential alarm — the warning → drift two-stage sequence"></svg>
+        <div class="readout" aria-live="polite" id="st-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="layers">
+      <h3><span class="idx">07</span> Three monitoring layers — and the two-clocks problem</h3>
+      <ul class="notes">
+        <li><b>Layer 1 — inputs / features.</b> Cheapest and available instantly: schema / range / null checks plus per-feature distribution distance (PSI / KS / Wasserstein). Catches pipeline breakage and covariate drift. <i>Problem:</i> feature distributions wobble constantly and most wobble is benign → alert fatigue. This overlaps directly with the schema and range checks in data quality and governance — see <a href="../data-engineering/data-quality-governance.html">Data Quality &amp; Governance</a>.</li>
+        <li><b>Layer 2 — predictions / output distribution.</b> Low-dimensional and easy to two-sample-test. Because the model weights are fixed, a shift in the output distribution is a strong proxy for a shift in inputs — often the best single signal you can get without labels.</li>
+        <li><b>Layer 3 — accuracy / business outcome.</b> The only layer that <i>directly</i> answers "is the model still good?", but gated by ground-truth availability. The model-evaluation metrics measured offline are the baseline this layer degrades away from.</li>
+        <li>Latency increases and trustworthiness increases as you go down the stack: inputs are instant but ambiguous; outcomes are definitive but late.</li>
+      </ul>
+      <div class="formula"><span class="eq">inputs (instant, noisy)</span>  <span class="eq">→</span>  <span class="eq">predictions (fast proxy)</span>  <span class="eq">→</span>  <span class="eq">accuracy / business (late, definitive)</span></div>
+      <ul class="notes">
+        <li><b>The two-clocks / ground-truth-lag problem.</b> Input drift is observable now; accuracy drift is observable only when labels arrive. <b>Feedback-loop length</b> sets how fast you can measure quality — a recommender gets a click in seconds, while a fraud or credit model gets labels weeks to months later via a dispute window. If such a model breaks and labels lag, damage compounds before detection.</li>
+        <li><b>Natural labels</b> (an ETA that self-corrects when the trip ends) are a luxury; most tasks need <b>proxy metrics</b> — click-through, completion rate, dwell time, downstream conversion — that approximate quality in real time.</li>
+        <li><b>Degenerate feedback loops:</b> the model's outputs shape the next inputs (popularity bias compounds). Detect via output diversity and long-tail coverage; correct with randomized exploration and positional features.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="tradeoffs">
+      <h3><span class="idx">08</span> Choosing a test — the sample-size trap</h3>
+      <ul class="notes">
+        <li><b>KS is sample-size-cursed.</b> Its statistical power explodes with n, so the p-value flags trivial changes — it fires on a ~0.5% shift once n exceeds roughly 100,000. Good for small data (&lt; ~1,000) or when tiny deviations genuinely matter; a poor default in a big production stream. The detector viz above demonstrates exactly this: flip n to 100k and KS turns red while PSI stays calm.</li>
+        <li><b>PSI / KL / JS are sample-size-stable</b> distance metrics (not p-values), so they behave predictably in production. PSI flags only big changes; JS is slightly more sensitive than KL.</li>
+        <li><b>Wasserstein is the pragmatic middle ground:</b> more sensitive than PSI, less trigger-happy than KS, and it reports the drift magnitude in interpretable units. <b>Preferred for high-dimensional and embedding spaces</b>, where KS degrades.</li>
+        <li><b>Chi-square</b> for categoricals; <b>MMD</b> for multivariate research settings. And always <b>reduce dimensionality before multivariate two-sample testing</b> — testing 500 raw features independently guarantees false alarms.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="windowing">
+      <h3><span class="idx">09</span> Windowing &amp; alerting</h3>
+      <ul class="notes">
+        <li><b>Reference vs current window.</b> A fixed reference (the training baseline) is compared against a sliding or current window. The window must be <b>≥ the seasonal cycle</b> — a sub-week window cannot see a weekly pattern and will alarm every weekend.</li>
+        <li><b>Sliding vs cumulative.</b> A sliding window tracks recency and forgets the past quickly (good for spotting recent shifts); a cumulative window retains history (good for a stable long-run baseline). Choose by whether recency or stability matters more.</li>
+        <li><b>The alerting dilemma.</b> Tighter thresholds catch drift early but drown the team in false alarms → engineers mute the alerts → real drift is missed. The whole game is tuning the threshold and <b>requiring a sustained breach, not a single spike</b>.</li>
+        <li><b>Route to triage, not to auto-retrain.</b> Since most alerts are pipeline or version errors, an alert should open a root-cause investigation rather than blindly kicking off a retraining job. Surfacing these signals well — on a single shared view — is the role of monitoring dashboards.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="llm">
+      <h3><span class="idx">10</span> LLM-specific drift</h3>
+      <ul class="notes">
+        <li><b>Embedding / data drift.</b> The input-prompt embedding distribution shifts — new topics, a product launch changes the query mix. Measure the distance between embedding distributions or centroids across time windows. Because embeddings are high-dimensional, <b>Wasserstein is preferred over KS</b>.</li>
+        <li><b>Concept drift in LLMs.</b> Prompts look statistically similar (low data drift) but the <i>desired</i> answer changed — "good investment" after a market shift. Only catchable via downstream business metrics and user feedback, not input statistics.</li>
+        <li><b>Prompt / response drift.</b> Changes to prompt templates, retrieved context, or a <b>silent provider model-version update</b> can shift outputs even when user inputs are perfectly stable. This is why pinning and re-evaluating the provider model is a monitoring concern — see <a href="../mlops/llmops.html">LLMOps</a>.</li>
+        <li><b>The two-layer pattern.</b> <i>Layer 1</i> is a cheap statistical embedding-distance test that fires an alert. <i>Layer 2</i> samples the drifted prompts and uses an LLM-as-judge to <b>classify the cause</b> ("new topic", "intent shift", "rising complexity", "language-style change"), turning a raw alarm into an actionable diagnosis. Output-quality drift is tracked via judge scores, toxicity / refusal rates, latency, and user thumbs — all detailed under <a href="../mlops/llmops.html">LLMOps</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="remediation">
+      <h3><span class="idx">11</span> Remediation ladder — alert to action</h3>
+      <ul class="notes">
+        <li><b>Triage first.</b> Confirm it is real drift, not a broken pipeline or a wrong-version deploy — statistically the most likely cause. Most of the ladder below is skipped once you find a schema mismatch.</li>
+        <li><b>Rollback.</b> If quality dropped right after a deploy, revert to the last-good model or prompt before doing anything else.</li>
+        <li><b>Retraining triggers.</b> <i>Scheduled</i> (cron), <i>threshold-based</i> (a PSI or accuracy breach), or <i>continuous</i>. Refresh the data window and revalidate against the held-out and online metrics — the retraining runs and their metrics are logged in experiment tracking so the loop is auditable.</li>
+        <li><b>Shadow deployment.</b> Run the candidate model on live traffic <i>without serving its outputs</i>, and compare to the incumbent before promotion. <b>Canary</b> = serve to a small percentage first, then ramp. The statistical machinery for comparing shadow / canary against the incumbent lives in <a href="../mlops/ab-testing.html">A/B Testing</a>; the rollout and rollback mechanics belong to model deployment.</li>
+        <li><b>For LLMs:</b> update prompts and system instructions, refresh the RAG corpus and index, re-pin or re-evaluate the provider model version, and adjust guardrails — again in concert with <a href="../mlops/llmops.html">LLMOps</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">12</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Name drift by which factor moves:</b> <code>P(X)</code> (covariate), <code>P(Y)</code> (label), <code>P(Y|X)</code> (concept) — and remember input stats cannot distinguish real from virtual drift.</li>
+        <li><b>Most alerts are pipeline / version errors,</b> not model decay — triage before you retrain.</li>
+        <li><b>Pick the test for the data:</b> PSI / JS / Wasserstein for stability at scale, Wasserstein for embeddings, chi-square for categoricals; KS only on small samples.</li>
+        <li><b>Monitor three layers</b> (inputs → predictions → outcomes) and bridge the ground-truth lag with proxy metrics.</li>
+        <li><b>Require sustained breaches,</b> route to triage, and remediate up the ladder: rollback → retrain → shadow → canary.</li>
+      </ul>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+/* ---- Primary viz: interactive drift detector ---- */
+(function(){
+  const C={accent:"#a3e635",good:"#4ade80",bad:"#f87171",a2:"#ffb454",muted:"#9aa3b2",ink:"#e6e9ef",line:"#2a2f3a"};
+  const svg=d3.select("#dr-svg"),W=640,H=240,m={t:16,r:16,b:30,l:42};
+  const iw=W-m.l-m.r, ih=H-m.t-m.b;
+  const g=svg.append("g").attr("transform",`translate(${m.l},${m.t})`);
+
+  // shared bins over a fixed domain
+  const lo=-6, hi=6, NB=40, EPS=1e-6;
+  const edges=d3.range(NB+1).map(i=>lo+(hi-lo)*i/NB);
+  const centers=d3.range(NB).map(i=>(edges[i]+edges[i+1])/2);
+  const bw=(hi-lo)/NB;
+
+  // reference: standard normal N(0,1)
+  function pdf(x,mu,sd){return Math.exp(-0.5*((x-mu)/sd)**2)/(sd*Math.sqrt(2*Math.PI));}
+  function binProbs(mu,sd){
+    // integrate pdf over each bin (midpoint rule * width), then normalize, floor with eps
+    let raw=centers.map(c=>pdf(c,mu,sd)*bw);
+    let s=d3.sum(raw)||1;
+    let p=raw.map(v=>Math.max(v/s,EPS));
+    let s2=d3.sum(p);
+    return p.map(v=>v/s2);
+  }
+  const Q=binProbs(0,1); // reference, fixed
+
+  function psi(P,Q){return d3.sum(P.map((p,i)=>(p-Q[i])*Math.log(p/Q[i])));}
+  function kl(P,Q){return d3.sum(P.map((p,i)=>p*Math.log(p/Q[i])));}
+  function jsDist(P,Q){
+    const M=P.map((p,i)=>0.5*(p+Q[i]));
+    const jsd=0.5*kl(P,M)+0.5*kl(Q,M); // nats
+    return Math.sqrt(Math.max(jsd,0));
+  }
+  function ksD(P,Q){
+    let cp=0,cq=0,mx=0;
+    for(let i=0;i<P.length;i++){cp+=P[i];cq+=Q[i];mx=Math.max(mx,Math.abs(cp-cq));}
+    return mx;
+  }
+  // approximate KS two-sample p-value via asymptotic Kolmogorov dist
+  function ksP(D,n){
+    const en=Math.sqrt(n/2); // both samples size n -> sqrt(n*n/(2n))=sqrt(n/2)
+    const t=(en+0.12+0.11/en)*D;
+    let s=0; for(let k=1;k<=100;k++){s+=2*Math.pow(-1,k-1)*Math.exp(-2*k*k*t*t);}
+    return Math.min(Math.max(s,0),1);
+  }
+
+  const x=d3.scaleLinear().domain([lo,hi]).range([0,iw]);
+  const y=d3.scaleLinear().range([ih,0]);
+  const xAxis=g.append("g").attr("transform",`translate(0,${ih})`);
+  const gRef=g.append("g"), gCur=g.append("g");
+  g.append("text").attr("x",iw/2).attr("y",ih+24).attr("text-anchor","middle").attr("fill",C.muted).attr("font-size",10).text("feature value");
+  // legend
+  const leg=g.append("g");
+  leg.append("rect").attr("x",iw-150).attr("y",2).attr("width",10).attr("height",10).attr("fill","rgba(154,163,178,.45)").attr("stroke",C.muted);
+  leg.append("text").attr("x",iw-135).attr("y",11).attr("fill",C.muted).attr("font-size",10).text("reference");
+  leg.append("rect").attr("x",iw-70).attr("y",2).attr("width",10).attr("height",10).attr("fill","rgba(163,230,53,.4)").attr("stroke",C.accent);
+  leg.append("text").attr("x",iw-55).attr("y",11).attr("fill",C.muted).attr("font-size",10).text("current");
+
+  function badge(v,amber,red){
+    const col = v>=red?C.bad : v>=amber?C.a2 : C.good;
+    return `<b style="color:${col}">${v.toFixed(3)}</b>`;
+  }
+
+  function draw(){
+    const dmu=+d3.select("#dr-mu").property("value");
+    const sdr=+d3.select("#dr-sd").property("value");
+    const n=+d3.select("#dr-n").property("value");
+    d3.select("#dr-mu-v").text(dmu.toFixed(2)+"σ");
+    d3.select("#dr-sd-v").text("×"+sdr.toFixed(2));
+
+    const P=binProbs(dmu,sdr);
+    const _psi=psi(P,Q), _kl=kl(P,Q), _js=jsDist(P,Q), _ks=ksD(P,Q), _ksp=ksP(_ks,n);
+
+    y.domain([0, d3.max([d3.max(P),d3.max(Q)])*1.12]);
+    xAxis.call(d3.axisBottom(x).ticks(7));
+    svg.selectAll(".domain,.tick line").attr("stroke",C.line);
+    svg.selectAll(".tick text").attr("fill",C.muted).attr("font-size",9);
+
+    const bars=(sel,probs,fill,stroke)=>{
+      const r=sel.selectAll("rect").data(probs);
+      r.enter().append("rect").merge(r)
+        .attr("x",(d,i)=>x(edges[i]))
+        .attr("width",x(edges[1])-x(edges[0])-1)
+        .attr("y",d=>y(d)).attr("height",d=>ih-y(d))
+        .attr("fill",fill).attr("stroke",stroke).attr("stroke-opacity",.6);
+      r.exit().remove();
+    };
+    bars(gRef,Q,"rgba(154,163,178,.30)","rgba(154,163,178,.6)");
+    bars(gCur,P,"rgba(163,230,53,.32)",C.accent);
+
+    // KS verdict: at large n, even tiny D becomes "significant" (p<0.05)
+    const ksSignif = _ksp<0.05;
+    const ksCol = ksSignif ? C.bad : C.good;
+
+    // overall drift state driven by PSI
+    let state,scol;
+    if(_psi>=0.25){state="DRIFT DETECTED";scol=C.bad;}
+    else if(_psi>=0.1){state="WATCH — moderate shift";scol=C.a2;}
+    else {state="STABLE";scol=C.good;}
+    d3.select("#dr-state").html(`<span style="color:${scol}">● ${state}</span> <span class="lbl" style="font-weight:400">(PSI threshold)</span>`);
+
+    d3.select("#dr-read").html(
+      `PSI ${badge(_psi,0.1,0.25)} · `+
+      `KL ${badge(_kl,0.1,0.3)} · `+
+      `JS dist ${badge(_js,0.1,0.2)} · `+
+      `KS-D <b style="color:${_ks>=0.1?C.a2:C.good}">${_ks.toFixed(3)}</b> `+
+      `(p ${_ksp<0.001?"&lt;0.001":_ksp.toFixed(3)}, n=${n.toLocaleString()}: <b style="color:${ksCol}">${ksSignif?"REJECT — drift":"no rejection"}</b>)`+
+      `<br><span class="lbl">KS-D is identical at both n, but the p-value verdict flips with sample size — flip n to 100k at a small Δμ to see KS scream while PSI stays calm.</span>`
+    );
+  }
+  ["#dr-mu","#dr-sd","#dr-n"].forEach(id=>d3.select(id).on("input",draw).on("change",draw));
+  draw();
+})();
+</script>
+<script>
+/* ---- Secondary viz: streaming Page-Hinkley / DDM warning->drift ---- */
+(function(){
+  const C={accent:"#a3e635",good:"#4ade80",bad:"#f87171",a2:"#ffb454",muted:"#9aa3b2",ink:"#e6e9ef",line:"#2a2f3a"};
+  const svg=d3.select("#st-svg"),W=640,H=220,m={t:16,r:16,b:30,l:46};
+  const iw=W-m.l-m.r, ih=H-m.t-m.b;
+  const g=svg.append("g").attr("transform",`translate(${m.l},${m.t})`);
+  const N=120;
+
+  // synthetic error stream: low error then a drift ramp after t=60
+  function genStream(){
+    const out=[];
+    for(let t=0;t<N;t++){
+      let base = t<60 ? 0.08 : 0.08 + Math.min(0.30,(t-60)*0.012);
+      let e = base + (Math.random()-0.5)*0.05;
+      out.push(Math.max(0.01,e));
+    }
+    return out;
+  }
+  let stream=genStream();
+
+  const x=d3.scaleLinear().domain([0,N-1]).range([0,iw]);
+  const y=d3.scaleLinear().domain([0,0.5]).range([ih,0]);
+  const xAxis=g.append("g").attr("transform",`translate(0,${ih})`);
+  const yAxis=g.append("g");
+  g.append("text").attr("x",iw/2).attr("y",ih+24).attr("text-anchor","middle").attr("fill",C.muted).attr("font-size",10).text("time (samples)");
+  g.append("text").attr("transform","rotate(-90)").attr("x",-ih/2).attr("y",-34).attr("text-anchor","middle").attr("fill",C.muted).attr("font-size",10).text("error rate pₜ");
+
+  const warnBand=g.append("rect").attr("fill","rgba(255,180,84,.10)");
+  const driftBand=g.append("rect").attr("fill","rgba(248,113,113,.10)");
+  const linePath=g.append("path").attr("fill","none").attr("stroke",C.accent).attr("stroke-width",1.6);
+  const warnLine=g.append("line").attr("stroke",C.a2).attr("stroke-dasharray","4 3").attr("stroke-width",1);
+  const driftLine=g.append("line").attr("stroke",C.bad).attr("stroke-dasharray","4 3").attr("stroke-width",1);
+  const cursor=g.append("circle").attr("r",4).attr("fill",C.ink).attr("stroke","#15181f").attr("stroke-width",1.5).style("display","none");
+  const warnMark=g.append("circle").attr("r",5).attr("fill",C.a2).style("display","none");
+  const driftMark=g.append("circle").attr("r",5).attr("fill",C.bad).style("display","none");
+
+  xAxis.call(d3.axisBottom(x).ticks(6));
+  yAxis.call(d3.axisLeft(y).ticks(5).tickFormat(d3.format(".0%")));
+  svg.selectAll(".domain,.tick line").attr("stroke",C.line);
+  svg.selectAll(".tick text").attr("fill",C.muted).attr("font-size",9);
+
+  // DDM-style running min of (p + s); warning at +2s, drift at +3s
+  let timer=null;
+  function reset(){
+    if(timer){timer.stop();timer=null;}
+    stream=genStream();
+    linePath.attr("d",null);
+    cursor.style("display","none"); warnMark.style("display","none"); driftMark.style("display","none");
+    warnBand.attr("width",0); driftBand.attr("width",0);
+    d3.select("#st-read").html(`<span class="lbl">DDM watches the online error rate; warning at p_min+2·s_min, drift at p_min+3·s_min.</span>`);
+  }
+  function run(){
+    reset();
+    let i=2, pmin=Infinity, smin=0, warnedAt=null, driftAt=null;
+    const ln=d3.line().x(d=>x(d.t)).y(d=>y(d.p));
+    const pts=[];
+    timer=d3.interval(()=>{
+      const p=stream[i];
+      const s=Math.sqrt(Math.max(p*(1-p)/(i+1),1e-9));
+      if(p+s < pmin+smin){pmin=p; smin=s;}
+      const warnTh=pmin+2*smin, driftTh=pmin+3*smin;
+      pts.push({t:i,p});
+      linePath.attr("d",ln(pts));
+      cursor.style("display",null).attr("cx",x(i)).attr("cy",y(p));
+      warnLine.attr("x1",0).attr("x2",iw).attr("y1",y(warnTh)).attr("y2",y(warnTh));
+      driftLine.attr("x1",0).attr("x2",iw).attr("y1",y(driftTh)).attr("y2",y(driftTh));
+
+      if(warnedAt===null && p+s>=warnTh && p>0.12){
+        warnedAt=i; warnMark.style("display",null).attr("cx",x(i)).attr("cy",y(p));
+        warnBand.attr("x",x(i)).attr("y",0).attr("width",Math.max(0,x(N-1)-x(i))).attr("height",ih);
+      }
+      if(driftAt===null && p+s>=driftTh && p>0.15){
+        driftAt=i; driftMark.style("display",null).attr("cx",x(i)).attr("cy",y(p));
+        driftBand.attr("x",x(i)).attr("y",0).attr("width",Math.max(0,x(N-1)-x(i))).attr("height",ih);
+        timer.stop();
+        d3.select("#st-read").html(
+          `<b style="color:${C.a2}">⚠ warning at t=${warnedAt}</b> → `+
+          `<b style="color:${C.bad}">● drift confirmed at t=${driftAt}</b> `+
+          `<span class="lbl">— the two-stage sequence: error climbs into the 2σ warning band, then the 3σ drift band fires the alarm.</span>`
+        );
+      }
+      i++;
+      if(i>=N){timer.stop();}
+    },45);
+  }
+  d3.select("#st-run").on("click",run);
+  d3.select("#st-reset").on("click",reset);
+  reset();
+})();
+</script>
+</body>
+</html>

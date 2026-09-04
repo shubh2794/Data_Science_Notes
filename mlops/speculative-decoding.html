@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Speculative Decoding</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Speculative Decoding</h1>
+      <p>Autoregressive decoding emits one token per expensive forward pass. Speculative decoding breaks that lockstep: a small, cheap <b>draft model</b> guesses several tokens ahead, and the large <b>target model</b> verifies them all in a single parallel pass — accepting a whole run at once. With the right acceptance rule it is <b>lossless</b>: the text is sampled from exactly the target's distribution, so quality is provably unchanged.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">MLOps &amp; Deployment</span>
+        <span class="pill">Inference</span>
+        <span class="pill">LLM Serving</span>
+      </div>
+    </header>
+
+    <section class="topic" id="why">
+      <h3><span class="idx">01</span> Why decoding is slow (and how to break the lockstep)</h3>
+      <ul class="notes">
+        <li>To produce N tokens, a plain <a href="../llm/large-language-models.html">LLM</a> runs its full stack N times — one token per pass.</li>
+        <li>Each pass is <b>memory-bandwidth-bound</b>, not compute-bound: most wall-clock time goes to streaming the model's weights from memory, while the GPU's arithmetic units sit mostly idle.</li>
+        <li>Key consequence: a single pass that scores <b>γ+1 positions</b> at once costs almost the same wall-clock time as a pass scoring <b>one</b> position — there is spare parallel slack to exploit.</li>
+      </ul>
+      <p class="lede">The draft → verify → accept loop, per cycle:</p>
+      <ul class="notes">
+        <li><b>Draft.</b> A cheap model <code>q</code> autoregressively guesses the next γ tokens (typically γ ≈ 4–7).</li>
+        <li><b>Verify in parallel.</b> The target <code>p</code> scores the prefix plus every drafted token in <b>one</b> forward pass — nearly free relative to running <code>p</code> γ times.</li>
+        <li><b>Accept / correct.</b> A modified rejection rule walks the drafts left-to-right, accepting each, and on the first rejection resamples one corrected token and discards the rest.</li>
+      </ul>
+      <p>Each cycle emits between <b>1 and γ+1</b> tokens while invoking the expensive model only <b>once</b>. It composes with the <a href="../deep-learning/attention.html">KV cache</a> and with <a href="model-acceleration.html">other acceleration</a> techniques.</p>
+    </section>
+
+    <section class="topic" id="intuition">
+      <h3><span class="idx">02</span> Intuition: autocomplete + proofreader</h3>
+      <ul class="notes">
+        <li><b>Easy tokens are common.</b> Much of generated text is predictable — closing brackets, common words, boilerplate. A small model gets these right most of the time; the big model only has to <i>check</i> them, which it does in bulk.</li>
+        <li><b>Verification is cheaper than generation.</b> Asking "are these γ tokens what I would have produced?" runs in parallel; generating them runs serially.</li>
+        <li><b>Mental model.</b> The draft model is a fast typist filling in obvious words; the target is a meticulous proofreader who reads the whole proposed phrase at once, keeps the correct prefix, and fixes the first mistake — and whose corrections make the final text indistinguishable from text it would have written alone.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="rule">
+      <h3><span class="idx">03</span> The acceptance rule, and why it is lossless</h3>
+      <p class="lede">At a position, the draft samples <code>x ~ q</code>. Let <code>q(x)</code> be the draft probability and <code>p(x)</code> the target probability for that token.</p>
+      <p>Accept <code>x</code> with probability tied to how well the draft matched the target:</p>
+      <div class="formula"><span class="eq">accept x with probability</span>  <span class="eq">min(1, p(x) / q(x))</span></div>
+      <ul class="notes">
+        <li>If <code>p(x) ≥ q(x)</code> the target likes it at least as much as the draft did — <b>always accept</b>.</li>
+        <li>If <code>p(x) &lt; q(x)</code>, accept with probability <code>p(x)/q(x)</code>; otherwise <b>reject</b>.</li>
+      </ul>
+      <p>On a rejection, resample one token from the normalized <b>residual</b> distribution:</p>
+      <div class="formula"><span class="eq">p′(x) = max(0, p(x) − q(x)) / ∑<sub>x′</sub> max(0, p(x′) − q(x′))</span></div>
+      <p class="lede">Distribution-preservation proof (per position)</p>
+      <p>The probability the loop outputs token <code>x</code> is the chance it was accepted plus the chance it was reached as a resample:</p>
+      <div class="formula"><span class="eq">P(output = x) = min(p(x), q(x)) + (p(x) − min(p(x), q(x))) = p(x)</span></div>
+      <ul class="notes">
+        <li>The accepted mass is <code>min(p, q)</code>; the leftover <code>p − min(p, q) = max(0, p − q)</code> is exactly recovered by the resample step.</li>
+        <li>So <b>P(output = x) = p(x) for any draft q</b> — the draft affects only <i>speed</i>, never the output distribution. Chaining over the accepted run preserves the full sequence distribution.</li>
+        <li>This is the exact rule, and it is <b>lossless</b>. Relaxed schemes (see variants) trade exactness for more accepted tokens.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="math">
+      <h3><span class="idx">04</span> The speedup calculus: α, γ, and c</h3>
+      <p>Let <b>α</b> be the expected per-token acceptance probability (the <i>acceptance rate</i>), assuming tokens accept independently. Acceptance behaves like a capped geometric process — stop at the first reject, cap at γ, plus one guaranteed corrected/bonus token:</p>
+      <div class="formula"><span class="eq">E[tokens] = (1 − α<sup>γ+1</sup>) / (1 − α)</span></div>
+      <p>(As α → 1 this tends to γ+1; as α → 0 it tends to 1.)</p>
+      <p>Let <b>c = C<sub>draft</sub> / C<sub>target</sub></b> be the cost ratio of one draft step to one target step, with <code>c ≪ 1</code>. A cycle costs roughly γ draft steps plus 1 target verification ≈ <code>(γc + 1)</code> target-step-equivalents, and yields <code>E[tokens]</code>:</p>
+      <div class="formula"><span class="eq">Speedup = (1 − α<sup>γ+1</sup>) / ((1 − α)(γc + 1))</span></div>
+      <ul class="notes">
+        <li>There is an <b>optimal γ</b> for each (α, c): larger γ raises potential tokens but also raises draft overhead γc and lowers the effective per-token accept chance. More drafting is not always better.</li>
+        <li>A net win requires roughly <b>α &gt; c</b>: the draft must agree often enough to pay for its own cost.</li>
+        <li>α is fundamentally bounded by how far the draft <code>q</code> diverges from the target <code>p</code> — a draft too far from the target accepts rarely. <a href="../deep-learning/knowledge-distillation.html">Distilling</a> the draft to mimic the target (or fine-tuning it on the target's own outputs) raises α.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="sim">
+      <h3><span class="idx">05</span> Interactive: draft, verify, accept</h3>
+      <p class="lede">Each cycle the draft emits γ ghosted candidates; the target verifies. Accepted tokens go solid green, the first rejected one turns red and is replaced by a resampled correction (blue), and trailing drafts fade out. Drag the sliders and watch <code>E[tokens]</code>, <code>Speedup</code>, and the optimal γ move.</p>
+
+      <div class="viz" id="viz-sd">
+        <div class="vhead">
+          <span class="vtitle">Token-stream simulator &amp; speedup curve</span>
+          <span class="vhint">α must exceed c to win; more drafting (γ) has an optimum</span>
+        </div>
+        <div class="controls">
+          <label>acceptance rate α <input type="range" id="sd-a" min="0" max="1" step="0.01" value="0.7"> <span id="sd-a-v">0.70</span></label>
+          <label>draft length γ <input type="range" id="sd-g" min="1" max="10" step="1" value="5"> <span id="sd-g-v">5</span></label>
+          <label>cost ratio c <input type="range" id="sd-c" min="0" max="1" step="0.01" value="0.15"> <span id="sd-c-v">0.15</span></label>
+          <button id="sd-step" type="button">step</button>
+        </div>
+        <svg id="sd-svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="Draft, verify, accept token-stream simulator with a speedup-versus-draft-length curve"></svg>
+        <div class="readout" aria-live="polite" id="sd-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="winlose">
+      <h3><span class="idx">06</span> When it wins, when it fails</h3>
+      <p class="lede">Wins</p>
+      <ul class="notes">
+        <li><b>Memory-bandwidth-bound regimes:</b> low-to-moderate batch size / low concurrency, latency-sensitive single- or few-stream serving — where the target's parallel slack exists to absorb verification.</li>
+        <li><b>Long outputs and large targets:</b> the bigger the target, the more a cheap draft is worth.</li>
+        <li><b>Predictable structure:</b> code and grounded summarization tend to show higher acceptance.</li>
+      </ul>
+      <p class="lede">Failure modes</p>
+      <ul class="notes">
+        <li><b>High concurrency / large batches.</b> Once the target is already compute-saturated by many parallel requests, the "free" verification slack vanishes; speedup shrinks and can plateau (degradation reported around ~20–30+ concurrent requests on a single GPU). Tensor parallelism across GPUs mitigates this — a core <a href="llmops.html">LLMOps</a> serving trade-off.</li>
+        <li><b>Poor draft–target alignment / low α.</b> Off-the-shelf drafts underperform on domain-shifted data; rejected drafts are wasted compute.</li>
+        <li><b>γ set too high</b> under load wastes draft work on tokens that get rejected, causing latency spikes.</li>
+        <li><b>Memory overhead:</b> an independent draft means a second set of weights resident in GPU memory.</li>
+      </ul>
+      <p><b>Tuning knobs:</b> draft size/quality (drives both α and c), γ (has an optimum), acceptance scheme (exact vs. relaxed), and whether drafting is a single chain or a branching tree.</p>
+    </section>
+
+    <section class="topic" id="variants">
+      <h3><span class="idx">07</span> Variant taxonomy (and lossless vs. lossy)</h3>
+      <p class="lede">All differ mainly in <i>how the draft is produced</i> and <i>how candidates are verified</i>.</p>
+      <ul class="notes">
+        <li><b>Independent draft model</b> <span class="pill">lossless</span> — a separate small LLM, often a smaller member of the same family. Classic, exact with the rejection rule above. Cost: extra weights + alignment burden.</li>
+        <li><b>Self-speculative / layer-skipping</b> <span class="pill">lossless</span> — the <i>target itself</i> drafts by skipping or early-exiting layers, then verifies with the full stack. No second model, no extra weights, inherently aligned.</li>
+        <li><b>Medusa</b> <span class="pill">lossy</span> — adds a few lightweight extra decoding heads on the frozen target's last hidden state, each predicting a future position; candidates combined via tree attention. Uses a <b>typical-acceptance</b> threshold, so it is <b>not</b> distribution-identical. Only the heads are trained.</li>
+        <li><b>EAGLE (and EAGLE-2/3)</b> — drafts autoregressively at the <b>feature level</b> (the hidden state before the LM head) rather than the token level, reducing uncertainty that hurts token-level drafting; later versions add dynamic draft <b>trees</b> and multi-layer feature fusion. Among the highest accepted lengths reported.</li>
+        <li><b>Lookahead</b> <span class="pill">model-free</span> — training-free Jacobi-style parallel iteration that generates and verifies n-grams against the target, maintaining an n-gram pool. No draft model, no datastore.</li>
+        <li><b>Prompt / retrieval lookup (n-gram)</b> — draft by copying n-grams from the prompt or a corpus; cheap and effective when output echoes input (RAG, editing, code).</li>
+      </ul>
+      <p><b>Verification structure.</b> <b>Token-tree / tree attention</b> verifies <i>many</i> candidate continuations (a branching tree of guesses) in one pass via a custom attention mask, raising the expected accepted length beyond a single linear draft chain — building directly on the <a href="../deep-learning/attention.html">attention</a> mechanism.</p>
+      <p><b>Lossless vs. lossy.</b> The exact modified-rejection rule (independent draft, self-speculative with full verification) preserves <code>p</code> exactly. Threshold / typical-acceptance schemes (e.g. Medusa) trade a small, usually-benign distribution change for more accepted tokens — so "speculative decoding is lossless" is only fully true for the exact variants.</p>
+    </section>
+
+    <section class="topic" id="numbers">
+      <h3><span class="idx">08</span> Reported speedups (directional)</h3>
+      <ul class="notes">
+        <li><b>~2–3×</b> per-token latency is typical for single-stream serving at moderate acceptance (roughly α ≥ 0.6, γ ≥ 5), with <b>zero</b> quality loss for the exact rule and no retraining of the target.</li>
+        <li>Encoder-decoder, 11B-class target: ~3.4× translation (greedy), ~3.1× summarization (greedy), ~2.6× translation (sampling) — identical outputs.</li>
+        <li>70B-class decoder, distributed: ~2×–2.5× (e.g. ~1.9× summarization, ~2.0× greedy, ~2.5× code) with no quality change; a wide-shallow draft limits communication overhead.</li>
+        <li><b>Variant numbers (relaxed acceptance, so not distribution-identical) are approximate and hardware/task dependent:</b> Medusa ~2×–2.5×; Lookahead ~1.5×–2.3×; the EAGLE family among the strongest. Treat all of these as directional, not canonical.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">09</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Draft cheap, verify in parallel, accept a run.</b> It converts serial big-model work into parallel big-model work plus cheap serial small-model work.</li>
+        <li><b>The exact rejection rule is provably lossless</b> — output equals the target's distribution for any draft. Relaxed schemes (Medusa-style thresholds) are lossy by design.</li>
+        <li><b>Speedup ≈ (1 − α<sup>γ+1</sup>) / ((1 − α)(γc + 1)):</b> win requires α &gt; c, and γ has an optimum.</li>
+        <li><b>Best at low concurrency;</b> high batch sizes erode the gain. A serving decision that lives in <a href="llmops.html">LLMOps</a>.</li>
+        <li><b>Raise α by aligning the draft</b> — same-family drafts, self-speculation, or <a href="../deep-learning/knowledge-distillation.html">distillation</a> onto target outputs. Composes with the <a href="../deep-learning/attention.html">KV cache</a> and the rest of the <a href="model-acceleration.html">acceleration stack</a>.</li>
+      </ul>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+(function(){
+  const C={accent:"#a3e635",good:"#4ade80",bad:"#f87171",a2:"#ffb454",blue:"#60a5fa",muted:"#9aa3b2",ink:"#e6e9ef",line:"#2a2f3a",panel:"#15181f"};
+  const svg=d3.select("#sd-svg"),W=640,H=360;
+
+  function eTokens(a,g){
+    if(a>=0.999) return g+1;            // limit of (1-a^(g+1))/(1-a) as a->1
+    return (1-Math.pow(a,g+1))/(1-a);
+  }
+  function speedup(a,g,c){
+    return eTokens(a,g)/(g*c+1);
+  }
+
+  // simulate one accept/reject pattern for the stream given alpha & gamma
+  function simCycle(a,g){
+    // walk gamma drafts; each accepted w.p. a until first reject
+    let accepted=0, rejectedAt=-1;
+    for(let i=0;i<g;i++){
+      if(Math.random()<a){ accepted++; }
+      else { rejectedAt=i; break; }
+    }
+    return {accepted, rejectedAt}; // if rejectedAt<0 all g accepted -> bonus token
+  }
+
+  function draw(){
+    const a=+d3.select("#sd-a").property("value");
+    const g=+d3.select("#sd-g").property("value");
+    const c=+d3.select("#sd-c").property("value");
+    d3.select("#sd-a-v").text(a.toFixed(2));
+    d3.select("#sd-g-v").text(g);
+    d3.select("#sd-c-v").text(c.toFixed(2));
+
+    svg.selectAll("*").remove();
+
+    // ---- token stream (top) ----
+    const {accepted,rejectedAt}=simCycle(a,g);
+    const allAccepted = rejectedAt<0;
+    const boxN=g+1;                 // gamma drafts + 1 correction/bonus slot
+    const bx0=20, bw=Math.min(54,(W-40)/boxN-8), gap=8, by=44, bh=40;
+    svg.append("text").attr("x",bx0).attr("y",26).attr("font-size",12).attr("fill",C.muted)
+       .text("one cycle:  γ drafted tokens + 1 correction / bonus");
+
+    for(let i=0;i<boxN;i++){
+      const x=bx0+i*(bw+gap);
+      let fill, op=1, label, lblColor;
+      if(i<g){ // a drafted position
+        if(allAccepted){ fill=C.good; label="✓"; lblColor="#0a0d12"; }       // all accepted
+        else if(i<accepted){ fill=C.good; label="✓"; lblColor="#0a0d12"; }   // accepted prefix
+        else if(i===accepted){ fill=C.bad; label="✗"; lblColor="#0a0d12"; }  // first reject
+        else { fill="#2a2f3a"; op=0.35; label=""; lblColor=C.muted; }        // trailing drafts fade
+      } else { // the final slot
+        if(allAccepted){ fill=C.accent; label="+"; lblColor="#0a0d12"; }     // bonus token
+        else { fill=C.blue; label="~"; lblColor="#0a0d12"; }                 // resampled correction
+      }
+      const grp=svg.append("g");
+      grp.append("rect").attr("x",x).attr("y",by).attr("width",bw).attr("height",bh).attr("rx",6)
+         .attr("fill",fill).attr("fill-opacity", (i<g && i>accepted && !allAccepted)?0.35:0.9)
+         .attr("opacity",op).attr("stroke",C.line);
+      if(label) grp.append("text").attr("x",x+bw/2).attr("y",by+bh/2+5).attr("text-anchor","middle")
+         .attr("font-size",16).attr("font-weight",700).attr("fill",lblColor).text(label);
+      // ghost outline for drafted positions
+      grp.append("text").attr("x",x+bw/2).attr("y",by-5).attr("text-anchor","middle")
+         .attr("font-size",9).attr("fill",C.muted).text(i<g?("d"+(i+1)):"out");
+    }
+    const emitted = allAccepted ? g+1 : accepted+1;
+    svg.append("text").attr("x",bx0).attr("y",by+bh+22).attr("font-size",11).attr("fill",C.ink)
+       .html(null).text("this cycle emitted "+emitted+" token"+(emitted!==1?"s":"")+" from 1 target pass");
+
+    // legend
+    const lg=[[C.good,"accepted"],[C.bad,"first reject"],[C.blue,"resampled fix"],[C.accent,"bonus"]];
+    lg.forEach((d,i)=>{
+      const lx=bx0+i*120, ly=by+bh+38;
+      svg.append("rect").attr("x",lx).attr("y",ly-9).attr("width",11).attr("height",11).attr("rx",2).attr("fill",d[0]);
+      svg.append("text").attr("x",lx+16).attr("y",ly).attr("font-size",10).attr("fill",C.muted).text(d[1]);
+    });
+
+    // ---- speedup vs gamma curve (bottom) ----
+    const m={l:46,r:18,t:175,b:42};
+    const pw=W-m.l-m.r, ph=H-m.t-m.b;
+    const gs=d3.range(1,11);
+    const ys=gs.map(gg=>speedup(a,gg,c));
+    const ymax=Math.max(1.05, d3.max(ys)*1.12);
+    const x=d3.scaleLinear().domain([1,10]).range([m.l,m.l+pw]);
+    const y=d3.scaleLinear().domain([0,ymax]).range([m.t+ph,m.t]);
+
+    // axes
+    svg.append("line").attr("x1",m.l).attr("y1",m.t+ph).attr("x2",m.l+pw).attr("y2",m.t+ph).attr("stroke",C.line);
+    svg.append("line").attr("x1",m.l).attr("y1",m.t).attr("x2",m.l).attr("y2",m.t+ph).attr("stroke",C.line);
+    // 1x baseline (no speedup)
+    if(1<=ymax){
+      svg.append("line").attr("x1",m.l).attr("y1",y(1)).attr("x2",m.l+pw).attr("y2",y(1))
+         .attr("stroke",C.muted).attr("stroke-dasharray","4 4").attr("opacity",0.6);
+      svg.append("text").attr("x",m.l+pw).attr("y",y(1)-4).attr("text-anchor","end").attr("font-size",9).attr("fill",C.muted).text("1× (no gain)");
+    }
+    gs.forEach(gg=>{
+      svg.append("text").attr("x",x(gg)).attr("y",m.t+ph+14).attr("text-anchor","middle").attr("font-size",9).attr("fill",C.muted).text(gg);
+    });
+    svg.append("text").attr("x",m.l+pw/2).attr("y",m.t+ph+34).attr("text-anchor","middle").attr("font-size",10).attr("fill",C.muted).text("draft length γ");
+    svg.append("text").attr("x",m.l-34).attr("y",m.t-6).attr("font-size",10).attr("fill",C.muted).text("speedup");
+    [0.5,1,1.5,2,2.5,3].filter(t=>t<=ymax).forEach(t=>{
+      svg.append("text").attr("x",m.l-8).attr("y",y(t)+3).attr("text-anchor","end").attr("font-size",9).attr("fill",C.muted).text(t+"×");
+    });
+
+    // curve
+    const line=d3.line().x((d,i)=>x(gs[i])).y(d=>y(d)).curve(d3.curveMonotoneX);
+    const winning = d3.max(ys)>1;
+    svg.append("path").datum(ys).attr("fill","none")
+       .attr("stroke", winning?C.accent:C.bad).attr("stroke-width",2.2).attr("d",line);
+    gs.forEach((gg,i)=>{
+      svg.append("circle").attr("cx",x(gg)).attr("cy",y(ys[i])).attr("r",2.6).attr("fill",winning?C.accent:C.bad);
+    });
+
+    // optimal gamma marker
+    const bestI=ys.indexOf(d3.max(ys)), bestG=gs[bestI], bestS=ys[bestI];
+    svg.append("line").attr("x1",x(bestG)).attr("y1",m.t+ph).attr("x2",x(bestG)).attr("y2",y(bestS))
+       .attr("stroke",C.a2).attr("stroke-dasharray","3 3");
+    svg.append("circle").attr("cx",x(bestG)).attr("cy",y(bestS)).attr("r",5).attr("fill",C.a2);
+    svg.append("text").attr("x",x(bestG)).attr("y",y(bestS)-9).attr("text-anchor","middle")
+       .attr("font-size",10).attr("font-weight",700).attr("fill",C.a2).text("γ*="+bestG);
+
+    // current gamma marker on curve
+    svg.append("circle").attr("cx",x(g)).attr("cy",y(speedup(a,g,c))).attr("r",4).attr("fill",C.ink).attr("stroke",C.line);
+
+    // ---- readout ----
+    const Et=eTokens(a,g), Sp=speedup(a,g,c);
+    const verdict = (a>c) ? `<span style="color:${C.good}">α &gt; c → net win possible</span>`
+                          : `<span style="color:${C.bad}">α ≤ c → draft does not pay for itself</span>`;
+    d3.select("#sd-read").html(
+      `E[tokens] = <b>${Et.toFixed(2)}</b> &nbsp;·&nbsp; Speedup at γ=${g}: <b style="color:${Sp>1?C.good:C.bad}">${Sp.toFixed(2)}×</b>`+
+      ` &nbsp;·&nbsp; optimal γ* = <b style="color:${C.a2}">${bestG}</b> (<b>${bestS.toFixed(2)}×</b>) &nbsp;·&nbsp; ${verdict}`
+    );
+  }
+
+  ["#sd-a","#sd-g","#sd-c"].forEach(s=>d3.select(s).on("input",draw));
+  d3.select("#sd-step").on("click",draw);   // re-roll the random accept/reject pattern
+  draw();
+})();
+</script>
+</body>
+</html>

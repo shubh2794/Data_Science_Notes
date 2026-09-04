@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Named Entity Recognition</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Named Entity Recognition</h1>
+      <p>NER finds and classifies the spans of text that name real-world things — people, places, organizations, dates — turning free text into <b>structured entities</b>. It is the first step of most information-extraction pipelines, and the classic testbed for every sequence-labeling idea from gazetteers to transformers.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">NLP</span>
+        <span class="pill">Sequence labeling</span>
+        <span class="pill">Information extraction</span>
+        <span class="pill">Span prediction</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="overview" data-nav="The task">
+      <h3><span class="idx">01</span> The task</h3>
+      <p class="lede">Input a sentence; output a set of typed <b>spans</b>. Two decisions per entity — where it starts and stops, and what kind of thing it is — and both are harder than they look.</p>
+      <ul class="notes">
+        <li><b>Formally:</b> given tokens <code>x = (x₁ … x_T)</code>, return a set of triples <code>(i, j, type)</code> meaning "tokens <code>i</code> through <code>j</code> name an entity of this type". Typical type sets are small — <code>PER</code>, <code>LOC</code>, <code>ORG</code>, <code>MISC</code> in general-domain corpora; hundreds of types in fine-grained or biomedical schemes.</li>
+        <li><b>Why it is hard.</b> Entities are <b>ambiguous</b> in type (<i>Apple</i> the company vs the fruit, <i>Washington</i> the person, city, or state), <b>multi-word</b> with fuzzy boundaries (is <i>the</i> part of <i>The New York Times</i>? is <i>Inc.</i> part of the org?), and <b>open-class</b> — new names appear every day, so memorisation cannot work.</li>
+        <li><b>Context does the disambiguation.</b> "…shares of Apple fell" versus "…ate an apple" differ only in surrounding words, which is precisely why contextual encoders transformed the task.</li>
+        <li><b>Two framings.</b> Cast it as <b>token labeling</b> (a tag per token, decoded into spans) or as <b>span classification</b> (enumerate candidate spans, classify each). The first dominates historically; the second handles overlap, and both appear in <a href="#spans">§05</a>.</li>
+      </ul>
+      <div class="formula"><span class="lbl">two framings of the same task</span><span class="eq">token labeling:  x → y ∈ S<sup>T</sup> ,</span>  <span class="eq">then decode spans from y</span>
+<span class="eq">span classification:  { (i, j) : 1 ≤ i ≤ j ≤ T, j − i &lt; L } → type ∪ { none }</span></div>
+      <div class="callout"><b>One idea:</b> NER is <i>boundary detection plus typing</i>. Most systems are good at typing and lose their points on boundaries — which is why the metric in <a href="#eval">§07</a> is unforgiving about exactly where a span begins and ends.</div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="bio" data-nav="Tag schemes: BIO &amp; BIOES">
+      <h3><span class="idx">02</span> Tag schemes: BIO &amp; BIOES</h3>
+      <p class="lede">To turn spans into per-token labels you need a scheme that marks <b>where each entity begins</b>, so that two adjacent entities of the same type do not silently merge into one.</p>
+      <h4>BIO and its variants</h4>
+      <ul class="notes">
+        <li><b>BIO</b> (also called IOB2) uses three prefixes: <code>B-</code> begins an entity, <code>I-</code> continues it, <code>O</code> is outside any entity. For <code>k</code> entity types the tag set has <code>2k + 1</code> labels.</li>
+        <li>The <code>B-</code> prefix is the entire reason the scheme exists. Without it (the older <code>IO</code> scheme), <i>Paris London</i> tagged <code>I-LOC I-LOC</code> is indistinguishable from the single two-word location <i>Paris London</i>. <code>IO</code> has only <code>k + 1</code> labels and is simpler to learn, but cannot represent adjacent same-type entities at all.</li>
+        <li><b>BIOES</b> (equivalently BILOU) adds <code>E-</code> for the last token of a multi-token entity and <code>S-</code> for a single-token entity, giving <code>4k + 1</code> labels. The extra labels make boundaries explicit rather than implicit, which usually buys a small F1 gain — at the cost of more classes and sparser training signal per class.</li>
+        <li>Every scheme induces <b>illegal transitions</b>: under BIO, <code>O → I-PER</code> and <code>B-LOC → I-PER</code> are ill-formed. A <a href="hidden-markov-models-crfs.html">CRF</a> layer or constrained decoding enforces these; a plain softmax merely learns to avoid them most of the time.</li>
+      </ul>
+      <div class="formula"><span class="lbl">tag-set size and legality</span><span class="eq">IO: k + 1 labels</span>   <span class="eq">BIO: 2k + 1</span>   <span class="eq">BIOES: 4k + 1</span>
+<span class="eq">legal(y<sub>t−1</sub> → I-X)  ⟺  y<sub>t−1</sub> ∈ { B-X , I-X }</span>
+<span class="eq">spans(y) = { (i, j, X) : y<sub>i</sub> = B-X ,  y<sub>i+1…j</sub> = I-X ,  y<sub>j+1</sub> ≠ I-X }</span></div>
+
+      <div class="viz" id="viz-ner">
+        <div class="vhead">
+          <span class="vtitle">BIO tags &amp; entity spans</span>
+          <span class="vhint">B- starts an entity, I- continues it, O is non-entity</span>
+        </div>
+        <div class="controls">
+          <label>sentence
+            <select id="ner-sel">
+              <option value="0">Tim Cook visited Paris with Apple.</option>
+              <option value="1">Ada Lovelace was born in London in 1815.</option>
+              <option value="2">The World Health Organization met in Geneva.</option>
+            </select>
+          </label>
+        </div>
+        <svg id="ner-svg" width="640" height="180" viewBox="0 0 640 180" role="img" aria-label="Interactive diagram: BIO tags &amp; entity spans"></svg>
+        <div class="readout" aria-live="polite" id="ner-read"></div>
+      </div>
+
+      <p>BIO lets a token classifier represent multi-word and adjacent entities unambiguously, and it makes span extraction a deterministic post-processing pass over the tag sequence. Note the asymmetry the readout exposes: a single wrong tag in the middle of a four-token organisation destroys the <i>whole</i> entity at evaluation time, because scoring is per span, not per token.</p>
+      <div class="callout"><b>Takeaway:</b> the tag scheme is a lossless encoding of a set of spans as a sequence of labels — provided the sequence is well-formed. Choosing BIO vs BIOES is a bias/variance trade: more labels means sharper boundary signal but fewer examples per label.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="approaches" data-nav="Approaches, old to new">
+      <h3><span class="idx">03</span> Approaches, old to new</h3>
+      <p class="lede">Four eras, each removing the previous era's manual labour: hand-written rules → hand-engineered features → learned word features → pretrained contextual features.</p>
+      <h4>Rules and gazetteers</h4>
+      <ul class="notes">
+        <li>Regular expressions over word shape (<code>Xxxxx Xxxxx</code>), trigger words (<i>Mr.</i>, <i>Inc.</i>, <i>said</i>), and <b>gazetteers</b> — curated lists of known names. High precision on the covered vocabulary, poor recall on everything else, and enormous maintenance cost per domain.</li>
+        <li>Gazetteers never fully disappeared: they survive as <i>features</i> inside statistical models and as post-hoc validators in production systems, where a lookup against a customer list is often more reliable than a model.</li>
+      </ul>
+      <h4>Statistical, neural, and pretrained</h4>
+      <ul class="notes">
+        <li><b>CRFs</b> replaced rules with weighted feature functions over the whole sequence, decoded with Viterbi — see <a href="hidden-markov-models-crfs.html">HMMs &amp; CRFs</a>. Features were still hand-designed (capitalisation, suffix, gazetteer hit, neighbouring words), but weights were learned and globally normalised.</li>
+        <li><b>BiLSTM-CRF</b> replaced feature engineering with learned representations: pretrained word <a href="embeddings.html">embeddings</a> plus a character-level encoder (for morphology and unseen-word shape), a bidirectional LSTM for context, and a CRF layer for valid transitions.</li>
+        <li><b>Transformer token classification</b> is the current default: fine-tune a pretrained encoder such as <a href="../models/bert.html">BERT</a> with a linear head over the tag set. Subword-level contextual vectors handle unseen names gracefully, and the pretraining does the work that gazetteers used to.</li>
+      </ul>
+      <h4>Generative LLM prompting</h4>
+      <ul class="notes">
+        <li>An instruction-tuned LLM can be asked to return entities directly as JSON, zero-shot or with a handful of demonstrations. This is unbeatable for <b>cold-start</b> work: a new entity type with no training data, or a one-off extraction over a few thousand documents.</li>
+        <li>The weaknesses are structural. Output is <b>generated, not aligned</b> — the model may return a normalised string ("New York City") that does not occur verbatim in the text, so offsets must be recovered by fuzzy matching and sometimes cannot be. Long documents strain recall, output is non-deterministic, and cost per document is orders of magnitude above a fine-tuned encoder. Constrained/structured decoding fixes the JSON shape but not the grounding.</li>
+        <li>The practical pattern is hybrid: use an LLM to <b>bootstrap</b> silver labels or handle rare types, then distil into a small encoder for volume.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Approach</th><th>Features from</th><th>Structure over labels</th><th>Data need</th><th>Best at</th><th>Weak at</th></tr>
+        <tr><td>Rules / gazetteers</td><td>Hand-written patterns &amp; name lists</td><td>Implicit in the rules</td><td>None (expert time instead)</td><td>Closed, known vocabularies</td><td>Recall; every new domain</td></tr>
+        <tr><td>CRF</td><td>Hand-engineered features</td><td><b>Global</b> — Viterbi over <code>Z(x)</code></td><td>Thousands of sentences</td><td>Small data, interpretability</td><td>Unseen words; feature labour</td></tr>
+        <tr><td>BiLSTM-CRF</td><td>Learned word + char vectors</td><td><b>Global</b> — CRF layer</td><td>Tens of thousands</td><td>Morphology, no feature design</td><td>Long-range context; data hunger</td></tr>
+        <tr><td>Transformer + head</td><td>Pretrained contextual vectors</td><td>Per-token softmax, or CRF head</td><td>Hundreds–thousands (fine-tune)</td><td>Accuracy, transfer, throughput</td><td>Nested spans; label cost</td></tr>
+        <tr><td>LLM prompting</td><td>Pretraining + instructions</td><td>None — free-form generation</td><td><b>Zero to a few</b> examples</td><td>Cold start, rare/novel types</td><td>Offsets, consistency, cost</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> the trend is a steady migration of knowledge from <i>hand-written artefacts</i> (rules, gazetteers, features) into <i>pretrained parameters</i>. What never migrated is the label scheme — every era still has to decide what counts as an entity.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="head" data-nav="The token-classification head">
+      <h3><span class="idx">04</span> The token-classification head</h3>
+      <p class="lede">Fine-tuning an encoder for NER is a two-line change — a linear layer and a cross-entropy loss. The subtlety is entirely in <b>aligning word-level labels to sub-word tokens</b>.</p>
+      <h4>The head itself</h4>
+      <ul class="notes">
+        <li>The encoder returns a contextual vector <code>h<sub>t</sub> ∈ ℝ<sup>d</sup></code> per token. A shared linear layer projects each to <code>|S|</code> logits, and a softmax gives a distribution over tags at that position. Loss is the mean cross-entropy over labelled positions.</li>
+        <li>Crucially there is <b>no interaction between positions</b> in the head — all context comes from the encoder. That is why a CRF layer (a learned <code>|S| × |S|</code> transition matrix, plus Viterbi) is an optional add-on, not a redesign.</li>
+      </ul>
+      <div class="formula"><span class="lbl">per-token softmax head</span><span class="eq">h<sub>t</sub> = Encoder(x)<sub>t</sub> ∈ ℝ<sup>d</sup></span>        <span class="eq">z<sub>t</sub> = W h<sub>t</sub> + b ,</span>  <span class="eq">W ∈ ℝ<sup>|S| × d</sup></span>
+<span class="eq">P(y<sub>t</sub> = s | x) = softmax(z<sub>t</sub>)<sub>s</sub> = exp(z<sub>t,s</sub>) ⁄ ∑<sub>s′</sub> exp(z<sub>t,s′</sub>)</span>
+<span class="eq">ℒ = −(1 ⁄ |M|) ∑<sub>t ∈ M</sub> log P(y<sub>t</sub> = y*<sub>t</sub> | x)</span>  <span class="eq">M = positions that carry a label</span></div>
+      <h4>Sub-word alignment</h4>
+      <ul class="notes">
+        <li>Labels are annotated on <b>words</b>; the model consumes <b>sub-words</b> (see <a href="tokenization.html">Tokenization</a>). <i>Lovelace</i> may become <code>Love ##lace</code>, so one gold label must be distributed over two positions.</li>
+        <li>The standard convention is <b>first-subword labelling</b>: the first piece of a word carries the word's tag; every continuation piece, plus special tokens such as <code>[CLS]</code> and <code>[SEP]</code>, is assigned the ignore index (conventionally <code>−100</code>) and excluded from both loss and prediction. At inference, the tag of the first piece is the tag of the whole word.</li>
+        <li>The alternative — propagating <code>B-X</code> to the first piece and <code>I-X</code> to the rest, and supervising every piece — trains on more positions but must then reconcile disagreements between pieces of one word at decode time. First-subword labelling avoids that entirely, which is why it is the default.</li>
+        <li>Two failure modes to watch: <b>offset drift</b>, where reconstructed character offsets no longer match the source text (always carry the tokenizer's offset mapping rather than re-finding strings), and <b>truncation</b>, where entities past the model's maximum length are silently unlabelled. Use overlapping windows with a stride and merge, rather than plain truncation.</li>
+      </ul>
+
+      <p>The diagram below shows the alignment for one sentence: words split into pieces, the gold tag attached to the first piece only, continuations masked out of the loss.</p>
+      <div class="viz" id="viz-align">
+        <div class="vhead">
+          <span class="vtitle">Word labels → sub-word positions</span>
+          <span class="vhint">first piece carries the tag; continuations get the ignore index −100</span>
+        </div>
+        <div class="controls">
+          <label>sentence
+            <select id="align-sel">
+              <option value="0">Ada Lovelace visited Reykjavik</option>
+              <option value="1">Cook joined Apple Incorporated</option>
+            </select>
+          </label>
+          <button class="btn ghost" id="align-mode">show: first-subword</button>
+        </div>
+        <svg id="align-svg" width="640" height="230" viewBox="0 0 640 230" role="img" aria-label="Interactive diagram: aligning word-level entity labels to sub-word tokens"></svg>
+        <div class="readout" aria-live="polite" id="align-read"></div>
+      </div>
+      <div class="callout"><b>Takeaway:</b> almost every silent NER bug lives in the alignment layer, not the model. Keep the tokenizer's offset mapping end-to-end and treat character offsets — not strings — as the ground truth for a span.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="spans" data-nav="Nested &amp; discontinuous entities">
+      <h3><span class="idx">05</span> Nested &amp; discontinuous entities</h3>
+      <p class="lede">BIO can only express a <b>flat, contiguous partition</b> of the tokens. Real annotation guidelines — especially biomedical and legal ones — routinely break both assumptions.</p>
+      <h4>Where flat tagging breaks</h4>
+      <ul class="notes">
+        <li><b>Nested entities.</b> In "the <i>University of Washington</i>", the organisation contains a location; in "<i>Bank of China</i> employees", an ORG contains a LOC. A token can belong to two entities at once, and BIO gives it only one tag. Fine-grained corpora contain a substantial minority of such cases, so ignoring them caps recall.</li>
+        <li><b>Discontinuous entities.</b> "left and right <i>ventricles</i>" encodes two entities sharing one head word; "<i>pain</i> in the neck and <i>shoulder</i>" splits one mention around intervening text. No contiguous span captures these.</li>
+        <li><b>Overlapping types.</b> The same span may be legitimately typed twice (a person's name that is also a product name), which flat single-label tagging cannot express.</li>
+      </ul>
+      <h4>Span-based models</h4>
+      <ul class="notes">
+        <li>Enumerate every candidate span up to a maximum width <code>L</code>, build a span representation from its endpoints (and optionally a pooled interior), and classify it into <code>types ∪ {none}</code>. Because spans are scored <b>independently</b>, overlap and nesting are free — the model can accept two spans that share tokens.</li>
+        <li>The <b>biaffine</b> formulation scores a span by combining a start representation and an end representation through a bilinear form, producing a <code>T × T × |types|</code> table; the upper triangle is exactly the set of valid spans. It is elegant and strong, but costs <code>O(T²)</code> candidates — hence the width cap.</li>
+        <li>Other framings: <b>machine-reading-comprehension NER</b> asks a question per type ("find all locations") and predicts start/end pointers, which transfers well to unseen types because the type name is in the prompt; <b>seq2seq NER</b> generates a linearised list of spans, handling nesting and discontinuity uniformly at the cost of exposure to generation errors; and <b>hypergraph / transition-based</b> parsers build nested structures directly.</li>
+      </ul>
+      <div class="formula"><span class="lbl">biaffine span scoring</span><span class="eq">s<sub>i</sub> = MLP<sub>start</sub>(h<sub>i</sub>) ,</span>  <span class="eq">e<sub>j</sub> = MLP<sub>end</sub>(h<sub>j</sub>)</span>
+<span class="eq">score(i, j) = s<sub>i</sub><sup>⊤</sup> U e<sub>j</sub> + W [ s<sub>i</sub> ; e<sub>j</sub> ] + b ∈ ℝ<sup>|types|+1</sup></span>
+<span class="eq">candidates: O(T · L) spans with width cap L ,  O(T²) without</span></div>
+      <div class="callout"><b>Takeaway:</b> choose the framing from the annotation, not from habit. Flat and contiguous → token labeling, which is cheaper and usually stronger. Nested or overlapping → span classification. Discontinuous → span classification plus an explicit combination step, or generation.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="linking" data-nav="From mentions to entities">
+      <h3><span class="idx">06</span> From mentions to entities</h3>
+      <p class="lede">NER returns <b>mentions</b> — pieces of text. Downstream systems need <b>entities</b> — stable identifiers. Bridging the two is entity linking, and it is a separate, harder problem.</p>
+      <h4>The linking pipeline</h4>
+      <ul class="notes">
+        <li><b>Mention detection</b> (this page) → <b>candidate generation</b> → <b>disambiguation</b> → <b>NIL handling</b>. Candidate generation uses an alias table (surface form → plausible identifiers, mined from redirects, anchor text, and synonym lists) or a dense retriever over entity descriptions; it must be high-recall, since disambiguation can only pick from what it is given.</li>
+        <li><b>Disambiguation</b> ranks candidates using three signals: <i>prior</i> popularity of each identifier for that surface form, <i>local</i> compatibility between the mention's context and the entity's description, and <i>global</i> coherence — the candidates chosen for all mentions in a document should be topically consistent with each other. Global coherence is what resolves "Paris" to the city in a travel article and to the person in a celebrity one.</li>
+        <li><b>NIL prediction</b> is mandatory in practice: many mentions refer to entities absent from the knowledge base, and a linker that always emits its best guess will confidently attach them to the wrong node.</li>
+        <li>Modern linkers are <b>bi-encoders</b> — mention-in-context and entity-description embedded into a shared space for fast retrieval — optionally followed by a cross-encoder re-ranker over the top candidates. The same retrieve-then-rerank shape as <a href="retrieval-augmented-generation.html">RAG</a>.</li>
+      </ul>
+      <div class="formula"><span class="lbl">bi-encoder linking score</span><span class="eq">score(m, e) = cos( f(mention m + context) , g(description of e) ) = (a · b) ⁄ (‖a‖ ‖b‖)</span>
+<span class="eq">ê = argmax<sub>e ∈ C(m)</sub> score(m, e)</span>   <span class="eq">predict NIL if max score &lt; τ</span></div>
+      <h4>Coreference and downstream use</h4>
+      <ul class="notes">
+        <li>Within a document, the same entity appears as <i>Tim Cook</i>, <i>Cook</i>, and <i>he</i>. <b>Coreference resolution</b> groups those mentions into one chain; NER only labels the ones that are names. Aggregating attributes per entity without coreference systematically under-counts.</li>
+        <li>Linked, coreferent entities are what make <a href="knowledge-graphs.html">knowledge graphs</a> possible: entities become nodes, and relation extraction over the linked mentions supplies the edges. Without linking you have strings, not a graph.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> "Apple" is a mention; <code>Q312</code> is an entity. NER stops at the string — anything that needs to <i>join</i> across documents needs linking, and linking needs a knowledge base plus an honest NIL threshold.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="eval" data-nav="Evaluation">
+      <h3><span class="idx">07</span> Evaluation</h3>
+      <p class="lede">NER is scored at the <b>entity level</b>, not the token level — and that single choice explains most of the gap between a model that looks good and one that is good.</p>
+      <h4>Entity-level precision, recall, F1</h4>
+      <ul class="notes">
+        <li>Predictions and gold annotations are both sets of <code>(start, end, type)</code> triples. Under the standard <b>exact-match</b> criterion, a prediction counts as a true positive only if <i>both</i> boundaries and the type match; otherwise it is a false positive, and the missed gold span is also a false negative.</li>
+        <li>That double penalty is severe. A four-token organisation with one token clipped off scores <b>zero</b>, and simultaneously costs a false positive — even though token-level accuracy for that entity was 75%. Token-level accuracy is therefore always flattering and should never be reported alone; the abundant <code>O</code> class also inflates it toward 95%+ regardless of skill.</li>
+        <li>Report micro-averaged F1 across all entities (the conventional headline number), and per-type F1 alongside it, since rare types are invisible in the micro average.</li>
+      </ul>
+      <div class="formula"><span class="lbl">entity-level scoring</span><span class="eq">TP = |{ predicted spans that exactly match a gold span, type included }|</span>
+<span class="eq">P = TP ⁄ |predicted| ,</span>  <span class="eq">R = TP ⁄ |gold| ,</span>  <span class="eq">F1 = 2PR ⁄ (P + R)</span>
+<span class="eq">micro-F1: pool TP/FP/FN over all types before dividing</span></div>
+      <h4>Exact vs partial match</h4>
+      <ul class="notes">
+        <li>Exact match is harsh in domains where boundaries are genuinely conventional (should a job title be inside the person span? is the trailing <i>Ltd.</i> part of the org?). Relaxed criteria exist: <b>type match</b> credits any overlap with the right type; <b>partial match</b> awards half credit for an overlapping span with the correct type; <b>boundary match</b> ignores type and scores boundaries alone.</li>
+        <li>Decomposing errors this way is diagnostically valuable — it separates "the model found the right thing and mislabelled it" from "the model found the wrong extent" from "the model missed it entirely" — but the numbers are not comparable to exact-match figures. <b>Always state which criterion you used.</b></li>
+        <li>Sanity checks that catch real bugs: does the evaluator ignore illegal tag sequences or silently repair them? Are offsets character-based or token-based on both sides? Were truncated documents scored as missed entities or dropped from the denominator?</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Criterion</th><th>Counts as correct when</th><th>Credits</th><th>Use for</th></tr>
+        <tr><td><b>Exact</b></td><td>Boundaries <b>and</b> type both match</td><td>Full only</td><td>Headline comparison; the default</td></tr>
+        <tr><td>Type</td><td>Any token overlap, correct type</td><td>Full</td><td>Isolating typing skill from boundaries</td></tr>
+        <tr><td>Partial</td><td>Overlap with correct type, imperfect extent</td><td>Half</td><td>Domains with conventional boundaries</td></tr>
+        <tr><td>Boundary</td><td>Boundaries match, type ignored</td><td>Full</td><td>Isolating span detection</td></tr>
+        <tr><td>Token accuracy</td><td>Per-token tag matches</td><td>Full, per token</td><td><b>Nothing</b> — inflated by the <code>O</code> class</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> exact-match entity F1 is the number that matters, and it punishes boundary errors twice. If your token accuracy is 98% and your F1 is 82%, the model is not confused about types — it is confused about where entities end.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="uses" data-nav="Domains &amp; where it's used">
+      <h3><span class="idx">08</span> Domains &amp; where it's used</h3>
+      <p class="lede">General-domain NER is close to saturated; almost all real work is <b>domain adaptation</b>, where the type inventory, the text, and the conventions all differ from anything pretrained.</p>
+      <h4>Domain adaptation</h4>
+      <ul class="notes">
+        <li>Specialised text breaks general models in specific ways: biomedical and chemical names are long, hyphenated, and non-capitalised; legal text has bespoke party and citation types; clinical notes are ungrammatical and abbreviation-dense; user-generated text abandons capitalisation entirely, removing a feature general models lean on heavily.</li>
+        <li>The reliable ladder, cheapest first: (1) <b>continued pretraining</b> of the encoder on unlabelled in-domain text, which is nearly always the largest single win; (2) fine-tune on a few hundred to a few thousand in-domain annotations; (3) add gazetteer features or a dictionary post-filter for closed sub-vocabularies such as product codes; (4) use an LLM to produce <b>silver labels</b> that a human corrects, rather than annotating from scratch.</li>
+        <li>Test on <b>capitalisation-perturbed</b> and lowercased inputs before shipping. A drop of 20+ F1 points when case is stripped is common and reveals a model that has learned orthography instead of semantics.</li>
+      </ul>
+      <h4>Applications</h4>
+      <ul class="notes">
+        <li>Information extraction and search indexing — entities are the facets users filter by, and the anchors that make retrieval precise.</li>
+        <li>Redaction and compliance: detecting <a href="../data-engineering/data-quality-governance.html">PII</a> before storage or before sending text to a third-party model. Note that recall matters far more than precision here — a missed name is a breach, an over-redaction is an inconvenience.</li>
+        <li>Structured extraction from forms and contracts, where NER supplies the values that <a href="document-intelligence.html">document intelligence</a> attaches to fields.</li>
+        <li>Building <a href="knowledge-graphs.html">knowledge graphs</a>, and feeding relation extraction, event extraction, and question answering — all of which take entity spans as their input.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the benchmark number tells you almost nothing about your corpus. Budget for in-domain annotation and continued pretraining, and pick the operating point (precision- or recall-heavy) from the consequence of each error type.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="takeaways" data-nav="Pitfalls &amp; what to remember">
+      <h3><span class="idx">09</span> Pitfalls &amp; what to remember</h3>
+      <p class="lede">The mistakes that cost real F1, and the lines worth carrying away.</p>
+      <h4>Pitfalls</h4>
+      <ul class="notes">
+        <li><b>Reporting token accuracy.</b> Inflated by the dominant <code>O</code> class and blind to boundary errors. Report entity-level F1 and name the match criterion.</li>
+        <li><b>Broken sub-word alignment.</b> Labelling every piece, forgetting the <code>−100</code> ignore index, or losing the offset mapping. The model trains fine and the spans come out wrong.</li>
+        <li><b>Silent truncation.</b> Entities past the maximum sequence length disappear without error. Use a sliding window with overlap and merge spans across windows.</li>
+        <li><b>Forcing nested annotations into BIO.</b> If the guidelines allow nesting, flat tagging silently discards the inner or outer mention and caps achievable recall. Switch framings instead of tolerating the loss.</li>
+        <li><b>Relying on capitalisation.</b> Works on newswire, collapses on lowercased queries, transcripts, and chat. Augment training data with case perturbation.</li>
+        <li><b>Trusting LLM output as spans.</b> Generated strings are not grounded offsets. Always verify the returned text occurs in the source, and treat anything unmatched as a failure rather than a paraphrase.</li>
+      </ul>
+      <h4>What to remember</h4>
+      <ul class="notes">
+        <li><b>NER = find + type entity spans</b>, framed either as token labeling or as span classification.</li>
+        <li><b>BIO/BIOES</b> encode spans as per-token tags; the <code>B-</code> prefix is what separates adjacent same-type entities.</li>
+        <li><b>Lineage:</b> rules → <a href="hidden-markov-models-crfs.html">CRFs</a> → BiLSTM-CRF → fine-tuned transformer heads, with LLM prompting for cold start.</li>
+        <li><b>Subword alignment</b> (first-piece labelling, ignore index for continuations) is where the bugs live.</li>
+        <li><b>Exact-match entity F1</b> is the metric, and boundaries are the hard part.</li>
+        <li><b>Mentions are not entities</b> — linking and coreference turn spans into identifiers.</li>
+      </ul>
+      <div class="callout"><b>Threads to pull:</b> the structured-decoding machinery is in <a href="hidden-markov-models-crfs.html">HMMs &amp; CRFs</a>; the encoder is <a href="../models/bert.html">BERT</a>; alignment starts at <a href="tokenization.html">Tokenization</a>; linked entities become nodes in <a href="knowledge-graphs.html">Knowledge Graphs</a>; and field-level extraction over pages is <a href="document-intelligence.html">Document Intelligence</a>.</div>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+const PC={accent:"#c084fc",a2:"#ffb454",good:"#4ade80",bad:"#f87171",blue:"#5b9cff",muted:"#9aa3b2",ink:"#e6e9ef",line:"#2a2f3a"};
+
+/* ───────────────────────── 02 · BIO tags & spans ───────────────────────── */
+(function(){
+  const C={accent:"#c084fc",a2:"#ffb454",good:"#4ade80",muted:"#9aa3b2",ink:"#e6e9ef",line:"#2a2f3a"};
+  const svg=d3.select("#ner-svg"),W=640;
+  const TYPES={PER:"#5b9cff",LOC:"#4ade80",ORG:"#fb923c",DATE:"#fbbf24"};
+  const sents=[
+    {toks:["Tim","Cook","visited","Paris","with","Apple","."], tags:["B-PER","I-PER","O","B-LOC","O","B-ORG","O"]},
+    {toks:["Ada","Lovelace","was","born","in","London","in","1815","."], tags:["B-PER","I-PER","O","O","O","B-LOC","O","B-DATE","O"]},
+    {toks:["The","World","Health","Organization","met","in","Geneva","."], tags:["O","B-ORG","I-ORG","I-ORG","O","O","B-LOC","O"]},
+  ];
+  function draw(){
+    svg.selectAll("*").remove();
+    const s=sents[+d3.select("#ner-sel").property("value")];
+    let x=20; const y=60;
+    s.toks.forEach((t,i)=>{
+      const tag=s.tags[i], type=tag==="O"?null:tag.slice(2), col=type?TYPES[type]:"#3a4150";
+      const w=Math.max(30,t.length*9+18);
+      svg.append("rect").attr("x",x).attr("y",y).attr("width",w).attr("height",30).attr("rx",6)
+        .attr("fill",type?d3.color(col).copy({opacity:0.18}):"#15181f").attr("stroke",col);
+      svg.append("text").attr("x",x+w/2).attr("y",y+20).attr("text-anchor","middle").attr("font-size",12).attr("fill",C.ink).text(t);
+      svg.append("text").attr("x",x+w/2).attr("y",y-8).attr("text-anchor","middle").attr("font-size",9).attr("fill",col).attr("font-family","SF Mono, monospace").text(tag);
+      x+=w+7;
+    });
+    // legend
+    let lx=20; const ly=140;
+    Object.entries(TYPES).forEach(([k,c])=>{ svg.append("rect").attr("x",lx).attr("y",ly-9).attr("width",10).attr("height",10).attr("rx",2).attr("fill",c);
+      svg.append("text").attr("x",lx+15).attr("y",ly).attr("font-size",10).attr("fill",C.muted).text(k); lx+=70; });
+    const ents=[]; let cur=null;
+    s.tags.forEach((tg,i)=>{ if(tg.startsWith("B-")){ if(cur)ents.push(cur); cur={type:tg.slice(2),toks:[s.toks[i]]}; } else if(tg.startsWith("I-")&&cur){ cur.toks.push(s.toks[i]); } else { if(cur){ents.push(cur);cur=null;} } });
+    if(cur)ents.push(cur);
+    d3.select("#ner-read").html(`<b>${ents.length}</b> entities: `+ents.map(e=>`<span style="color:${TYPES[e.type]}">${e.toks.join(" ")} (${e.type})</span>`).join(" · "));
+  }
+  d3.select("#ner-sel").on("change",draw);
+  draw();
+})();
+
+/* ───────────────────────── 04 · word labels → sub-word positions ───────────────────────── */
+(function(){
+  const C=PC;
+  const svg=d3.select("#align-svg");
+  const readEl=d3.select("#align-read");
+  const btn=document.getElementById("align-mode");
+  const TYPES={PER:"#5b9cff",LOC:"#4ade80",ORG:"#fb923c"};
+  let mode="first";   // "first" = first-subword labelling, "prop" = propagate B-/I- to every piece
+
+  // words with their gold tag and a plausible sub-word split
+  const data=[
+    {words:[
+      {w:"Ada",       pieces:["Ada"],                tag:"B-PER"},
+      {w:"Lovelace",  pieces:["Love","##lace"],      tag:"I-PER"},
+      {w:"visited",   pieces:["visited"],            tag:"O"},
+      {w:"Reykjavik", pieces:["Rey","##kja","##vik"],tag:"B-LOC"}
+    ]},
+    {words:[
+      {w:"Cook",         pieces:["Cook"],                  tag:"B-PER"},
+      {w:"joined",       pieces:["joined"],                tag:"O"},
+      {w:"Apple",        pieces:["Apple"],                 tag:"B-ORG"},
+      {w:"Incorporated", pieces:["Incor","##por","##ated"],tag:"I-ORG"}
+    ]}
+  ];
+
+  function pieceTag(word, k){
+    if(mode==="first") return k===0 ? word.tag : "−100";
+    if(word.tag==="O") return "O";
+    return k===0 ? word.tag : "I-"+word.tag.slice(2);
+  }
+
+  function draw(){
+    svg.selectAll("*").remove();
+    const d=data[+d3.select("#align-sel").property("value")];
+    const yWord=48, yPiece=132;
+
+    svg.append("text").attr("x",14).attr("y",yWord+5).attr("font-size",10).attr("fill",C.muted).text("words");
+    svg.append("text").attr("x",14).attr("y",yPiece+5).attr("font-size",10).attr("fill",C.muted).text("pieces");
+
+    let px=74, masked=0, supervised=0;
+    const wordBoxes=[];
+    d.words.forEach(word=>{
+      const start=px, pieceBoxes=[];
+      word.pieces.forEach((p,k)=>{
+        const tg=pieceTag(word,k);
+        const type=(tg==="O"||tg==="−100")?null:tg.slice(2);
+        const col=type?TYPES[type]:(tg==="−100"?"#3a4150":"#4a5262");
+        const w=Math.max(34,p.length*7.6+14);
+        const ignored=(tg==="−100");
+        if(ignored) masked++; else supervised++;
+        svg.append("rect").attr("x",px).attr("y",yPiece).attr("width",w).attr("height",28).attr("rx",6)
+          .attr("fill",ignored?"#13161d":d3.color(col).copy({opacity:.18}))
+          .attr("stroke",col).attr("stroke-dasharray",ignored?"3 2":null);
+        svg.append("text").attr("x",px+w/2).attr("y",yPiece+19).attr("text-anchor","middle")
+          .attr("font-size",11).attr("font-family","SF Mono, monospace")
+          .attr("fill",ignored?"#5c6474":C.ink).text(p);
+        svg.append("text").attr("x",px+w/2).attr("y",yPiece+46).attr("text-anchor","middle")
+          .attr("font-size",9).attr("font-family","SF Mono, monospace").attr("fill",col).text(tg);
+        pieceBoxes.push(px+w/2);
+        px+=w+6;
+      });
+      wordBoxes.push({word,start,end:px-6,mids:pieceBoxes});
+      px+=10;
+    });
+
+    wordBoxes.forEach(b=>{
+      const type=b.word.tag==="O"?null:b.word.tag.slice(2);
+      const col=type?TYPES[type]:"#3a4150";
+      const w=b.end-b.start;
+      svg.append("rect").attr("x",b.start).attr("y",yWord-14).attr("width",w).attr("height",28).attr("rx",6)
+        .attr("fill",type?d3.color(col).copy({opacity:.16}):"#15181f").attr("stroke",col);
+      svg.append("text").attr("x",b.start+w/2).attr("y",yWord+5).attr("text-anchor","middle")
+        .attr("font-size",11.5).attr("fill",C.ink).text(b.word.w);
+      svg.append("text").attr("x",b.start+w/2).attr("y",yWord-20).attr("text-anchor","middle")
+        .attr("font-size",9).attr("font-family","SF Mono, monospace").attr("fill",col).text(b.word.tag);
+      // link word → the piece(s) that receive supervision
+      b.mids.forEach((mx,k)=>{
+        const carries = (mode==="first") ? (k===0) : true;
+        svg.append("line").attr("x1",b.start+w/2).attr("y1",yWord+15).attr("x2",mx).attr("y2",yPiece-2)
+          .attr("stroke",carries?col:"#252a35").attr("stroke-width",carries?1.6:1)
+          .attr("stroke-dasharray",carries?null:"3 3").attr("opacity",carries?.85:.6);
+      });
+    });
+
+    readEl.html(mode==="first"
+      ? `<b>First-subword labelling.</b> <b style="color:${C.a2}">${supervised}</b> positions supervised, <b>${masked}</b> continuation pieces set to the ignore index <code>−100</code> and dropped from the loss. At inference the first piece's tag is the word's tag — no reconciliation needed.`
+      : `<b>Propagate-to-all.</b> All <b style="color:${C.a2}">${supervised}</b> positions are supervised (continuations become <code>I-</code>), so there is more training signal — but pieces of one word can now disagree at decode time and must be reconciled (majority vote, or trust the first piece).`);
+    btn.textContent = "show: " + (mode==="first" ? "first-subword" : "propagate-to-all");
+  }
+  d3.select("#align-sel").on("change",draw);
+  btn.addEventListener("click",()=>{ mode = (mode==="first") ? "prop" : "first"; draw(); });
+  draw();
+})();
+</script>
+</body>
+</html>

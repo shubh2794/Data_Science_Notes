@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · GANs</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <h1>Generative Adversarial Networks</h1>
+      <p>Two networks with opposing goals. A <b>generator</b> turns noise into samples, a <b>discriminator</b> tries to tell them from real data, and the pressure of losing to each other is the only training signal either one gets.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Deep Learning</span>
+        <span class="pill">Generative Models</span>
+        <span class="pill">Adversarial Training</span>
+        <span class="pill">Minimax</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="setup" data-nav="The adversarial game">
+      <h3><span class="idx">01</span> The two-player game</h3>
+      <p class="lede">A GAN replaces a hand-written loss with a <b>learned</b> one: a second network, retrained continuously to notice whatever the generator is getting wrong.</p>
+
+      <h4>The two players</h4>
+      <ul class="notes">
+        <li><b>Generator</b> <code>G<sub>θ</sub> : ℝ<sup>d<sub>z</sub></sup> → X</code>. Sample a latent <code>z ~ p<sub>z</sub></code> — almost always an isotropic Gaussian with <code>d<sub>z</sub></code> between 64 and 512 — and push it through a deconvolutional or upsampling stack until it has the shape of a data point. There is no encoder and no input image; the whole sample is invented from the noise vector.</li>
+        <li><b>Discriminator</b> <code>D<sub>φ</sub> : X → (0, 1)</code>. An ordinary binary classifier: high output means "I believe this is real". Its labels are free — real data gets 1, generator output gets 0 — so it never runs out of supervision, and it can be made arbitrarily strong just by training it longer.</li>
+        <li>Their objectives are <b>exactly opposed</b> on the same scalar. The discriminator pushes it up, the generator pushes it down. Nothing else in the setup says what a good sample is: there is no reconstruction target, no perceptual loss, no reference image.</li>
+        <li>Because the two networks are trained against each other, the difficulty of the task <b>auto-adjusts</b>. A curriculum falls out for free — early on the discriminator only has to notice that outputs are noise, later it has to notice that a hand has six fingers.</li>
+      </ul>
+
+      <div class="formula"><span class="lbl">the value function (minimax game)</span><span class="eq">min<sub>G</sub> max<sub>D</sub>  V(D, G) = 𝔼<sub>x~p<sub>data</sub></sub>[ log D(x) ] + 𝔼<sub>z~p<sub>z</sub></sub>[ log(1 − D(G(z))) ]</span></div>
+
+      <h4>What kind of model this is</h4>
+      <ul class="notes">
+        <li>A GAN is an <b>implicit</b> generative model. It defines a distribution <code>p<sub>g</sub></code> only through a sampling procedure — you can draw from it all day, but you cannot evaluate <code>p<sub>g</sub>(x)</code> for a given <code>x</code>. Autoregressive models and normalising flows give you the density; VAEs give you a bound on it; a GAN gives you neither.</li>
+        <li>That is the trade the whole family makes: <b>give up the likelihood, gain sharpness</b>. Likelihood-based models trained with a pixel-wise reconstruction term average over all plausible outcomes and blur; an adversarial critic punishes anything that looks off-manifold, so the generator has to commit to <i>one</i> plausible answer.</li>
+        <li>The generator is a <b>deterministic</b> function; all the randomness enters at the input. That is what makes the latent space a usable handle: fix <code>z</code> and you fix the sample exactly, so you can interpolate, edit, and reproduce.</li>
+        <li>Sampling is a <b>single forward pass</b>. Not 20, not 1000 — one. That is still the strongest structural advantage GANs have over diffusion.</li>
+      </ul>
+
+      <div class="callout"><b>One idea:</b> the loss function is itself a neural network, retrained every step. The generator is never told what a face looks like — only that its output is discriminable, and which way to move to become less so.</div>
+
+      <div class="viz" id="viz-gan">
+        <div class="vhead">
+          <span class="vtitle">Training dynamics &amp; the generator's gradient</span>
+          <span class="vhint">Pick a regime and run — watch D(real) / D(fake) and the two gradient scales on the right</span>
+        </div>
+        <div class="controls">
+          <label>Regime
+            <select id="gan-regime">
+              <option value="balanced">Balanced → converging to 0.5</option>
+              <option value="dstrong">Discriminator too strong</option>
+              <option value="osc">Oscillating / non-convergent</option>
+            </select>
+          </label>
+          <button class="btn" id="gan-train">Train</button>
+          <button class="btn ghost" id="gan-reset">Reset</button>
+        </div>
+        <svg id="gan-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Interactive diagram: GAN training dynamics with discriminator outputs and generator gradient scales"></svg>
+        <div class="readout" aria-live="polite" id="gan-readout"></div>
+      </div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="theory" data-nav="What the game optimizes">
+      <h3><span class="idx">02</span> What the game actually optimizes</h3>
+      <p class="lede">Solve the inner maximization by hand and the objective becomes a recognisable <b>divergence</b> between the data distribution and the generator's — the source of both the theory and the trouble.</p>
+
+      <h4>The optimal discriminator</h4>
+      <ul class="notes">
+        <li>Freeze <code>G</code>. The value function is an integral over <code>x</code> whose integrand depends on <code>D(x)</code> only at that one point, so the maximization <b>decouples</b>: for every <code>x</code> independently, maximise <code>p<sub>data</sub>(x) log D + p<sub>g</sub>(x) log(1 − D)</code>.</li>
+        <li>That scalar problem has the form <code>a log t + b log(1 − t)</code>, whose maximum over <code>t ∈ (0,1)</code> sits at <code>t = a/(a+b)</code>. Setting the derivative to zero therefore gives a ratio — the best possible discriminator is not a mysterious learned object, it is a <b>fixed function of the two densities</b>.</li>
+        <li>Read in logit form, <code>D</code> is estimating the <b>log density ratio</b> <code>log p<sub>data</sub>(x) − log p<sub>g</sub>(x)</code>. This is the single most useful way to think about what a discriminator computes, and it is why the same machinery reappears in density-ratio estimation and noise-contrastive objectives.</li>
+      </ul>
+      <div class="formula"><span class="lbl">optimal discriminator for a fixed generator</span><span class="eq">D*(x) = p<sub>data</sub>(x) / ( p<sub>data</sub>(x) + p<sub>g</sub>(x) )</span>
+
+<span class="lbl">equivalently, in logit form</span><span class="eq">D*(x) = σ( log p<sub>data</sub>(x) − log p<sub>g</sub>(x) )</span></div>
+
+      <h4>The divergence view</h4>
+      <ul class="notes">
+        <li>Substitute <code>D*</code> back into <code>V</code> and the expression collapses to a constant plus the <b>Jensen–Shannon divergence</b>. Minimizing over <code>G</code> therefore minimizes JSD, whose unique minimum is <code>p<sub>g</sub> = p<sub>data</sub></code>, at which <code>D* ≡ ½</code> and the value bottoms out at <code>−log 4 ≈ −1.386</code>.</li>
+        <li>JSD is symmetric and bounded by <code>log 2 ≈ 0.693</code> nats (1 bit). The bound is the problem: once <code>p<sub>data</sub></code> and <code>p<sub>g</sub></code> stop overlapping, JSD <b>pins at its maximum</b> and stops reporting <i>how far apart</i> they are — a generator 1 pixel off and a generator producing static receive the same score. Real image data sits on a thin manifold and so does the generator's output, so non-overlap is the normal situation early in training, not an edge case.</li>
+        <li>Every step of the derivation assumes an <b>optimal</b> discriminator with unlimited capacity and access to the true densities. In practice <code>D</code> is a finite network given a handful of gradient steps, so what you are really minimizing is a noisy, capacity-limited surrogate — a <b>neural divergence</b>, not the textbook JSD. Whether that surrogate is better or worse behaved than the real thing is an empirical question, and often it is better: a weak discriminator cannot separate the distributions perfectly, so it cannot saturate.</li>
+        <li>The theory also says nothing about <b>parameters</b>. It describes convergence in the space of distributions, assuming <code>G</code> can represent any <code>p<sub>g</sub></code> and can be updated directly. The actual optimization moves <code>θ</code>, and the map from <code>θ</code> to <code>p<sub>g</sub></code> is neither convex nor surjective.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the game at the optimal discriminator</span><span class="eq">V(G, D*) = −log 4 + 2 · JSD( p<sub>data</sub> ‖ p<sub>g</sub> )</span>
+
+<span class="eq">JSD(p ‖ q) = ½ KL(p ‖ m) + ½ KL(q ‖ m),    m = ½(p + q)</span></div>
+
+      <p>Move the generator's mean and width. The green curve is <code>D*</code> computed exactly from the two densities; the readout tracks the divergence and both gradient scales.</p>
+      <div class="viz" id="viz-jsd">
+        <div class="vhead">
+          <span class="vtitle">Optimal discriminator &amp; Jensen–Shannon divergence (1-D toy)</span>
+          <span class="vhint">drag the orange handle or use the sliders · D* and JSD update live</span>
+        </div>
+        <div class="controls">
+          <label>Generator mean μ<sub>g</sub> <input type="range" id="jsd-mu" min="-4.5" max="4.5" step="0.05" value="-3.4"></label>
+          <label>Generator width σ<sub>g</sub> <input type="range" id="jsd-sig" min="0.25" max="2.6" step="0.05" value="0.6"></label>
+          <button class="btn ghost" id="jsd-fit">Snap to a data mode</button>
+        </div>
+        <svg id="jsd-svg" width="640" height="330" viewBox="0 0 640 330" role="img" aria-label="Interactive diagram: data density, generator density, and the optimal discriminator curve"></svg>
+        <div class="readout" aria-live="polite" id="jsd-readout"></div>
+      </div>
+
+      <h4>Why nobody uses the original generator loss</h4>
+      <ul class="notes">
+        <li>Write the discriminator's pre-sigmoid output as <code>a</code>, so <code>D = σ(a)</code>. Differentiating the generator's two candidate losses with respect to <code>a</code> gives clean factors: the <b>saturating</b> loss <code>log(1 − D(G(z)))</code> carries weight <code>D</code>, the <b>non-saturating</b> loss <code>−log D(G(z))</code> carries weight <code>1 − D</code>.</li>
+        <li>Early in training the discriminator wins easily, so <code>D(G(z)) ≈ 0</code>. The saturating weight goes to zero exactly when the generator is worst and most needs a signal; the non-saturating weight goes to <b>one</b>. Same fixed point, opposite gradient behaviour — and the gap between them is not subtle, it is one to two orders of magnitude in the regime that matters.</li>
+        <li>The non-saturating form is no longer the JSD game — under an optimal discriminator it corresponds to a reverse-KL-flavoured, <b>mode-seeking</b> objective, which is part of why collapse is a GAN problem and not a diffusion problem — but it is what essentially every implementation actually runs.</li>
+        <li>The same reasoning explains why people clamp or smooth <code>D</code>'s outputs: any transformation that keeps <code>D(G(z))</code> away from the saturated ends of the sigmoid keeps the generator's gradient alive.</li>
+      </ul>
+      <div class="formula"><span class="lbl">generator gradient scale w.r.t. the discriminator logit a</span><span class="eq">saturating:      ∂/∂a  log(1 − σ(a))  = −D(G(z))          → 0 when D wins</span>
+<span class="eq">non-saturating:  ∂/∂a  [ −log σ(a) ] = −(1 − D(G(z)))    → 1 when D wins</span></div>
+
+      <h4>Worked example: computing D* by hand</h4>
+      <p>Take two points in the 1-D toy above. At <code>x₀</code> the data is dense and the generator rarely goes; at <code>x₁</code> the generator has dumped its mass somewhere the data is not.</p>
+      <div class="formula"><span class="lbl">point x₀ — inside the data mode</span><span class="eq">p_data(x₀) = 0.30,  p_g(x₀) = 0.05</span>
+<span class="eq">D*(x₀) = 0.30 / (0.30 + 0.05) = 0.857          logit = log(0.30 / 0.05) = log 6 = 1.792</span>
+
+<span class="lbl">point x₁ — inside the generator's mode</span><span class="eq">p_data(x₁) = 0.01,  p_g(x₁) = 0.40</span>
+<span class="eq">D*(x₁) = 0.01 / (0.01 + 0.40) = 0.024          logit = log(0.025) = −3.689</span>
+
+<span class="lbl">generator gradient scale at x₁</span><span class="eq">saturating      = D*(x₁)      = 0.024      ← 2.4% of full scale, effectively dead</span>
+<span class="eq">non-saturating  = 1 − D*(x₁)  = 0.976      ← 40× larger signal, from the same D</span>
+
+<span class="lbl">local contribution to the jsd integral at x₁ (m = 0.205)</span><span class="eq">½ (0.01) ln(0.01/0.205) + ½ (0.40) ln(0.40/0.205) = −0.0151 + 0.1337 = 0.1186</span></div>
+      <p>Nothing about the discriminator changed between the two losses — only how the generator <i>reads</i> it. That single change of reading is the difference between a stalled run and a training one.</p>
+
+      <div class="callout"><b>Takeaway:</b> the JSD story explains the <i>fixed point</i>, not the <i>trajectory</i>. Swap in the non-saturating loss and a finite discriminator — which you must — and you are optimizing something the theory does not cover.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="training" data-nav="Training procedure">
+      <h3><span class="idx">03</span> The training loop</h3>
+      <p class="lede">A GAN is not minimizing anything — it is hunting a <b>saddle point</b>, which changes what the loss curves mean and how you schedule updates.</p>
+
+      <h4>One iteration, step by step</h4>
+      <ol class="notes">
+        <li>Draw <code>m</code> real samples and <code>m</code> latents; generate <code>m</code> fakes.</li>
+        <li><b>Discriminator step.</b> Ascend <code>∇<sub>φ</sub> [ ⅟ₘ ∑ log D(x⁽ⁱ⁾) + ⅟ₘ ∑ log(1 − D(G(z⁽ⁱ⁾))) ]</code>. Detach the fakes — no gradient flows into <code>G</code> here.</li>
+        <li>Repeat the discriminator step <code>k</code> times (5 for WGAN-style critics, 1 for most modern setups).</li>
+        <li><b>Generator step.</b> Draw <i>fresh</i> latents, regenerate, and descend <code>∇<sub>θ</sub> [ −⅟ₘ ∑ log D(G(z⁽ⁱ⁾)) ]</code> with <code>φ</code> frozen. Gradients travel through <code>D</code> into <code>G</code> — the discriminator <i>is</i> the differentiable loss.</li>
+      </ol>
+
+      <h4>Practical details that actually matter</h4>
+      <ul class="notes">
+        <li><b>Keep real and fake in separate forward passes</b> when the discriminator uses BatchNorm. Mixing them lets batch statistics leak information about the ratio of real to fake, which the network happily exploits instead of learning anything about images.</li>
+        <li><b>Two optimizers, two states.</b> Adam with <code>β₁</code> lowered to 0.0–0.5 is near-universal; the default 0.9 gives too much momentum for a game whose gradient direction keeps rotating. Never share an optimizer between the players.</li>
+        <li><b>TTUR</b> (two time-scale update rule): give the discriminator a larger learning rate than the generator — e.g. <code>4e-4</code> vs <code>1e-4</code> — instead of running extra discriminator steps. Cheaper per iteration, and it comes with convergence arguments to a local Nash equilibrium that the naive alternating scheme does not have.</li>
+        <li><b>Alternating vs simultaneous.</b> Alternating updates (the standard) let the generator react to a discriminator that has already moved; fully simultaneous updates use stale opponents and tend to spiral outward. The rotational part of the game's vector field is what causes the spiralling — a property of the dynamics, not a bug in your code.</li>
+        <li><b>The generator never sees real data.</b> Its only contact with the dataset is second-hand, through the discriminator's gradients. This is why a broken discriminator silently destroys the generator, and why debugging should always start at <code>D</code>.</li>
+        <li><b>Fresh noise every step.</b> Reusing the latents from the discriminator step in the generator step correlates the two updates and wastes the independence the estimator assumes.</li>
+      </ul>
+
+      <h4>Why it is a saddle point, not a minimum</h4>
+      <ul class="notes">
+        <li>Ordinary training descends a fixed landscape, so the loss is a progress meter and any decrease is real progress. Here the landscape <b>moves</b>: <code>G</code> is descending a surface that <code>D</code> is simultaneously reshaping.</li>
+        <li>The target is a <b>Nash equilibrium</b> — a point where neither player can improve unilaterally. That is a saddle of <code>V</code>: a minimum along <code>θ</code> and a maximum along <code>φ</code>. Gradient descent–ascent has no reason to converge to one, because there is no scalar function that decreases at every step.</li>
+        <li>The canonical illustration is the smallest possible bilinear game. The unique equilibrium is the origin, but the update rule circles it forever in continuous time, and spirals <i>outward</i> under ordinary discrete steps.</li>
+      </ul>
+      <div class="formula"><span class="lbl">worked example: the simplest minimax game</span><span class="eq">V(x, y) = x · y      min over x, max over y      equilibrium at (0, 0)</span>
+
+<span class="eq">gradient descent–ascent:   x ← x − η y,   y ← y + η x</span>
+<span class="eq">radius after one step:      x′² + y′² = (1 + η²)(x² + y²)      ← grows every step</span>
+
+<span class="lbl">with η = 0.1, starting at radius 1</span><span class="eq">after 100 steps: radius = (1.01)⁵⁰ ≈ 1.64      after 1000 steps: ≈ 1.5 × 10⁵</span></div>
+      <ul class="notes">
+        <li>The radius identity is exact and has no fixed point other than the origin: <b>the divergence is structural</b>, not a learning-rate accident. Every practical GAN stabilizer — momentum tweaks, averaging, extra-gradient/lookahead-style corrections, weight EMA — is in some form a damping term added to this rotation.</li>
+        <li>Which is also why <b>weight averaging works so well</b>. If the iterates orbit the equilibrium, their average is much closer to it than any individual iterate.</li>
+      </ul>
+
+      <div class="callout"><b>Takeaway:</b> a falling generator loss can mean the generator improved <i>or</i> that the discriminator got worse. Except in the Wasserstein family, <b>loss values are not progress</b> — track FID and look at samples.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="failures" data-nav="Failure modes">
+      <h3><span class="idx">04</span> Failure modes and why they happen</h3>
+      <p class="lede">GANs fail in a few recognisable ways. Each has a mechanism, and the mechanism tells you which fix to reach for.</p>
+
+      <h4>Mode collapse</h4>
+      <ul class="notes">
+        <li>The generator maps most or all latents to a narrow set of outputs. Nothing in its objective rewards diversity — it is only asked to fool the current discriminator, and a single very convincing output does that perfectly well.</li>
+        <li>The mechanism is a <b>swapped inner and outer optimization</b>. The theory assumes <code>D</code> is fully optimized before <code>G</code> moves. In practice, if <code>G</code> gets ahead of <code>D</code>, it finds the discriminator's current blind spot and dumps all its mass there. The discriminator eventually catches up and marks that region as fake, so <code>G</code> hops to the next blind spot — <b>mode hopping</b>, visible as samples that cycle through a few looks over training.</li>
+        <li>The mode-seeking character of the non-saturating loss makes this worse: covering a mode you are unsure about costs you, ignoring one does not.</li>
+        <li>Partial collapse is far more common than total collapse and much easier to miss: the samples look fine, but the effective diversity is a fraction of the dataset's. A generator that reproduces 3 of 8 modes flawlessly scores <b>precision ≈ 1.0</b> and <b>recall ≈ 0.38</b> — a metric pair that catches it instantly, and a sample grid that never will.</li>
+      </ul>
+
+      <div class="viz" id="viz-mc">
+        <div class="vhead">
+          <span class="vtitle">Mode collapse on a ring of 8 Gaussians</span>
+          <span class="vhint">slide the collapse dial — generator mass concentrates and coverage drops</span>
+        </div>
+        <div class="controls">
+          <label>Collapse <input type="range" id="mc-c" min="0" max="1" step="0.01" value="0"></label>
+          <button class="btn ghost" id="mc-reset">Reset</button>
+        </div>
+        <svg id="mc-svg" width="640" height="330" viewBox="0 0 640 330" role="img" aria-label="Interactive diagram: generator samples collapsing onto a subset of eight data modes"></svg>
+        <div class="readout" aria-live="polite" id="mc-readout"></div>
+      </div>
+
+      <h4>Vanishing gradients</h4>
+      <ul class="notes">
+        <li>The mirror image: if <code>D</code> gets too far ahead it separates real from fake perfectly, saturates, and — with the original loss — the generator's gradient goes to zero.</li>
+        <li>Root cause is the non-overlap that pins JSD at <code>log 2</code>: a perfect separator exists and the divergence has no slope left to follow. This is the argument that motivates Wasserstein losses.</li>
+      </ul>
+
+      <h4>Oscillation, overfitting, memorization</h4>
+      <ul class="notes">
+        <li><b>Non-convergence.</b> Even the simplest bilinear minimax game with gradient descent–ascent orbits its equilibrium forever rather than converging (see the worked example above). There is no single quantity that decreases every step, so "the loss went down" cannot certify progress.</li>
+        <li><b>Discriminator overfitting.</b> On small datasets the discriminator memorizes the training set. Its outputs then encode "have I seen this exact image" rather than "does this look real", the signal it passes to the generator becomes meaningless, and FID starts climbing while the discriminator's training loss keeps falling. This is the dominant limited-data failure, and the reason adaptive augmentation exists.</li>
+        <li><b>Memorization by the generator.</b> The winning move against a memorizing discriminator is to reproduce training examples. Always run a nearest-neighbour check in feature space on your best samples — a stunning FID can hide a copy machine.</li>
+        <li><b>Imbalance.</b> Either player permanently dominating is fatal. Health check: <code>D(real) ≈ 0.7–0.9</code> and <code>D(fake) ≈ 0.1–0.3</code>. Both near 0.5 with no structure means the discriminator has given up; <code>0.99 / 0.01</code> means the generator has.</li>
+        <li><b>Artifacts as a distinct failure.</b> Checkerboard patterns from transposed convolutions, droplet blobs from normalization schemes, and texture "sticking" to pixel coordinates are architectural bugs, not optimization ones — they do not respond to loss changes and need the fix made in the layer.</li>
+      </ul>
+
+      <div class="callout"><b>Takeaway:</b> almost every GAN pathology is an <b>imbalance</b> between the players or a <b>degenerate divergence</b> with no usable slope — exactly what the next section attacks.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="stabilizers" data-nav="Stabilization toolkit">
+      <h3><span class="idx">05</span> The stabilization toolkit</h3>
+      <p class="lede">A decade of engineering that does one of two things: <b>limit how sharp the discriminator can get</b>, or <b>give the generator a reason to be diverse</b>.</p>
+
+      <h4>Constraining the discriminator</h4>
+      <ul class="notes">
+        <li><b>Spectral normalization</b> — divide every weight matrix by its largest singular value, estimated with one power-iteration step per forward pass. Bounds the network's Lipschitz constant almost for free; the cheapest large win available.</li>
+        <li><b>Gradient penalty</b> — add <code>λ (‖∇<sub>x̂</sub> D(x̂)‖₂ − 1)²</code> with <code>λ = 10</code>, at points <code>x̂</code> sampled on lines between real and fake samples, softly enforcing the same Lipschitz constraint where it actually matters.</li>
+        <li><b>R1 regularization</b> — penalize <code>(γ/2)‖∇<sub>x</sub> D(x)‖²</code> on <b>real data only</b>. Cheaper than a two-sided penalty, tolerant of lazy application (every 16 steps is standard), and the default in the StyleGAN line; it directly damps the divergence-driven blow-up near the data manifold.</li>
+        <li><b>One-sided label smoothing</b> — train <code>D</code> against a target of 0.9 for real instead of 1.0, leaving fake at 0.0. Smoothing <i>both</i> sides would shift the optimal discriminator toward <code>(α p<sub>data</sub> + β p<sub>g</sub>)/(p<sub>data</sub> + p<sub>g</sub>)</code>, creating a spurious optimum in low-density regions — which is why it is one-sided.</li>
+        <li><b>Instance noise / adaptive augmentation</b> — add noise, or apply differentiable augmentations to <i>both</i> real and fake inputs, to force the two distributions to overlap so the divergence has a slope again. Adaptive schemes tune the augmentation strength from an online overfitting statistic and are what make GANs trainable on a few thousand images.</li>
+      </ul>
+
+      <h4>Encouraging the generator</h4>
+      <ul class="notes">
+        <li><b>Feature matching</b> — instead of maximizing <code>D</code>'s output, match the <i>mean of an intermediate feature layer</i> between real and fake batches. A softer target that is harder to overfit, and one the generator cannot satisfy with a single sample.</li>
+        <li><b>Minibatch discrimination / minibatch standard deviation</b> — let the discriminator see statistics <i>across</i> the batch. If every sample in a batch is nearly identical, that is itself detectable, so collapse becomes directly punishable. The stddev variant appends one channel holding the batch's average feature standard deviation and costs almost nothing.</li>
+        <li><b>Historical averaging &amp; weight EMA</b> — penalize drift from a running average of parameters, and sample from an exponential moving average of the generator's weights (half-life of order 10k images). The EMA generator is nearly always visibly better than the raw one and is standard practice — it is the damping term the rotating dynamics were asking for.</li>
+        <li><b>Unrolled updates</b> — differentiate the generator's step through <code>k</code> simulated future discriminator steps, so <code>G</code> cannot exploit a blind spot the discriminator is about to close. Directly targets mode collapse; expensive in memory, which is why it stayed a research tool.</li>
+      </ul>
+
+      <div class="formula"><span class="lbl">worked example: why a lipschitz bound needs enforcing per layer</span><span class="eq">Lip(D) ≤ ∏<sub>i</sub> ‖W<sub>i</sub>‖<sub>2</sub>      (spectral norms multiply through the depth)</span>
+
+<span class="eq">10 layers, each ‖W‖₂ = 1.3   →   Lip(D) ≤ 1.3¹⁰ ≈ 13.8</span>
+<span class="eq">10 layers, each ‖W‖₂ = 2.0   →   Lip(D) ≤ 2.0¹⁰ ≈ 1024</span>
+<span class="eq">spectral norm sets every ‖W<sub>i</sub>‖₂ = 1   →   Lip(D) ≤ 1</span></div>
+      <p>A mild per-layer excess compounds geometrically with depth, which is why an unconstrained deep discriminator can become almost arbitrarily sharp and why the constraint has to be applied layer by layer rather than to the network as a whole.</p>
+
+      <table class="cmp">
+        <tr><th>Symptom</th><th>First thing to try</th><th>Then</th></tr>
+        <tr><td>Generator gradient ≈ 0, D loss ≈ 0</td><td>Non-saturating loss; spectral norm on D</td><td>Switch to WGAN-GP or hinge loss</td></tr>
+        <tr><td>Samples all look alike</td><td>Minibatch stddev layer</td><td>Unrolled steps; check latent dimension</td></tr>
+        <tr><td>Quality cycles up and down</td><td>Lower <code>β₁</code>; generator weight EMA</td><td>TTUR; R1 penalty</td></tr>
+        <tr><td>Great train FID, poor held-out</td><td>Adaptive augmentation</td><td>More data; smaller D; nearest-neighbour audit</td></tr>
+      </table>
+
+      <div class="callout"><b>Takeaway:</b> if you only adopt three things — <b>spectral normalization or R1</b>, a <b>generator weight EMA</b>, and a <b>hinge or Wasserstein loss</b> — you have most of the empirical gain of the last decade.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="wgan" data-nav="Wasserstein GAN">
+      <h3><span class="idx">06</span> Wasserstein GAN: a distance that keeps working</h3>
+      <p class="lede">If the problem is a divergence that saturates when the distributions do not overlap, measure distance with something that <b>never</b> saturates.</p>
+
+      <h4>Earth-mover intuition</h4>
+      <ul class="notes">
+        <li>Picture both distributions as piles of dirt. The <b>Wasserstein-1</b> or earth-mover distance is the minimum total work — mass times distance moved — to reshape one pile into the other. The optimal plan is a transport map; the cost of that plan is the distance.</li>
+        <li>Two non-overlapping spikes separated by <code>δ</code>: JSD reports <code>log 2</code> regardless of <code>δ</code>, KL reports infinity, but <code>W₁</code> reports exactly <code>δ</code>. It <b>degrades gracefully</b> and keeps a usable gradient in precisely the situation where the others give up.</li>
+        <li>Crucially, <code>W₁</code> is <b>continuous and almost-everywhere differentiable</b> in the generator's parameters under mild conditions, which is exactly the property the JS-based objective lacks when the supports are disjoint.</li>
+      </ul>
+
+      <div class="formula"><span class="lbl">worked example: two parallel spikes, distance δ apart</span><span class="eq">p_data = point mass at 0        p_g = point mass at δ        (no overlap for any δ > 0)</span>
+
+<span class="eq">JSD  = log 2 = 0.693 nats   for δ = 0.1  AND  for δ = 5.0     ∂/∂δ = 0   ← no signal</span>
+<span class="eq">KL   = ∞                    for δ = 0.1  AND  for δ = 5.0     undefined  ← no signal</span>
+<span class="eq">W₁   = 0.1                  and 5.0                            ∂/∂δ = 1   ← usable signal</span></div>
+
+      <h4>From transport to a critic</h4>
+      <ul class="notes">
+        <li>The transport problem is a linear program; its dual (Kantorovich–Rubinstein, in words) says <code>W₁</code> is the largest gap between the mean score on real and on fake data, where the scoring function must be <b>1-Lipschitz</b>.</li>
+        <li>So the discriminator becomes a <b>critic</b>: no sigmoid, no probability — a real-valued score trained to maximize that gap, which the generator minimizes.</li>
+        <li>Everything hinges on enforcing that constraint. The original <b>weight clipping</b> to <code>[−c, c]</code> works but wastes capacity and biases the critic toward simple functions. <b>WGAN-GP</b> replaces it with the gradient penalty; spectral normalization is the cheap modern alternative.</li>
+        <li>The payoff: because the critic estimates a genuine distance, <b>its loss correlates with sample quality</b> — the one GAN variant whose training curve means something.</li>
+      </ul>
+
+      <div class="formula"><span class="lbl">wasserstein objective (critic f, 1-lipschitz)</span><span class="eq">W₁(p<sub>data</sub>, p<sub>g</sub>) = sup<sub>‖f‖<sub>L</sub> ≤ 1</sub>  𝔼<sub>x~p<sub>data</sub></sub>[ f(x) ] − 𝔼<sub>x~p<sub>g</sub></sub>[ f(x) ]</span>
+
+<span class="lbl">wgan-gp critic loss</span><span class="eq">L<sub>D</sub> = 𝔼<sub>x̃~p<sub>g</sub></sub>[ f(x̃) ] − 𝔼<sub>x~p<sub>data</sub></sub>[ f(x) ] + λ 𝔼<sub>x̂</sub>[ ( ‖∇<sub>x̂</sub> f(x̂) ‖₂ − 1 )² ]</span>
+<span class="eq">x̂ = ε x + (1 − ε) x̃,   ε ~ U[0,1],   λ = 10</span></div>
+
+      <table class="cmp">
+        <tr><th>Objective</th><th>Discriminator / critic loss</th><th>Generator loss</th><th>Character</th></tr>
+        <tr><td>Vanilla (saturating)</td><td>−𝔼[log D(x)] − 𝔼[log(1 − D(x̃))]</td><td>𝔼[log(1 − D(x̃))]</td><td>Faithful to the JSD theory; gradient dies early</td></tr>
+        <tr><td>Non-saturating</td><td>same as above</td><td>−𝔼[log D(x̃)]</td><td>The practical default; strong gradient when losing</td></tr>
+        <tr><td>LSGAN (least squares)</td><td>𝔼[(D(x) − 1)²] + 𝔼[D(x̃)²]</td><td>𝔼[(D(x̃) − 1)²]</td><td>Penalizes confidently-correct fakes; smooth, easy to tune</td></tr>
+        <tr><td>Hinge</td><td>𝔼[max(0, 1 − D(x))] + 𝔼[max(0, 1 + D(x̃))]</td><td>−𝔼[D(x̃)]</td><td>Margin-based; pairs naturally with spectral norm</td></tr>
+        <tr><td>WGAN (clipping)</td><td>𝔼[f(x̃)] − 𝔼[f(x)], weights clipped</td><td>−𝔼[f(x̃)]</td><td>Meaningful loss; clipping wastes capacity</td></tr>
+        <tr><td>WGAN-GP</td><td>as above + gradient penalty</td><td>−𝔼[f(x̃)]</td><td>Robust across architectures; no BatchNorm in the critic</td></tr>
+      </table>
+
+      <div class="callout"><b>Takeaway:</b> WGAN's real contribution was reframing the discriminator as a <b>Lipschitz-constrained distance estimator</b> — a lesson that setups keeping cross-entropy inherited as spectral normalization.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="lineage" data-nav="Architecture lineage">
+      <h3><span class="idx">07</span> Architecture lineage: one idea per generation</h3>
+      <p class="lede">Progress came less from new losses than from <b>where the network injects information</b> — and how gradually you grow it.</p>
+
+      <h4>The DCGAN recipe</h4>
+      <ul class="notes">
+        <li>Replace pooling with <b>strided convolutions</b> in <code>D</code> and <b>transposed convolutions</b> (or upsample-then-convolve, to avoid checkerboard artifacts) in <code>G</code>; drop fully-connected hidden layers.</li>
+        <li>BatchNorm in both networks except <code>G</code>'s output and <code>D</code>'s input layer.</li>
+        <li><b>ReLU</b> in <code>G</code> with a <code>tanh</code> output; <b>LeakyReLU</b> (slope ≈ 0.2) throughout <code>D</code> so gradients survive on the negative side.</li>
+      </ul>
+
+      <table class="cmp">
+        <tr><th>Model</th><th>The one new idea</th><th>What it unlocked</th></tr>
+        <tr><td>DCGAN</td><td>A convolutional architecture recipe that actually trains</td><td>Stable image GANs; latent arithmetic on faces</td></tr>
+        <tr><td>Conditional GAN</td><td>Feed a label <code>y</code> to <b>both</b> players</td><td>Controlled, class-specific generation</td></tr>
+        <tr><td>Pix2Pix</td><td>Paired image→image translation: adversarial loss + L1 reconstruction, U-Net generator, patch-level discriminator</td><td>Sketch→photo, map→aerial, segmentation→scene</td></tr>
+        <tr><td>CycleGAN</td><td><b>Cycle consistency</b>: translate A→B→A and require the round trip to return the original</td><td>Translation with <i>no</i> paired data — style transfer between unaligned domains</td></tr>
+        <tr><td>SRGAN / ESRGAN</td><td>Adversarial + perceptual loss for super-resolution</td><td>Sharp upscaling instead of blurry MSE output</td></tr>
+        <tr><td>Progressive GAN</td><td>Grow both networks layer by layer, 4×4 → 1024×1024</td><td>The first convincing megapixel faces; big stability win</td></tr>
+        <tr><td>StyleGAN</td><td>Mapping network <code>z → w</code>; inject <code>w</code> as per-layer <b>AdaIN</b> styles; per-pixel noise</td><td>Disentangled control, style mixing, coarse-to-fine editing</td></tr>
+        <tr><td>StyleGAN2</td><td>Weight demodulation replaces AdaIN; path-length regularization</td><td>Removed droplet artifacts; smoother latent geometry</td></tr>
+        <tr><td>StyleGAN3</td><td>Alias-free resampling for translation/rotation equivariance</td><td>Features stop "sticking" to pixel coordinates — clean video</td></tr>
+        <tr><td>BigGAN</td><td>Scale: huge batches, wide channels, class-conditional BatchNorm, self-attention, truncation</td><td>High-fidelity 512×512 ImageNet across 1000 classes</td></tr>
+      </table>
+
+      <h4>Translation GANs: the loss is the design</h4>
+      <ul class="notes">
+        <li><b>Pix2Pix</b> pairs an adversarial term with an <code>L1</code> reconstruction term at a large weight (≈100). The <code>L1</code> gets the low frequencies right — overall colour and layout — and the discriminator only has to police high-frequency realism. That division of labour is why the discriminator can be a small <b>patch</b> classifier scoring overlapping local windows rather than the whole image, which also makes it resolution-agnostic and cheap.</li>
+        <li><b>CycleGAN</b> removes the need for paired data by adding two generators and two discriminators plus a <b>cycle-consistency</b> term, <code>‖F(G(x)) − x‖₁ + ‖G(F(y)) − y‖₁</code>, at weight ≈10. Without it, the adversarial loss alone is satisfied by <i>any</i> mapping onto the target domain, including one that ignores the input entirely.</li>
+        <li>Both are worth remembering as a general pattern: <b>adversarial loss for realism, a reconstruction or consistency loss for correspondence</b>. Almost every conditional GAN in production is some weighting of those two terms.</li>
+      </ul>
+
+      <h4>Inside StyleGAN</h4>
+      <ul class="notes">
+        <li>The latent <code>z</code> never enters the convolution stack. An 8-layer MLP maps it to an intermediate code <code>w</code> in a learned space <b>W</b> that is not forced to match the Gaussian's shape — which is exactly what lets factors of variation disentangle, because the mapping can "unwarp" the density before it is used.</li>
+        <li>The synthesis network starts from a <b>learned constant</b> 4×4 tensor. All the content arrives as per-layer normalization parameters derived from <code>w</code>: early layers set pose and face shape, middle layers set features and hair, late layers set colour and micro-texture.</li>
+        <li>Per-pixel <b>noise inputs</b> are added at each resolution, so stochastic detail (freckles, stray hairs) is supplied locally instead of being carved out of the latent budget.</li>
+        <li><b>Style mixing</b>: run two different <code>w</code> codes on different layer ranges during training. It regularizes against layers co-adapting and gives the familiar "take pose from A, take colouring from B" edit for free.</li>
+        <li>StyleGAN2 replaced AdaIN with <b>weight demodulation</b> — folding the style scale into the convolution weights and normalizing there — which removed the characteristic droplet artifact, and added a <b>path-length</b> regularizer that pushes a fixed step in <code>W</code> to cause a fixed-magnitude change in the image. StyleGAN3 then made the resampling <b>alias-free</b> so features move with the object instead of sticking to the pixel grid.</li>
+      </ul>
+
+      <div class="callout"><b>Takeaway:</b> the winning generator design stopped being "decode a vector" and became "<b>modulate a fixed backbone with per-layer styles</b>" — a design that reappears, with the same motivation, in conditioning modern diffusion backbones.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="latent" data-nav="Conditioning &amp; latent space">
+      <h3><span class="idx">08</span> Conditioning and the latent space</h3>
+      <p class="lede">An unconditional GAN gives you samples. Conditioning and <b>navigating the latent space</b> turn it into a tool.</p>
+
+      <h4>Ways to condition</h4>
+      <ul class="notes">
+        <li><b>Concatenation</b> — append a label embedding to <code>z</code> and to <code>D</code>'s input. Simple; weak with many classes.</li>
+        <li><b>Conditional BatchNorm</b> — let the class choose <code>G</code>'s per-layer scale and shift. Cheap, and it scales to a thousand classes.</li>
+        <li><b>Projection discriminator</b> — take an inner product between the class embedding and <code>D</code>'s feature vector rather than asking it to classify. Better than an auxiliary classifier head, which rewards easily-classified samples and thereby <i>encourages</i> within-class collapse.</li>
+      </ul>
+
+      <h4>Moving through latent space</h4>
+      <ul class="notes">
+        <li><b>Interpolation</b> between two latents produces a smooth semantic morph, not a cross-fade — evidence that the generator learned a manifold rather than memorizing. Use <b>spherical</b> interpolation for Gaussian latents; straight lines pass through the low-density centre of a high-dimensional Gaussian shell, where the generator has effectively never been trained.</li>
+        <li><b>Arithmetic</b>: average the codes of samples with an attribute, subtract the average of those without, and you get a direction vector you can add to any code. Unsupervised methods recover similar directions from the principal components of the intermediate latent space, with no labels at all.</li>
+        <li><b>Truncation</b>: pull codes toward the mean by a factor <code>ψ</code>. Fidelity goes up, diversity goes down — a single knob for trading recall against precision <i>at inference time</i>, with no retraining. Because it is a linear shrink, the covariance of the sampled codes scales by <code>ψ²</code>: <code>ψ = 0.7</code> keeps 49% of the spread, <code>ψ = 0.5</code> keeps 25%.</li>
+        <li><b>GAN inversion</b>: to edit a real photo you must first find its latent. Optimize a code to reconstruct the image (typically in an extended per-layer space, one <code>w</code> per layer, which fits far more images), or train an encoder to predict it, then apply your edit direction. The tension is always reconstruction accuracy versus how editable the recovered code remains — codes far outside the training distribution reconstruct beautifully and edit terribly.</li>
+      </ul>
+      <div class="formula"><span class="lbl">truncation trick in the intermediate latent space</span><span class="eq">w′ = w̄ + ψ (w − w̄),    ψ ∈ [0, 1],    w̄ = 𝔼<sub>z</sub>[ f<sub>mapping</sub>(z) ]</span>
+<span class="eq">ψ → 0 : the average, safest sample      ψ → 1 : the full, riskier distribution</span></div>
+
+      <div class="callout"><b>Takeaway:</b> a GAN's latent space is a <b>near-linear editing surface</b>, and that is still its most distinctive practical asset. Diffusion models generate beautifully but do not hand you one vector you can add a direction to.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="evaluation" data-nav="Evaluation metrics">
+      <h3><span class="idx">09</span> Evaluating a generator</h3>
+      <p class="lede">No likelihood to report, so evaluation means <b>comparing two sets of samples in a feature space</b> — with all the caveats that implies.</p>
+
+      <h4>The standard metrics</h4>
+      <ul class="notes">
+        <li><b>Inception Score</b> — rewards samples whose predicted class distribution is confident while the marginal is broad. It never looks at real data, so it cannot see drift away from the dataset, and it is blind to collapse <i>within</i> a class.</li>
+        <li><b>FID</b> — push real and generated samples through a fixed classifier, fit a Gaussian to each set of pooled features, take the Fréchet distance. Lower is better; it tracks human judgement far better than IS.</li>
+        <li><b>KID</b> — a kernel MMD on the same features. Unbiased, so it stays trustworthy at a few thousand samples where FID is still badly biased.</li>
+        <li><b>Precision &amp; recall for distributions</b> — <b>precision</b> is fidelity (are samples inside the real manifold), <b>recall</b> is coverage (does the generator span it). The only family that separates the two failure directions a single FID confounds.</li>
+      </ul>
+      <div class="formula"><span class="lbl">inception score</span><span class="eq">IS = exp( 𝔼<sub>x~p<sub>g</sub></sub> [ KL( p(y | x) ‖ p(y) ) ] )</span>
+
+<span class="lbl">fréchet distance between the two feature gaussians</span><span class="eq">FID = ‖ μ<sub>r</sub> − μ<sub>g</sub> ‖² + Tr( Σ<sub>r</sub> + Σ<sub>g</sub> − 2 ( Σ<sub>r</sub> Σ<sub>g</sub> )<sup>½</sup> )</span></div>
+
+      <h4>Worked example: FID on a 2-D toy feature space</h4>
+      <p>Pretend the feature extractor outputs two dimensions. Fit a mean and covariance to the real features and to the generated ones, then evaluate the formula. Diagonal covariances commute, so the matrix square root is taken entry-wise.</p>
+      <div class="formula"><span class="lbl">the two fitted gaussians</span><span class="eq">μ_r = (0.0,  0.0)     Σ_r = diag(1.00, 4.00)</span>
+<span class="eq">μ_g = (0.3, −0.4)     Σ_g = diag(0.25, 1.00)</span>
+
+<span class="lbl">mean term</span><span class="eq">‖μ_r − μ_g‖² = 0.3² + 0.4² = 0.09 + 0.16 = 0.25</span>
+
+<span class="lbl">covariance term  (commuting case: (Σ_r Σ_g)^½ = diag(√(1·0.25), √(4·1)) = diag(0.5, 2.0))</span><span class="eq">Tr( Σ_r + Σ_g − 2(Σ_r Σ_g)^½ ) = (1.00 + 0.25 − 1.0) + (4.00 + 1.00 − 4.0) = 0.25 + 1.00 = 1.25</span>
+
+<span class="lbl">total</span><span class="eq">FID = 0.25 + 1.25 = 1.50</span></div>
+      <ul class="notes">
+        <li>For commuting covariances each diagonal term reduces to <code>(√σ<sub>r</sub> − √σ<sub>g</sub>)²</code> — here <code>(1 − 0.5)² = 0.25</code> and <code>(2 − 1)² = 1.00</code>. So FID is, in that case, just <b>squared distance between means plus squared distance between standard deviations</b>.</li>
+        <li>Note where the cost came from: <b>1.25 of the 1.50 is the generator being under-dispersed</b> (variance 1 where the data has 4). That is the covariance term detecting collapse — and it is also why FID improves when you widen a too-narrow generator even if individual samples get slightly worse.</li>
+      </ul>
+
+      <h4>Worked example: Inception Score and a dropped class</h4>
+      <p>Three classes, and a generator whose samples are each classified confidently at <code>(0.98, 0.01, 0.01)</code> for their class. Compare covering all three classes against covering only two.</p>
+      <div class="formula"><span class="lbl">covering all 3 classes equally  →  marginal p(y) = (⅓, ⅓, ⅓)</span><span class="eq">KL = 0.98 ln(0.98 / 0.333) + 2 (0.01) ln(0.01 / 0.333) = 1.0568 − 0.0701 = 0.9867</span>
+<span class="eq">IS = exp(0.9867) = 2.68        (ceiling for 3 classes = 3.00)</span>
+
+<span class="lbl">dropping one class  →  marginal p(y) = (0.495, 0.495, 0.010)</span><span class="eq">KL = 0.98 ln(0.98 / 0.495) + 0.01 ln(0.01 / 0.495) + 0.01 ln(0.01 / 0.010) = 0.6694 − 0.0390 = 0.6304</span>
+<span class="eq">IS = exp(0.6304) = 1.88</span></div>
+      <ul class="notes">
+        <li>IS is bounded above by the <b>number of classes</b>, so its scale is a property of the classifier, not of your model.</li>
+        <li>Dropping a third of the modes cost 2.68 → 1.88. But had the generator instead produced <i>one</i> image per class over and over, the score would be <b>unchanged</b> — the marginal is still uniform and every sample is still confident. That is the blind spot in one line.</li>
+      </ul>
+
+      <h4>Caveats worth remembering</h4>
+      <ul class="notes">
+        <li>FID numbers are <b>only comparable within one protocol</b>: same feature extractor, same sample count (50k is the convention), same resizing and preprocessing. Cross-paper comparisons routinely break on this.</li>
+        <li>The Gaussian assumption is wrong — feature distributions are not Gaussian — the estimator is <b>biased with sample count</b> (fewer samples give a systematically worse number, so you cannot compare a 10k run to a 50k one), and it inherits every bias of the classifier it borrows its features from.</li>
+        <li>FID is also <b>not decomposable</b>: one number mixes fidelity and coverage, so two failing models with opposite problems can score the same.</li>
+        <li>No feature metric detects <b>memorization</b>. Copying the training set gives an excellent FID. Run an explicit nearest-neighbour audit against the training data in the same feature space.</li>
+        <li>And none of them is a substitute for looking. Fix a set of latents at the start of training and render the same grid every checkpoint — artifacts, collapse, and texture sticking are all visible long before a metric moves.</li>
+      </ul>
+
+      <div class="callout"><b>Takeaway:</b> report FID <b>and</b> a precision/recall pair. FID alone cannot tell "sharp but collapsed" from "diverse but rough" — and those need opposite fixes.</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="compare" data-nav="GANs vs diffusion vs VAEs">
+      <h3><span class="idx">10</span> GANs vs diffusion vs VAEs</h3>
+      <p class="lede">Diffusion took the crown for open-ended synthesis. Knowing <b>why</b> shows where GANs are still the right answer.</p>
+
+      <table class="cmp">
+        <tr><th>Axis</th><th>GAN</th><th>Diffusion</th><th>VAE</th></tr>
+        <tr><td>Training objective</td><td>Adversarial minimax (saddle point)</td><td>Denoising regression (plain minimization)</td><td>Evidence lower bound</td></tr>
+        <tr><td>Stability</td><td>Delicate — needs the toolkit</td><td>Very stable, hard to diverge</td><td>Very stable</td></tr>
+        <tr><td>Sample quality</td><td>Sharp; state of the art in narrow domains</td><td>Highest for open-domain images</td><td>Blurry without a learned/adversarial decoder</td></tr>
+        <tr><td>Mode coverage</td><td>Weak point — collapse is real</td><td>Strong; likelihood-flavoured objective</td><td>Strong</td></tr>
+        <tr><td>Sampling cost</td><td><b>One</b> forward pass</td><td>Tens to hundreds of steps (fewer when distilled)</td><td>One forward pass</td></tr>
+        <tr><td>Density available</td><td>No</td><td>Yes, via the ODE formulation</td><td>Lower bound</td></tr>
+        <tr><td>Latent space</td><td>Compact and highly editable</td><td>Same dimension as data; editing is indirect</td><td>Compact, smooth, less expressive</td></tr>
+      </table>
+
+      <h4>Where GANs still win</h4>
+      <ul class="notes">
+        <li><b>Latency.</b> One-step generation matters for real-time, interactive and on-device work. Much of the recent few-step distillation of diffusion models leans on an <b>adversarial</b> loss to recover the sharpness lost at low step counts — the GAN objective survives as a component even where the GAN model does not.</li>
+        <li><b>Restoration tasks.</b> Super-resolution, denoising, inpainting and face restoration are conditional problems with a strong input prior; an adversarial term is an efficient way to buy perceptual sharpness that a reconstruction loss alone will always blur away.</li>
+        <li><b>Adversarial losses inside other systems.</b> The decoders of the image tokenizers used by latent diffusion models, and most neural audio vocoders and codecs, are trained with a discriminator alongside a reconstruction loss. That is a GAN doing quiet, essential work underneath models that are not GANs.</li>
+        <li><b>Editing.</b> When you want a single vector you can move along an interpretable direction, the latent space of a trained GAN is still unusually convenient — diffusion editing goes through inversion, prompts, or attention surgery instead.</li>
+        <li><b>Narrow domains with limited data.</b> With adaptive augmentation, a GAN can be trained to high quality on a few thousand images of one thing, on one GPU. That is a very different resource profile from training or even fine-tuning a diffusion model.</li>
+      </ul>
+      <p>Related pages: <a href="diffusion-models.html">Diffusion Models</a> for the likelihood-style alternative, and <a href="contrastive-learning.html">Contrastive Learning</a> for the other major "learn by comparing" objective.</p>
+
+      <div class="callout"><b>Takeaway:</b> diffusion trades <b>compute at sampling time</b> for <b>stability at training time</b>. GANs make the opposite bet — and that bet still pays whenever you need the sample now.</div>
+    </section>
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="practice" data-nav="Practical checklist">
+      <h3><span class="idx">11</span> Practical checklist &amp; pitfalls</h3>
+      <p class="lede">A default configuration that works, and the mistakes that waste the most time.</p>
+
+      <h4>A sane starting point</h4>
+      <ul class="notes">
+        <li>Architecture: residual generator and discriminator, <b>spectral normalization</b> in the discriminator, upsample-then-convolve rather than raw transposed convolutions, and a <code>tanh</code> output with inputs normalized to <code>[−1, 1]</code>.</li>
+        <li>Loss: <b>hinge</b> or non-saturating, with an <b>R1</b> penalty on real data. <code>k = 1</code> discriminator step, TTUR rather than extra steps.</li>
+        <li>Optimizers: Adam, <code>β = (0.0, 0.99)</code>, generator <code>1e-4</code>, discriminator <code>2e-4</code> to <code>4e-4</code>. Largest batch you can afford — GANs benefit from batch size more than most models do.</li>
+        <li>Always evaluate and ship the <b>EMA copy</b> of the generator, never the raw weights.</li>
+        <li>Instrument from the start: log <code>D(real)</code>, <code>D(fake)</code>, both losses, the gradient-penalty magnitude, and FID every few thousand steps, plus a fixed latent grid you look at with your own eyes.</li>
+        <li>On fewer than ~50k images, turn on <b>adaptive augmentation</b> before anything else; it is usually the difference between working and not.</li>
+        <li>Checkpoint often. GAN runs can be healthy for 100k steps and then collapse irrecoverably in 2k — you want to be able to roll back and lower the learning rate rather than restart.</li>
+      </ul>
+
+      <h4>Pitfalls</h4>
+      <ul class="notes">
+        <li>Forgetting to <b>detach</b> the generator output in the discriminator step — you end up training <code>G</code> to help <code>D</code>.</li>
+        <li>Reusing the same latents for the discriminator and generator steps within one iteration; draw fresh noise each time.</li>
+        <li><b>BatchNorm in a WGAN-GP critic</b> — the penalty is defined per-sample, and BatchNorm couples samples within a batch. Use layer/instance normalization, or none.</li>
+        <li>Applying augmentations to the real branch only — the discriminator then learns to detect the augmentation instead of detecting fakes. Augment <b>both</b> branches, differentiably.</li>
+        <li>Judging progress from loss curves outside the Wasserstein family, or from a cherry-picked sample grid.</li>
+        <li>Too small a latent dimension, which caps achievable diversity no matter what else you fix.</li>
+        <li>Comparing FID across papers or runs with different sample counts, resizing, or feature extractors.</li>
+        <li>Shipping without a nearest-neighbour memorization audit.</li>
+      </ul>
+
+      <div class="callout"><b>Takeaway:</b> treat the discriminator as a <b>hyperparameter of the loss</b>. Most GAN tuning is regulating how strong it may become, not redesigning the generator.</div>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+/* ═══════════ 01 · training dynamics + generator gradient scales ═══════════ */
+(function(){
+  const svg=d3.select("#gan-svg"), W=640, H=300, m={t:22,r:212,b:34,l:46};
+  const x=d3.scaleLinear().domain([0,120]).range([m.l,W-m.r]);
+  const y=d3.scaleLinear().domain([0,1]).range([H-m.b,m.t]);
+  svg.append("g").attr("class","axis").attr("transform","translate(0,"+(H-m.b)+")").call(d3.axisBottom(x).ticks(5));
+  svg.append("g").attr("class","axis").attr("transform","translate("+m.l+",0)").call(d3.axisLeft(y).ticks(5));
+  svg.append("text").attr("x",(m.l+(W-m.r))/2).attr("y",H-6).attr("text-anchor","middle").attr("font-size",10).attr("fill",C.muted).text("training step");
+  svg.append("line").attr("x1",x(0)).attr("x2",x(120)).attr("y1",y(0.5)).attr("y2",y(0.5)).attr("stroke",C.good).attr("stroke-dasharray","5 5").attr("stroke-opacity",.7);
+  svg.append("text").attr("x",x(120)).attr("y",y(0.5)-6).attr("text-anchor","end").attr("fill",C.good).attr("font-size",10).text("equilibrium D = 0.5");
+  const lineR=svg.append("path").attr("fill","none").attr("stroke",C.A).attr("stroke-width",2);
+  const lineF=svg.append("path").attr("fill","none").attr("stroke",C.B).attr("stroke-width",2);
+  svg.append("text").attr("x",m.l+8).attr("y",m.t+2).attr("fill",C.A).attr("font-size",11).text("D(real)");
+  svg.append("text").attr("x",m.l+8).attr("y",m.t+18).attr("fill",C.B).attr("font-size",11).text("D(fake)");
+
+  // right-hand gradient-scale panel
+  const bx=W-m.r+34, bw=52, bBase=H-m.b, bTop=m.t+30;
+  const by=d3.scaleLinear().domain([0,1]).range([bBase,bTop]);
+  const gBars=svg.append("g");
+  svg.append("text").attr("x",bx).attr("y",m.t+8).attr("font-size",11).attr("fill",C.ink).text("generator ∇ scale");
+  svg.append("line").attr("x1",bx-6).attr("x2",W-14).attr("y1",bBase).attr("y2",bBase).attr("stroke",C.line);
+  const bars=[{k:"sat",label:"saturating",sub:"= D(fake)",col:C.bad,x:bx},
+              {k:"non",label:"non-sat.",sub:"= 1 − D(fake)",col:C.good,x:bx+82}];
+  bars.forEach(b=>{
+    b.rect=gBars.append("rect").attr("x",b.x).attr("width",bw).attr("fill",b.col).attr("fill-opacity",.55).attr("stroke",b.col);
+    b.val=gBars.append("text").attr("x",b.x+bw/2).attr("text-anchor","middle").attr("font-size",11).attr("fill",C.ink);
+    svg.append("text").attr("x",b.x+bw/2).attr("y",bBase+14).attr("text-anchor","middle").attr("font-size",10).attr("fill",C.muted).text(b.label);
+    svg.append("text").attr("x",b.x+bw/2).attr("y",bBase+26).attr("text-anchor","middle").attr("font-size",9).attr("fill",C.muted).text(b.sub);
+  });
+
+  const ld=d3.line().x(d=>x(d.t)).y(d=>y(d.v)).curve(d3.curveMonotoneX);
+  let dR=[],dF=[],t=0,timer=null;
+  const regime=()=>document.getElementById("gan-regime").value;
+  function state(t){
+    const n=()=>(Math.random()-0.5)*0.05;
+    if(regime()==="dstrong")  return {r:Math.min(0.995,0.80+0.19*(1-Math.exp(-t/18)))+n()*0.3, f:Math.max(0.005,0.20*Math.exp(-t/18))+n()*0.3};
+    if(regime()==="osc")      return {r:0.5+0.40*Math.cos(t/9)+n(), f:0.5-0.40*Math.cos(t/9+0.7)+n()};
+    const d=Math.exp(-t/38);
+    return {r:0.5+0.42*d*(0.6+0.4*Math.cos(t/11))+n()*d, f:0.5-0.42*d*(0.6+0.4*Math.cos(t/11+0.4))+n()*d};
+  }
+  function clamp(v){ return Math.max(0.005,Math.min(0.995,v)); }
+  function bar(f){
+    const vals={sat:f, non:1-f};
+    bars.forEach(b=>{
+      const v=vals[b.k];
+      b.rect.attr("y",by(v)).attr("height",Math.max(1,bBase-by(v)));
+      b.val.attr("y",by(v)-6).text(v.toFixed(2));
+    });
+  }
+  function render(){
+    lineR.attr("d",ld(dR)); lineF.attr("d",ld(dF));
+    const f=dF.length?dF[dF.length-1].v:0.5, r=dR.length?dR[dR.length-1].v:0.5;
+    bar(f);
+    const warn = f<0.08 ? " — saturating loss has no gradient left" : (Math.abs(f-0.5)<0.06 ? " — balanced" : "");
+    d3.select("#gan-readout").html("step <b>"+t+"</b> &nbsp;·&nbsp; D(real) <b>"+r.toFixed(2)+"</b> &nbsp;·&nbsp; D(fake) <b>"+f.toFixed(2)+"</b> &nbsp;·&nbsp; ∇ scale: saturating <b>"+f.toFixed(2)+"</b>, non-saturating <b>"+(1-f).toFixed(2)+"</b>"+warn);
+  }
+  function reset(){ if(timer){clearInterval(timer);timer=null;} t=0; const s=state(0); dR=[{t:0,v:clamp(s.r)}]; dF=[{t:0,v:clamp(s.f)}]; render(); }
+  function train(){ if(timer) return; if(t>=120) reset();
+    timer=setInterval(()=>{ t+=2; const s=state(t);
+      dR.push({t,v:clamp(s.r)}); dF.push({t,v:clamp(s.f)}); render();
+      if(t>=120){clearInterval(timer);timer=null;}
+    },110);
+  }
+  d3.select("#gan-train").on("click",train);
+  d3.select("#gan-reset").on("click",reset);
+  d3.select("#gan-regime").on("change",reset);
+  reset();
+})();
+
+/* ═══════════ 02 · p_data vs p_g, optimal discriminator, JSD ═══════════ */
+(function(){
+  const svg=d3.select("#jsd-svg"), W=640, H=330, m={t:22,r:52,b:40,l:52};
+  const XLO=-5.2, XHI=5.2, N=261, dx=(XHI-XLO)/(N-1);
+  const xs=d3.range(N).map(i=>XLO+i*dx);
+  const g1=(x,mu,s)=>Math.exp(-0.5*Math.pow((x-mu)/s,2))/(s*Math.sqrt(2*Math.PI));
+  const MODES=[{mu:-1.7,s:0.62,w:0.5},{mu:1.8,s:0.55,w:0.5}];
+  const pdata=x=>MODES.reduce((a,k)=>a+k.w*g1(x,k.mu,k.s),0);
+
+  const x=d3.scaleLinear().domain([XLO,XHI]).range([m.l,W-m.r]);
+  const yD=d3.scaleLinear().domain([0,0.55]).range([H-m.b,m.t]);
+  const yP=d3.scaleLinear().domain([0,1]).range([H-m.b,m.t]);
+  svg.append("g").attr("class","axis").attr("transform","translate(0,"+(H-m.b)+")").call(d3.axisBottom(x).ticks(7));
+  svg.append("g").attr("class","axis").attr("transform","translate("+m.l+",0)").call(d3.axisLeft(yD).ticks(4));
+  svg.append("g").attr("class","axis").attr("transform","translate("+(W-m.r)+",0)").call(d3.axisRight(yP).ticks(3));
+  svg.append("text").attr("x",m.l-6).attr("y",m.t-8).attr("text-anchor","end").attr("font-size",10).attr("fill",C.muted).text("density");
+  svg.append("text").attr("x",W-m.r+6).attr("y",m.t-8).attr("font-size",10).attr("fill",C.good).text("D*(x)");
+  svg.append("text").attr("x",(m.l+W-m.r)/2).attr("y",H-8).attr("text-anchor","middle").attr("font-size",10).attr("fill",C.muted).text("x");
+  svg.append("line").attr("x1",x(XLO)).attr("x2",x(XHI)).attr("y1",yP(0.5)).attr("y2",yP(0.5)).attr("stroke",C.good).attr("stroke-dasharray","4 4").attr("stroke-opacity",.4);
+
+  const area=d3.area().x(d=>x(d.x)).y0(yD(0)).y1(d=>yD(d.v)).curve(d3.curveBasis);
+  const line=d3.line().x(d=>x(d.x)).y(d=>yP(d.v)).curve(d3.curveBasis);
+  const aReal=svg.append("path").attr("fill",C.A).attr("fill-opacity",.28).attr("stroke",C.A).attr("stroke-width",1.6);
+  const aGen =svg.append("path").attr("fill",C.B).attr("fill-opacity",.28).attr("stroke",C.B).attr("stroke-width",1.6);
+  const lDs  =svg.append("path").attr("fill","none").attr("stroke",C.good).attr("stroke-width",2.2);
+  svg.append("text").attr("x",m.l+8).attr("y",m.t+2).attr("fill",C.A).attr("font-size",11).text("p_data");
+  svg.append("text").attr("x",m.l+8).attr("y",m.t+18).attr("fill",C.B).attr("font-size",11).text("p_g (generator)");
+  svg.append("text").attr("x",m.l+8).attr("y",m.t+34).attr("fill",C.good).attr("font-size",11).text("D*(x) = p_data / (p_data + p_g)");
+  const handle=svg.append("circle").attr("r",8).attr("fill",C.B).attr("stroke","#0f1117").attr("stroke-width",2).style("cursor","ew-resize");
+
+  const muEl=document.getElementById("jsd-mu"), sigEl=document.getElementById("jsd-sig"), out=document.getElementById("jsd-readout");
+  function render(){
+    const mu=+muEl.value, s=+sigEl.value;
+    const P=xs.map(v=>pdata(v)), Q=xs.map(v=>g1(v,mu,s));
+    aReal.attr("d",area(xs.map((v,i)=>({x:v,v:P[i]}))));
+    aGen .attr("d",area(xs.map((v,i)=>({x:v,v:Q[i]}))));
+    const D=xs.map((v,i)=>{ const d=P[i]+Q[i]; return d<1e-12?0.5:P[i]/d; });
+    lDs.attr("d",line(xs.map((v,i)=>({x:v,v:D[i]}))));
+    handle.attr("cx",x(mu)).attr("cy",yD(Math.min(0.55,g1(mu,mu,s))));
+    let jsd=0, satW=0, qMass=0;
+    for(let i=0;i<N;i++){
+      const p=P[i], q=Q[i], mm=0.5*(p+q);
+      if(p>1e-12&&mm>1e-12) jsd+=0.5*p*Math.log(p/mm)*dx;
+      if(q>1e-12&&mm>1e-12) jsd+=0.5*q*Math.log(q/mm)*dx;
+      satW+=q*D[i]*dx; qMass+=q*dx;
+    }
+    const sat=satW/Math.max(qMass,1e-9);
+    const bits=jsd/Math.LN2, V=-Math.log(4)+2*jsd;
+    const col = bits>0.85 ? C.bad : (bits<0.15 ? C.good : C.B);
+    out.innerHTML="JSD = <b style=\"color:"+col+"\">"+bits.toFixed(3)+"</b> / 1.000 bits &nbsp;·&nbsp; V(G, D*) = <b>"+V.toFixed(3)+"</b> (floor −1.386) &nbsp;·&nbsp; 𝔼<sub>p_g</sub>[D*] = <b>"+sat.toFixed(3)+"</b> — the saturating-loss gradient scale &nbsp;·&nbsp; non-saturating = <b>"+(1-sat).toFixed(3)+"</b>";
+  }
+  muEl.addEventListener("input",render); sigEl.addEventListener("input",render);
+  handle.call(d3.drag().on("drag",e=>{
+    const v=Math.max(-4.5,Math.min(4.5,x.invert(e.x)));
+    muEl.value=v.toFixed(2); render();
+  }));
+  document.getElementById("jsd-fit").addEventListener("click",()=>{ muEl.value="1.80"; sigEl.value="0.55"; render(); });
+  render();
+})();
+
+/* ═══════════ 04 · mode collapse on a ring of 8 modes ═══════════ */
+(function(){
+  const svg=d3.select("#mc-svg"), W=640, H=330, K=8, NP=280;
+  const cx=190, cy=168, R=112;
+  const modes=d3.range(K).map(i=>{ const a=-Math.PI/2+2*Math.PI*i/K; return {i,a,x:cx+R*Math.cos(a),y:cy+R*Math.sin(a)}; });
+  // fixed randomness so the slider animates smoothly
+  let seed=42; const rnd=()=>{ seed=(seed*1103515245+12345)&0x7fffffff; return seed/0x7fffffff; };
+  const pts=d3.range(NP).map(()=>({u:rnd(), jx:(rnd()+rnd()+rnd()-1.5)*13, jy:(rnd()+rnd()+rnd()-1.5)*13}));
+
+  svg.append("text").attr("x",cx).attr("y",26).attr("text-anchor","middle").attr("font-size",11).attr("fill",C.muted).text("data modes (rings) · generator samples (dots)");
+  const gRings=svg.append("g"), gPts=svg.append("g");
+  modes.forEach(mo=>{
+    gRings.append("circle").attr("cx",mo.x).attr("cy",mo.y).attr("r",20).attr("fill","none").attr("stroke",C.A).attr("stroke-opacity",.75).attr("stroke-dasharray","3 3");
+  });
+
+  // right-hand bar chart of generator mass per mode
+  const bx0=390, bw=26, bBase=H-56, bTop=64;
+  const byS=d3.scaleLinear().domain([0,0.6]).range([bBase,bTop]);
+  svg.append("text").attr("x",bx0).attr("y",44).attr("font-size",11).attr("fill",C.ink).text("generator mass per mode");
+  svg.append("line").attr("x1",bx0-6).attr("x2",bx0+K*bw+4).attr("y1",bBase).attr("y2",bBase).attr("stroke",C.line);
+  const target=svg.append("line").attr("x1",bx0-6).attr("x2",bx0+K*bw+4).attr("y1",byS(1/K)).attr("y2",byS(1/K)).attr("stroke",C.good).attr("stroke-dasharray","4 3").attr("stroke-opacity",.7);
+  svg.append("text").attr("x",bx0+K*bw+8).attr("y",byS(1/K)+4).attr("font-size",9).attr("fill",C.good).text("1/8");
+  const gBars=svg.append("g");
+
+  const cEl=document.getElementById("mc-c"), out=document.getElementById("mc-readout");
+  function render(){
+    const c=+cEl.value, kappa=9*c;
+    const raw=modes.map(mo=>Math.exp(kappa*Math.cos(mo.a+Math.PI/2)));
+    const tot=d3.sum(raw), w=raw.map(v=>v/tot);
+    const cum=[]; let acc=0; w.forEach(v=>{acc+=v; cum.push(acc);});
+    const counts=new Array(K).fill(0);
+    const placed=pts.map(p=>{
+      let k=0; while(k<K-1&&p.u>cum[k]) k++;
+      counts[k]++;
+      return {x:modes[k].x+p.jx, y:modes[k].y+p.jy, k};
+    });
+    gPts.selectAll("circle").data(placed).join("circle")
+      .attr("cx",d=>d.x).attr("cy",d=>d.y).attr("r",2.4).attr("fill",C.B).attr("fill-opacity",.75);
+    gBars.selectAll("rect").data(w).join("rect")
+      .attr("x",(d,i)=>bx0+i*bw+2).attr("width",bw-4)
+      .attr("y",d=>byS(Math.min(0.6,d))).attr("height",d=>Math.max(1,bBase-byS(Math.min(0.6,d))))
+      .attr("fill",(d,i)=>counts[i]>=NP*0.02?C.B:C.bad).attr("fill-opacity",.6).attr("stroke",(d,i)=>counts[i]>=NP*0.02?C.B:C.bad);
+    const covered=counts.filter(v=>v>=NP*0.02).length;
+    const dom=100*d3.max(w);
+    const col = covered>=7?C.good : covered>=4?C.B : C.bad;
+    out.innerHTML="modes covered <b style=\"color:"+col+"\">"+covered+" / 8</b> &nbsp;·&nbsp; largest mode holds <b>"+dom.toFixed(0)+"%</b> of generator mass &nbsp;·&nbsp; "+(covered>=7?"healthy coverage":covered>=4?"partial collapse — samples still look fine, diversity is halved":"severe collapse — a beautiful, useless generator");
+  }
+  cEl.addEventListener("input",render);
+  document.getElementById("mc-reset").addEventListener("click",()=>{ cEl.value=0; render(); });
+  render();
+})();
+</script>
+</body>
+</html>

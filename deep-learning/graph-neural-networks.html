@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Graph Neural Networks</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <h1>Graph Neural Networks</h1>
+      <p>Deep learning where the data has <b>no grid and no order</b> — only nodes and the edges between them. Every architecture on this page is one answer to a single question: <i>how should a node listen to its neighbours?</i></p>
+      <div style="margin-top:10px">
+        <span class="pill">Deep Learning</span>
+        <span class="pill">Message passing</span>
+        <span class="pill">Relational data</span>
+        <span class="pill">Permutation invariance</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="graphs-as-data" data-nav="Graphs as data">
+      <h3><span class="idx">01</span> Graphs as data</h3>
+      <p class="lede">A graph is a set of entities plus a set of relations. That's a far weaker assumption than a grid or a sequence — and the weakness is exactly what forces a new architecture.</p>
+
+      <h4>The objects</h4>
+      <ul class="notes">
+        <li>A graph is <code>G = (V, E)</code> with <code>N = |V|</code> nodes. Connectivity lives in the <b>adjacency matrix</b> <code>A ∈ ℝ<sup>N×N</sup></code>, where <code>Aᵢⱼ ≠ 0</code> means an edge <code>i → j</code>. Undirected graphs give a symmetric <code>A</code>; directed graphs do not.</li>
+        <li>The <b>degree matrix</b> <code>D</code> is diagonal with <code>dᵢ = ∑ⱼ Aᵢⱼ</code> — how many neighbours node <code>i</code> has. It is the normalizer that appears in almost every layer below.</li>
+        <li>Signals ride on the structure: a <b>node feature matrix</b> <code>X ∈ ℝ<sup>N×F</sup></code> (one row per node), optional <b>edge features</b> <code>eᵥᵤ</code> (bond type, transaction amount, relation label), and sometimes a graph-level vector <code>u</code>.</li>
+        <li><b>Heterogeneous</b> graphs carry typed nodes and typed edges (user / item / review · <i>bought</i>, <i>rated</i>). Each type usually gets its own transform, then results are pooled across relations — the pattern behind R-GCN and most <a href="../nlp/knowledge-graphs.html">knowledge-graph</a> models.</li>
+        <li>In practice you almost never materialize a dense <code>A</code>: graphs are stored as an <b>edge list</b> (<code>2 × |E|</code> index tensor) and aggregation is a scatter-add, so cost is <code>O(|E|)</code>, not <code>O(N²)</code>.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the ingredients</span><span class="eq">G = (V, E)</span>        <span class="eq">A ∈ ℝ<sup>N×N</sup></span>        <span class="eq">D = diag(d₁, …, d<sub>N</sub>),  dᵢ = ∑ⱼ Aᵢⱼ</span>        <span class="eq">X ∈ ℝ<sup>N×F</sup></span></div>
+
+      <h4>Why CNN and RNN assumptions break</h4>
+      <ul class="notes">
+        <li>A convolution assumes a <b>fixed, ordered neighbourhood</b>: the pixel above-left is always the same slot in the kernel. On a graph there is no "above-left", and node degree varies from 1 to millions — a fixed-size weight patch cannot even be written down.</li>
+        <li>An RNN assumes a <b>canonical order</b>. Nodes have none: relabelling them must not change the answer.</li>
+        <li>So the layer must be <b>permutation equivariant</b> — permute the input nodes and the output permutes identically — and any whole-graph prediction must be <b>permutation invariant</b>.</li>
+        <li>The only cheap way to guarantee that is to build the layer out of <b>set functions</b>: sum, mean, or max over a neighbourhood, which have no notion of order by construction.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the symmetry constraint</span><span class="eq">equivariance:  f(PAPᵀ, PX) = P · f(A, X)</span>
+<span class="eq">invariance:    ρ( f(PAPᵀ, PX) ) = ρ( f(A, X) )      for every permutation matrix P</span></div>
+      <div class="callout"><b>Takeaway:</b> a CNN is a GNN on a grid whose neighbourhoods happen to be ordered and identical everywhere. Drop those two luxuries and you are forced into order-free neighbourhood aggregation — which <i>is</i> the graph neural network.</div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="message-passing" data-nav="Message passing">
+      <h3><span class="idx">02</span> The message-passing framework</h3>
+      <p class="lede">Nearly every GNN is the same three-step loop repeated <code>L</code> times: <b>message</b>, <b>aggregate</b>, <b>update</b>. The variants differ only in what you plug into those three slots.</p>
+
+      <h4>The loop</h4>
+      <ul class="notes">
+        <li><b>Message</b> <code>ψ</code>: for each edge, compute what the neighbour sends — a function of the sender, the receiver, and the edge feature.</li>
+        <li><b>Aggregate</b> <code>⊕</code>: collapse the incoming multiset into one vector with a <b>permutation-invariant</b> operator (sum, mean, max, attention-weighted sum).</li>
+        <li><b>Update</b> <code>φ</code>: combine the node's own state with the aggregate — typically a linear map plus a nonlinearity, sometimes an MLP or a GRU cell.</li>
+        <li>Initialize with <code>hᵥ⁽⁰⁾ = xᵥ</code>. All nodes update <b>in parallel</b> from layer <code>l</code> to layer <code>l+1</code>; weights are <b>shared across every node</b>, which is what makes the model size independent of <code>N</code>.</li>
+      </ul>
+      <div class="formula"><span class="lbl">one message-passing layer</span><span class="eq">mᵥ⁽ˡ⁾ = ⊕<sub>u ∈ N(v)</sub> ψ⁽ˡ⁾( hᵥ⁽ˡ⁾, hᵤ⁽ˡ⁾, eᵥᵤ )</span>
+<span class="eq">hᵥ⁽ˡ⁺¹⁾ = φ⁽ˡ⁾( hᵥ⁽ˡ⁾, mᵥ⁽ˡ⁾ )</span>        <span class="eq">hᵥ⁽⁰⁾ = xᵥ</span></div>
+
+      <h4>Depth = radius</h4>
+      <ul class="notes">
+        <li>After one layer a node knows its own features and its 1-hop neighbours. After <code>L</code> layers its state is a function of everything within <code>L</code> hops — the <b>receptive field</b> is the <code>L</code>-hop ball around the node.</li>
+        <li>This is the single most useful mental model on the page: <b>depth is not capacity, depth is radius</b>. If the signal you need lives 3 hops away, you need at least 3 layers. If it lives 1 hop away, more layers mostly add noise.</li>
+        <li>The receptive field grows roughly like <code>d̄<sup>L</sup></code> for average degree <code>d̄</code>, so on a social graph 3 layers can already touch a large fraction of the network — this is the root of both the sampling problem (§08) and over-squashing (§09).</li>
+      </ul>
+
+      <p>Pick a centre node, then grow <code>L</code>. Colour marks hop distance; grey nodes are invisible to the centre at that depth.</p>
+      <div class="viz" id="viz-gnn">
+        <div class="vhead">
+          <span class="vtitle">Receptive field: L layers = L hops</span>
+          <span class="vhint">click a node to make it the centre · drag the layer slider</span>
+        </div>
+        <div class="controls">
+          <label>Layers L <input type="range" id="gnn-layers" min="0" max="5" step="1" value="1"> <span id="gnn-lval">1</span></label>
+          <button class="btn ghost" id="gnn-reset">Reset</button>
+        </div>
+        <svg id="gnn-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="Interactive diagram: the L-hop receptive field of a node under message passing"></svg>
+        <div class="readout" aria-live="polite" id="gnn-readout"></div>
+      </div>
+      <div class="callout"><b>Takeaway:</b> message passing is a learnable, order-free convolution whose kernel is "the neighbourhood". Choose <code>ψ</code>, <code>⊕</code>, <code>φ</code> and you have named a specific architecture.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="gcn" data-nav="GCN">
+      <h3><span class="idx">03</span> GCN — the normalized average</h3>
+      <p class="lede">The simplest useful layer: transform every node, average over the neighbourhood <b>including yourself</b>, with a degree normalization that keeps activations from exploding at hubs.</p>
+
+      <h4>The layer</h4>
+      <ul class="notes">
+        <li>Add <b>self-loops</b> so a node keeps its own signal: <code>Ã = A + I</code>, with <code>D̃</code> the degree matrix of <code>Ã</code>. This pair is the <b>renormalization trick</b>.</li>
+        <li>Normalize <b>symmetrically</b> on both ends of the edge. A neighbour with huge degree contributes less, and a high-degree receiver is damped too — the eigenvalues of <code>D̃<sup>−½</sup> Ã D̃<sup>−½</sup></code> lie in <code>(−1, 1]</code>, so stacking layers does not blow up.</li>
+        <li>Everything is one sparse matrix product per layer: cheap, batch-free on small graphs, and trivially parallel.</li>
+      </ul>
+      <div class="formula"><span class="lbl">matrix form</span><span class="eq">H⁽ˡ⁺¹⁾ = σ( D̃<sup>−½</sup> Ã D̃<sup>−½</sup> H⁽ˡ⁾ W⁽ˡ⁾ )</span>        <span class="eq">Ã = A + I,   D̃ᵢᵢ = ∑ⱼ Ãᵢⱼ</span>
+<span class="lbl">per-node form</span><span class="eq">hᵥ⁽ˡ⁺¹⁾ = σ( ∑<sub>u ∈ N(v) ∪ {v}</sub>  (1 / √(d̃ᵥ · d̃ᵤ)) · W⁽ˡ⁾ hᵤ⁽ˡ⁾ )</span></div>
+
+      <h4>Where the formula comes from</h4>
+      <ul class="notes">
+        <li>Spectral graph theory defines convolution through the <b>graph Laplacian</b> <code>L = I − D<sup>−½</sup> A D<sup>−½</sup></code>: diagonalize it, multiply in the eigenbasis, transform back. Exact but <code>O(N³)</code> and not localized.</li>
+        <li>Approximating the spectral filter by a truncated <b>Chebyshev polynomial</b> makes it local — a degree-<code>K</code> polynomial in <code>L</code> only mixes <code>K</code>-hop neighbours. Keeping just <code>K = 1</code>, tying the two coefficients, and applying the renormalization trick collapses the whole construction into the one-line layer above.</li>
+        <li>So GCN is a <b>first-order spectral filter that turned out to be a spatial rule</b>. That is why it needs no eigendecomposition and why the same weights transfer to graphs of different size.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the aggregation weights <code>1/√(d̃ᵥ d̃ᵤ)</code> are <b>fixed by the graph</b> — no feature ever influences how much a neighbour counts. That single limitation is what GAT removes.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="graphsage" data-nav="GraphSAGE">
+      <h3><span class="idx">04</span> GraphSAGE — sample and aggregate</h3>
+      <p class="lede">Built for graphs too big to fit in memory and for nodes that <b>did not exist at training time</b>. Two changes to GCN do it: sample the neighbourhood, and keep the self-vector separate.</p>
+
+      <h4>The layer</h4>
+      <ul class="notes">
+        <li>Sample a <b>fixed-size</b> set <code>S(v) ⊂ N(v)</code> (a "fanout", e.g. 25 at layer 1 and 10 at layer 2), so per-node cost is bounded no matter how many neighbours a hub has.</li>
+        <li>Aggregate the sample, then <b>concatenate</b> the result with the node's own previous state before the linear map — unlike GCN, self and neighbours are not averaged into the same pot, so the layer can tell them apart.</li>
+        <li><code>ℓ₂</code>-normalize the output of each layer; it stabilizes training and makes dot-product similarity meaningful downstream.</li>
+        <li>Aggregator choices: <b>mean</b> (close to GCN), <b>max-pool</b> (an MLP per neighbour, then element-wise max — good at "does any neighbour have property X?"), and an <b>LSTM</b> over a randomly permuted neighbour list (more expressive, but only permutation-invariant in expectation).</li>
+      </ul>
+      <div class="formula"><span class="lbl">sample → aggregate → concat</span><span class="eq">h<sub>N(v)</sub>⁽ˡ⁺¹⁾ = AGG⁽ˡ⁾( { hᵤ⁽ˡ⁾ : u ∈ S(v) } )</span>
+<span class="eq">hᵥ⁽ˡ⁺¹⁾ = σ( W⁽ˡ⁾ · [ hᵥ⁽ˡ⁾ ‖ h<sub>N(v)</sub>⁽ˡ⁺¹⁾ ] )</span>        <span class="eq">hᵥ⁽ˡ⁺¹⁾ ← hᵥ⁽ˡ⁺¹⁾ / ‖hᵥ⁽ˡ⁺¹⁾‖₂</span>
+<span class="lbl">max-pool aggregator</span><span class="eq">AGG = max<sub>u ∈ S(v)</sub> σ( W<sub>pool</sub> hᵤ + b )</span></div>
+
+      <h4>Inductive by design</h4>
+      <ul class="notes">
+        <li>Because the model learns <b>aggregator weights</b> rather than a lookup table of node vectors, a brand-new node gets an embedding from its features and neighbours in a single forward pass — no retraining. That is the difference between learning <i>embeddings</i> and learning <i>a function that produces embeddings</i> (see <a href="../nlp/embeddings.html">Embeddings</a>).</li>
+        <li>Unsupervised training needs no labels at all: push connected nodes together, push random nodes apart — a contrastive objective on the graph.</li>
+      </ul>
+      <div class="formula"><span class="lbl">unsupervised graph loss</span><span class="eq">L = − log σ( z<sub>v</sub> · z<sub>u</sub> ) − Q · 𝔼<sub>uₙ ∼ Pₙ</sub> log σ( − z<sub>v</sub> · z<sub>uₙ</sub> )</span>   <span class="eq">u = a node co-occurring with v on a short random walk</span></div>
+      <div class="callout"><b>Takeaway:</b> sampling turns an inherently global computation into a bounded, mini-batchable one — the reason GraphSAGE-style layers dominate industrial graphs.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="gat" data-nav="GAT">
+      <h3><span class="idx">05</span> GAT — learned neighbour weights</h3>
+      <p class="lede">Replace the fixed <code>1/√(d̃ᵥ d̃ᵤ)</code> with a <b>learned, feature-dependent</b> coefficient. It is <a href="attention.html">attention</a> masked by the adjacency matrix.</p>
+
+      <h4>Attention over a neighbourhood</h4>
+      <ul class="notes">
+        <li>Score each edge with a shared linear map <code>W</code> and a shared attention vector <code>a</code>, squashed by a <b>LeakyReLU</b> (negative slope 0.2) so scores stay signed and non-saturating.</li>
+        <li><b>Softmax over the neighbourhood only</b> (self-loop included), not over all nodes — so the coefficients form a convex combination per node and remain cheap: <code>O(|E|)</code>, never <code>O(N²)</code>.</li>
+        <li><b>Multi-head</b>: run <code>K</code> independent attentions and concatenate; each head can specialize (one on structural hubs, one on feature similarity). At the final layer <b>average</b> the heads instead of concatenating, so the output dimension matches the label space.</li>
+        <li>Dropout is usually applied <b>to the attention coefficients themselves</b>, which randomly removes edges each step and acts as strong regularization on small citation graphs.</li>
+        <li>A known wrinkle: in the original formulation the ranking of neighbours is the same for every query node — "static" attention. <b>GATv2</b> fixes it by moving the nonlinearity <i>before</i> the attention vector, <code>e = aᵀ LeakyReLU(W[hᵥ ‖ hᵤ])</code>, restoring genuinely dynamic attention at the same cost.</li>
+      </ul>
+      <div class="formula"><span class="lbl">attention coefficients</span><span class="eq">eᵥᵤ = LeakyReLU( aᵀ [ W hᵥ ‖ W hᵤ ] )</span>
+<span class="eq">αᵥᵤ = exp(eᵥᵤ) / ∑<sub>k ∈ N(v) ∪ {v}</sub> exp(eᵥₖ)</span>
+<span class="lbl">update (multi-head, concat)</span><span class="eq">hᵥ' = ‖<sub>k=1..K</sub> σ( ∑<sub>u ∈ N(v) ∪ {v}</sub> αᵥᵤ<sup>k</sup> W<sup>k</sup> hᵤ )</span></div>
+
+      <p>Same star neighbourhood, three aggregation rules. Edge thickness is the weight actually applied to that neighbour's message.</p>
+      <div class="viz" id="viz-agg">
+        <div class="vhead">
+          <span class="vtitle">Who gets to speak? GCN vs mean vs attention</span>
+          <span class="vhint">switch rule · numbers on edges are aggregation weights</span>
+        </div>
+        <div class="controls">
+          <button class="btn" id="agg-gcn">GCN (degree norm)</button>
+          <button class="btn ghost" id="agg-mean">Mean</button>
+          <button class="btn ghost" id="agg-gat">GAT (attention)</button>
+        </div>
+        <svg id="agg-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Interactive diagram: aggregation weights of a neighbourhood under GCN, mean and attention"></svg>
+        <div class="readout" aria-live="polite" id="agg-readout"></div>
+      </div>
+      <div class="callout"><b>Takeaway:</b> GCN weights come from <b>structure</b>, GAT weights come from <b>content</b>. On noisy graphs where many edges are irrelevant, letting the model down-weight an edge is worth the extra parameters; on clean, homophilous graphs GCN is often just as good and faster.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="gin-mpnn" data-nav="GIN, MPNN &amp; expressiveness">
+      <h3><span class="idx">06</span> GIN, edge features &amp; expressiveness</h3>
+      <p class="lede">How powerful <i>can</i> a message-passing network be? The answer is a precise one, and it changes which aggregator you should pick.</p>
+
+      <h4>The Weisfeiler-Lehman ceiling</h4>
+      <ul class="notes">
+        <li>The <b>1-WL</b> colour-refinement test decides whether two graphs might be isomorphic: repeatedly replace each node's colour by a hash of (own colour, multiset of neighbour colours) and compare the colour histograms.</li>
+        <li>That is <i>structurally identical</i> to message passing. The consequence: <b>no message-passing GNN can distinguish two graphs that 1-WL cannot</b>. It cannot count triangles, cannot tell a 6-cycle from two disjoint triangles, and is blind to many regular graphs.</li>
+        <li>A GNN reaches that ceiling only if both its aggregate and its update are <b>injective on multisets</b>. Mean loses multiplicity ({a, a, b} ≡ {a, b}); max loses everything but the distinct set. <b>Sum keeps both</b>.</li>
+      </ul>
+      <div class="formula"><span class="lbl">GIN layer — sum aggregation + MLP</span><span class="eq">hᵥ⁽ˡ⁺¹⁾ = MLP⁽ˡ⁾( (1 + ε⁽ˡ⁾) · hᵥ⁽ˡ⁾ + ∑<sub>u ∈ N(v)</sub> hᵤ⁽ˡ⁾ )</span>
+<span class="lbl">graph readout — every depth, concatenated</span><span class="eq">h<sub>G</sub> = ‖<sub>l = 0..L</sub> SUM( { hᵥ⁽ˡ⁾ : v ∈ V } )</span></div>
+      <ul class="notes">
+        <li><code>ε</code> (learned or fixed at 0) lets the layer weight the self term differently from the neighbours; the MLP supplies the universal function needed for injectivity.</li>
+        <li>Reading out <b>every layer</b>, not just the last, keeps both fine-grained and coarse structure — a small change that reliably helps graph classification.</li>
+        <li>To go beyond 1-WL you must add information message passing cannot see: subgraph counts, distance encodings, random node identifiers, or higher-order (k-WL) tensors — all more expensive.</li>
+      </ul>
+
+      <h4>Edge features: the general MPNN</h4>
+      <ul class="notes">
+        <li>Molecules make edges first-class (single / double / aromatic bond). The general MPNN message function takes the edge as an argument, often by having a small network <b>generate the weight matrix</b> from the edge feature.</li>
+        <li>Update can be recurrent (a GRU over layers, sharing weights), and readout can be a learned set function rather than a plain sum.</li>
+      </ul>
+      <div class="formula"><span class="lbl">edge-conditioned message</span><span class="eq">mᵥ = ∑<sub>u ∈ N(v)</sub> M<sub>θ</sub>(eᵥᵤ) · hᵤ</span>        <span class="eq">hᵥ' = GRU( hᵥ, mᵥ )</span></div>
+
+      <table class="cmp">
+        <tr><th>Layer</th><th>Aggregation weight on neighbour u</th><th>Self term</th><th>Strength</th><th>Watch out</th></tr>
+        <tr><td><b>GCN</b></td><td>1 / √(d̃ᵥ d̃ᵤ) — fixed by structure</td><td>Self-loop, same pot</td><td>Fast, strong baseline, few params</td><td>Transductive by habit; can't ignore a bad edge</td></tr>
+        <tr><td><b>GraphSAGE</b></td><td>1 / |S(v)| over a sampled subset (or max-pool)</td><td>Concatenated, separate</td><td>Inductive, scales to billions of edges</td><td>Sampling variance; fanout is a real hyperparameter</td></tr>
+        <tr><td><b>GAT</b></td><td>αᵥᵤ — learned from features, sums to 1</td><td>In the softmax</td><td>Noisy / heterogeneous edges, interpretable weights</td><td>More params; original variant has static attention</td></tr>
+        <tr><td><b>GIN</b></td><td>1 (plain sum)</td><td>(1 + ε) · hᵥ</td><td>Maximally expressive under 1-WL; best for graph-level tasks</td><td>Unnormalized sums scale with degree — can destabilize</td></tr>
+        <tr><td><b>MPNN / NNConv</b></td><td>M<sub>θ</sub>(eᵥᵤ) — a matrix produced from the edge</td><td>GRU-style update</td><td>Rich edge features (chemistry, physics)</td><td>Heaviest per-edge cost</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> pick the aggregator by the question. Counting-style graph properties want <b>sum</b>; "what is the typical neighbour" wants <b>mean</b>; "does any neighbour do X" wants <b>max</b>; "which neighbours matter" wants <b>attention</b>.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="tasks" data-nav="Tasks &amp; readouts">
+      <h3><span class="idx">07</span> Tasks, heads &amp; readouts</h3>
+      <p class="lede">The stack of message-passing layers is shared; what changes per task is the <b>head</b> that reads the final node states.</p>
+
+      <h4>Node level</h4>
+      <ul class="notes">
+        <li><b>Node classification / regression</b>: a linear layer on <code>hᵥ⁽ᴸ⁾</code>. Loss is computed on <b>labelled nodes only</b> via a boolean mask, even though the forward pass touches the whole graph.</li>
+      </ul>
+      <h4>Edge level</h4>
+      <ul class="notes">
+        <li><b>Link prediction</b>: encode nodes, then <b>decode pairs</b>. The cheapest decoder is a dot product; typed relations get a diagonal or full relation matrix; anything richer is an MLP on <code>[zᵤ ‖ zᵥ]</code>.</li>
+        <li>Train with <b>negative sampling</b>: real edges are positives, random non-edges are negatives, binary cross-entropy on the score. Removing the target edges from the message-passing graph is essential or the model simply reads the answer off the adjacency.</li>
+      </ul>
+      <div class="formula"><span class="lbl">pairwise decoders</span><span class="eq">score(u, v) = zᵤ · zᵥ</span>        <span class="eq">score<sub>r</sub>(u, v) = zᵤᵀ R<sub>r</sub> zᵥ</span>        <span class="eq">Â = σ( Z Zᵀ )</span>
+<span class="lbl">loss</span><span class="eq">L = − ∑<sub>(u,v) ∈ E</sub> log σ(score) − ∑<sub>(u,v') ∉ E</sub> log(1 − σ(score))</span></div>
+      <h4>Graph level</h4>
+      <ul class="notes">
+        <li><b>Readout / pooling</b> collapses <code>N</code> node vectors into one graph vector — and must be permutation invariant. Sum keeps size information, mean is size-normalized, max is a feature detector; concatenating sum and max is a common cheap default.</li>
+        <li><b>Hierarchical pooling</b> coarsens instead: learn a soft cluster assignment and pool nodes into super-nodes (DiffPool), or keep the top-<code>k</code> nodes by a learned score. Useful when the graph has real hierarchy (functional groups, communities).</li>
+      </ul>
+      <h4>Transductive vs inductive</h4>
+      <ul class="notes">
+        <li><b>Transductive</b>: one fixed graph, all nodes present at training, only labels are hidden. Classic citation-network benchmarks work this way; models may even learn per-node embeddings.</li>
+        <li><b>Inductive</b>: test on nodes — or entire graphs — never seen during training. This demands that everything be a <b>function of features and structure</b>, and it is what real deployments almost always need.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> encoder once, decoder per task. Most GNN bugs in link prediction are leakage bugs: the edge you are predicting must not be in the graph you are passing messages over.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="training" data-nav="Training in practice">
+      <h3><span class="idx">08</span> Training in practice</h3>
+      <p class="lede">Mini-batching is the hard part. In a GNN, examples are not independent — each node's loss depends on a neighbourhood that spreads with depth.</p>
+
+      <h4>Full batch vs sampling</h4>
+      <ul class="notes">
+        <li><b>Full batch</b>: on graphs up to a few hundred thousand nodes, run the whole graph on GPU each step. Exact gradients, but one gradient step per epoch and memory scales with <code>N × F × L</code>.</li>
+        <li><b>Neighbour sampling</b>: for a batch of target nodes, sample a fanout per layer and build the induced computation graph (a "block" per layer). Bounded memory, unbiased-ish gradients, some variance. Without it, the <b>neighbour explosion</b> — <code>d̄<sup>L</sup></code> nodes per target — makes 3 layers intractable on a dense graph.</li>
+        <li><b>Subgraph sampling</b>: partition the graph into clusters and use whole clusters as batches (Cluster-GCN), or sample node/edge-induced subgraphs with normalization to remove the bias (GraphSAINT). No exponential blow-up because messages stay inside the subgraph.</li>
+      </ul>
+      <h4>Regularization &amp; stability</h4>
+      <ul class="notes">
+        <li><b>Normalization</b> matters more than in an MLP because degrees vary: layer norm per node is the safest default; batch norm works for graph-level tasks; PairNorm-style schemes explicitly fight feature collapse.</li>
+        <li><b>Dropout</b> on hidden features, <b>attention dropout</b> on coefficients, and <b>DropEdge</b> — randomly deleting a fraction of edges every epoch, which both regularizes and slows over-smoothing by thinning the propagation.</li>
+        <li>Small benchmark graphs overfit almost instantly: weight decay, early stopping on a validation mask, and 2 layers are usually the whole recipe. See <a href="neural-network-training.html">Neural Network Training</a> for the general optimizer/schedule story.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the batch in a GNN is not a set of rows, it is a <b>subgraph</b>. Choose the sampler before you tune the model — it determines memory, variance, and how deep you can afford to go.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="failure-modes" data-nav="Over-smoothing &amp; friends">
+      <h3><span class="idx">09</span> Over-smoothing, over-squashing &amp; heterophily</h3>
+      <p class="lede">GNNs stubbornly refuse to get deeper. Three distinct pathologies explain why — and each has its own fix.</p>
+
+      <h4>Over-smoothing</h4>
+      <ul class="notes">
+        <li>Repeated normalized averaging is a <b>diffusion process</b>. Iterate it enough and every node's representation converges toward the same point (up to a degree-dependent scaling): the dominant eigenvector of the propagation matrix. Node identity is erased and classes become inseparable.</li>
+        <li>Diagnostic: track the <b>spread</b> of node features — pairwise distance, or the Dirichlet energy <code>E(H) = ∑<sub>(u,v) ∈ E</sub> ‖hᵤ − hᵥ‖²</code>. It decays geometrically with depth.</li>
+        <li>Remedies: <b>residual / skip connections</b> (see <a href="residual-skip-connections.html">Residual Connections</a>), <b>initial residuals</b> that re-inject <code>h⁽⁰⁾</code> at every layer plus identity mapping (GCNII), <b>jumping knowledge</b> (concatenate or max-pool all layer outputs so each node picks its own effective depth), <b>DropEdge</b>, and normalization that preserves feature variance.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the smoothing operator and its fix</span><span class="eq">plain:   H⁽ˡ⁺¹⁾ = Â H⁽ˡ⁾ W,        Â = D̃<sup>−½</sup> Ã D̃<sup>−½</sup>   ⟹   Â<sup>L</sup> → rank-1 as L → ∞</span>
+<span class="eq">initial residual:   H⁽ˡ⁺¹⁾ = σ( ( (1 − α) Â H⁽ˡ⁾ + α H⁽⁰⁾ ) · ( (1 − β) I + β W ) )</span></div>
+
+      <p>Watch the two communities dissolve. The curve is the separation between them; toggle the residual to see depth become survivable.</p>
+      <div class="viz" id="viz-os">
+        <div class="vhead">
+          <span class="vtitle">Over-smoothing: features collapse with depth</span>
+          <span class="vhint">drag depth · toggle initial-residual propagation</span>
+        </div>
+        <div class="controls">
+          <label>Layers <input type="range" id="os-layers" min="0" max="14" step="1" value="0"> <span id="os-lval">0</span></label>
+          <label><input type="checkbox" id="os-res"> initial residual (α = 0.3)</label>
+        </div>
+        <svg id="os-svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="Interactive diagram: node features from two communities converging as GNN depth increases"></svg>
+        <div class="readout" aria-live="polite" id="os-readout"></div>
+      </div>
+
+      <h4>Over-squashing</h4>
+      <ul class="notes">
+        <li>A node's <code>L</code>-hop ball can hold exponentially many nodes, yet its state is a <b>fixed-size vector</b>. Information from far away is compressed through bottleneck edges until the gradient signal is effectively zero — long-range dependencies simply cannot be learned.</li>
+        <li>It is a <b>topology</b> problem, not a depth problem: it concentrates on edges with negative discrete curvature (bridges between densely connected regions).</li>
+        <li>Remedies: <b>graph rewiring</b> (add or reweight edges to relieve bottlenecks), a <b>virtual global node</b>, multi-hop propagation, or replacing local passing with global attention (§10).</li>
+      </ul>
+
+      <h4>Heterophily</h4>
+      <ul class="notes">
+        <li>Standard GNNs assume <b>homophily</b> — neighbours share labels. Averaging then acts as a denoiser. On heterophilous graphs (fraud rings hiding among normal accounts, dating networks) averaging <i>destroys</i> the signal, and a plain MLP on node features can beat a GCN.</li>
+        <li>Remedies: keep the <b>ego embedding separate</b> from the neighbour embedding, use <b>higher-order</b> neighbourhoods (2-hop neighbours may be homophilous even when 1-hop is not), allow <b>signed / negative</b> aggregation weights, and learn a per-layer combination coefficient that can turn propagation off.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> before adding layers, ask which problem you actually have. Need a bigger radius but features collapse → residuals + jumping knowledge. Need long-range signal through a bottleneck → rewiring or global attention. Neighbours disagree with you → stop averaging.</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="graph-transformers" data-nav="Graph transformers">
+      <h3><span class="idx">10</span> Graph transformers &amp; the attention connection</h3>
+      <p class="lede">A transformer is a GNN on a <b>complete graph</b>. Say that out loud and both families snap into one picture.</p>
+      <ul class="notes">
+        <li>Self-attention lets every token attend to every other — that is aggregation over a fully connected graph, with the sequence order supplied externally by positional encodings. A GNN is the same computation <b>masked by the adjacency matrix</b>, with structure supplied by the mask instead. See <a href="attention.html">Attention</a> and <a href="transformers.html">Transformers</a>.</li>
+        <li>Going global removes over-squashing (everything is one hop away) but throws away the graph. So structure must be <b>re-injected as features or as an attention bias</b>.</li>
+        <li><b>Laplacian eigenvector</b> positional encodings play the role of sinusoids — the graph's own Fourier basis, with a sign/basis ambiguity that needs handling. <b>Random-walk</b> structural encodings use return probabilities over <code>k</code> steps and are often simpler and stronger.</li>
+        <li><b>Attention biases</b>: add a learned term per shortest-path distance, per edge type along that path, and a degree-based term — the recipe behind Graphormer-style models, strong on molecular property prediction.</li>
+        <li><b>Hybrids</b> (local MPNN layer + global attention layer, alternating) are the pragmatic sweet spot: locality where it is cheap and correct, global reach where it is needed.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the same operation, two masks</span><span class="eq">GNN:          hᵥ' = ∑<sub>u</sub> Aᵥᵤ · αᵥᵤ · W hᵤ       (structure = hard mask)</span>
+<span class="eq">Transformer:  hᵥ' = ∑<sub>u</sub> softmax( qᵥᵀkᵤ/√d<sub>k</sub> + bᵥᵤ ) · W hᵤ   (structure = bias bᵥᵤ)</span></div>
+      <div class="callout"><b>Takeaway:</b> cost decides. Message passing is <code>O(|E|)</code> and biased toward locality; graph attention is <code>O(N²)</code> and biased toward nothing. Sparse graphs with local signal → GNN. Small graphs with long-range interactions (molecules) → graph transformer.</div>
+    </section>
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="applications" data-nav="Applications &amp; checklist">
+      <h3><span class="idx">11</span> Where they earn their keep — and how to not get burned</h3>
+      <p class="lede">GNNs pay off exactly when the <b>relations carry signal that the node features do not</b>. If they don't, a gradient-boosted tree on tabular features will beat you.</p>
+
+      <h4>Applications</h4>
+      <ul class="notes">
+        <li><b>Molecules &amp; materials</b>: atoms as nodes, bonds as edges — property prediction, force fields, and generative design. The canonical home turf, since a molecule <i>is</i> a graph.</li>
+        <li><b>Recommendation</b>: the user-item bipartite graph; message passing propagates preference several hops, surfacing items no co-occurrence count would find.</li>
+        <li><b>Knowledge graphs</b>: relation-aware layers for entity classification and link prediction — the structured grounding behind retrieval and reasoning systems (<a href="../nlp/knowledge-graphs.html">Knowledge Graphs</a>).</li>
+        <li><b>Traffic &amp; forecasting</b>: road sensors as nodes; spatial GNN layers combined with temporal layers give spatio-temporal forecasting.</li>
+        <li><b>Physics simulation</b>: particles as nodes and interactions as edges, learning the update rule for the next timestep.</li>
+        <li><b>Fraud &amp; security</b>: rings are visible in the topology long before they are visible per account — though these graphs are often <b>heterophilous</b>, so read §09 first.</li>
+      </ul>
+      <h4>Tooling</h4>
+      <ul class="notes">
+        <li>Two mature libraries dominate: <b>PyTorch Geometric</b> and <b>DGL</b> — both give sparse message-passing primitives, batched samplers, and the standard layers as one-liners.</li>
+      </ul>
+      <h4>Checklist &amp; pitfalls</h4>
+      <ol class="notes">
+        <li><b>Beat the no-graph baseline first.</b> An MLP on node features, and a feature-free structural baseline (label propagation, node2vec). If the GNN doesn't beat both, the edges aren't helping.</li>
+        <li><b>Measure homophily</b> before choosing a layer. It decides whether averaging is a denoiser or a destroyer.</li>
+        <li><b>Start at 2 layers.</b> Add depth only with residuals or jumping knowledge, and only if the task genuinely needs a bigger radius.</li>
+        <li><b>Check for leakage</b>: target edges removed from the message graph, temporal splits by time, no test nodes in the training loss.</li>
+        <li><b>Self-loops and normalization</b> — forgetting either is the most common silent bug; activations drift and hubs dominate.</li>
+        <li><b>Watch degree distribution.</b> Heavy tails wreck memory during sampling; cap fanout, and consider dropping or splitting super-hubs.</li>
+        <li><b>Log a smoothing metric</b> (feature variance or Dirichlet energy) per layer. It turns "deeper didn't help" into a diagnosis.</li>
+      </ol>
+      <div class="callout"><b>Takeaway:</b> the graph is a modelling choice, not a given. Deciding what a node is, what an edge means, and which features live where usually moves the metric more than swapping GCN for GAT.</div>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+/* ─────────────────── 02 · receptive field = L hops ─────────────────── */
+(function(){
+  const svg=d3.select("#gnn-svg");
+  const P=[[60,170],[140,90],[140,250],[215,170],[225,60],[230,290],[300,110],[305,225],
+           [380,60],[385,170],[390,285],[470,110],[475,235],[550,170],[600,80],[600,265]];
+  const nodes=P.map((p,i)=>({id:i,x:p[0],y:p[1]}));
+  const edges=[[0,1],[0,2],[1,3],[2,3],[1,4],[2,5],[3,6],[3,7],[4,6],[5,7],[6,8],[6,9],
+               [7,9],[7,10],[8,9],[9,10],[8,11],[9,11],[9,12],[10,12],[11,13],[12,13],
+               [11,14],[13,14],[13,15],[12,15]];
+  const adj=nodes.map(()=>[]);
+  edges.forEach(([a,b])=>{ adj[a].push(b); adj[b].push(a); });
+
+  const gE=svg.append("g"), gN=svg.append("g"), gL=svg.append("g");
+  const lines=gE.selectAll("line").data(edges).enter().append("line")
+    .attr("x1",d=>nodes[d[0]].x).attr("y1",d=>nodes[d[0]].y)
+    .attr("x2",d=>nodes[d[1]].x).attr("y2",d=>nodes[d[1]].y).attr("stroke-width",1.6);
+
+  const hopCol=k=> k===0 ? C.B : d3.interpolateRgb(C.A,"#2f3a52")(Math.min(1,(k-1)/4));
+  let centre=3, L=1;
+
+  function hops(src){
+    const dist=nodes.map(()=>Infinity); dist[src]=0; const q=[src];
+    while(q.length){ const v=q.shift(); adj[v].forEach(u=>{ if(dist[u]===Infinity){ dist[u]=dist[v]+1; q.push(u); } }); }
+    return dist;
+  }
+
+  const g=gN.selectAll("g.nd").data(nodes).enter().append("g").attr("class","nd")
+    .attr("transform",d=>`translate(${d.x},${d.y})`).attr("cursor","pointer")
+    .on("click",(ev,d)=>{ centre=d.id; render(); });
+  g.append("circle").attr("r",14).attr("stroke","#0f1117").attr("stroke-width",2);
+  g.append("text").attr("text-anchor","middle").attr("dy",4).attr("font-size",11).attr("font-weight",600);
+
+  // legend
+  const lg=gL.append("g").attr("transform","translate(16,318)");
+  ["centre","1 hop","2 hops","3+ hops","unreached"].forEach((t,i)=>{
+    const col=i===4?"#232a36":hopCol(i);
+    const x=i*112;
+    lg.append("circle").attr("cx",x).attr("cy",-4).attr("r",6).attr("fill",col).attr("stroke","#0f1117").attr("stroke-width",1.4);
+    lg.append("text").attr("x",x+11).attr("y",0).attr("font-size",10.5).attr("fill",C.muted).text(t);
+  });
+
+  function render(){
+    const dist=hops(centre);
+    lines.transition().duration(250)
+      .attr("stroke",d=>(dist[d[0]]<=L&&dist[d[1]]<=L)?C.A:C.line)
+      .attr("stroke-opacity",d=>(dist[d[0]]<=L&&dist[d[1]]<=L)?0.85:0.35)
+      .attr("stroke-width",d=>(dist[d[0]]<=L&&dist[d[1]]<=L)?2.4:1.4);
+    g.select("circle").transition().duration(250)
+      .attr("r",d=>dist[d.id]===0?17:14)
+      .attr("fill",d=>dist[d.id]<=L?hopCol(dist[d.id]):"#232a36")
+      .attr("stroke",d=>dist[d.id]===0?"#fff":"#0f1117");
+    g.select("text").attr("fill",d=>dist[d.id]<=L?"#101520":C.muted).text(d=>d.id);
+    const counts=[]; let total=0;
+    for(let k=0;k<=L;k++){ const c=dist.filter(v=>v===k).length; total+=c; if(k>0) counts.push(`${k}-hop: <b>${c}</b>`); }
+    const tail=L===0?"it sees only its own features (h⁽⁰⁾ = x<sub>v</sub>)":counts.join(" · ");
+    d3.select("#gnn-readout").html(
+      `centre <b>${centre}</b> · L = <b>${L}</b> → receptive field <b>${total}</b>/${nodes.length} nodes &nbsp;·&nbsp; ${tail}`);
+  }
+  const sl=document.getElementById("gnn-layers"), lv=document.getElementById("gnn-lval");
+  sl.addEventListener("input",()=>{ L=+sl.value; lv.textContent=L; render(); });
+  d3.select("#gnn-reset").on("click",()=>{ centre=3; L=1; sl.value=1; lv.textContent="1"; render(); });
+  render();
+})();
+
+/* ─────────────────── 05 · aggregation weights: GCN / mean / GAT ─────────────────── */
+(function(){
+  const svg=d3.select("#agg-svg"), cx=205, cy=150;
+  const nb=[{y:40,d:2,s:1.4},{y:95,d:3,s:-0.6},{y:150,d:6,s:0.9},{y:205,d:10,s:-1.2},{y:260,d:4,s:0.3}];
+  const nx=430, selfScore=0.7, dv=nb.length;               // centre degree = 5
+  const lrelu=z=> z>0 ? z : 0.2*z;
+  const gE=svg.append("g"), gN=svg.append("g"), gT=svg.append("g");
+
+  function weights(mode){
+    if(mode==="mean") return {w:nb.map(()=>1/dv), self:null, sum:1};
+    if(mode==="gcn"){ const w=nb.map(n=>1/Math.sqrt((dv+1)*(n.d+1))); return {w, self:1/(dv+1), sum:w.reduce((a,b)=>a+b,0)+1/(dv+1)}; }
+    const ex=nb.map(n=>Math.exp(lrelu(n.s))), es=Math.exp(lrelu(selfScore));
+    const Z=ex.reduce((a,b)=>a+b,0)+es;
+    return {w:ex.map(e=>e/Z), self:es/Z, sum:1};
+  }
+  const copy={
+    gcn:"GCN — weight <b>1/√(d̃<sub>v</sub> d̃<sub>u</sub>)</b>: purely structural. High-degree neighbours are damped; features are irrelevant. Weights do <b>not</b> sum to 1.",
+    mean:"Mean (GraphSAGE) — every sampled neighbour counts <b>equally</b>; the self-vector is kept aside and concatenated, not averaged in.",
+    gat:"GAT — <b>α<sub>vu</sub> = softmax(LeakyReLU(aᵀ[Wh<sub>v</sub>‖Wh<sub>u</sub>]))</b>: learned from features, a convex combination over the neighbourhood plus self."
+  };
+
+  const eg=gE.selectAll("line").data(nb).enter().append("line")
+    .attr("x1",cx).attr("y1",cy).attr("x2",nx).attr("y2",d=>d.y).attr("stroke",C.A).attr("stroke-linecap","round");
+  const wl=gT.selectAll("text.w").data(nb).enter().append("text").attr("class","w")
+    .attr("x",(cx+nx)/2).attr("y",d=>(cy+d.y)/2-6).attr("text-anchor","middle").attr("font-size",11)
+    .attr("font-family","Menlo,monospace").attr("fill",C.B)
+    .attr("paint-order","stroke").attr("stroke","#0f1117").attr("stroke-width",3).attr("stroke-linejoin","round");
+
+  const ng=gN.selectAll("g").data(nb).enter().append("g").attr("transform",d=>`translate(${nx},${d.y})`);
+  ng.append("circle").attr("r",15).attr("fill","#2a3340").attr("stroke",C.A).attr("stroke-width",1.6);
+  ng.append("text").attr("text-anchor","middle").attr("dy",4).attr("font-size",11).attr("fill",C.ink).text((d,i)=>"u"+(i+1));
+  ng.append("text").attr("x",22).attr("dy",4).attr("font-size",10.5).attr("fill",C.muted).text(d=>"deg "+d.d);
+
+  const cnode=gN.append("g").attr("transform",`translate(${cx},${cy})`);
+  cnode.append("circle").attr("r",20).attr("fill",C.B).attr("stroke","#fff").attr("stroke-width",2);
+  cnode.append("text").attr("text-anchor","middle").attr("dy",5).attr("font-size",13).attr("font-weight",700).attr("fill","#101520").text("v");
+  const selfTxt=gT.append("text").attr("x",cx).attr("y",cy+40).attr("text-anchor","middle").attr("font-size",11)
+    .attr("font-family","Menlo,monospace").attr("fill",C.good);
+  gT.append("text").attr("x",cx).attr("y",cy-32).attr("text-anchor","middle").attr("font-size",10.5).attr("fill",C.muted).text("deg 5");
+
+  function draw(mode){
+    const {w,self,sum}=weights(mode);
+    eg.data(nb).transition().duration(350).attr("stroke-width",(d,i)=>1.5+26*w[i]).attr("stroke-opacity",(d,i)=>0.35+0.65*Math.min(1,w[i]*3));
+    wl.data(nb).text((d,i)=>w[i].toFixed(3));
+    selfTxt.text(self===null?"self: concatenated":"self weight "+self.toFixed(3));
+    d3.select("#agg-readout").html(copy[mode]+` &nbsp;·&nbsp; Σ weights = <b>${sum.toFixed(3)}</b>`);
+    ["gcn","mean","gat"].forEach(m=>d3.select("#agg-"+m).attr("class",m===mode?"btn":"btn ghost"));
+  }
+  ["gcn","mean","gat"].forEach(m=>d3.select("#agg-"+m).on("click",()=>draw(m)));
+  draw("gcn");
+})();
+
+/* ─────────────────── 09 · over-smoothing ─────────────────── */
+(function(){
+  const svg=d3.select("#os-svg"), N=14, STEPS=14, ALPHA=0.3;
+  const pos=[], comm=[];
+  for(let i=0;i<7;i++){ const a=i*2*Math.PI/7-0.4; pos.push([105+62*Math.cos(a),120+62*Math.sin(a)]); comm.push(0); }
+  for(let i=0;i<7;i++){ const a=i*2*Math.PI/7+0.9; pos.push([240+62*Math.cos(a),250+62*Math.sin(a)]); comm.push(1); }
+  const E=[];
+  for(let b=0;b<2;b++){ const o=b*7;
+    for(let i=0;i<7;i++) E.push([o+i,o+(i+1)%7]);
+    E.push([o+0,o+3]); E.push([o+1,o+4]); E.push([o+2,o+5]); }
+  [[2,10],[1,11],[2,9],[0,11]].forEach(e=>E.push(e));   // bridges between the two communities
+
+  // normalized adjacency with self-loops:  Â = D̃^-1/2 (A+I) D̃^-1/2
+  const deg=new Array(N).fill(1);
+  E.forEach(([a,b])=>{ deg[a]++; deg[b]++; });
+  function prop(h){
+    const acc=new Array(N).fill(0);
+    for(let i=0;i<N;i++) acc[i]+=h[i]/deg[i];   // self-loop term: 1/√(d̃ᵢd̃ᵢ)
+    E.forEach(([a,b])=>{ const s=1/Math.sqrt(deg[a]*deg[b]); acc[a]+=s*h[b]; acc[b]+=s*h[a]; });
+    return acc;
+  }
+  const h0=[]; for(let i=0;i<N;i++) h0.push((comm[i]?-1:1)*(1+0.12*Math.sin(i*2.3)));
+  function run(res){ const seq=[h0.slice()];
+    for(let l=0;l<STEPS;l++){ const p=prop(seq[l]);
+      seq.push(res? p.map((v,i)=>(1-ALPHA)*v+ALPHA*h0[i]) : p); }
+    return seq; }
+  const seqP=run(false), seqR=run(true);
+  const gap=s=>{ const A=d3.mean(s.filter((v,i)=>!comm[i])), B=d3.mean(s.filter((v,i)=>comm[i])); return Math.abs(A-B); };
+  const g0=gap(h0);
+  const curveP=seqP.map(s=>gap(s)/g0), curveR=seqR.map(s=>gap(s)/g0);
+
+  const col=d3.scaleLinear().domain([-1,0,1]).range([C.B,"#39414f",C.A]).clamp(true);
+  const gE=svg.append("g"), gN=svg.append("g"), gC=svg.append("g");
+  svg.append("text").attr("x",20).attr("y",26).attr("font-size",11).attr("fill",C.muted).text("two communities · node colour = feature value");
+  gE.selectAll("line").data(E).enter().append("line")
+    .attr("x1",d=>pos[d[0]][0]).attr("y1",d=>pos[d[0]][1])
+    .attr("x2",d=>pos[d[1]][0]).attr("y2",d=>pos[d[1]][1])
+    .attr("stroke",d=>comm[d[0]]!==comm[d[1]]?C.good:C.line).attr("stroke-width",d=>comm[d[0]]!==comm[d[1]]?2:1.4);
+  const nodesSel=gN.selectAll("circle").data(d3.range(N)).enter().append("circle")
+    .attr("cx",i=>pos[i][0]).attr("cy",i=>pos[i][1]).attr("r",11)
+    .attr("stroke","#0f1117").attr("stroke-width",1.8);
+
+  // chart
+  const x0=375,x1=620,y0=300,y1=60;
+  const xs=d3.scaleLinear().domain([0,STEPS]).range([x0,x1]);
+  const ys=d3.scaleLinear().domain([0,1]).range([y0,y1]);
+  gC.append("line").attr("x1",x0).attr("y1",y0).attr("x2",x1).attr("y2",y0).attr("stroke","#3a4150");
+  gC.append("line").attr("x1",x0).attr("y1",y0).attr("x2",x0).attr("y2",y1).attr("stroke","#3a4150");
+  [0,0.5,1].forEach(t=>{ gC.append("line").attr("x1",x0).attr("y1",ys(t)).attr("x2",x1).attr("y2",ys(t)).attr("stroke","#1b2130");
+    gC.append("text").attr("x",x0-6).attr("y",ys(t)+4).attr("text-anchor","end").attr("font-size",10).attr("fill",C.muted).text(t); });
+  [0,7,14].forEach(t=>gC.append("text").attr("x",xs(t)).attr("y",y0+16).attr("text-anchor","middle").attr("font-size",10).attr("fill",C.muted).text(t));
+  gC.append("text").attr("x",(x0+x1)/2).attr("y",y0+34).attr("text-anchor","middle").attr("font-size",10.5).attr("fill",C.muted).text("layers");
+  gC.append("text").attr("x",x0).attr("y",y1-16).attr("font-size",10.5).attr("fill",C.muted).text("class separation (relative to layer 0)");
+  const ln=d3.line().x((d,i)=>xs(i)).y(d=>ys(Math.min(1,d)));
+  gC.append("path").datum(curveP).attr("d",ln).attr("fill","none").attr("stroke",C.bad).attr("stroke-width",2);
+  gC.append("path").datum(curveR).attr("d",ln).attr("fill","none").attr("stroke",C.good).attr("stroke-width",2).attr("stroke-dasharray","5 3");
+  gC.append("text").attr("x",x1).attr("y",ys(curveP[STEPS])+16).attr("text-anchor","end").attr("font-size",10).attr("fill",C.bad).text("plain");
+  gC.append("text").attr("x",x1).attr("y",ys(curveR[STEPS])-8).attr("text-anchor","end").attr("font-size",10).attr("fill",C.good).text("initial residual");
+  const marker=gC.append("line").attr("y1",y1).attr("y2",y0).attr("stroke",C.muted).attr("stroke-dasharray","3 3");
+  const dotP=gC.append("circle").attr("r",4).attr("fill",C.bad);
+  const dotR=gC.append("circle").attr("r",4).attr("fill",C.good);
+
+  const sl=document.getElementById("os-layers"), lv=document.getElementById("os-lval"), cb=document.getElementById("os-res");
+  function render(){
+    const L=+sl.value, res=cb.checked; lv.textContent=L;
+    const s=(res?seqR:seqP)[L];
+    nodesSel.transition().duration(200).attr("fill",i=>col(s[i]));
+    marker.attr("x1",xs(L)).attr("x2",xs(L));
+    dotP.attr("cx",xs(L)).attr("cy",ys(Math.min(1,curveP[L])));
+    dotR.attr("cx",xs(L)).attr("cy",ys(Math.min(1,curveR[L])));
+    const sep=(res?curveR:curveP)[L], spread=d3.deviation(s)||0;
+    const verdict = sep>0.55 ? `<b style="color:${C.good}">separable</b>` : sep>0.2 ? `<b style="color:${C.B}">fading</b>` : `<b style="color:${C.bad}">collapsed</b>`;
+    d3.select("#os-readout").html(
+      `L = <b>${L}</b> · ${res?"initial residual":"plain propagation"} &nbsp;·&nbsp; class separation <b>${(100*sep).toFixed(0)}%</b> of layer 0 &nbsp;·&nbsp; node spread <b>${spread.toFixed(3)}</b> &nbsp;·&nbsp; ${verdict}`);
+  }
+  sl.addEventListener("input",render); cb.addEventListener("change",render); render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Data Sampling &amp; Imbalance</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Data Sampling &amp; Imbalance</h1>
+      <p>How you select rows decides what the model can learn. Two problems recur: drawing a <i>representative</i> sample with a known error bar, and surviving <i>class imbalance</i>, where the class you care about — fraud, disease, defects — is a rounding error in the data.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Engineering</span>
+        <span class="pill">Datasets</span>
+        <span class="pill">Imbalance</span>
+        <span class="pill">Fundamentals</span>
+      </div>
+    </header>
+
+    <section class="topic" id="overview" data-nav="Representative sampling">
+      <h3><span class="idx">01</span> Representative sampling</h3>
+      <ul class="notes">
+        <li>A sample is representative when every unit of the target population had a <b>known, non-zero probability</b> of being drawn. Break either condition and no amount of modelling repairs it — you have estimated something, just not the quantity you wanted.</li>
+        <li><b>Selection bias</b> enters through the sampling frame, not the algorithm: surveying app users about app quality, training a defect detector only on units that reached final inspection, or labelling only the cases a human already flagged.</li>
+        <li><b>Survivorship and truncation</b> are the same failure in time: rows that churned, crashed, or were rejected never enter the table, so the model learns the physics of the survivors.</li>
+        <li><b>Distribution shift</b> is the gap between the sampling distribution and production. <i>Covariate shift</i> moves <code>P(x)</code>, <i>label shift</i> moves <code>P(y)</code>, <i>concept drift</i> moves <code>P(y|x)</code>. Sampling design controls the first two; only monitoring catches the third — see <a href="../mlops/monitoring-and-drift.html">Monitoring &amp; Drift</a>.</li>
+        <li>Sample weights are the repair when inclusion probabilities are unequal: weight each row by <code>wᵢ = 1/πᵢ</code> so the weighted sample behaves like the population.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the sampling frame is a modelling assumption. Write down who <i>could not</i> have been sampled before writing down the loss function.</div>
+    </section>
+
+    <section class="topic" id="designs" data-nav="Sampling designs">
+      <h3><span class="idx">02</span> Sampling designs</h3>
+      <p class="lede">Five designs cover almost every case you meet in a data pipeline, plus one estimator trick for when you cannot sample from the distribution you want.</p>
+
+      <h4>The classical four</h4>
+      <ul class="notes">
+        <li><b>Simple random.</b> Every subset of size <code>n</code> equally likely. Unbiased, trivially analysable, and expensive on a distributed store because it touches everything. Rare strata can be missed entirely by luck.</li>
+        <li><b>Stratified.</b> Partition into strata (class, region, device) and sample within each. Guarantees representation of small groups and <i>reduces</i> variance whenever the strata differ in mean. Always stratify the train/test split by label.</li>
+        <li><b>Cluster.</b> Sample whole groups — stores, sessions, hospitals — then take everything inside. Cheap to collect, but observations inside a cluster are correlated, so the effective sample size is far below <code>n</code>. Cluster sampling and grouped splits are the same idea used for different reasons.</li>
+        <li><b>Systematic.</b> Take every <code>k</code>-th row after a random start. One pass, streaming-friendly — and catastrophically wrong if the file has a period matching <code>k</code> (every 7th row is a Sunday).</li>
+      </ul>
+
+      <h4>Reservoir and importance sampling</h4>
+      <ul class="notes">
+        <li><b>Reservoir sampling</b> draws a uniform sample of size <code>k</code> from a stream of unknown length in one pass and <code>O(k)</code> memory. Fill the reservoir with the first <code>k</code> items; for item <code>i &gt; k</code> pick <code>j</code> uniformly in <code>1…i</code> and, if <code>j ≤ k</code>, overwrite slot <code>j</code>. Every item ends up in the reservoir with probability exactly <code>k/n</code>.</li>
+        <li><b>Importance sampling</b> answers a different question: you can only draw from a convenient proposal <code>q</code> but need an expectation under <code>p</code>. Reweight by the likelihood ratio. It is the formal justification for oversampling rare events and correcting later, and it degrades badly when <code>q</code> has thin tails where <code>p</code> does not.</li>
+      </ul>
+      <div class="formula"><span class="lbl">reservoir sampling — one pass, O(k) memory, uniform over an unknown n</span><span class="eq">for i = 1…k:   R[i] ← xᵢ</span>
+<span class="eq">for i = k+1…n:   j ← Uniform{1…i};   if j ≤ k then R[j] ← xᵢ</span>
+<span class="eq">P(xᵢ ∈ R) = k/i · ∏_{t=i+1..n} (1 − 1/t) = k/n</span>   <span class="eq">← uniform, for every i</span>
+<span class="lbl">importance sampling — sample from q, estimate under p</span><span class="eq">E_p[f(x)] = ∫ f(x)·p(x) dx = E_q[ f(x)·p(x)/q(x) ]</span>        <span class="eq">weight w(x) = p(x)/q(x)</span>
+<span class="eq">estimate:  (1/n)·∑ᵢ f(xᵢ)·w(xᵢ),   xᵢ ~ q</span>   <span class="eq">requires q(x) &gt; 0 wherever p(x) &gt; 0</span></div>
+      <div class="callout"><b>Takeaway:</b> stratify by default, reach for reservoir sampling on streams, and remember that oversampling a rare class is importance sampling — which means the resulting probabilities are on the wrong scale until you correct them.</div>
+    </section>
+
+    <section class="topic" id="precision" data-nav="Sample size &amp; error">
+      <h3><span class="idx">03</span> Sample size and the error bar</h3>
+      <p class="lede">Every estimate from a sample carries a standard error. Knowing it turns "how much data do I need?" from a vibe into arithmetic.</p>
+      <ul class="notes">
+        <li>The standard error of a mean shrinks as <code>1/√n</code>. Halving the error costs <b>four times</b> the data — the single most useful fact in sampling, and the reason labelling budgets hit diminishing returns fast.</li>
+        <li>For a <b>proportion</b> the variance is <code>p(1−p)</code>, maximal at <code>p = 0.5</code> and tiny near 0 or 1. That is why estimating a 0.1% fraud rate to within a relative 10% needs a huge <code>n</code> even though the absolute error looks small.</li>
+        <li><b>Stratification reduces variance</b> because only within-stratum variance survives; the between-stratum component is removed by construction. With proportional allocation you never do worse than simple random sampling.</li>
+        <li><b>Finite population correction</b> matters when the sample is a large fraction of a bounded population — sampling 80% of a 10,000-row table has far less error than the <code>1/√n</code> formula suggests.</li>
+        <li><b>Clustering hurts:</b> the design effect inflates the variance by roughly <code>1 + (m − 1)·ρ</code> for clusters of size <code>m</code> and intra-cluster correlation <code>ρ</code>. Ten thousand rows from fifty users are not ten thousand independent rows.</li>
+      </ul>
+      <div class="formula"><span class="lbl">standard error of a mean and of a proportion</span><span class="eq">SE(x̄) = σ/√n</span>        <span class="eq">SE(p̂) = √( p(1−p)/n )</span>        <span class="eq">finite population: × √((N − n)/(N − 1))</span>
+<span class="lbl">required n for a ± e margin at confidence level z</span><span class="eq">n = z²·p(1−p) / e²</span>   <span class="eq">e.g. p ≈ 0.5, e = 0.03, z = 1.96  ⟹  n ≈ 1067</span>
+<span class="lbl">stratified variance — only within-stratum variance survives</span><span class="eq">Var(x̄_strat) = ∑ₕ Wₕ²·σₕ²/nₕ</span>   <span class="eq">Wₕ = Nₕ/N</span>   <span class="eq">≤ Var(x̄_srs) under proportional allocation</span>
+<span class="lbl">design effect from clustering</span><span class="eq">DEFF ≈ 1 + (m − 1)·ρ</span>   <span class="eq">n_effective = n / DEFF</span></div>
+      <div class="callout"><b>Takeaway:</b> before buying more labels, compute the current standard error. If it is already below the decision threshold, spend the budget on <i>better</i> rows — rare classes, hard cases — instead of more rows.</div>
+    </section>
+
+    <section class="topic" id="imbalance" data-nav="The imbalance problem">
+      <h3><span class="idx">04</span> The imbalance problem</h3>
+      <p class="lede">When 99% of examples are one class, a model scores 99% accuracy by ignoring the rare class entirely. Rebalance below and watch the minority grow.</p>
+
+      <div class="viz" id="viz-imb">
+        <div class="vhead">
+          <span class="vtitle">Class imbalance &amp; resampling</span>
+          <span class="vhint">Majority vs minority class — and how resampling changes the mix</span>
+        </div>
+        <div class="controls">
+          <label>strategy
+            <select id="imb-sel">
+              <option value="none">Imbalanced (raw)</option>
+              <option value="over">Oversample minority</option>
+              <option value="under">Undersample majority</option>
+              <option value="smote">SMOTE (synthesize)</option>
+            </select>
+          </label>
+        </div>
+        <svg id="imb-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Interactive diagram: Class imbalance & resampling"></svg>
+        <div class="readout" aria-live="polite" id="imb-read"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>The ratio is not the problem — absolute minority count is.</b> A 1:99 split with 50,000 positives is comfortable; 1:99 with 40 positives is hopeless, because the model has almost no evidence of what the class looks like. Always report the raw minority count alongside the ratio.</li>
+        <li><b>Why learners collapse:</b> an unweighted loss is dominated by majority terms, so the cheapest gradient direction is to predict the prior. Regularization pushes the same way, and a tree's split criterion sees almost no purity gain from isolating a tiny class.</li>
+        <li><b>Overlap makes it worse.</b> If the classes are separable, extreme imbalance is survivable; the damage comes from minority points sitting inside majority territory, where the decision boundary has no reason to bend.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> diagnose with three numbers — imbalance ratio, absolute minority count, and class overlap. Only the last two tell you whether the problem is fixable with resampling or needs more data.</div>
+    </section>
+
+    <section class="topic" id="metrics" data-nav="Metrics that don't lie">
+      <h3><span class="idx">05</span> Why accuracy lies, and what to use</h3>
+      <ul class="notes">
+        <li>With 1% positives, "always negative" scores 99% accuracy and catches nothing. Accuracy is a weighted average of per-class recall with weights equal to the priors, so the rare class is invisible in it by construction.</li>
+        <li><b>ROC-AUC is also optimistic under imbalance.</b> Its x-axis is the false-positive <i>rate</i>, and with a huge negative pool a thousand false positives barely moves it. <b>PR-AUC</b> uses precision, whose denominator is dominated by those same false positives, so it moves.</li>
+        <li><b>Know the baselines.</b> A random classifier has ROC-AUC 0.5 regardless of prevalence, but PR-AUC equal to the prevalence <code>π</code>. A PR-AUC of 0.15 at <code>π = 0.01</code> is a 15× lift, not a failure.</li>
+        <li><b>F-β</b> encodes the asymmetry explicitly: <code>β &gt; 1</code> weights recall (missing fraud is expensive), <code>β &lt; 1</code> weights precision (a false alarm wastes an analyst's hour). <b>Balanced accuracy</b> and <b>MCC</b> are prevalence-robust summaries when you must report a single number.</li>
+        <li>Full definitions and the confusion-matrix mechanics live in <a href="../machine-learning/model-evaluation.html">Model Evaluation</a>.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the metrics that survive imbalance</span><span class="eq">precision = TP/(TP + FP)</span>   <span class="eq">recall = TP/(TP + FN)</span>   <span class="eq">TNR = TN/(TN + FP)</span>
+<span class="eq">F_β = (1 + β²)·precision·recall / (β²·precision + recall)</span>   <span class="eq">β = 1 balanced, β = 2 recall-heavy</span>
+<span class="eq">balanced accuracy = (recall + TNR)/2</span>        <span class="eq">random baseline PR-AUC = π (the positive prevalence)</span>
+<span class="eq">MCC = (TP·TN − FP·FN) / √((TP+FP)(TP+FN)(TN+FP)(TN+FN))</span>   <span class="eq">∈ [−1, 1], 0 = chance</span></div>
+      <div class="callout"><b>Takeaway:</b> report PR-AUC against the prevalence baseline, plus precision and recall <i>at the operating threshold you will actually deploy</i>. A single threshold-free number never survives a product conversation.</div>
+    </section>
+
+    <section class="topic" id="resampling" data-nav="Resampling &amp; cleaning">
+      <h3><span class="idx">06</span> Resampling and boundary cleaning</h3>
+      <p class="lede">Change the training distribution so the loss stops ignoring the minority. Every method here trades one pathology for another.</p>
+
+      <h4>Over, under, and synthetic</h4>
+      <ul class="notes">
+        <li><b>Random oversampling</b> duplicates minority rows. Nothing is lost, but exact duplicates let a flexible model memorise individual points, and duplicates straddling a CV fold boundary leak outright.</li>
+        <li><b>Random undersampling</b> discards majority rows. Fast and often surprisingly strong on huge datasets, but it throws away information; <b>bagged undersampling</b> (train an ensemble, each member on a different majority subsample) recovers most of it.</li>
+        <li><b>SMOTE</b> interpolates: pick a minority point, pick one of its <code>k</code> minority neighbours, and place a new point randomly on the segment between them. It fabricates variety instead of duplicates — and it fabricates it <i>inside the convex hull</i> of the minority, so it cannot invent genuinely new regions and will happily interpolate through majority territory when the classes overlap.</li>
+        <li><b>Variants</b> aim at where the boundary actually is: <i>borderline</i> SMOTE synthesises only near the frontier, <i>ADASYN</i> allocates more synthetic points to minority examples that are hard to classify, and <i>SMOTE-NC</i> handles mixed categorical columns by taking the majority category among neighbours.</li>
+      </ul>
+
+      <h4>Cleaning the overlap</h4>
+      <ul class="notes">
+        <li><b>Tomek links</b> remove a pair of nearest neighbours from opposite classes, deleting the majority member. This sharpens the boundary rather than balancing the counts.</li>
+        <li><b>Edited nearest neighbours (ENN)</b> drops any point disagreeing with the majority vote of its neighbours — an aggressive noise filter.</li>
+        <li>The standard combinations are <b>SMOTE + Tomek</b> and <b>SMOTE + ENN</b>: synthesise first, then delete the synthetic points that landed on the wrong side.</li>
+      </ul>
+
+      <table class="cmp">
+        <tr><th>Approach</th><th>What it does</th><th>Strength</th><th>Caution</th></tr>
+        <tr><td>Random oversampling</td><td>Duplicate minority rows</td><td>Loses no data; trivial</td><td>Memorisation; leaks across folds if done before splitting</td></tr>
+        <tr><td>Random undersampling</td><td>Drop majority rows</td><td>Fast; strong on very large data</td><td>Discards information; higher variance</td></tr>
+        <tr><td>Bagged undersampling</td><td>Ensemble over majority subsamples</td><td>Undersampling without the data loss</td><td>k× the training cost</td></tr>
+        <tr><td>SMOTE</td><td>Interpolate between minority neighbours</td><td>Variety instead of duplicates</td><td>Blurs the boundary; poor in high dimensions and on categoricals</td></tr>
+        <tr><td>Borderline SMOTE / ADASYN</td><td>Synthesise near the frontier / hard cases</td><td>Spends synthesis where it matters</td><td>Amplifies label noise sitting on the boundary</td></tr>
+        <tr><td>Tomek / ENN</td><td>Delete overlapping or noisy points</td><td>Sharper boundary</td><td>Cleaning, not balancing; can delete real rare cases</td></tr>
+        <tr><td>Class weights</td><td>Scale the loss per class</td><td>No data mutation, no leakage risk</td><td>Distorts predicted probabilities</td></tr>
+        <tr><td>Threshold moving</td><td>Shift the decision cut, not the data</td><td>Preserves calibration; free to retune</td><td>Needs a held-out set and a stated cost ratio</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> <b>resample the training folds only</b> — never validation or test, and never before the split. A test set rebalanced to 50/50 reports precision for a world that does not exist.</div>
+    </section>
+
+    <section class="topic" id="costsens" data-nav="Weights &amp; thresholds">
+      <h3><span class="idx">07</span> Cost-sensitive learning and threshold moving</h3>
+      <p class="lede">Usually the cleanest fix touches neither the data nor the model: state the cost of each error type and move the decision boundary. Drag the threshold and watch precision and recall trade off at 1% prevalence.</p>
+
+      <div class="viz" id="viz-thr">
+        <div class="vhead">
+          <span class="vtitle">Threshold moving at 1% prevalence</span>
+          <span class="vhint">per-class score densities · 1,980 negatives vs 20 positives</span>
+        </div>
+        <div class="controls">
+          <label>threshold t <input type="range" id="thr-t" min="0.02" max="0.98" step="0.01" value="0.5"></label>
+          <button class="btn ghost" id="thr-f1">Snap to best F1</button>
+        </div>
+        <svg id="thr-svg" width="640" height="270" viewBox="0 0 640 270" role="img" aria-label="Interactive diagram: precision and recall as the decision threshold moves"></svg>
+        <div class="readout" aria-live="polite" id="thr-read"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Class weights</b> multiply each example's loss by a per-class factor — mathematically equivalent to duplicating rows, but without materialising them, so no memorisation and no leakage. The usual default is inverse-frequency weighting.</li>
+        <li><b>Focal loss</b> goes further by down-weighting <i>easy</i> examples of any class, which matters when the imbalance is between easy background and hard foreground rather than between labels.</li>
+        <li><b>Threshold moving</b> is the most under-used tool on this page. Train a well-calibrated model on the natural distribution, then choose the cut that minimises expected cost. Under symmetric costs that is <code>0.5</code>; when a miss costs ten times a false alarm, it drops to about <code>0.09</code>.</li>
+        <li>Pick the threshold on a <b>validation set at production prevalence</b>, then report the test metrics at that fixed threshold. Choosing it on test is just a subtler overfit.</li>
+      </ul>
+      <div class="formula"><span class="lbl">inverse-frequency class weights (K classes, nₖ rows in class k)</span><span class="eq">wₖ = n / (K · nₖ)</span>   <span class="eq">binary 1:99  ⟹  w₊ = 50, w₋ ≈ 0.505</span>
+<span class="lbl">cost-optimal threshold — predict positive when expected cost is lower</span><span class="eq">p·C_FN &gt; (1 − p)·C_FP</span>   <span class="eq">⟹</span>   <span class="eq">t* = C_FP / (C_FP + C_FN)</span>
+<span class="eq">C_FN = 10·C_FP  ⟹  t* ≈ 0.091</span>        <span class="eq">C_FN = C_FP  ⟹  t* = 0.5</span></div>
+      <div class="callout"><b>Takeaway:</b> class weights plus threshold tuning solve most imbalance problems with less machinery and less risk than synthetic resampling. Try them first; reach for SMOTE only when the minority count is genuinely tiny.</div>
+    </section>
+
+    <section class="topic" id="calibration" data-nav="Calibration &amp; framing">
+      <h3><span class="idx">08</span> Calibration after resampling, and reframing</h3>
+
+      <h4>Resampling breaks your probabilities</h4>
+      <ul class="notes">
+        <li>Train on a rebalanced set and the model learns <code>P(y|x)</code> under the <i>resampled</i> prior <code>π′</code>, not the real one. Every predicted probability is inflated — a "0.6" from a 50/50-balanced model trained on 1% data may mean a true risk of about 0.015.</li>
+        <li>That is fine if you only ever rank, and disastrous if the score feeds an expected-value calculation, a cost threshold, or a downstream rule. Anything that multiplies the probability by money needs calibration.</li>
+        <li>Two repairs: an analytic <b>prior correction</b> that maps the score back to the original base rate, or a <b>post-hoc calibrator</b> (Platt scaling, isotonic regression) fitted on a held-out set at <i>natural</i> prevalence. Check the result with a reliability curve and expected calibration error.</li>
+      </ul>
+      <div class="formula"><span class="lbl">undoing the resampled prior — π = true prevalence, π′ = training prevalence</span><span class="eq">let  r = (π/π′) / ((1 − π)/(1 − π′))</span>
+<span class="eq">p_corrected = r·p / ( r·p + (1 − p) )</span>
+<span class="eq">π = 0.01, π′ = 0.5, p = 0.6  ⟹  r ≈ 0.0101  ⟹  p_corrected ≈ 0.0150</span></div>
+
+      <h4>When to stop rebalancing and reframe</h4>
+      <ul class="notes">
+        <li>Below roughly a few hundred positives, supervised classification runs out of evidence. <b>Anomaly detection</b> reframes the task as one-class: model the majority (isolation forest, one-class SVM, an autoencoder's reconstruction error) and score deviation, using the few positives only to set the threshold.</li>
+        <li>Other reframings: <b>ranking</b> ("score every claim, we will review the top 200 a day") sidesteps thresholds entirely and matches how the output is consumed; <b>weak supervision</b> and heuristic labelling manufacture more positives; <b>active learning</b> spends the labelling budget on the ambiguous region instead of uniformly.</li>
+        <li>Ask what the consumer actually needs — a capacity-constrained review queue wants precision@k, not a probability — before optimising anything.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> if you resampled, you owe the downstream consumer a calibration step. If there is almost nothing to resample, change the framing rather than manufacturing minority points that were never observed.</div>
+    </section>
+
+    <section class="topic" id="takeaways" data-nav="Pitfalls &amp; checklist">
+      <h3><span class="idx">09</span> Pitfalls &amp; checklist</h3>
+      <h4>Pitfalls</h4>
+      <ul class="notes">
+        <li><b>Resampling before the split</b> — synthetic points derived from a row that lands in validation, so the score is fiction.</li>
+        <li><b>Rebalancing the test set</b> — precision computed at a prevalence that will never occur in production.</li>
+        <li><b>Reporting ROC-AUC alone</b> at 0.1% prevalence, where it stays flattering while precision collapses.</li>
+        <li><b>Comparing PR-AUC across datasets</b> with different prevalence — the baseline moved, so the numbers are not comparable.</li>
+        <li><b>SMOTE on high-dimensional or one-hot data</b>, where interpolation produces points that are half-way between two categories and physically impossible.</li>
+        <li><b>Using resampled probabilities in an expected-value rule</b> without prior correction.</li>
+        <li><b>Ignoring cluster structure</b>: 10,000 rows from 50 users, treated as 10,000 independent observations.</li>
+      </ul>
+      <h4>Checklist</h4>
+      <ul class="notes">
+        <li>State the population, the sampling frame, and who could not have been sampled.</li>
+        <li>Stratify the split by label (and by any small subgroup you must not lose); group by entity where rows repeat.</li>
+        <li>Report imbalance ratio <i>and</i> absolute minority count; compute the standard error of the key estimate.</li>
+        <li>Resample inside the CV loop, training folds only; leave validation and test at natural prevalence.</li>
+        <li>Try class weights and threshold moving before synthetic resampling.</li>
+        <li>Choose the threshold from an explicit cost ratio on validation; fix it before touching test.</li>
+        <li>Calibrate if the probability is consumed numerically, and check the reliability curve.</li>
+        <li>Report PR-AUC against the prevalence baseline plus precision/recall at the deployed threshold.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> pairs with <a href="../machine-learning/model-evaluation.html">Model Evaluation</a> for the metric mechanics, <a href="data-preprocessing.html">Data Preprocessing</a> for the transforms that must stay inside the same pipeline, and <a href="data-quality-governance.html">Data Quality &amp; Governance</a> for whether the rows deserve trust at all.</div>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+(function(){
+  const C={accent:"#22d3ee",maj:"#5b9cff",min:"#fb923c",synth:"#fbbf24",muted:"#9aa3b2",ink:"#e6e9ef",line:"#2a2f3a"};
+  const svg=d3.select("#imb-svg"),W=640,H=250;
+  function draw(){
+    svg.selectAll("*").remove();
+    const k=d3.select("#imb-sel").property("value");
+    let maj=900, min=100, synth=0, syntFlag=false;
+    if(k==="over"){ min=900; }
+    else if(k==="under"){ maj=100; }
+    else if(k==="smote"){ min=100; synth=800; syntFlag=true; }
+    // bars
+    const x0=70, bw=110, base=150, scale=130/900;
+    const bars=[["majority",maj,C.maj], ["minority",min+synth,syntFlag?C.min:C.min]];
+    bars.forEach((b,i)=>{
+      const x=x0+i*200, h=b[1]*scale;
+      svg.append("rect").attr("x",x).attr("y",base-h).attr("width",bw).attr("height",h).attr("rx",4).attr("fill",b[2]).attr("fill-opacity",.85);
+      if(syntFlag && i===1){ const sh=synth*scale; svg.append("rect").attr("x",x).attr("y",base-h).attr("width",bw).attr("height",sh).attr("rx",4).attr("fill",C.synth).attr("fill-opacity",.7);
+        svg.append("text").attr("x",x+bw/2).attr("y",base-h+14).attr("text-anchor","middle").attr("font-size",9).attr("fill","#1a1207").text("synthetic"); }
+      svg.append("text").attr("x",x+bw/2).attr("y",base-h-8).attr("text-anchor","middle").attr("font-size",12).attr("fill",b[2]).text(b[1]);
+      svg.append("text").attr("x",x+bw/2).attr("y",base+18).attr("text-anchor","middle").attr("font-size",11).attr("fill",C.muted).text(b[0]);
+    });
+    svg.append("line").attr("x1",40).attr("y1",base).attr("x2",W-40).attr("y2",base).attr("stroke","#3a4150");
+    const ratio=(maj/(min+synth)).toFixed(1);
+    const note={none:"99% accuracy by predicting only majority — minority ignored",over:"minority duplicated up to parity",under:"majority thrown away down to parity (data lost)",smote:"minority grown with synthetic points between neighbours"}[k];
+    d3.select("#imb-read").html(`ratio majority:minority = <b>${ratio} : 1</b> · ${note}`);
+  }
+  d3.select("#imb-sel").on("change",draw);
+  draw();
+})();
+
+/* ── threshold moving under 1% prevalence ── */
+(function(){
+  const C={accent:"#22d3ee",good:"#4ade80",bad:"#f87171",maj:"#5b9cff",min:"#fb923c",muted:"#9aa3b2"};
+  const svg=d3.select("#thr-svg"),W=640,H=270,px=44,py=26,pw=W-88,ph=170;
+  // deterministic pseudo-random so the page reads the same every visit
+  let seed=20240917; const rnd=()=>{ seed=(seed*1103515245+12345)&0x7fffffff; return seed/0x7fffffff; };
+  const gauss=(m,s)=>{ const u=Math.max(1e-9,rnd()), v=rnd(); return m+s*Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); };
+  const clip=v=>Math.min(0.999,Math.max(0.001,v));
+  const NEG=[],POS=[];
+  for(let i=0;i<1980;i++) NEG.push(clip(gauss(0.28,0.15)));
+  for(let i=0;i<20;i++)   POS.push(clip(gauss(0.66,0.17)));
+  const x=d3.scaleLinear().domain([0,1]).range([px,px+pw]);
+  const binner=d3.bin().domain([0,1]).thresholds(40);
+  const bn=binner(NEG), bp=binner(POS);
+  const mn=d3.max(bn,b=>b.length)||1, mp=d3.max(bp,b=>b.length)||1;
+  const y=d3.scaleLinear().domain([0,1]).range([py+ph,py]);
+  function stats(t){
+    const TP=POS.filter(v=>v>=t).length, FN=POS.length-TP;
+    const FP=NEG.filter(v=>v>=t).length, TN=NEG.length-FP;
+    const prec=TP+FP?TP/(TP+FP):0, rec=TP/(TP+FN||1);
+    const f1=prec+rec?2*prec*rec/(prec+rec):0;
+    const acc=(TP+TN)/(POS.length+NEG.length), bal=(rec+TN/(TN+FP||1))/2;
+    return {TP,FN,FP,TN,prec,rec,f1,acc,bal};
+  }
+  let bestT=0.5,bestF=-1;
+  for(let t=0.02;t<=0.98;t+=0.01){ const s=stats(t); if(s.f1>bestF){bestF=s.f1;bestT=t;} }
+  function draw(){
+    svg.selectAll("*").remove();
+    const t=+d3.select("#thr-t").property("value"), s=stats(t);
+    // per-class densities, each normalised to its own peak so 20 positives stay visible
+    const area=(bins,max,col,op)=>svg.append("path")
+      .attr("d",d3.area().x(d=>x((d.x0+d.x1)/2)).y0(y(0)).y1(d=>y(d.length/max)).curve(d3.curveBasis)(bins))
+      .attr("fill",col).attr("fill-opacity",op).attr("stroke",col).attr("stroke-opacity",.8).attr("stroke-width",1.5);
+    area(bn,mn,C.maj,.22); area(bp,mp,C.min,.28);
+    svg.append("line").attr("x1",px).attr("y1",y(0)).attr("x2",px+pw).attr("y2",y(0)).attr("stroke","#3a4150");
+    [0,0.25,0.5,0.75,1].forEach(v=>svg.append("text").attr("x",x(v)).attr("y",y(0)+16).attr("text-anchor","middle").attr("font-size",10).attr("fill",C.muted).text(v.toFixed(2)));
+    svg.append("text").attr("x",px).attr("y",py-10).attr("font-size",10).attr("fill",C.maj).text("negatives (1,980)");
+    svg.append("text").attr("x",px+pw).attr("y",py-10).attr("text-anchor","end").attr("font-size",10).attr("fill",C.min).text("positives (20)");
+    svg.append("line").attr("x1",x(t)).attr("y1",py-2).attr("x2",x(t)).attr("y2",y(0)).attr("stroke",C.good).attr("stroke-width",2);
+    svg.append("text").attr("x",x(t)).attr("y",py+ph+34).attr("text-anchor","middle").attr("font-size",10).attr("fill",C.good).text("t = "+t.toFixed(2));
+    d3.select("#thr-read").html(
+      `TP <b style="color:${C.min}">${s.TP}</b> · FN <b>${s.FN}</b> · FP <b style="color:${C.bad}">${s.FP}</b> · TN <b>${s.TN}</b>` +
+      ` &nbsp;|&nbsp; precision <b>${s.prec.toFixed(3)}</b> · recall <b>${s.rec.toFixed(2)}</b> · F1 <b>${s.f1.toFixed(3)}</b>` +
+      ` &nbsp;|&nbsp; accuracy <b>${(100*s.acc).toFixed(1)}%</b> (all-negative scores 99.0%) · balanced acc <b>${s.bal.toFixed(3)}</b>`);
+  }
+  d3.select("#thr-t").on("input",draw);
+  d3.select("#thr-f1").on("click",()=>{ d3.select("#thr-t").property("value",bestT.toFixed(2)); draw(); });
+  draw();
+})();
+</script>
+</body>
+</html>

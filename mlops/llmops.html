@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · LLMOps</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>LLMOps</h1>
+      <p>Operating LLM applications in production. It inherits MLOps but adds new problems: prompts as artifacts, non-deterministic outputs, eval without ground truth, prompt-injection safety, and serious cost/latency management.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">MLOps &amp; Deployment</span>
+        <span class="pill">LLM systems</span>
+        <span class="pill">Production</span>
+      </div>
+    </header>
+
+    <section class="topic" id="overview">
+      <h3><span class="idx">01</span> How LLMOps differs from MLOps</h3>
+      <ul class="notes">
+        <li>The "model" is often a third-party API; the thing <i>you</i> own and version is the <b>prompt, context, and tools</b> — see <a href="../llm/context-engineering.html">Context Engineering</a>. Classic ML ships a weights file; here the weights belong to a provider and your day-to-day artifact is the prompt template, retrieval config, tool schemas, and model+version pin.</li>
+        <li>Outputs are <b>non-deterministic</b> and open-ended, and there is usually <b>no ground-truth label</b>, so evaluation shifts from exact-match accuracy to graded, rubric- and <a href="../llm/llm-as-a-judge.html">judge-assisted</a> scoring plus human review — and it must continue <i>in production</i>, not just before launch.</li>
+        <li><b>Cost &amp; latency</b> per call are first-class concerns: every call is a metered transaction costing real money per token and taking hundreds of ms to seconds, turning token budgets, caching, and latency percentiles into core SLOs.</li>
+        <li>The <b>input channel is an attack surface</b>: instructions and data share one text channel, so untrusted content (a user message, a retrieved page, a tool result) can hijack the <a href="../llm/large-language-models.html">model</a>. Safety becomes a runtime concern on both ingress and egress.</li>
+      </ul>
+      <div class="formula"><span class="eq">LLMOps = MLOps + (prompts-as-artifacts) + (non-determinism) + (eval-without-ground-truth) + (runtime safety) + (token-cost economics)</span></div>
+    </section>
+
+    <section class="topic" id="prompts">
+      <h3><span class="idx">02</span> Prompt &amp; context management</h3>
+      <ul class="notes">
+        <li>Treat prompts <b>as code</b>: prompts, templates, few-shot examples, tool/function schemas, and the model+version pin are <b>versioned artifacts</b> — stored in version control, diffed on change, and attached to traces so any output is reproducible.</li>
+        <li><b>Environment aliases</b> (dev / staging / prod) let a prompt be promoted or rolled back <i>independently of app code</i> — the prompt has its own release lifecycle.</li>
+        <li><b>Pin the provider model version</b> explicitly. Silent provider model bumps are a real source of regressions: treat a model update like a dependency upgrade and re-run evals before adopting it.</li>
+        <li>The decision of <i>where</i> knowledge and behavior live is itself a managed surface — see the <a href="#ladder">tuning ladder</a> below and <a href="../llm/context-engineering.html">Context Engineering</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="serving">
+      <h3><span class="idx">03</span> The request path</h3>
+      <p class="lede">A production LLM call passes through guardrails, a cache, the model, and monitoring. Toggle a cache hit vs miss.</p>
+
+      <div class="viz" id="viz-llmops">
+        <div class="vhead">
+          <span class="vtitle">LLM request flow</span>
+          <span class="vhint">Caching repeated prompts saves most of the latency and cost</span>
+        </div>
+        <div class="controls">
+          <label>scenario
+            <select id="lo-sel"><option value="miss">Cache miss</option><option value="hit">Cache hit</option></select>
+          </label>
+        </div>
+        <svg id="lo-svg" width="640" height="200" viewBox="0 0 640 200" role="img" aria-label="Interactive diagram: LLM request flow"></svg>
+        <div class="readout" aria-live="polite" id="lo-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="rag">
+      <h3><span class="idx">04</span> RAG / retrieval ops</h3>
+      <ul class="notes">
+        <li>In a <a href="../nlp/retrieval-augmented-generation.html">RAG</a> app the retrieval layer is part of the production surface: monitor <b>retrieval quality</b> (was the right context fetched?), <b>context relevance</b>, and <b>faithfulness / groundedness</b> (did the answer stick to the retrieved context?) — not just final answer quality. See <a href="../llm/hallucination-factuality.html">Hallucination &amp; Factuality</a>.</li>
+        <li>Retrieval adds an <b>attack surface</b> (OWASP LLM08, vector &amp; embedding weaknesses): embedding poisoning and access-control leakage across tenants. Untrusted retrieved text can also carry <i>indirect</i> prompt injection.</li>
+        <li>The retrieval config (chunking, top-k, similarity threshold, reranker, embedding model) is a versioned artifact like the prompt. Cross-link to <a href="../data-engineering/vector-databases.html">Vector Databases</a> rather than re-deriving ANN internals here.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="eval">
+      <h3><span class="idx">05</span> Evaluation — the defining LLMOps problem</h3>
+      <ul class="notes">
+        <li><b>Offline (pre-merge):</b> a curated eval set scored by deterministic checks (format / schema / regex), rubric scorers, and <a href="../llm/llm-as-a-judge.html">LLM judges</a> — run in CI as regression tests so a prompt or model change can't silently degrade quality.</li>
+        <li><b><a href="../llm/llm-as-a-judge.html">LLM-as-a-judge</a> modes:</b> pointwise (reference-free) for production monitoring, pairwise for A/B-style "which is better", reference-based for correctness/faithfulness. Calibrate against a small human-labeled set and watch for position, verbosity, and self-enhancement bias — a strong judge agrees with humans only ≈ 80%+ of the time, so treat it as a noisy classifier.</li>
+        <li><b>Online (in production):</b> <a href="ab-testing.html">A/B tests</a>, thumbs-up/down, and implicit signals (edits, retries, abandonment) catch drift, edge cases, abuse, and cost spikes that offline sets miss.</li>
+        <li>The mature pattern is <b>all three layers</b>: deterministic checks for objective constraints, judges for qualitative quality at scale, human annotation for calibration and edge cases. Track <a href="../llm/hallucination-factuality.html">faithfulness</a> and safety, not just helpfulness.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="cost">
+      <h3><span class="idx">06</span> Cost &amp; latency math</h3>
+      <p class="lede">Per-call cost is metered on tokens; report latency as a distribution, never a mean.</p>
+      <div class="formula"><span class="eq">cost_per_call = n_in × price_in + n_out × price_out</span>   <span class="eq">≈</span>   <span class="eq">tokens × price_per_token</span></div>
+      <div class="formula"><span class="eq">cost_eff = h · c_hit + (1 − h) · c_miss</span>   <span class="eq">≈</span>   <span class="eq">(1 − h) · c_miss</span>     <span class="lbl">(when c_hit ≈ 0)</span></div>
+      <div class="formula"><span class="eq">input_cost ≈ n_in · price_in · (1 − f · d)</span>     <span class="lbl">(prefix cache: fraction f of input billed at discount d)</span></div>
+      <div class="formula"><span class="eq">total_latency = TTFT + (n_out − 1) × TPOT</span>     <span class="lbl">(streaming: time-to-first-token + decode loop)</span></div>
+      <ul class="notes">
+        <li><b>The (1 − h) lever.</b> A cache hit-rate of h gives roughly an (1 − h) cost multiplier: h = 0.6 ⇒ ≈ 40% of the uncached spend. The same form gives effective latency: latency_eff = h · L_hit + (1 − h) · L_miss.</li>
+        <li><b>Percentiles, not means.</b> Track p₅₀ / p₉₅ / p₉₉ — a mean of ≈ 2 s can hide a p₉₉ of ≈ 45 s. For streaming, perceived responsiveness is mostly <code>TTFT</code> (the prefill pass); total cost/throughput is mostly the <code>TPOT</code> decode side.</li>
+        <li><b>Throughput vs latency.</b> Higher batch size packs more requests' decode steps together ⇒ higher tokens/sec per GPU ⇒ lower cost-per-token, at the price of higher per-request latency — the central serving trade-off.</li>
+      </ul>
+
+      <div class="viz" id="viz-cost">
+        <div class="vhead">
+          <span class="vtitle">Cost &amp; latency calculator</span>
+          <span class="vhint">Watch monthly spend follow the (1 − h) slope as cache hit-rate rises</span>
+        </div>
+        <div class="controls">
+          <label>tier
+            <select id="cc-tier">
+              <option value="frontier">frontier ($5 / $15 per 1M)</option>
+              <option value="mid" selected>mid ($0.50 / $1.50 per 1M)</option>
+              <option value="small">small ($0.10 / $0.40 per 1M)</option>
+            </select>
+          </label>
+          <label>requests/day <span id="cc-req-v" class="lbl"></span>
+            <input id="cc-req" type="range" min="1000" max="2000000" step="1000" value="200000">
+          </label>
+          <label>input tokens n_in <span id="cc-in-v" class="lbl"></span>
+            <input id="cc-in" type="range" min="50" max="8000" step="50" value="1200">
+          </label>
+          <label>output tokens n_out <span id="cc-out-v" class="lbl"></span>
+            <input id="cc-out" type="range" min="20" max="4000" step="20" value="400">
+          </label>
+          <label>cache hit-rate h <span id="cc-h-v" class="lbl"></span>
+            <input id="cc-h" type="range" min="0" max="0.95" step="0.01" value="0.4">
+          </label>
+          <label>% routed to small model <span id="cc-rt-v" class="lbl"></span>
+            <input id="cc-rt" type="range" min="0" max="1" step="0.01" value="0">
+          </label>
+        </div>
+        <svg id="cc-svg" width="640" height="240" viewBox="0 0 640 240" role="img" aria-label="Interactive diagram: Cost & latency calculator"></svg>
+        <div class="readout" aria-live="polite" id="cc-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="caching">
+      <h3><span class="idx">07</span> Caching — reported numbers</h3>
+      <ul class="notes">
+        <li><b>Exact / prefix caching</b> (provider-side): caching a long fixed prefix (system prompt, few-shot, retrieved context) is lossless for the cached tokens. Reported ≈ 90% cost and ≈ 85% latency reduction on long prompts, and ≈ 50% input-cost savings from automatic caching — directional, workload-dependent.</li>
+        <li><b>Semantic caching</b> (e.g. GPTCache / Redis vector cache): embed the query, return a stored response when within a similarity threshold. Reported cache hit-rates ≈ 61–69%, API-call reductions up to ≈ 68.8%, with hit latency dropping toward sub-100 ms. One cited figure: ≈ 31% of queries are semantically similar to a prior request.</li>
+        <li><b>The key knob is the similarity threshold.</b> Too loose ⇒ confidently wrong false hits; too tight ⇒ low hit-rate. This is the failure mode to guard.</li>
+        <li class="lbl">Caching, quantization, and speculative-decoding magnitudes are vendor/engineering figures, not peer-reviewed bounds — treat as reported ≈, not guarantees.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="serving-opt">
+      <h3><span class="idx">08</span> Inference serving &amp; cost optimization</h3>
+      <ul class="notes">
+        <li><b>Continuous (in-flight) batching</b> (vLLM / TGI / SGLang) is the foundation of modern serving: dynamically swap finished sequences out and new requests in mid-batch to keep the GPU busy.</li>
+        <li><b>Quantization:</b> FP16 → INT8/INT4 cuts memory ≈ 2–4× and inference cost ≈ 50% while typically retaining ≈ 95–99% of quality. See <a href="model-acceleration.html">Model Acceleration</a>.</li>
+        <li><b>Speculative decoding:</b> ≈ 2–3× decode speedup, lossless for the exact variant; effectiveness drops at high batch concurrency. See <a href="speculative-decoding.html">Speculative Decoding</a>.</li>
+        <li><b>KV cache</b> reuse and <b>model routing</b> (easy → small/cheap, hard → large) attack cost from multiple sides; <b>stacking</b> optimizations is reported at ≈ 5–8× better cost-efficiency than naive FP16 + static batching — a single H100-class vendor claim, directional only.</li>
+        <li><b>Build vs buy:</b> self-hosting on your own GPUs gives control and can be cheaper at scale but adds ops burden; provider APIs are simpler but meter per token and update models under you.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="ladder">
+      <h3><span class="idx">09</span> Fine-tuning vs prompting vs RAG ladder</h3>
+      <ul class="notes">
+        <li>Default escalation order: <b>prompt engineering → few-shot / better context → <a href="../nlp/retrieval-augmented-generation.html">RAG</a> (knowledge at runtime) → fine-tuning (<a href="../llm/parameter-efficient-fine-tuning.html">PEFT / LoRA</a>) → full fine-tune / continued pretraining.</b></li>
+        <li>Prompting and RAG are cheaper to iterate and easy to roll back; fine-tuning is justified for consistent format/style/behavior, lower latency from shorter prompts, or capability not reachable by context.</li>
+        <li><b>Heuristic:</b> knowledge that changes often → RAG; behavior/format that must be reliable → fine-tune. See <a href="../llm/context-engineering.html">Context Engineering</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="guardrails">
+      <h3><span class="idx">10</span> Guardrails &amp; safety</h3>
+      <ul class="notes">
+        <li><b>Input guardrails:</b> detect/block prompt injection and jailbreaks, scan and redact PII, and <b>fence untrusted content</b> (retrieved docs, tool outputs, user text) so it can't be read as instructions.</li>
+        <li><b>Output guardrails:</b> validate format/schema, filter unsafe/toxic content, check grounding/faithfulness, and never execute LLM output without validation (OWASP LLM05, improper output handling).</li>
+        <li>Prefer established frameworks (NeMo Guardrails, LLM Guard) over hand-rolled checks; treat guardrails as <b>defense-in-depth</b>, not a single gate.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="governance">
+      <h3><span class="idx">11</span> Governance &amp; security</h3>
+      <p class="lede">The OWASP Top 10 for LLM Applications (2025) is the security backbone.</p>
+      <ul class="notes">
+        <li><b>LLM01</b> Prompt Injection (still #1) · <b>LLM02</b> Sensitive Information Disclosure · <b>LLM03</b> Supply Chain · <b>LLM04</b> Data &amp; Model Poisoning · <b>LLM05</b> Improper Output Handling · <b>LLM06</b> Excessive Agency (over-broad tool/permission scope) · <b>LLM07</b> System Prompt Leakage · <b>LLM08</b> Vector &amp; Embedding Weaknesses (<a href="../nlp/retrieval-augmented-generation.html">RAG</a>) · <b>LLM09</b> Misinformation · <b>LLM10</b> Unbounded Consumption (denial-of-wallet / model extraction).</li>
+        <li><b>Prompt injection has two flavors:</b> <i>direct</i> (the user manipulates the prompt) and <i>indirect</i> (malicious instructions arrive via retrieved or tool content). There is no complete fix today — manage with defense-in-depth: input filtering, system-prompt hardening, output validation, least-privilege tool scope, behavioral monitoring.</li>
+        <li><b>AI gateway as central control plane:</b> key management, rate limiting, per-team cost tracking, and <b>budget caps to bound LLM10</b> (denial-of-wallet). Keep audit trails of prompts and outputs for policy enforcement.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="observability">
+      <h3><span class="idx">12</span> Observability &amp; tracing</h3>
+      <ul class="notes">
+        <li><b>Tracing vs monitoring:</b> monitoring answers "is it working?"; tracing/observability answers "why isn't it?". Capture each step — prompt, retrieved context, tool calls, completion, token counts, latency, cost — as a distributed trace so a bad output can be debugged end to end.</li>
+        <li>Instrument with <b>OpenTelemetry-style</b> conventions so LLM metrics live in the same stack as the rest of the system, with per-tenant / per-feature / per-model cost attribution.</li>
+        <li><b>Dashboard metrics:</b> latency p₅₀ / p₉₅ / p₉₉ (and TTFT for streaming), error / timeout / rate-limit rates, prompt vs completion tokens, cost per request / per 1K tokens / per model / per tenant, cache hit ratio, and online eval quality/safety scores.</li>
+        <li><b>Monitor</b> quality, cost, latency, and <a href="../index.html?focus=Monitoring%20%26%20Drift">drift</a>; capture feedback to improve prompts and eval sets.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">13</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>LLMOps = MLOps + prompts, non-determinism, eval-without-truth, safety, and cost.</b></li>
+        <li><b>Version prompts/context</b> like code and <b>pin the provider model</b>; <b>evaluate</b> offline (judges in CI) + online (A/B + implicit signals).</li>
+        <li><b>Cache, batch, quantize, and route</b> to control cost and latency — and report percentiles (p₉₉), not means.</li>
+        <li><b>Guardrail</b> inputs and outputs against the OWASP LLM Top 10; an AI gateway bounds spend and denial-of-wallet.</li>
+        <li><b>Trace every step</b> for per-tenant cost attribution and end-to-end debugging.</li>
+      </ul>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+(function(){
+  const C={accent:"#a3e635",good:"#4ade80",bad:"#f87171",a2:"#ffb454",muted:"#9aa3b2",ink:"#e6e9ef",line:"#2a2f3a"};
+  const svg=d3.select("#lo-svg"),W=640,H=200;
+  const stages=["User","Guardrail","Cache","LLM","Guardrail","Response"];
+  function draw(){
+    svg.selectAll("*").remove();
+    const hit=d3.select("#lo-sel").property("value")==="hit";
+    const active = hit ? ["User","Guardrail","Cache","Response"] : stages;
+    const bw=88, gap=14, y=70, x0=20;
+    stages.forEach((s,i)=>{
+      const x=x0+i*(bw+gap), on=active.includes(s) && !(hit && (s==="LLM"));
+      const skipped = hit && (s==="LLM" || (s==="Guardrail" && i===4));
+      svg.append("rect").attr("x",x).attr("y",y).attr("width",bw).attr("height",44).attr("rx",8)
+        .attr("fill",skipped?"#15181f":"rgba(163,230,53,.14)").attr("stroke",skipped?"#2a2f3a":C.accent).attr("stroke-opacity",skipped?.5:1);
+      svg.append("text").attr("x",x+bw/2).attr("y",y+27).attr("text-anchor","middle").attr("font-size",11).attr("fill",skipped?C.muted:C.ink).text(s);
+      if(i<stages.length-1){ const skipArrow = hit && (stages[i]==="Cache");
+        svg.append("text").attr("x",x+bw+gap/2).attr("y",y+27).attr("text-anchor","middle").attr("font-size",13).attr("fill",C.muted).text("›"); }
+    });
+    if(hit){ // arrow from Cache straight to Response
+      const cx=x0+2*(bw+gap)+bw/2, rx=x0+5*(bw+gap)+bw/2;
+      svg.append("path").attr("d",`M${cx},${y+44} C${cx},${y+90} ${rx},${y+90} ${rx},${y+44}`).attr("fill","none").attr("stroke",C.good).attr("stroke-width",2).attr("stroke-dasharray","4 3");
+      svg.append("text").attr("x",(cx+rx)/2).attr("y",y+104).attr("text-anchor","middle").attr("fill",C.good).attr("font-size",10).text("cache hit → skip the model");
+    }
+    // monitoring tap
+    svg.append("text").attr("x",W/2).attr("y",24).attr("text-anchor","middle").attr("fill",C.muted).attr("font-size",10).text("every call is logged → monitoring (quality · cost · latency · drift)");
+    const lat=hit?"~20 ms":"~900 ms", cost=hit?"$0.000":"$0.004";
+    d3.select("#lo-read").html(hit?`<b style="color:${C.good}">cache hit</b> · latency <b>${lat}</b> · cost <b>${cost}</b> — model skipped entirely`:`<b>cache miss</b> · latency <b>${lat}</b> · cost <b>${cost}</b> — full guardrail + model + guardrail path`);
+  }
+  d3.select("#lo-sel").on("change",draw);
+  draw();
+})();
+</script>
+<script>
+(function(){
+  const C={accent:"#a3e635",good:"#4ade80",bad:"#f87171",a2:"#ffb454",muted:"#9aa3b2",ink:"#e6e9ef",line:"#2a2f3a"};
+  // illustrative price tiers: per-token = per-1M / 1e6. L_miss = full-path latency (ms), small model assumed faster.
+  const TIERS={
+    frontier:{in:5/1e6, out:15/1e6, lat:1800},
+    mid:     {in:0.50/1e6, out:1.50/1e6, lat:900},
+    small:   {in:0.10/1e6, out:0.40/1e6, lat:350}
+  };
+  const SMALL=TIERS.small, L_HIT=20; // cache-hit latency (ms)
+  const svg=d3.select("#cc-svg"),W=640,H=240,m={t:18,r:18,b:34,l:64};
+  const iw=W-m.l-m.r, ih=H-m.t-m.b;
+  const g=svg.append("g").attr("transform",`translate(${m.l},${m.t})`);
+  const x=d3.scaleLinear().domain([0,0.95]).range([0,iw]);
+  const y=d3.scaleLinear().range([ih,0]);
+  const area=g.append("path").attr("fill","rgba(163,230,53,.12)");
+  const line=g.append("path").attr("fill","none").attr("stroke",C.accent).attr("stroke-width",2);
+  const dot=g.append("circle").attr("r",4.5).attr("fill",C.a2).attr("stroke","#15181f").attr("stroke-width",1.5);
+  const xAxis=g.append("g").attr("transform",`translate(0,${ih})`);
+  const yAxis=g.append("g");
+  g.append("text").attr("x",iw/2).attr("y",ih+30).attr("text-anchor","middle").attr("fill",C.muted).attr("font-size",10).text("cache hit-rate h");
+  g.append("text").attr("transform","rotate(-90)").attr("x",-ih/2).attr("y",-50).attr("text-anchor","middle").attr("fill",C.muted).attr("font-size",10).text("monthly spend ($)");
+
+  const fmt$=v=> v>=1e6 ? "$"+(v/1e6).toFixed(2)+"M" : v>=1e3 ? "$"+(v/1e3).toFixed(1)+"k" : "$"+v.toFixed(2);
+  function val(id){return +d3.select(id).property("value");}
+
+  function costPerCall(t){
+    // blend full-tier and small-model cost by routing fraction rt
+    const rt=val("#cc-rt"), nin=val("#cc-in"), nout=val("#cc-out");
+    const cFull = nin*t.in + nout*t.out;
+    const cSmall= nin*SMALL.in + nout*SMALL.out;
+    return (1-rt)*cFull + rt*cSmall;
+  }
+  function spendAt(h,t){
+    const req=val("#cc-req");
+    return (1-h)*costPerCall(t)*req*30;
+  }
+
+  function draw(){
+    const t=TIERS[d3.select("#cc-tier").property("value")];
+    const h=val("#cc-h");
+    d3.select("#cc-req-v").text(val("#cc-req").toLocaleString());
+    d3.select("#cc-in-v").text(val("#cc-in"));
+    d3.select("#cc-out-v").text(val("#cc-out"));
+    d3.select("#cc-h-v").text(h.toFixed(2));
+    d3.select("#cc-rt-v").text((val("#cc-rt")*100).toFixed(0)+"%");
+
+    const pts=d3.range(0,0.951,0.025).map(hh=>({h:hh,s:spendAt(hh,t)}));
+    y.domain([0, d3.max(pts,d=>d.s)*1.08 || 1]);
+    const ln=d3.line().x(d=>x(d.h)).y(d=>y(d.s));
+    const ar=d3.area().x(d=>x(d.h)).y0(ih).y1(d=>y(d.s));
+    line.attr("d",ln(pts));
+    area.attr("d",ar(pts));
+    dot.attr("cx",x(h)).attr("cy",y(spendAt(h,t)));
+    xAxis.call(d3.axisBottom(x).ticks(6).tickFormat(d3.format(".0%")));
+    yAxis.call(d3.axisLeft(y).ticks(5).tickFormat(fmt$));
+    svg.selectAll(".domain,.tick line").attr("stroke",C.line);
+    svg.selectAll(".tick text").attr("fill",C.muted).attr("font-size",9);
+
+    const cpc=costPerCall(t), ceff=(1-h)*cpc;
+    const latMiss=(1-val("#cc-rt"))*t.lat + val("#cc-rt")*SMALL.lat;
+    const latEff=h*L_HIT + (1-h)*latMiss;
+    d3.select("#cc-read").html(
+      `cost/call <b>${"$"+cpc.toFixed(5)}</b> · cost_eff (×(1−h)) <b style="color:${C.a2}">${"$"+ceff.toFixed(5)}</b> · `+
+      `monthly spend <b style="color:${C.accent}">${fmt$(spendAt(h,t))}</b> · `+
+      `latency_eff <b style="color:${C.good}">${latEff.toFixed(0)} ms</b> &nbsp;|&nbsp; `+
+      `<span class="lbl">h=${h.toFixed(2)} ⇒ ≈ ${((1-h)*100).toFixed(0)}% of uncached spend · figures illustrative</span>`
+    );
+  }
+  ["#cc-tier","#cc-req","#cc-in","#cc-out","#cc-h","#cc-rt"].forEach(id=>d3.select(id).on("input",draw).on("change",draw));
+  draw();
+})();
+</script>
+</body>
+</html>

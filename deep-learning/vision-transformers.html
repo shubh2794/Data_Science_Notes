@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Vision Transformers (ViT)</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <h1>Vision Transformers (ViT)</h1>
+      <p>Drop the convolutions: cut an image into fixed-size patches, treat each patch as a token, and feed the sequence to a plain Transformer encoder. At scale, "an image is worth 16×16 words" — ViT matches or beats CNNs and underpins CLIP, modern detectors, and vision-language models.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Deep Learning</span>
+        <span class="pill">Computer vision</span>
+        <span class="pill">Attention</span>
+        <span class="pill">Patches</span>
+      </div>
+    </header>
+
+    <section class="topic" id="overview">
+      <h3><span class="idx">01</span> The core idea: an image as a sequence of patches</h3>
+      <p class="lede">A Transformer already knows how to model a set of tokens with global attention. Make image patches the tokens and almost nothing else has to change.</p>
+      <p>CNNs bake in two strong priors — <b>locality</b> (a pixel relates to its neighbors) and <b>translation equivariance</b> (a cat is a cat anywhere). Those priors are what let CNNs learn from modest data. ViT throws most of them away and lets attention learn spatial relationships from data instead. With enough data, that flexibility wins; with too little, the missing priors hurt.</p>
+      <h4>The pipeline in one breath</h4>
+      <ol class="notes" style="padding-left:22px;">
+        <li>Split the image into a grid of non-overlapping <code>P×P</code> patches.</li>
+        <li>Flatten each patch and linearly project it to a <code>D</code>-dim embedding.</li>
+        <li>Prepend a learnable <code>[CLS]</code> token; add positional embeddings.</li>
+        <li>Run a standard Transformer encoder (multi-head self-attention + MLP, pre-norm).</li>
+        <li>Read the final <code>[CLS]</code> representation through an MLP head for classification.</li>
+      </ol>
+      <div class="callout"><b>One sentence:</b> ViT = patch embedding → <code>[CLS]</code> + position → vanilla Transformer encoder → linear head. The only vision-specific piece is how you turn pixels into tokens.</div>
+      <p>The Transformer encoder itself is exactly the one covered under <a href="transformers.html">Transformers &amp; Self-Attention</a> and <a href="attention.html">Attention</a> — ViT is best understood as a clever <i>tokenizer</i> bolted onto that machinery.</p>
+    </section>
+
+    <section class="topic" id="patchify">
+      <h3><span class="idx">02</span> Patchify: how many tokens?</h3>
+      <p class="lede">Patch size is the one knob that sets sequence length, compute, and how fine the model can see.</p>
+      <p>An <code>H×W</code> image with <code>C</code> channels, cut into square patches of side <code>P</code>, yields</p>
+      <div class="formula"><span class="eq">N = (H · W) / P²</span></div>
+      <p>tokens, each a flattened vector of dimension <code>P²·C</code>. For the canonical setup — a 224×224 RGB image with <code>P = 16</code> — that's <code>N = (224·224)/16² = 196</code> patches, each of length <code>16²·3 = 768</code>, plus one <code>[CLS]</code> token → a sequence of length 197.</p>
+      <h4>Patch embedding = a strided convolution</h4>
+      <p>Each patch is flattened and projected by a shared matrix <code>E ∈ ℝ^{(P²·C)×D}</code>:</p>
+      <div class="formula"><span class="eq">z₀ = [ x_class ; x¹ₚ E ; x²ₚ E ; … ; xᴺₚ E ] + E_pos</span></div>
+      <p>where <code>xⁱₚ</code> is the flattened <i>i</i>-th patch and <code>E_pos ∈ ℝ^{(N+1)×D}</code> are positional embeddings. Implementation-wise this is identical to a single <code>Conv2d</code> with kernel <code>P</code> and stride <code>P</code> — the only convolution left in the whole model.</p>
+      <h4>The quadratic catch</h4>
+      <p>Self-attention costs <code>O(N²·D)</code>. Halving <code>P</code> from 16 to 8 <b>quadruples</b> <code>N</code> and so multiplies attention cost by ~16×. Smaller patches = finer detail but far more compute; this is the central tension the slider below makes concrete.</p>
+
+      <div class="viz" id="viz-patch">
+        <div class="vhead">
+          <span class="vtitle">Patch-size sweep · N = (H·W) / P²</span>
+          <span class="vhint">Drag patch size and resolution — watch the patch grid, token count, and attention cost change</span>
+        </div>
+        <div class="controls">
+          <label>Patch size P <input type="range" id="p-patch" min="4" max="56" step="4" value="16"></label>
+          <label>Image side (H=W) <input type="range" id="p-res" min="112" max="448" step="28" value="224"></label>
+          <label>Embed dim D <input type="range" id="p-dim" min="192" max="1024" step="64" value="768"></label>
+        </div>
+        <svg id="patch-svg" width="640" height="320" viewBox="0 0 640 320" role="img" aria-label="Interactive diagram: Patch-size sweep · N = (H·W) / P²"></svg>
+        <div id="patch-readout" class="vhint" style="margin-top:8px;"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="clstoken">
+      <h3><span class="idx">03</span> The [CLS] token &amp; positional embeddings</h3>
+      <p class="lede">A spare token to aggregate the image, and learned vectors to tell attention where each patch lives.</p>
+      <h4>The classification token</h4>
+      <ul class="notes">
+        <li>A single learnable vector <code>x_class</code> is prepended to the patch sequence. It carries no image content of its own — its job is to <i>accumulate</i> information from all patches via self-attention.</li>
+        <li>After the final encoder layer, only the <code>[CLS]</code> output <code>z⁰_L</code> is fed to the classification head. It's the borrowed-from-BERT trick: one designated slot becomes the whole-image summary.</li>
+        <li><b>Alternative:</b> global average pooling over all patch tokens works about as well; the <code>[CLS]</code> token is a convention, not a necessity.</li>
+      </ul>
+      <h4>Positional embeddings</h4>
+      <ul class="notes">
+        <li>Attention is <b>permutation-invariant</b> — without position, shuffling the patches would give the same output. ViT adds a learnable 1-D position embedding to each token.</li>
+        <li>Standard 1-D learned embeddings beat or tie 2-D and relative schemes in the original study — surprisingly, the model recovers a 2-D grid structure on its own (nearby patches learn similar position vectors).</li>
+        <li><b>Resolution change:</b> at fine-tuning on larger images, <code>N</code> grows, so the pretrained position embeddings are <b>2-D interpolated</b> to the new grid — one of the few hand-built priors ViT keeps.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="encoder">
+      <h3><span class="idx">04</span> The encoder: a standard Transformer</h3>
+      <p class="lede">From here it is the textbook encoder — pre-norm, multi-head attention, GELU MLP, residuals.</p>
+      <p>Each of the <code>L</code> layers applies, with LayerNorm <i>before</i> each sublayer (pre-norm):</p>
+      <div class="formula"><span class="eq">z'ₗ = MSA( LN(zₗ₋₁) ) + zₗ₋₁</span>
+<span class="eq">zₗ</span>  <span class="eq">= MLP( LN(z'ₗ) ) + z'ₗ</span></div>
+      <p>where <code>MSA</code> is multi-head self-attention and the per-token <code>MLP</code> is two linear layers with a GELU in between (hidden width <code>≈ 4D</code>). The final image / class representation is</p>
+      <div class="formula"><span class="eq">y = LN( z⁰_L )</span></div>
+      <ul class="notes">
+        <li><b>Self-attention</b> is <code>softmax(QKᵀ/√d_k)V</code> over the full patch set — every patch can talk to every other patch in <b>one</b> layer, giving a global receptive field from the start (a CNN needs many layers to reach that).</li>
+        <li><b>Attention distance:</b> empirically, early heads split into local (small attention distance, CNN-like) and global heads; deeper layers attend globally across the whole image.</li>
+        <li><b>GELU</b>, pre-norm, and residual connections match modern language Transformers — see <a href="residual-skip-connections.html">Residual / Skip Connections</a> for why depth is trainable at all.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="sizes">
+      <h3><span class="idx">05</span> Model sizes &amp; the P/notation</h3>
+      <p class="lede">ViT-B/16 means "Base, patch 16". Three knobs: depth, width, patch size.</p>
+      <table class="cmp">
+        <tr><th>Model</th><th>Layers L</th><th>Hidden D</th><th>MLP size</th><th>Heads</th><th>Params</th></tr>
+        <tr><td>ViT-Base</td><td>12</td><td>768</td><td>3072</td><td>12</td><td>≈86M</td></tr>
+        <tr><td>ViT-Large</td><td>24</td><td>1024</td><td>4096</td><td>16</td><td>≈307M</td></tr>
+        <tr><td>ViT-Huge</td><td>32</td><td>1280</td><td>5120</td><td>16</td><td>≈632M</td></tr>
+      </table>
+      <ul class="notes">
+        <li>The <code>/P</code> suffix is the patch size: <b>ViT-L/16</b> vs <b>ViT-L/14</b> share the architecture but differ in token count and thus cost and accuracy.</li>
+        <li>Smaller patch → more tokens → more compute → usually higher accuracy. Most of the FLOPs live in attention (<code>N²</code>) and the MLP (<code>D²</code>).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="data">
+      <h3><span class="idx">06</span> The data-hunger problem</h3>
+      <p class="lede">ViT's weak inductive bias is a double-edged sword: it needs a lot of data to pay off.</p>
+      <ul class="notes">
+        <li><b>On ImageNet-1k alone</b> (~1.3M images), ViT <i>underperforms</i> a comparable ResNet — it lacks locality/translation priors and overfits.</li>
+        <li><b>Pretrained on ImageNet-21k</b> (~14M) it catches up; pretrained on the in-house <b>JFT-300M</b> (~300M images) it <i>beats</i> the best CNNs while costing less to train.</li>
+        <li>The lesson: inductive bias and data are substitutes. CNNs encode priors so they learn from less; ViT learns priors from data, so it needs more — but scales further once you have it.</li>
+      </ul>
+      <div class="callout">The original paper's title — "An Image Is Worth 16×16 Words" (Dosovitskiy et al., 2020) — is also its thesis: at sufficient scale, a generic sequence model on patches dethrones bespoke vision architectures.</div>
+    </section>
+
+    <section class="topic" id="variants">
+      <h3><span class="idx">07</span> Beating the data hunger: DeiT, hybrids, and friends</h3>
+      <p class="lede">A wave of follow-ups made ViT trainable on ordinary datasets and pushed it past CNNs everywhere.</p>
+      <table class="cmp">
+        <tr><th>Variant</th><th>Key idea</th><th>What it buys</th></tr>
+        <tr><td>DeiT</td><td>Heavy augmentation + a <b>distillation token</b> that learns from a CNN teacher</td><td>Trains on ImageNet-1k only, no giant pretraining</td></tr>
+        <tr><td>Hybrid ViT</td><td>Feed CNN feature-map cells (not raw pixels) as the patch tokens</td><td>Reintroduces some locality; strong at small scale</td></tr>
+        <tr><td>Swin</td><td>Hierarchical windows with shifted local attention</td><td>Linear cost in image size; a drop-in detection/segmentation backbone</td></tr>
+        <tr><td>MAE</td><td>Mask ~75% of patches, reconstruct them (self-supervised)</td><td>Label-free pretraining; learns from plain images</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>DeiT</b>'s distillation token works like the <code>[CLS]</code> token but is supervised by a teacher's prediction — see <a href="knowledge-distillation.html">Knowledge Distillation</a>.</li>
+        <li><b>Swin</b> restores a CNN-like pyramid, making windows the unit of attention so cost grows linearly, not quadratically, with resolution.</li>
+        <li><b>MAE</b> turns ViT into a masked autoencoder — an image-domain analogue of masked language modeling.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="vit-vs-cnn">
+      <h3><span class="idx">08</span> ViT vs CNN, head to head</h3>
+      <p class="lede">Not "better" or "worse" — different trade-offs in priors, receptive field, and data.</p>
+      <table class="cmp">
+        <tr><th></th><th>CNN (e.g. ResNet)</th><th>Vision Transformer</th></tr>
+        <tr><td>Inductive bias</td><td>Strong: locality, translation equivariance</td><td>Weak: learned from data</td></tr>
+        <tr><td>Receptive field</td><td>Grows with depth (local → global)</td><td>Global from layer&nbsp;1 via attention</td></tr>
+        <tr><td>Data efficiency</td><td>Good on small/medium datasets</td><td>Needs large-scale pretraining</td></tr>
+        <tr><td>Scaling behavior</td><td>Saturates earlier</td><td>Keeps improving with data + params</td></tr>
+        <tr><td>Compute cost</td><td>O(H·W·k²·C²) per layer</td><td>O(N²·D) — quadratic in #patches</td></tr>
+        <tr><td>Interpretability</td><td>Feature maps / Grad-CAM</td><td>Attention maps over patches</td></tr>
+      </table>
+      <p>For a broader matrix across architectures, see <a href="dl-architectures-compared.html">DL Architectures Compared</a> and the <a href="convolutional-networks.html">CNN</a> notes.</p>
+    </section>
+
+    <section class="topic" id="downstream">
+      <h3><span class="idx">09</span> Where ViT shows up downstream</h3>
+      <p class="lede">The patch-token backbone became the default visual encoder across modern systems.</p>
+      <ul class="notes">
+        <li><b>Vision-language &amp; <a href="../models/clip.html">CLIP</a>:</b> a ViT image encoder paired with a text encoder, aligned by contrastive training, powers zero-shot recognition and feeds multimodal <a href="../llm/vision-language-models.html">vision-language models</a>.</li>
+        <li><b>Detection &amp; segmentation:</b> ViT/Swin backbones (DETR-style, ViTDet, SAM) replaced CNN feature extractors.</li>
+        <li><b>Document AI:</b> patch-based vision encoders read page images directly without OCR.</li>
+        <li><b>Self-supervised features:</b> MAE and DINO ViTs yield strong general-purpose representations transferable with little labeled data — see <a href="fine-tuning-transfer-learning.html">Fine-Tuning &amp; Transfer Learning</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">10</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Tokens, not pixels.</b> Split the image into <code>P×P</code> patches → <code>N = (H·W)/P²</code> tokens, linearly embed, and run a plain Transformer encoder.</li>
+        <li><b>Patch size is the master knob.</b> Smaller <code>P</code> → more tokens → finer detail but <code>O(N²)</code> attention cost grows fast.</li>
+        <li><b>[CLS] + learned positions</b> give a whole-image summary and a sense of where each patch sits; attention itself is order-blind.</li>
+        <li><b>Weak inductive bias ⇒ data hunger.</b> ViT needs large-scale pretraining (ImageNet-21k / JFT-300M) to beat CNNs; below that, CNN priors win.</li>
+        <li><b>DeiT, Swin, MAE</b> closed the data gap with distillation, hierarchical local attention, and masked self-supervision.</li>
+        <li><b>The default visual backbone</b> now — feeding CLIP, detectors, segmenters, document AI, and vision-language models.</li>
+      </ul>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+(function(){
+  const svg=d3.select("#patch-svg"), W=640, H=320;
+  const boxX=20, boxY=20, boxS=260;          // image canvas
+  function draw(){
+    const P=+d3.select("#p-patch").property("value");
+    const res=+d3.select("#p-res").property("value");
+    const D=+d3.select("#p-dim").property("value");
+    const perSide=Math.max(1,Math.round(res/P));   // patches per row/col
+    const N=perSide*perSide;
+    const patchVec=P*P*3;                            // flattened patch length
+    svg.selectAll("*").remove();
+
+    // ---- left: patch grid over a faux image ----
+    svg.append("text").attr("x",boxX).attr("y",14).attr("fill",C.muted).attr("font-size",11)
+       .text(`${res}×${res} image · ${P}×${P} patches`);
+    const cell=boxS/perSide;
+    const g=svg.append("g");
+    for(let i=0;i<perSide;i++)for(let j=0;j<perSide;j++){
+      const t=(i+j)/(2*Math.max(1,perSide-1));      // diagonal gradient = stand-in image
+      g.append("rect").attr("x",boxX+j*cell).attr("y",boxY+i*cell)
+        .attr("width",Math.max(0.5,cell-1.4)).attr("height",Math.max(0.5,cell-1.4))
+        .attr("rx",cell>10?2:0)
+        .attr("fill",d3.interpolateViridis(t)).attr("opacity",0.92);
+    }
+    svg.append("rect").attr("x",boxX).attr("y",boxY).attr("width",boxS).attr("height",boxS)
+       .attr("fill","none").attr("stroke",C.line).attr("rx",4);
+
+    // ---- right: token sequence schematic ----
+    const rx=boxX+boxS+60;
+    svg.append("text").attr("x",rx).attr("y",14).attr("fill",C.muted).attr("font-size",11).text("token sequence");
+    const tokW=26, tokH=18, gap=6, cols=6, startY=boxY+6;
+    const labels=["[CLS]"];
+    const show=Math.min(N, cols*4-1);
+    for(let k=0;k<show;k++) labels.push("p"+(k+1));
+    const trailing = N>show;
+    labels.forEach((lab,idx)=>{
+      const r=Math.floor(idx/cols), c=idx%cols;
+      const x=rx+c*(tokW+gap), y=startY+r*(tokH+gap);
+      svg.append("rect").attr("x",x).attr("y",y).attr("width",tokW).attr("height",tokH).attr("rx",3)
+        .attr("fill",idx===0?C.B:C.A).attr("opacity",idx===0?0.95:0.55);
+      svg.append("text").attr("x",x+tokW/2).attr("y",y+tokH/2+3).attr("text-anchor","middle")
+        .attr("font-size",8).attr("fill","#0b0e14").attr("pointer-events","none").text(lab);
+    });
+    if(trailing){
+      const idx=labels.length, r=Math.floor(idx/cols), c=idx%cols;
+      svg.append("text").attr("x",rx+c*(tokW+gap)).attr("y",startY+r*(tokH+gap)+tokH/2+3)
+        .attr("font-size",11).attr("fill",C.muted).text("… +"+(N-show));
+    }
+    // each token -> D-dim arrow note
+    svg.append("text").attr("x",rx).attr("y",startY+5*(tokH+gap)+14)
+       .attr("fill",C.muted).attr("font-size",10).text(`each → ℝ^${patchVec} → embed → ℝ^${D}`);
+
+    // ---- bottom: cost bars ----
+    const baseN=(224*224)/(16*16);                  // reference: ViT-B/16 = 196
+    const baseCost=baseN*baseN;
+    const cost=N*N;                                  // attention ∝ N²
+    const ratio=cost/baseCost;
+    const barY=boxY+boxS+18, barX=boxX, barMaxW=W-2*boxX-10;
+    const frac=Math.min(1, Math.log10(ratio+0.0001)/2 + 0.5); // log-scaled fill, centered on 1×
+    svg.append("text").attr("x",barX).attr("y",barY-6).attr("fill",C.muted).attr("font-size",10)
+       .text("attention cost ∝ N²  (relative to ViT-B/16, N=196)");
+    svg.append("rect").attr("x",barX).attr("y",barY).attr("width",barMaxW).attr("height",14).attr("rx",7)
+       .attr("fill",C.line).attr("opacity",0.5);
+    svg.append("rect").attr("x",barX).attr("y",barY).attr("width",Math.max(4,barMaxW*frac)).attr("height",14).attr("rx",7)
+       .attr("fill",ratio>2?C.bad:(ratio<0.6?C.good:C.A));
+    svg.append("text").attr("x",barX+barMaxW).attr("y",barY+11).attr("text-anchor","end")
+       .attr("font-size",10).attr("fill",C.ink).text(ratio.toFixed(2)+"×");
+
+    d3.select("#patch-readout").html(
+      `<b>P=${P}</b>, image ${res}×${res} → grid <b>${perSide}×${perSide}</b> → `+
+      `<b>N=${N}</b> patch tokens (+1 [CLS] = ${N+1}). `+
+      `Each patch is a ${P}·${P}·3 = <b>${patchVec}</b>-vector projected to D=${D}. `+
+      `Attention cost ≈ <b>${ratio.toFixed(2)}×</b> a ViT-B/16.`
+    );
+  }
+  d3.select("#p-patch").on("input",draw);
+  d3.select("#p-res").on("input",draw);
+  d3.select("#p-dim").on("input",draw);
+  draw();
+})();
+</script>
+</body>
+</html>

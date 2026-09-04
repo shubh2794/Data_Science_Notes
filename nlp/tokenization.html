@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Tokenization</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <h1>Tokenization</h1>
+      <p>Cutting text into the discrete pieces a model can count — the <b>boundary between language and tensors</b>.</p>
+      <div style="margin-top:10px">
+        <span class="pill">NLP</span>
+        <span class="pill">Sub-words</span>
+        <span class="pill">Fundamentals</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="overview">
+      <h3><span class="idx">01</span> What tokenization is</h3>
+      <p class="lede">A neural network can't ingest a string — it ingests <b>integers</b>. Tokenization is the function that turns raw text into a sequence of IDs drawn from a fixed vocabulary, and back again.</p>
+      <ul class="notes">
+        <li>It is a deterministic map <code>text → [id₁, id₂, …, id<sub>n</sub>]</code>, where each ID indexes a row of the model's <a href="embeddings.html">embedding</a> table.</li>
+        <li>The unit isn't a word and isn't a character — it's a <b>token</b>: a sub-word chunk learned from a corpus so that frequent strings stay whole and rare ones split into reusable pieces.</li>
+        <li>The tokenizer is trained <b>once, before the model</b>, and then frozen. Its vocabulary is part of the model's contract: the same string must always produce the same IDs.</li>
+        <li>Every downstream cost — sequence length, attention compute, context-window budget, and API price — is denominated in <b>tokens</b>, not words or characters.</li>
+      </ul>
+      <div class="formula"><span class="eq">tokenize : Σ* → V<sup>n</sup></span>        <span class="eq">detokenize ∘ tokenize = id</span>        <span class="eq">|V| ≈ 30k – 256k</span></div>
+      <div class="callout"><b>One idea:</b> a token is the <i>atom of cost and meaning</i> for a language model. Pick the atoms well and short, common text becomes cheap while rare or unseen text still survives — never an out-of-vocabulary crash.</div>
+
+      <p>Type anything below. Watch it split against a fixed vocabulary, longest-match first, and read off the <b>chars-per-token</b> ratio — the headline efficiency number for any tokenizer.</p>
+      <div class="viz" id="viz-tok">
+        <div class="vhead">
+          <span class="vtitle">Greedy sub-word tokenizer</span>
+          <span class="vhint">type text → colored token chips · ## marks a continuation piece</span>
+        </div>
+        <div class="controls">
+          <input type="text" id="tok-input" size="52" value="Tokenization makes transformers unimaginably powerful" style="background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font-size:13px;flex:1;min-width:280px;">
+        </div>
+        <div id="tok-out" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;"></div>
+        <div class="readout" aria-live="polite" id="tok-readout" style="margin-top:10px;"></div>
+      </div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="granularity">
+      <h3><span class="idx">02</span> The granularity spectrum</h3>
+      <p class="lede">Where you cut decides everything. There are three natural grain sizes — and sub-word is the engineered compromise between the two extremes.</p>
+      <h4>Characters — tiny vocab, long sequences</h4>
+      <ul class="notes">
+        <li>Vocabulary is just the alphabet (≈100 symbols). <b>Never any OOV</b> — every string is representable.</li>
+        <li>But sentences explode into long sequences, and the model must <b>relearn spelling</b> from scratch. Self-attention is O(n²) in sequence length, so long sequences are expensive.</li>
+      </ul>
+      <h4>Words — short sequences, brittle vocab</h4>
+      <ul class="notes">
+        <li>One token per word: short sequences, intuitive units.</li>
+        <li>But the vocabulary must be enormous to cover a language, the long tail is always incomplete, and any <b>unseen word</b> ("antidisestablishmentarianism", a typo, a new product name) becomes an <code>&lt;UNK&gt;</code> — information destroyed.</li>
+      </ul>
+      <h4>Sub-words — the sweet spot</h4>
+      <ul class="notes">
+        <li>Keep frequent whole words as single tokens; split rare words into morpheme-like pieces (<code>tokenization → token + ization</code>).</li>
+        <li>A modest vocabulary (30k–256k) covers <b>any</b> string with <b>no OOV</b>, because the fallback is always smaller pieces, down to single bytes.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Granularity</th><th>Vocab size</th><th>Sequence length</th><th>OOV handling</th><th>Trade-off</th></tr>
+        <tr><td>Character</td><td>~100 (tiny)</td><td>Very long</td><td>None — always covered</td><td>Cheap vocab, costly compute &amp; weak morphology</td></tr>
+        <tr><td>Word</td><td>10⁵–10⁶ (huge)</td><td>Short</td><td>Brittle — <code>&lt;UNK&gt;</code> drops it</td><td>Intuitive but fails on the long tail</td></tr>
+        <tr><td>Sub-word</td><td>30k–256k (moderate)</td><td>Medium</td><td>Graceful — split into pieces</td><td>The engineered compromise everyone uses</td></tr>
+      </table>
+      <div class="callout">The spectrum is a single knob: shrink the vocabulary and sequences lengthen; grow it and sequences shorten but the embedding table balloons. Sub-word tokenizers <b>learn where to sit on that knob</b> from data.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="bpe">
+      <h3><span class="idx">03</span> Byte-Pair Encoding (BPE)</h3>
+      <p class="lede">The dominant recipe. Start from characters and <b>greedily merge the most frequent adjacent pair</b>, over and over, until the vocabulary hits its target size.</p>
+      <h4>The algorithm</h4>
+      <ul class="notes">
+        <li>Begin with every word as a sequence of single characters (plus an end-of-word marker).</li>
+        <li>Count all adjacent symbol pairs across the corpus. Find the <b>most frequent pair</b>, merge it into one new symbol, and record that merge as a rule.</li>
+        <li>Repeat. Each merge adds exactly one token to the vocabulary, so after <code>k</code> merges the vocab is <code>base + k</code>.</li>
+        <li>At inference, apply the learned merge rules <b>in the order they were learned</b> — that ordering is the whole tokenizer.</li>
+      </ul>
+      <div class="formula"><span class="eq">repeat until |V| = target:</span>
+    <span class="eq">(x, y) = argmax<sub>(a,b)</sub></span>  <span class="eq">count( a · b )</span>      <span class="eq">⟵ most frequent adjacent pair</span>
+    <span class="eq">merge x · y → z ,</span>  <span class="eq">add z to V ,</span>  <span class="eq">record rule (x, y) → z</span></div>
+      <p>Step through it. The corpus below starts as raw characters; each click merges the most frequent adjacent pair and appends a rule. Watch the token count shrink as pieces fuse.</p>
+      <div class="viz" id="viz-bpe">
+        <div class="vhead">
+          <span class="vtitle">BPE merge stepper</span>
+          <span class="vhint">merge the most frequent adjacent pair, one step at a time</span>
+        </div>
+        <div class="controls">
+          <button class="btn" id="bpe-step">Merge next pair</button>
+          <button class="btn ghost" id="bpe-reset">Reset</button>
+          <span class="readout" id="bpe-readout" style="margin-top:0;"></span>
+        </div>
+        <svg id="bpe-svg" width="640" height="210" viewBox="0 0 640 210" role="img" aria-label="Interactive diagram: Greedy sub-word tokenizer">role="img" aria-label="Interactive diagram: BPE merge stepper"></svg>
+        <div class="readout" aria-live="polite" id="bpe-rules" style="margin-top:6px;"></div>
+      </div>
+      <div class="callout"><b>Why it works:</b> frequency is a proxy for usefulness. The pairs worth a vocabulary slot are exactly the ones that recur — common morphemes and whole words earn their place; rare strings stay decomposed.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="wordpiece-unigram">
+      <h3><span class="idx">04</span> WordPiece &amp; Unigram</h3>
+      <p class="lede">BPE merges by raw frequency. Two alternatives merge by <b>likelihood</b> instead — they ask which vocabulary best <i>explains</i> the corpus, not which pair is simply most common.</p>
+      <h4>WordPiece — merge by likelihood gain</h4>
+      <ul class="notes">
+        <li>Like BPE, it merges pairs greedily, but the score isn't raw count — it's the <b>gain in corpus likelihood</b> from the merge, which favours pairs whose co-occurrence is more than coincidence.</li>
+        <li>Marks continuation pieces with <code>##</code> (so <code>playing → play + ##ing</code>). This is BERT's tokenizer.</li>
+      </ul>
+      <div class="formula"><span class="eq">score(a, b) = count(a · b) / ( count(a) · count(b) )</span>      <span class="eq">⟵ merge by mutual association, not just count</span></div>
+      <h4>Unigram — prune, don't grow</h4>
+      <ul class="notes">
+        <li>Works <b>top-down</b>: start with a large candidate vocabulary, then <b>iteratively remove</b> the tokens that hurt corpus likelihood least, until the target size remains.</li>
+        <li>Each word can be segmented many ways; the model assigns a probability to each token and picks the <b>most probable segmentation</b> (it can even sample alternatives — useful as regularization during training).</li>
+      </ul>
+      <div class="formula"><span class="eq">P(segmentation) = ∏<sub>i</sub> p(t<sub>i</sub>)</span>        <span class="eq">seg* = argmax<sub>seg</sub> ∏<sub>i</sub> p(t<sub>i</sub>)</span></div>
+      <h4>SentencePiece — the language-agnostic wrapper</h4>
+      <ul class="notes">
+        <li>SentencePiece is the <i>library</i>, not an algorithm: it runs BPE <b>or</b> Unigram directly on raw Unicode, treating the space as an ordinary symbol (<code>▁</code>). No language-specific pre-tokenization, so it works the same for English, Japanese, or code.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Tokenizer</th><th>Merge / pruning criterion</th><th>Continuation marker</th><th>Used by</th></tr>
+        <tr><td>BPE</td><td>Most frequent adjacent pair</td><td>(varies)</td><td>GPT-2/3/4, RoBERTa</td></tr>
+        <tr><td>WordPiece</td><td>Max likelihood-gain pair</td><td><code>##</code> prefix</td><td>BERT, DistilBERT, ELECTRA</td></tr>
+        <tr><td>Unigram (SentencePiece)</td><td>Prune lowest-likelihood-loss tokens</td><td><code>▁</code> word-start</td><td>T5, ALBERT, XLNet</td></tr>
+        <tr><td>Byte-level BPE</td><td>Frequent pair, over raw bytes</td><td>(none — byte fallback)</td><td>GPT-2+, LLaMA, most modern LLMs</td></tr>
+      </table>
+      <div class="callout">BPE is <b>frequency-greedy and bottom-up</b>; Unigram is <b>probabilistic and top-down</b>. WordPiece sits between — greedy like BPE, but scored by likelihood like Unigram.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="byte-special">
+      <h3><span class="idx">05</span> Byte-level BPE &amp; special tokens</h3>
+      <p class="lede">Two engineering details make tokenizers bulletproof in production: a <b>byte fallback</b> so nothing is ever unrepresentable, and <b>special tokens</b> that carry structure the text alone can't.</p>
+      <h4>Byte-level BPE</h4>
+      <ul class="notes">
+        <li>Run BPE over the <b>256 raw UTF-8 bytes</b> rather than Unicode characters. The base alphabet is then exactly 256 symbols — so <b>any</b> byte sequence (emoji, rare scripts, malformed input, binary) is always tokenizable.</li>
+        <li>Guarantees a <b>truly closed vocabulary</b>: there is no <code>&lt;UNK&gt;</code> at all, because the worst case is falling back to individual bytes. This is why GPT-2 and most modern LLMs adopted it.</li>
+      </ul>
+      <h4>Special tokens</h4>
+      <ul class="notes">
+        <li><b>Sentinels &amp; structure:</b> <code>[CLS]</code> (a pooled-sentence slot) and <code>[SEP]</code> (segment boundary) in BERT; <code>&lt;|endoftext|&gt;</code> as a document separator in GPT.</li>
+        <li><b>Sequence boundaries:</b> <code>&lt;BOS&gt;</code> / <code>&lt;EOS&gt;</code> mark where a generation starts and stops — sampling halts when <code>&lt;EOS&gt;</code> is produced.</li>
+        <li><b>Padding &amp; masking:</b> <code>&lt;PAD&gt;</code> fills short sequences to a uniform length for batching (and is masked out of attention); <code>[MASK]</code> is the prediction target in masked-language-model pretraining.</li>
+        <li>Chat models add <b>role/turn tokens</b> (system / user / assistant delimiters) so the model can tell who is speaking — these are reserved IDs the user's text can never collide with.</li>
+      </ul>
+      <div class="callout">Special tokens are real vocabulary entries with reserved IDs. They are how a flat token stream encodes <b>hierarchy</b> — turns, segments, document edges — that raw characters can't express.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="vocab-size">
+      <h3><span class="idx">06</span> Vocabulary size as a trade-off</h3>
+      <p class="lede">Choosing <code>|V|</code> is a balancing act between <b>three competing costs</b>. There is no free lunch — every gain on one axis is paid for on another.</p>
+      <ul class="notes">
+        <li><b>Embedding &amp; output table:</b> grows linearly with <code>|V|</code> — each token needs an input-embedding row and an output-projection column, both of width <code>d</code>. A 256k vocab at d=4096 is billions of parameters before any layer.</li>
+        <li><b>Tokens per sentence:</b> a bigger vocabulary fuses more text into single tokens, so the same passage uses <b>fewer tokens</b> — shorter sequences, less attention compute, more text per context window.</li>
+        <li><b>Compute / context budget:</b> attention is O(n²) in token count, and API billing is per token. Fewer tokens means cheaper inference and longer effective context.</li>
+      </ul>
+      <div class="formula"><span class="eq">params<sub>embed</sub> ≈ 2 · |V| · d</span>          <span class="eq">compute ∝ n²</span>          <span class="eq">cost ∝ n</span>  <span class="eq">(n = tokens)</span></div>
+      <p>So a larger vocabulary trades a <b>one-time parameter cost</b> (the embedding table) for a <b>per-sentence saving</b> (fewer tokens forever). Modern multilingual LLMs push <code>|V|</code> up (128k–256k) precisely to keep <code>n</code> small across many languages.</p>
+      <div class="callout">Rule of thumb: grow the vocabulary until the embedding-table cost stops paying for itself in shorter sequences. The crossover depends on model width <code>d</code> and how multilingual your text is.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="pitfalls">
+      <h3><span class="idx">07</span> Pitfalls &amp; the tokenization tax</h3>
+      <p class="lede">Tokenization quietly shapes what a model can and can't do well. Most "weird" LLM failures trace back to how the text was cut.</p>
+      <h4>Numbers &amp; arithmetic</h4>
+      <ul class="notes">
+        <li>A number like <code>12345</code> may split into arbitrary chunks (<code>123 + 45</code>) that don't align with place value, which is part of why naïve LLMs struggle with multi-digit arithmetic. Many modern tokenizers now <b>split digits individually</b> to fix this.</li>
+      </ul>
+      <h4>Whitespace, code &amp; formatting</h4>
+      <ul class="notes">
+        <li>Leading spaces are usually part of the token (<code>"hello"</code> ≠ <code>" hello"</code>), so the same word can have different IDs depending on context.</li>
+        <li>Code is space- and indentation-heavy; tokenizers tuned for prose waste tokens on runs of spaces, which is why code-focused models add <b>whitespace-run tokens</b>.</li>
+      </ul>
+      <h4>Multilingual text — the tokenization tax</h4>
+      <ul class="notes">
+        <li>A tokenizer trained mostly on English fragments other languages into many more pieces. The <b>same sentence in Hindi or Thai can cost 2–5× the tokens</b> of its English translation.</li>
+        <li>That is a real, unequal <b>tax</b>: non-English users pay more (longer sequences, higher cost, less fits in the context window) for identical content — a key motivation for large multilingual vocabularies.</li>
+      </ul>
+      <h4>Cost &amp; context follow tokens, not words</h4>
+      <ul class="notes">
+        <li>Context windows, rate limits, and pricing are all measured in tokens. A 100k-word document is <b>not</b> 100k tokens — roughly <b>~1.3 tokens per English word</b>, and far more for other scripts or dense code.</li>
+        <li>This is why prompt size estimates must count tokens, not characters or words — see the cost relation in <a href="#vocab-size">§06</a>.</li>
+      </ul>
+      <div class="callout"><b>The tokenization tax:</b> every quirk above is invisible in the prose but very visible on the bill and in the context budget. Knowing your tokenizer is knowing your true input length.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">08</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Tokens are the atoms.</b> Models read integer IDs, not text; the tokenizer is the frozen map between them.</li>
+        <li><b>Sub-word wins.</b> It dodges both the huge vocabulary of word-level and the long sequences of character-level, while eliminating OOV.</li>
+        <li><b>BPE = merge frequent pairs; Unigram = prune unlikely tokens; WordPiece = merge by likelihood.</b> Byte-level BPE makes the vocabulary truly closed.</li>
+        <li><b>Vocabulary size is a three-way trade-off</b> between embedding-table parameters, tokens-per-sentence, and compute/cost.</li>
+        <li><b>The cut has consequences:</b> arithmetic, code, and especially non-English text all pay a hidden tokenization tax.</li>
+      </ul>
+      <div class="callout"><b>Threads to pull:</b> tokens become vectors in <a href="embeddings.html">Embeddings</a>; they feed the next-token objective of <a href="language-models.html">Language Models</a> and the self-attention of <a href="../deep-learning/transformers.html">Transformers</a>; and clean input starts with <a href="text-preprocessing.html">Text Preprocessing</a>.</div>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+const PC={accent:"#c084fc",a2:"#ffb454",good:"#4ade80",bad:"#f87171",ink:"#e6e9ef",muted:"#9aa3b2",line:"#2a2f3a"};
+
+/* ───────────────────────── 01 · greedy sub-word tokenizer ───────────────────────── */
+(function(){
+  const words=["the","a","to","of","and","is","in","it","make","makes","power","powerful","trans","former","transform","transformer","transformers","token","tokens","tokenize","tokenization","model","models","language","learn","learning","deep","neural","network","word","embed","embedding","attention","context","vector","data","gener","generate","un","imag","ine","able","ly","ing","ed","er","ers","s","ization","ation","ize"];
+  const subs=["tion","ize","iza","ing","ness","ment","able","ful","un","re","pre","over","under","form","port","struct","work","net","sub"];
+  let vocab=Array.from(new Set([...words,...subs]));
+  "abcdefghijklmnopqrstuvwxyz".split("").forEach(c=>{ if(!vocab.includes(c)) vocab.push(c); });
+  const vmap=new Map(vocab.map((v,i)=>[v,i+5])); // ids offset for "specials"
+  const pal=["#c084fc","#5b9cff","#4ade80","#ffb454","#f472b6","#22d3ee","#fbbf24"];
+
+  function tokenizeWord(w){
+    const out=[]; let i=0; const lw=w.toLowerCase();
+    while(i<lw.length){
+      let end=lw.length, piece=null;
+      while(end>i){ const cand=lw.slice(i,end); if(vmap.has(cand)){piece=cand;break;} end--; }
+      if(piece===null){ out.push({t:lw[i],id:vmap.get(lw[i]),cont:i>0}); i++; }
+      else { out.push({t:piece,id:vmap.get(piece),cont:i>0}); i=end; }
+    }
+    return out;
+  }
+  const box=d3.select("#tok-out");
+  function render(){
+    const text=d3.select("#tok-input").property("value");
+    const wordList=text.split(/(\s+)/).filter(s=>s.length);
+    const chips=[]; let ci=0;
+    wordList.forEach(seg=>{
+      if(/^\s+$/.test(seg)) return;
+      tokenizeWord(seg).forEach(tk=>{
+        chips.push({label:(tk.cont?"##":"")+tk.t, id:tk.id, col:pal[(ci++)%pal.length]});
+      });
+    });
+    box.selectAll("span.tok").data(chips).join("span")
+      .attr("class","tok").attr("title",d=>"id "+d.id)
+      .attr("style",d=>`display:inline-block;padding:3px 9px;border-radius:7px;font-size:13px;font-family:'SF Mono',Menlo,monospace;background:${d.col}22;color:${d.col};border:1px solid ${d.col}55;`)
+      .text(d=>d.label);
+    const chars=text.replace(/\s/g,"").length, total=chips.length;
+    d3.select("#tok-readout").html(`<b>${total}</b> tokens from <b>${chars}</b> characters · ratio ≈ <b>${chars?(chars/total).toFixed(1):0}</b> chars/token (hover a token for its id)`);
+  }
+  d3.select("#tok-input").on("input",render);
+  render();
+})();
+
+/* ───────────────────────── 03 · BPE merge stepper ───────────────────────── */
+(function(){
+  const svg=d3.select("#bpe-svg"),W=640;
+  const stepBtn=document.getElementById("bpe-step"),
+        resetBtn=document.getElementById("bpe-reset"),
+        readout=document.getElementById("bpe-readout"),
+        rulesEl=document.getElementById("bpe-rules");
+  // tiny corpus: word + frequency (· = end-of-word marker)
+  const CORPUS=[["low",5],["lower",2],["newest",6],["widest",3]];
+  let words, rules, lastPair;
+
+  function reset(){
+    words=CORPUS.map(([w,f])=>({sym:w.split("").concat("·"),f}));
+    rules=[]; lastPair=null;
+    stepBtn.disabled=false; stepBtn.style.opacity=1;
+    render();
+  }
+  function pairCounts(){
+    const m=new Map();
+    words.forEach(({sym,f})=>{
+      for(let i=0;i<sym.length-1;i++){
+        const k=sym[i]+"\u0001"+sym[i+1];
+        m.set(k,(m.get(k)||0)+f);
+      }
+    });
+    return m;
+  }
+  function step(){
+    const m=pairCounts();
+    if(m.size===0){ finish(); return; }
+    let best=null,bc=-1;
+    m.forEach((c,k)=>{ if(c>bc){bc=c;best=k;} });
+    const [a,b]=best.split("\u0001");
+    lastPair={a,b,c:bc};
+    words.forEach(o=>{
+      const ns=[];
+      for(let i=0;i<o.sym.length;i++){
+        if(i<o.sym.length-1 && o.sym[i]===a && o.sym[i+1]===b){ ns.push(a+b); i++; }
+        else ns.push(o.sym[i]);
+      }
+      o.sym=ns;
+    });
+    rules.push({pair:a+" + "+b, res:a+b, c:bc});
+    render();
+    if(pairCounts().size===0) finish();
+  }
+  function finish(){ stepBtn.disabled=true; stepBtn.style.opacity=.45; lastPair=null; render(); }
+
+  function render(){
+    const g=svg.html("").append("g");
+    const rowH=46, padL=20;
+    words.forEach((o,r)=>{
+      const y=22+r*rowH;
+      g.append("text").attr("x",padL).attr("y",y+4).attr("font-size",11).attr("fill",PC.muted)
+        .attr("font-family","'SF Mono',Menlo,monospace").text("×"+o.f);
+      let x=padL+44;
+      o.sym.forEach((s)=>{
+        const wpx=Math.max(20, s.length*9+14);
+        const isNew=lastPair && s===lastPair.a+lastPair.b;
+        const isEow=s==="·";
+        const col=isNew?PC.good:isEow?PC.muted:PC.accent;
+        g.append("rect").attr("x",x).attr("y",y-15).attr("width",wpx).attr("height",26).attr("rx",6)
+          .attr("fill",col+(isNew?"33":"1f")).attr("stroke",col+(isNew?"":"66"))
+          .attr("stroke-width",isNew?1.8:1);
+        g.append("text").attr("x",x+wpx/2).attr("y",y+3).attr("text-anchor","middle")
+          .attr("font-size",12.5).attr("font-family","'SF Mono',Menlo,monospace")
+          .attr("font-weight",isNew?700:500).attr("fill",isNew?PC.good:isEow?PC.muted:PC.ink).text(s);
+        x+=wpx+6;
+      });
+    });
+    const ntok=words.reduce((s,o)=>s+o.sym.length,0);
+    const vocab=new Set(); words.forEach(o=>o.sym.forEach(s=>vocab.add(s)));
+    readout.innerHTML = lastPair
+      ? `merged <b style="color:${PC.good}">${lastPair.a} + ${lastPair.b}</b> (count ${lastPair.c}) · <b>${rules.length}</b> rules · <b>${ntok}</b> symbols · |V| <b>${vocab.size}</b>`
+      : (rules.length? `done — no adjacent pair left · <b>${rules.length}</b> rules · |V| <b>${vocab.size}</b>`
+                     : `start: every word is single characters (· = end-of-word) · <b>${ntok}</b> symbols`);
+    rulesEl.innerHTML = rules.length
+      ? "merge rules: "+rules.map(r=>`<b style="color:${PC.accent}">${r.pair} → ${r.res}</b>`).join(" &nbsp;·&nbsp; ")
+      : "merge rules: <i>none yet — click “Merge next pair”</i>";
+  }
+
+  stepBtn.addEventListener("click",step);
+  resetBtn.addEventListener("click",reset);
+  reset();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Mixture of Experts</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <h1>Mixture of Experts</h1>
+      <p>Scale a model's parameters by 10–100× while keeping per-token compute almost flat: replace the dense feed-forward layer with many expert FFNs, and route each token to just a few of them.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Deep Learning</span>
+        <span class="pill">Sparse models</span>
+        <span class="pill">LLM scaling</span>
+      </div>
+    </header>
+
+    <section class="topic" id="overview">
+      <h3><span class="idx">01</span> The core idea: conditional computation</h3>
+      <p class="lede">Decouple how many parameters a model <i>has</i> from how many it <i>uses</i> per token.</p>
+      <p>A dense Transformer runs every token through every weight. Doubling the parameters doubles the compute. MoE breaks that link with <b>conditional computation</b>: maintain a large pool of <code>N</code> expert sub-networks, but for each token activate only the top <code>k</code> of them (often <code>k</code>=1 or 2).</p>
+      <ul class="notes">
+        <li><b>Capacity</b> grows with the total number of experts <code>N</code>.</li>
+        <li><b>Compute</b> per token grows only with the active experts <code>k</code>.</li>
+        <li>So you can scale total parameters enormously while training/inference FLOPs stay roughly fixed.</li>
+      </ul>
+      <div class="callout"><b>One sentence:</b> a learned router sends each token to a small subset of specialist FFNs, so the model is huge in parameters but cheap per token.</div>
+    </section>
+
+    <section class="topic" id="block">
+      <h3><span class="idx">02</span> Experts &amp; the router</h3>
+      <p class="lede">An MoE layer swaps one FFN for many, plus a tiny network that decides who handles what.</p>
+      <h4>The experts</h4>
+      <p>Each expert is just an ordinary feed-forward network — the same 2-layer MLP that normally sits in a Transformer block, only now there are <code>N</code> copies. They're all trained on the same data but, because routing sends them different tokens, they <b>specialize</b> on their own.</p>
+      <h4>The gating / router network</h4>
+      <p>A single linear layer scores the token against each expert:</p>
+      <div class="formula"><span class="eq">g(x) = x · W_router</span>        <span class="eq">∈ ℝᴺ</span>     <span class="eq">(one logit per expert)</span></div>
+      <p>It acts as a dynamic controller — implicitly clustering tokens and dispatching each cluster to the expert best suited to it. Typically only the FFN sub-layer becomes MoE; attention stays dense.</p>
+    </section>
+
+    <section class="topic" id="routing">
+      <h3><span class="idx">03</span> Gating &amp; top-k routing</h3>
+      <p class="lede">Softmax the router logits, keep the top k, drop the rest. Drag the controls to watch tokens get dispatched — and the experts load up unevenly.</p>
+
+      <div class="viz" id="viz-moe">
+        <div class="vhead">
+          <span class="vtitle">Token routing through the gate</span>
+          <span class="vhint">Each token routes to its top-k experts · watch the per-expert load bars and the imbalance readout</span>
+        </div>
+        <div class="controls">
+          <label>Experts (N) <input type="range" id="moe-n" min="4" max="16" step="1" value="8"></label>
+          <label>Route top-k
+            <select id="moe-k"><option value="1">top-1 (Switch)</option><option value="2" selected>top-2 (Mixtral)</option></select>
+          </label>
+          <button class="btn ghost" id="moe-reroute">Re-sample router</button>
+        </div>
+        <svg id="moe-svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="Interactive diagram: Token routing through the gate"></svg>
+        <div class="readout" aria-live="polite" id="moe-read"></div>
+      </div>
+
+      <div class="formula"><span class="eq">p(x)</span>  <span class="eq">= softmax(g(x))</span>
+<span class="eq">G(x)</span>  <span class="eq">= keep top-k of p(x), zero the rest</span>  <span class="eq">(renormalized over the k)</span></div>
+      <p><b>Noisy top-k gating</b> (Shazeer et&nbsp;al., 2017) adds tunable Gaussian noise to the logits <i>before</i> the top-k cut during training — it encourages exploration and helps spread load, then is turned off at inference.</p>
+    </section>
+
+    <section class="topic" id="output">
+      <h3><span class="idx">04</span> The combined output</h3>
+      <p class="lede">Run only the selected experts, then blend their outputs by the gate weights.</p>
+      <div class="formula"><span class="eq">y(x) = Σ_(i ∈ top-k)</span>  <span class="eq">Gᵢ(x) · Eᵢ(x)</span></div>
+      <ul class="notes">
+        <li><code>E_i(x)</code> — expert <i>i</i>'s FFN output for this token.</li>
+        <li><code>G_i(x)</code> — the gate weight (renormalized softmax probability) for expert <i>i</i>.</li>
+        <li>The sum runs over <b>only the k selected experts</b>, so just <code>k</code> FFNs actually execute — the whole point.</li>
+      </ul>
+      <p>The top-k selection is non-differentiable, so gradients reach the experts through the kept gate weights (a straight-through-style path): chosen experts and the router both get trained, idle experts get no signal that step.</p>
+    </section>
+
+    <section class="topic" id="topk">
+      <h3><span class="idx">05</span> Top-1 vs top-2, and sparsity</h3>
+      <p class="lede">How many experts per token, and how sparse the whole layer is.</p>
+      <ul class="notes">
+        <li><b>Top-1 (Switch Transformer):</b> each token → a single expert. Minimal compute and communication, but needs a stronger balancing loss to avoid collapse.</li>
+        <li><b>Top-2 (GShard, Mixtral):</b> each token → two experts. More stable (the token gets two views) and more expressive, at ~2× the expert compute.</li>
+      </ul>
+      <p><b>Sparsity</b> is the key scaling knob — total experts divided by active experts:</p>
+      <div class="formula"><span class="eq">sparsity</span>  <span class="eq">=</span>  <span class="eq">N_total / k_active</span></div>
+      <table class="cmp">
+        <tr><th>Model</th><th>Experts (total)</th><th>Active / token</th><th>Sparsity</th></tr>
+        <tr><td>Mixtral 8×7B</td><td>8</td><td>2</td><td>4×</td></tr>
+        <tr><td>DeepSeek-V3</td><td>256</td><td>8</td><td>32×</td></tr>
+        <tr><td>Kimi K2</td><td>384</td><td>8</td><td>48×</td></tr>
+      </table>
+      <p>Empirically, <b>raising sparsity lowers loss at a fixed active-parameter budget</b> — more total experts help even if you keep the per-token compute constant. The practical limit is routing/communication complexity, not quality.</p>
+    </section>
+
+    <section class="topic" id="balancing">
+      <h3><span class="idx">06</span> The load-balancing problem</h3>
+      <p class="lede">Left alone, routers collapse — a few popular experts hog every token while the rest starve.</p>
+      <p>It's a "rich-get-richer" loop: an over-chosen expert trains faster, so it gets chosen even more, while neglected experts never specialize and their capacity is wasted. You saw this as the imbalance (CV) readout in the viz above. Three standard fixes:</p>
+      <h4>1 · Auxiliary load-balancing loss (Switch Transformer)</h4>
+      <div class="formula"><span class="eq">L_balance = λ · N · Σ_i</span>  <span class="eq">f_i · P_i</span>
+
+  <span class="eq">f_i = fraction of tokens routed to expert i</span>
+  <span class="eq">P_i = average router probability for expert i</span>
+  <span class="eq">perfect balance: f_i = P_i = 1/N</span></div>
+      <p>Added to the main loss with a small weight <code>λ</code> (≈0.01–0.1), it pushes utilization toward uniform.</p>
+      <h4>2 · Expert capacity &amp; token dropping</h4>
+      <div class="formula"><span class="eq">C = (T / N) · α</span>        <span class="eq">α = capacity factor (≈1.0–1.5)</span></div>
+      <p>Each expert accepts at most <code>C</code> tokens per batch; overflow tokens are <b>dropped</b> (passed through via the residual) or rerouted. The capacity factor <code>α</code>&gt;1 leaves slack for imperfect balance.</p>
+      <h4>3 · Noisy gating &amp; loss-free routing</h4>
+      <p>Noise in the router (above) softens the winner-take-all dynamics. Newer models like DeepSeek-V3 go <b>auxiliary-loss-free</b>: they nudge per-expert router <i>biases</i> dynamically to balance load without a competing loss term.</p>
+    </section>
+
+    <section class="topic" id="params">
+      <h3><span class="idx">07</span> Active vs total parameters</h3>
+      <p class="lede">The headline number and the one that actually sets your compute are different.</p>
+      <div class="formula"><span class="eq">Mixtral 8×7B:</span>  <span class="eq">~47B total params</span>  <span class="eq">·</span>  <span class="eq">~13B active per token (top-2 of 8)</span>
+                <span class="eq">→ roughly 3.6× cheaper per token than a dense 47B model</span></div>
+      <ul class="notes">
+        <li><b>Latency &amp; FLOPs</b> depend on <i>active</i> params, not total — that's the win.</li>
+        <li><b>Memory</b> depends on <i>total</i> params: every expert must be resident in accelerator memory even though only k run per token. This is MoE's primary constraint.</li>
+        <li><b>Throughput</b> beats a dense model of equal total size, because per-token work is far smaller.</li>
+      </ul>
+      <div class="callout">MoE trades <b>memory for compute</b>: you pay to store all experts, but only compute a few. Great when you're compute/latency-bound, costly when you're VRAM-bound.</div>
+    </section>
+
+    <section class="topic" id="models">
+      <h3><span class="idx">08</span> Landmark models</h3>
+      <p class="lede">The line from the first big sparse net to trillion-parameter LLMs.</p>
+      <table class="cmp">
+        <tr><th>Model (year)</th><th>Routing</th><th>Scale</th><th>Contribution</th></tr>
+        <tr><td>Shazeer et al. (2017)</td><td>Noisy top-k</td><td>137B</td><td>First large sparse MoE; top-k gating + aux loss</td></tr>
+        <tr><td>GShard (2020)</td><td>Top-2</td><td>600B</td><td>Distributed sparse training, all-to-all sharding</td></tr>
+        <tr><td>Switch Transformer (2021)</td><td>Top-1</td><td>1.6T</td><td>Simplified to top-1; capacity factor formalized</td></tr>
+        <tr><td>GLaM (2021)</td><td>Top-2</td><td>1.2T</td><td>Efficient large-scale MoE LM, strong few-shot</td></tr>
+        <tr><td>Mixtral 8×7B (2024)</td><td>Top-2 of 8</td><td>47B / 13B active</td><td>Open MoE matching larger dense models</td></tr>
+        <tr><td>DeepSeek-V3 (2024)</td><td>Top-8 of 256</td><td>671B / 37B active</td><td>Fine-grained + shared experts; loss-free balancing</td></tr>
+        <tr><td>Kimi K2 (2025)</td><td>Top-8 of 384</td><td>1.04T / 32B active</td><td>Sparsity 48; stability engineering at scale</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="specialization">
+      <h3><span class="idx">09</span> Expert specialization</h3>
+      <p class="lede">No one tells the experts what to specialize in — it emerges from sparse routing.</p>
+      <ul class="notes">
+        <li><b>Self-organization:</b> with no explicit supervision, each expert ends up seeing a narrower slice of the data distribution, converges faster, and interferes less with the others.</li>
+        <li><b>What they cluster on:</b> probing studies find experts organizing by language, domain, or token type — especially visible in multilingual and instruction-tuned models.</li>
+        <li><b>Shared experts:</b> some designs (DeepSeek-MoE) keep one expert <i>always</i> active to capture universal knowledge, letting the routed experts focus purely on specialization.</li>
+        <li><b>Fine-grained experts:</b> many smaller experts give finer specialization and less memory each, at the cost of more routing decisions to balance.</li>
+      </ul>
+      <div class="callout">The theory: high-dimensional input naturally clusters, and a non-linear expert per cluster learns a sharper local boundary than one dense network spanning all clusters.</div>
+    </section>
+
+    <section class="topic" id="tradeoffs">
+      <h3><span class="idx">10</span> Trade-offs &amp; limitations</h3>
+      <p class="lede">Sparsity isn't free — it moves the cost around.</p>
+      <ul class="notes">
+        <li><b>Memory residency (primary):</b> all experts must sit in VRAM; you can't grow N indefinitely on fixed hardware. Mitigations: expert parallelism (shard experts across devices), quantization (QMoE).</li>
+        <li><b>Training instability:</b> uneven selection gives noisy gradients and risks routing collapse; needs balancing loss + capacity tuning.</li>
+        <li><b>Communication overhead:</b> distributed MoE needs all-to-all token exchange to reach the device holding each expert — a real bottleneck, sensitive to routing skew.</li>
+        <li><b>Latency variability:</b> a "straggler" expert that gets too many tokens slows the whole batch; latency is less predictable than a dense model's.</li>
+        <li><b>Non-differentiable routing:</b> top-k is a hard selection; gradients flow only through chosen experts, a biased-but-lower-variance signal.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">11</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>MoE = conditional computation.</b> Many expert FFNs, a router picks top-k per token: huge parameter count, small per-token compute.</li>
+        <li><b>Output</b> is the gate-weighted sum over only the selected experts: <code>y = Σ G_i(x)·E_i(x)</code>.</li>
+        <li><b>Load balancing is the central engineering problem</b> — auxiliary loss, expert capacity, noisy/loss-free routing keep experts evenly used.</li>
+        <li><b>Active ≠ total params.</b> Compute scales with active (Mixtral ~13B); memory scales with total (~47B).</li>
+        <li><b>Sparsity is a scaling knob</b> — more total experts lowers loss at fixed active compute, until routing/communication costs bite.</li>
+        <li>Experts are FFNs (<a href="neural-networks.html">Feedforward / MLP</a>) dropped into a <a href="transformers.html">Transformer</a> block in place of the dense FFN.</li>
+      </ul>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+(function(){
+  const svg=d3.select("#moe-svg"), W=640, H=360, T=12;
+  let logits=[];
+  function reroute(){
+    const N=+d3.select("#moe-n").property("value");
+    logits = d3.range(T).map(()=> d3.range(N).map(()=> Math.random()));
+    draw();
+  }
+  function draw(){
+    const N=+d3.select("#moe-n").property("value");
+    const K=Math.min(+d3.select("#moe-k").property("value"), N);
+    svg.selectAll("*").remove();
+    const tx=95, ex=470, tTop=54, eTop=44;
+    const tGap=(H-80)/(T-1), eGap=(H-70)/(Math.max(N-1,1));
+    const color=d3.scaleSequential(d3.interpolateTurbo).domain([-0.6,N-0.4]);
+    const ty=i=>tTop+i*tGap, ey=j=>eTop+j*eGap;
+    svg.append("text").attr("x",tx).attr("y",26).attr("text-anchor","middle").attr("fill",C.muted).attr("font-size",11).text("tokens");
+    svg.append("text").attr("x",(tx+ex)/2).attr("y",26).attr("text-anchor","middle").attr("fill",C.B).attr("font-size",11).text(`router · top-${K}`);
+    svg.append("text").attr("x",ex).attr("y",26).attr("text-anchor","middle").attr("fill",C.muted).attr("font-size",11).text(`${N} experts`);
+    const load=new Array(N).fill(0);
+    logits.forEach((row,i)=>{
+      const idx=d3.range(N).sort((a,b)=>row[b]-row[a]).slice(0,K);
+      const m=Math.max(...idx.map(j=>row[j]));
+      const exps=idx.map(j=>Math.exp(row[j]-m)); const s=d3.sum(exps);
+      idx.forEach((j,r)=>{
+        const w=exps[r]/s; load[j]++;
+        svg.append("path")
+          .attr("d",`M${tx+7},${ty(i)} C${(tx+ex)/2},${ty(i)} ${(tx+ex)/2},${ey(j)} ${ex-11},${ey(j)}`)
+          .attr("fill","none").attr("stroke",color(j)).attr("stroke-width",0.7+w*2.6).attr("stroke-opacity",.5);
+      });
+    });
+    logits.forEach((_,i)=>{
+      svg.append("circle").attr("cx",tx).attr("cy",ty(i)).attr("r",4.5).attr("fill","#2a2f3a").attr("stroke",C.muted).attr("stroke-width",1);
+    });
+    const maxLoad=Math.max(1,...load);
+    for(let j=0;j<N;j++){
+      svg.append("rect").attr("x",ex-10).attr("y",ey(j)-9).attr("width",20).attr("height",18).attr("rx",4).attr("fill",color(j)).attr("stroke","#0f1117").attr("stroke-width",1.3);
+      svg.append("rect").attr("x",ex+18).attr("y",ey(j)-5).attr("width",load[j]/maxLoad*78).attr("height",10).attr("rx",3).attr("fill",color(j)).attr("fill-opacity",.55);
+      svg.append("text").attr("x",ex+18+load[j]/maxLoad*78+6).attr("y",ey(j)+3.5).attr("font-size",9).attr("fill",C.muted).text(load[j]);
+    }
+    const activePct=Math.round(K/N*100);
+    const fold=N/K, foldStr=Number.isInteger(fold)?fold.toFixed(0):fold.toFixed(1);
+    const mean=d3.mean(load), sd=Math.sqrt(d3.mean(load.map(l=>(l-mean)**2))), cv=mean?sd/mean:0;
+    d3.select("#moe-read").html(`active ≈ <b>${K}/${N} = ${activePct}%</b> of experts &nbsp;·&nbsp; sparsity <b>${foldStr}×</b> &nbsp;·&nbsp; load imbalance (CV) <b>${cv.toFixed(2)}</b> ${cv>0.5?"⚠ skewed — would need balancing":"✓ fairly even"}`);
+  }
+  d3.select("#moe-n").on("input",reroute);
+  d3.select("#moe-k").on("change",draw);
+  d3.select("#moe-reroute").on("click",reroute);
+  reroute();
+})();
+</script>
+</body>
+</html>

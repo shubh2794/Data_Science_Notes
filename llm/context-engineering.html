@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Context Engineering</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <h1>Context Engineering</h1>
+      <p>A model's behaviour is set by what's in its context window. Context engineering is the discipline of deciding — and budgeting — exactly what goes in there: instructions, examples, retrieved knowledge, tools, and memory.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">LLMs &amp; Generative AI</span>
+        <span class="pill">Prompting</span>
+        <span class="pill">LLM systems</span>
+      </div>
+    </header>
+
+    <section class="topic" id="overview">
+      <h3><span class="idx">01</span> Beyond prompt engineering</h3>
+      <p class="lede">Prompt engineering tweaks the wording of one instruction. Context engineering designs the whole information payload the model sees at inference.</p>
+      <ul class="notes">
+        <li>An LLM has no state between calls — <b>the context window is the entire interface</b>. Everything it "knows" for this turn is whatever you packed in. Weights supply general capability; context supplies the situation.</li>
+        <li>Because of <a href="large-language-models.html#incontext">in-context learning</a>, changing the context changes behaviour with <b>no retraining</b> — which is exactly why getting the context right is so high-leverage. A context change ships in seconds; a fine-tune ships in days.</li>
+        <li>It spans more than a prompt string: system instructions, few-shot examples, retrieved documents, tool definitions and results, conversation history, and scratchpad/memory. Most of those are <b>assembled by code at request time</b>, not typed by a human — which makes context a piece of software, with versions, tests and regressions.</li>
+        <li>The job is therefore closer to <b>information retrieval and caching</b> than to copywriting: select, order, compress, cache, and evaluate.</li>
+      </ul>
+      <div class="callout"><b>One sentence:</b> context engineering = assembling the right tokens, in the right order, within a finite budget, so the model can do the task.</div>
+    </section>
+
+    <section class="topic" id="window">
+      <h3><span class="idx">02</span> The context window is a budget</h3>
+      <p class="lede">Every component competes for a fixed number of tokens. Overspend and something gets truncated. Drag the controls and watch the budget fill.</p>
+
+      <div class="viz" id="viz-ctx">
+        <div class="vhead">
+          <span class="vtitle">Context window budget packer</span>
+          <span class="vhint">Components fill the window in order; past the capacity line, tokens are truncated</span>
+        </div>
+        <div class="controls">
+          <label>Window <input type="range" id="ctx-cap" min="1500" max="12000" step="500" value="4000"></label>
+          <label>Retrieved chunks <input type="range" id="ctx-docs" min="0" max="12" step="1" value="4"></label>
+          <label>History turns <input type="range" id="ctx-hist" min="0" max="24" step="1" value="6"></label>
+          <label>Few-shot <input type="range" id="ctx-few" min="0" max="6" step="1" value="2"></label>
+        </div>
+        <svg id="ctx-svg" width="640" height="240" viewBox="0 0 640 240" role="img" aria-label="Interactive diagram: Context window budget packer"></svg>
+        <div class="readout" aria-live="polite" id="ctx-read"></div>
+      </div>
+
+      <h4>Three currencies, not one</h4>
+      <p>The token count is only the visible cost. Behind it sit two others: <b>compute</b> and <b>KV-cache memory</b>. Prefill (reading the prompt) is quadratic in length because every token attends to every earlier one; decoding is linear per token but must hold the whole key/value cache in GPU memory, which grows linearly with context and is often the real limit on batch size.</p>
+      <div class="formula"><span class="lbl">what a long context actually costs</span><span class="eq">prefill compute ∝ n²</span>     <span class="eq">decode compute per token ∝ n</span>     <span class="eq">price ∝ n</span>
+<span class="lbl">kv-cache memory for n tokens</span><span class="eq">mem<sub>KV</sub> = 2 · L · n · h<sub>kv</sub> · d<sub>head</sub> · bytes</span>   <span class="eq">(2 = keys + values · L layers · h<sub>kv</sub> kv-heads)</span></div>
+      <ul class="notes">
+        <li><code>h_kv</code> is why grouped-query and multi-query attention exist: shrinking the number of KV heads shrinks the cache linearly, which is what makes long contexts servable at all.</li>
+        <li>Modern windows are large, but never free — long contexts cost more, run slower, and <b>dilute attention</b> across more candidates. The budget is real even at 200k tokens.</li>
+        <li>A useful discipline: give every component an explicit token allowance and a truncation rule, rather than letting whichever section is generated last silently overflow. See <a href="context-length-extension.html">Context-Length Extension</a> for how the window gets big in the first place.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> budget in tokens, but reason in three currencies — tokens billed, compute burned, and cache memory held. Only the first is on the invoice.</div>
+    </section>
+
+    <section class="topic" id="components">
+      <h3><span class="idx">03</span> What goes in the window</h3>
+      <p class="lede">The standard ingredients, roughly in priority order. Each one should be able to justify its tokens.</p>
+      <table class="cmp">
+        <tr><th>Component</th><th>Role</th><th>Volatility</th><th>Typical failure</th></tr>
+        <tr><td>System / instructions</td><td>Persona, task, rules, output format, guardrails</td><td>Stable — cache it</td><td>Bloats into contradictory rules nobody re-reads</td></tr>
+        <tr><td>Tool definitions</td><td>Schemas the model may call</td><td>Stable — cache it</td><td>Too many tools; overlapping descriptions</td></tr>
+        <tr><td>Few-shot examples</td><td>Demonstrate the pattern when instructions alone are ambiguous</td><td>Stable, or retrieved per query</td><td>Examples leak their specifics into the answer</td></tr>
+        <tr><td>Retrieved knowledge</td><td>Grounding facts pulled in via <a href="../nlp/retrieval-augmented-generation.html">RAG</a></td><td>Per query</td><td>Low-precision chunks crowd out the good ones</td></tr>
+        <tr><td>Memory / state</td><td>History, summaries, scratchpad, prior tool results</td><td>Grows every turn</td><td>Unbounded growth; stale facts never expire</td></tr>
+        <tr><td>User query</td><td>The actual request for this turn</td><td>Always fresh</td><td>Buried in the middle of everything else</td></tr>
+      </table>
+      <p>The <b>volatility</b> column is the one people forget. It determines cache-ability (<a href="#caching">§08</a>) and therefore most of your latency and cost, so it is worth designing the layout around it.</p>
+      <div class="callout">A useful frame: <b>instructions</b> say <i>how</i>, <b>examples</b> show <i>how</i>, <b>retrieval</b> supplies <i>what</i>, <b>tools</b> extend <i>what it can do</i>, <b>memory</b> supplies <i>state</i>. If a block doesn't answer one of those, cut it.</div>
+    </section>
+
+    <section class="topic" id="prompting">
+      <h3><span class="idx">04</span> Prompting techniques</h3>
+      <p class="lede">The classic levers that still live inside the context.</p>
+      <ul class="notes">
+        <li><b>Zero-shot vs few-shot:</b> describe the task, or include input→output examples and let the model infer the pattern. Examples win when the output format is idiosyncratic or the label boundary is hard to state in words; they lose when they are long enough to crowd out retrieval. Cover the <b>edge cases</b> and the label distribution, not just the easy middle.</li>
+        <li><b>Chain-of-thought:</b> ask for step-by-step reasoning to unlock multi-step tasks (see <a href="reasoning-in-llms.html">Reasoning in LLMs</a>). On reasoning-trained models this is often redundant — they already think — so explicit CoT instructions can just add latency.</li>
+        <li><b>Role &amp; format:</b> set a persona, and specify the exact output shape (schema, headings, field names) — constrain ambiguity before it becomes a parsing bug.</li>
+        <li><b>Delimiters &amp; structure:</b> fence sections (instructions / documents / query) with unambiguous markers so the model never confuses <i>data</i> for <i>commands</i>. Consistent tags also make the context diffable and testable — and are the first line of defence against prompt injection.</li>
+        <li><b>Positive over negative:</b> "answer only from the documents" beats "don't make things up." Rules stated as behaviours are easier to follow than rules stated as prohibitions.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> prompting is now a <i>component</i> of context engineering, not a rival to it. Wording matters least when the right facts are present and most when they aren't.</div>
+    </section>
+
+    <section class="topic" id="retrieval">
+      <h3><span class="idx">05</span> Bringing knowledge in</h3>
+      <p class="lede">Most of the "what" in the window is retrieved, not written by hand.</p>
+      <ul class="notes">
+        <li><a href="../nlp/retrieval-augmented-generation.html">RAG</a> is the workhorse: embed the query, search a vector store, drop the top chunks into the context — grounding the answer and sidestepping the knowledge cutoff.</li>
+        <li>Retrieval quality <i>is</i> context quality: bad chunks waste budget <i>and</i> mislead. A cheap first-stage retriever pulling ~50 candidates followed by a <b>cross-encoder re-ranker</b> that keeps 3–5 is the standard shape — it spends tokens only on what survives a second, sharper look.</li>
+        <li><b>Hybrid retrieval</b> (dense embeddings plus lexical/BM25) catches what pure vectors miss: exact identifiers, error codes, rare product names.</li>
+      </ul>
+      <h4>Chunking is a context decision</h4>
+      <ul class="notes">
+        <li>Chunk too small and each piece loses the context that makes it interpretable; too large and every hit drags in filler you pay for. Splitting on <b>structure</b> (headings, sections, function boundaries) beats splitting on a fixed character count.</li>
+        <li>Two patterns fix most of it: <b>overlap</b> between adjacent chunks so a fact spanning a boundary survives, and <b>retrieve small, expand large</b> — match on a precise sentence, then send its surrounding section to the model.</li>
+        <li>Always carry <b>provenance</b> (title, section, date, URL-free identifier) into the context. It lets the model cite, lets you debug, and lets conflicting sources be ranked by recency or authority.</li>
+        <li>Tool results — API calls, database queries, code execution — are another channel of fresh, grounded context fed back into the window, and need the same discipline: truncate, summarize, label.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> retrieval decides <i>what</i> is in the window and chunking decides <i>how legible</i> it is. Both are worth more tuning than the prompt wrapped around them.</div>
+    </section>
+
+    <section class="topic" id="memory">
+      <h3><span class="idx">06</span> Memory &amp; state</h3>
+      <p class="lede">Conversations and agent runs outgrow the window — so we compress, externalize, or drop.</p>
+      <h4>The three tiers</h4>
+      <ul class="notes">
+        <li><b>Short-term:</b> the last few turns kept verbatim. Cheap, exact, and where nearly all the relevant detail actually lives.</li>
+        <li><b>Compaction / summarization:</b> older history distilled into a running summary so it keeps informing the model without eating the budget. Trigger it on a threshold (say 70% of window), summarize the oldest span, and always keep the most recent turns raw — summarizing what just happened is where the worst information loss occurs.</li>
+        <li><b>Long-term:</b> facts written out to an external store and <i>retrieved</i> when relevant. Once memory is external, memory becomes a retrieval problem — with all the same questions of recall, precision, staleness and conflict.</li>
+      </ul>
+      <h4>Externalizing state</h4>
+      <ul class="notes">
+        <li>A <b>scratchpad</b> — a file, a to-do list, a structured plan the agent rewrites each turn — keeps state out of the transcript. It survives compaction, is cheap to re-read, and is inspectable by a human.</li>
+        <li>Prefer <b>pointers over payloads</b>: keep an identifier and one-line description of a large artefact in context, and fetch the body only when a step needs it.</li>
+        <li>Memory needs a <b>write policy</b> as much as a read policy — what gets promoted to durable memory, what expires, and what happens when a new fact contradicts an old one. Without expiry, long-lived memories quietly poison later runs.</li>
+        <li>This matters most for <a href="../agentic/agents.html">agents</a>, whose multi-step runs would otherwise blow the window in a few iterations.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the window is working memory, not storage. Anything that must survive belongs in a file, a database, or a summary you deliberately maintain.</div>
+    </section>
+
+    <section class="topic" id="ordering">
+      <h3><span class="idx">07</span> Ordering &amp; "lost in the middle"</h3>
+      <p class="lede">Where you put something in the window matters as much as whether it's there.</p>
+      <ul class="notes">
+        <li>Retrieval accuracy as a function of position is famously <b>U-shaped</b>: models use information at the <b>start and end</b> of a long context far more reliably than the same information buried in the middle. The effect persists in models whose windows are nominally long enough to hold everything.</li>
+        <li>So: put the most important instructions and the highest-relevance chunks <b>near the edges</b>. A common layout is stable instructions first, evidence in the middle ordered best-outward, and the actual question last.</li>
+        <li><b>Compress before you pad</b> — a tight, relevant context beats a long, noisy one. More tokens is not more signal; every extra distractor is another candidate attention has to discount.</li>
+        <li>Re-ranking plus putting top results at the edges is the cheapest reliability win in a RAG pipeline — no retraining, no new infrastructure.</li>
+        <li>Related failure: <b>context rot</b> — accuracy degrades gradually as a window fills, even below the nominal limit. Treat "fits in the window" as a necessary, not sufficient, condition. <a href="context-length-extension.html">Context-Length Extension</a> covers why usable length trails advertised length.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> a long window is a <i>capacity</i>, not a promise. Position is a free lever — use it before reaching for a bigger model.</div>
+    </section>
+
+    <section class="topic" id="caching">
+      <h3><span class="idx">08</span> Caching &amp; the cost of re-reading</h3>
+      <p class="lede">The same prefix is re-read on every turn. Caching its key/value tensors turns that quadratic re-read into a lookup.</p>
+      <h4>How prefix caching works</h4>
+      <ul class="notes">
+        <li>Prefill computes a key/value pair per token per layer. If the next request begins with the <b>byte-identical prefix</b>, those tensors are still valid and can be reused instead of recomputed — cached reads are dramatically cheaper and faster than fresh prefill, at the cost of a small premium to write the cache and a short time-to-live.</li>
+        <li>The rule that follows: order the context <b>stable → volatile</b>. System prompt, tool schemas and long reference documents go first; retrieved chunks next; the user's new turn last. One edited character early in the prompt invalidates everything after it.</li>
+        <li>This puts genuine tension on <a href="#ordering">§07</a>: recency wants the important thing last, caching wants the stable thing first. The usual resolution is to keep the bulk stable and cheap, and re-state the few critical instructions in a short block right before the question.</li>
+        <li>Rotating a timestamp, a session id, or a shuffled example order into the system prompt is the classic own-goal — it silently destroys every cache hit.</li>
+      </ul>
+      <div class="formula"><span class="lbl">why layout dominates cost in multi-turn use</span><span class="eq">cost<sub>uncached</sub> ≈ T · n<sub>prefix</sub></span>      <span class="eq">cost<sub>cached</sub> ≈ n<sub>prefix</sub> + T · n<sub>delta</sub></span>   <span class="eq">(T turns, n<sub>delta</sub> = new tokens per turn)</span></div>
+      <div class="callout"><b>Takeaway:</b> in a multi-turn or agentic loop, prompt layout is a performance decision. Sort by volatility and most of the bill disappears.</div>
+    </section>
+
+    <section class="topic" id="tools">
+      <h3><span class="idx">09</span> Tools, schemas &amp; the agent loop</h3>
+      <p class="lede">In an agent, the context is not written once — it is rewritten on every iteration of plan → act → observe.</p>
+      <h4>Tool definitions are prompt</h4>
+      <ul class="notes">
+        <li>A tool schema — name, description, typed parameters — occupies real tokens and is read as instructions. Names and descriptions do most of the routing work, so vague or overlapping descriptions cause tool-selection errors that look like reasoning failures.</li>
+        <li>Fewer, sharper tools beat many overlapping ones. When the set grows large, <b>retrieve the relevant tools</b> per query rather than shipping the whole catalogue every turn — the same selection problem as document retrieval. Packaging instructions, schemas and resources as loadable units is the idea behind <a href="../agentic/agent-skills.html">agent skills</a>.</li>
+        <li><b>Structured outputs</b> close the loop on the other side: constrained decoding against a schema masks invalid tokens at each step, so the result parses by construction. That converts a class of retry loops into a guarantee — and keeps tool results machine-readable when they are fed back in.</li>
+      </ul>
+      <h4>The loop is where context explodes</h4>
+      <ul class="notes">
+        <li>Every observation — a search result, a file, a stack trace — is appended, so context grows monotonically while the useful fraction shrinks. Truncate and summarize tool output <b>at the boundary</b>, before it enters the transcript.</li>
+        <li><b>Sub-agents</b> are a context tactic as much as an architecture: give a child a clean window and a narrow brief, and return only its conclusion to the parent. Isolation stops one noisy sub-task from polluting the whole run. See <a href="../agentic/agents.html">Agents</a> and <a href="../agentic/agentic-design-patterns.html">Agentic Design Patterns</a>.</li>
+        <li>Treat every tool result as <b>untrusted data</b>. Retrieved pages and API responses can carry instructions; fence them and never grant them the authority of the system block.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> in agent loops, context management <i>is</i> the control loop. What you choose to append, summarize or discard each turn determines whether the run converges or drowns.</div>
+    </section>
+
+    <section class="topic" id="evaluation">
+      <h3><span class="idx">10</span> Evaluating context strategies</h3>
+      <p class="lede">Context changes are code changes. They need a test suite, not a vibe check.</p>
+      <ul class="notes">
+        <li><b>Separate the two failure sources.</b> Score retrieval on its own (recall@k, precision, whether the answer-bearing chunk is present) before scoring the answer. If the fact never made it into the window, no prompt fix will help.</li>
+        <li><b>Fix the seed set.</b> A few hundred representative prompts with expected answers or rubric criteria, versioned alongside the context template, so any edit can be A/B'd. Grade with a rubric-based model judge plus spot checks — see <a href="llm-as-a-judge.html">LLM-as-a-Judge</a>.</li>
+        <li><b>Ablate.</b> Drop one component at a time — the few-shot block, the summary, the last three chunks — and measure. Components that don't move the score are pure cost.</li>
+        <li><b>Probe position.</b> Plant a needed fact at the start, middle and end of a filled window; the accuracy gap is your local "lost in the middle" curve and tells you where the good chunks belong.</li>
+        <li>Track cost and latency as first-class metrics next to quality, including cache-hit rate — most context wins are quality <i>per token</i>, not quality alone.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Technique</th><th>Token cost</th><th>Benefit</th><th>Reach for it when</th></tr>
+        <tr><td>Few-shot examples</td><td>Medium–high</td><td>Format and edge-case control</td><td>Output shape is idiosyncratic</td></tr>
+        <tr><td>Retrieval (RAG)</td><td>High</td><td>Grounding, freshness, citations</td><td>The answer depends on private or current facts</td></tr>
+        <tr><td>Re-ranking</td><td>Negative (fewer chunks)</td><td>Big precision win</td><td>Almost always, once you retrieve at all</td></tr>
+        <tr><td>Summarization / compaction</td><td>Negative, plus a call</td><td>Long sessions stay in budget</td><td>History exceeds its allowance</td></tr>
+        <tr><td>External memory</td><td>Low (pointers)</td><td>Unbounded state, survives compaction</td><td>Facts must persist across sessions</td></tr>
+        <tr><td>Prefix caching</td><td>None (layout only)</td><td>Large latency and cost cut</td><td>Stable prefix, many turns</td></tr>
+        <tr><td>Structured output</td><td>Low (schema)</td><td>Parses by construction</td><td>The output feeds code</td></tr>
+        <tr><td>Just use a longer window</td><td>Very high</td><td>Simplicity</td><td>Last resort — cost and dilution both scale</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> measure retrieval and generation separately, ablate every block, and price quality per token. Context work without evaluation is superstition.</div>
+    </section>
+
+    <section class="topic" id="failures">
+      <h3><span class="idx">11</span> Failure modes</h3>
+      <p class="lede">How well-meaning context goes wrong — and the standard fix for each.</p>
+      <table class="cmp">
+        <tr><th>Failure</th><th>What happens</th><th>Fix</th></tr>
+        <tr><td>Context overflow</td><td>Important tokens truncated to fit</td><td>Per-component budgets, compaction, fewer/better chunks</td></tr>
+        <tr><td>Lost in the middle</td><td>Key info ignored mid-context</td><td>Re-rank, place at edges, shorten</td></tr>
+        <tr><td>Distraction / noise</td><td>Irrelevant chunks pull the answer off</td><td>Tighter retrieval, re-ranking, higher score threshold</td></tr>
+        <tr><td>Conflicting context</td><td>Sources disagree; model picks wrong one</td><td>Deduplicate, prefer authoritative or recent, cite</td></tr>
+        <tr><td>Stale memory</td><td>An old summarized fact overrides a fresh one</td><td>Timestamp memories, expire them, prefer raw recent turns</td></tr>
+        <tr><td>Prompt injection</td><td>Retrieved or tool text hijacks instructions</td><td>Fence data, never trust it as commands, gate side effects</td></tr>
+        <tr><td>Cache thrash</td><td>A rotating token kills every cache hit</td><td>Sort stable → volatile; no timestamps in the prefix</td></tr>
+        <tr><td>Cost / latency</td><td>Huge contexts are slow and expensive</td><td>Compaction, caching, only-what's-needed</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> almost every one of these is a <i>selection</i> or <i>ordering</i> bug, not a model deficiency. Debug the payload before blaming the weights.</div>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">12</span> Pitfalls &amp; what to remember</h3>
+      <ul class="notes">
+        <li><b>The context window is the interface</b> — the model knows only what you pack in, and it's a finite budget in tokens, compute and KV memory.</li>
+        <li><b>Assemble, don't just prompt:</b> instructions + examples + retrieval + tools + memory, each earning its tokens and each independently ablatable.</li>
+        <li><b>Order matters</b> — edges over middle for attention, stable-before-volatile for caching. Reconcile the two deliberately.</li>
+        <li><b>Retrieval quality is context quality</b> — hybrid search, re-rank, chunk on structure, carry provenance.</li>
+        <li><b>Manage state</b> via compaction and external memory, with an explicit write-and-expire policy — especially for agents.</li>
+        <li><b>Longer is not better.</b> Dilution, cost and latency all scale with length; a bigger window is the last resort, not the first.</li>
+        <li><b>Evaluate it like code:</b> a fixed seed set, retrieval scored separately, ablations, and cost tracked next to quality.</li>
+      </ul>
+      <div class="callout"><b>Threads to pull:</b> builds on <a href="large-language-models.html">Large Language Models</a> and <a href="../nlp/retrieval-augmented-generation.html">RAG</a>; the window itself comes from <a href="context-length-extension.html">Context-Length Extension</a>; the loop that consumes it is <a href="../agentic/agents.html">Agents</a>; and grading it is <a href="llm-as-a-judge.html">LLM-as-a-Judge</a>.</div>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+(function(){
+  const C={accent:"#2dd4bf",a2:"#ffb454",good:"#4ade80",bad:"#f87171",ink:"#e6e9ef",muted:"#9aa3b2",line:"#2a2f3a"};
+  const svg=d3.select("#ctx-svg"),W=640,H=240;
+  const comps=[
+    {name:"System",       color:"#5b9cff", tok:()=>250},
+    {name:"Instructions", color:"#818cf8", tok:()=>200},
+    {name:"Few-shot",     color:"#c084fc", tok:()=> +d3.select("#ctx-few").property("value")*350},
+    {name:"Retrieved",    color:"#2dd4bf", tok:()=> +d3.select("#ctx-docs").property("value")*320},
+    {name:"History",      color:"#a3e635", tok:()=> +d3.select("#ctx-hist").property("value")*110},
+    {name:"Query",        color:"#ffb454", tok:()=>90},
+  ];
+  function draw(){
+    svg.selectAll("*").remove();
+    const cap=+d3.select("#ctx-cap").property("value");
+    const left=24, right=24, trackW=W-left-right, top=64, barH=46;
+    const scale=trackW/cap;
+    const segs=comps.map(c=>({name:c.name,color:c.color,tok:c.tok()}));
+    const total=d3.sum(segs,s=>s.tok);
+    // capacity track
+    svg.append("rect").attr("x",left).attr("y",top).attr("width",trackW).attr("height",barH).attr("rx",6).attr("fill","#11141b").attr("stroke",C.line);
+    // segments
+    let x=left;
+    segs.forEach(s=>{
+      const w=s.tok*scale; if(w<=0) return;
+      const drawW=Math.max(0,Math.min(x+w,left+trackW)-x);
+      if(drawW>0){
+        svg.append("rect").attr("x",x).attr("y",top).attr("width",drawW).attr("height",barH).attr("fill",s.color).attr("fill-opacity",.85).attr("stroke","#0f1117");
+        if(drawW>34) svg.append("text").attr("x",x+drawW/2).attr("y",top+barH/2+4).attr("text-anchor","middle").attr("font-size",10).attr("fill","#06101f").attr("font-weight",700).text(s.name);
+      }
+      x+=w;
+    });
+    // overflow region
+    if(x>left+trackW){
+      svg.append("rect").attr("x",left+trackW).attr("y",top).attr("width",Math.min(x,W-2)-(left+trackW)).attr("height",barH)
+        .attr("fill","rgba(248,113,113,.18)").attr("stroke",C.bad).attr("stroke-dasharray","3 3");
+    }
+    // capacity line
+    svg.append("line").attr("x1",left+trackW).attr("x2",left+trackW).attr("y1",top-10).attr("y2",top+barH+12).attr("stroke",C.bad).attr("stroke-width",1.5);
+    svg.append("text").attr("x",left+trackW).attr("y",top-15).attr("text-anchor","end").attr("fill",C.bad).attr("font-size",10).text("window limit");
+    // "edges vs middle" guide
+    svg.append("text").attr("x",left+6).attr("y",top+barH+26).attr("font-size",9.5).attr("fill",C.muted).text("◀ models attend most to the edges");
+    svg.append("text").attr("x",left+trackW-6).attr("y",top+barH+26).attr("text-anchor","end").attr("font-size",9.5).attr("fill",C.muted).text("edges ▶");
+    // legend with tokens
+    let lx=left, ly=H-26;
+    segs.forEach(s=>{
+      svg.append("rect").attr("x",lx).attr("y",ly-9).attr("width",10).attr("height",10).attr("rx",2).attr("fill",s.color);
+      const t=svg.append("text").attr("x",lx+15).attr("y",ly).attr("font-size",10).attr("fill",C.muted).text(`${s.name} ${s.tok}`);
+      lx += 15 + (s.name.length*6.2 + (""+s.tok).length*6.5 + 22);
+    });
+    const over=Math.max(0,total-cap);
+    const pct=Math.round(total/cap*100);
+    d3.select("#ctx-read").html(`used <b>${total.toLocaleString()}</b> / ${cap.toLocaleString()} tokens (<b>${pct}%</b>) ${over>0?`· <span style="color:#f87171">⚠ ${over.toLocaleString()} tokens truncated</span>`:"· ✓ fits"}`);
+  }
+  ["#ctx-cap","#ctx-docs","#ctx-hist","#ctx-few"].forEach(s=>d3.select(s).on("input",draw));
+  draw();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Vector Databases (HNSW)</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Vector Databases — HNSW Indexing</h1>
+      <p>How a vector database finds the nearest neighbors of a query <b>fast</b>. Brute force compares the query to every stored vector — O(N), hopeless at a billion vectors. <b>HNSW</b> (Hierarchical Navigable Small World) is the index most production systems use: a layered proximity graph that answers approximate nearest-neighbor queries in ~O(log N).</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Engineering</span>
+        <span class="pill">Vector Search</span>
+        <span class="pill">ANN</span>
+        <span class="pill">Indexing</span>
+      </div>
+    </header>
+
+    <section class="topic" id="problem">
+      <h3><span class="idx">01</span> The problem: approximate nearest neighbors</h3>
+      <p class="lede">Semantic search turns text/images into <a href="../nlp/embeddings.html">embedding</a> vectors where similarity = geometric proximity. The query is "find the k vectors closest to this one."</p>
+      <ul class="notes">
+        <li><b>Brute force (flat):</b> compute the distance to all N vectors → <b>O(N)</b> per query. At 1M vectors × top-5 that's 5M distance computations; at a billion it's a non-starter.</li>
+        <li><b>The relaxation:</b> accept <b>approximate</b> answers (ANN). Trading a tiny bit of <b>recall</b> for orders-of-magnitude speed is almost always worth it — hence the "A" in ANN.</li>
+        <li>HNSW does this in <b>~O(log N)</b> by walking a graph instead of scanning a list. It's the engine inside FAISS, pgvector, Qdrant, Weaviate, Milvus, and powers <a href="../nlp/retrieval-augmented-generation.html">RAG</a> retrieval.</li>
+      </ul>
+      <div class="callout"><b>One line:</b> HNSW = a <b>skip-list of graphs</b> — sparse upper layers let you teleport near the answer, dense lower layers refine it — searched greedily from the top down.</div>
+    </section>
+
+    <section class="topic" id="twoideas">
+      <h3><span class="idx">02</span> Two ideas, combined</h3>
+      <table class="cmp">
+        <tr><th>Idea</th><th>What it gives HNSW</th></tr>
+        <tr><td><b>Skip lists</b> (hierarchy)</td><td>Multiple graph layers stacked on each other. The top is sparsest, each layer down is denser. You descend coarse→fine, like express then local trains.</td></tr>
+        <tr><td><b>Navigable Small World</b> graphs</td><td>Any node is reachable from any other in a few "hops." Each vector links to its nearest neighbors per layer — enough connectivity to navigate, without connecting everything to everything.</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Layer assignment is probabilistic:</b> a node's top layer is drawn so the probability of reaching level ℓ <b>decays exponentially</b> — most nodes live only on the base layer, a few reach high. That's what makes the upper layers sparse.</li>
+      </ul>
+      <div class="formula"><span class="eq">level = ⌊ −ln(uniform(0,1)) · m_L ⌋</span>        <span class="eq">P(node reaches layer ℓ) ∝ e^(−ℓ / m_L)</span></div>
+    </section>
+
+    <section class="topic" id="search">
+      <h3><span class="idx">03</span> Searching: greedy descent through the layers</h3>
+      <p class="lede">Start at a fixed entry point on the <b>top</b> layer; greedily hop to whichever neighbor is closest to the query; when you can't get closer, <b>drop down a layer</b> and repeat. The base layer returns the answer. Step through it:</p>
+
+      <div class="viz" id="viz-hnsw">
+        <div class="vhead">
+          <span class="vtitle">HNSW layered greedy search</span>
+          <span class="vhint">▶ step the search from the top layer down</span>
+        </div>
+        <div class="controls">
+          <button type="button" id="hn-step">▶ step</button>
+          <button type="button" id="hn-auto">⏩ play</button>
+          <button type="button" id="hn-reset">⟲ reset</button>
+          <label>query x <input type="range" id="hn-qx" min="10" max="92" step="1" value="76"></label>
+        </div>
+        <svg id="hn-svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="Interactive diagram: HNSW layered greedy search"></svg>
+        <div class="readout" aria-live="polite" id="hn-read"></div>
+      </div>
+
+      <ul class="notes">
+        <li>At each layer the search keeps a dynamic candidate pool of size <b>ef</b> (efSearch): it tracks the ef closest nodes found so far, expanding their neighbors until none get closer.</li>
+        <li>Bigger <b>ef</b> explores more of the graph → higher recall, slower query. It's the main accuracy↔latency knob at query time.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="construction">
+      <h3><span class="idx">04</span> Building the index (insertion)</h3>
+      <ul class="notes">
+        <li><b>1. Pick a level</b> for the new vector from the exponential distribution above.</li>
+        <li><b>2. Find entry:</b> greedy-search from the top down to the new node's top level to locate good entry points (just like query search).</li>
+        <li><b>3. Connect:</b> from that level down to layer 0, link the new node to its <b>M</b> nearest neighbors on each layer (using Euclidean or cosine distance). A neighbor-selection heuristic keeps links diverse, not just nearest.</li>
+        <li><b>4. Prune:</b> if connecting pushes an existing node over its max degree, drop its weakest links to preserve the small-world property.</li>
+        <li>Construction explores with its own, usually larger, pool <b>efConstruction</b> — higher = better-quality graph, slower build.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="params">
+      <h3><span class="idx">05</span> The knobs</h3>
+      <table class="cmp">
+        <tr><th>Parameter</th><th>Controls</th><th>Bigger →</th></tr>
+        <tr><td><b>M</b></td><td>Links per node per layer (graph degree)</td><td>Better recall &amp; connectivity, more memory, slower build</td></tr>
+        <tr><td><b>efConstruction</b></td><td>Candidate pool while building</td><td>Higher-quality index, slower build (one-time cost)</td></tr>
+        <tr><td><b>efSearch (ef)</b></td><td>Candidate pool while querying</td><td>Higher recall, slower query — tune per request</td></tr>
+        <tr><td><b>m_L</b></td><td>Layer-assignment multiplier</td><td>More layers / taller hierarchy</td></tr>
+      </table>
+      <p class="lede">efSearch is the live recall↔latency dial. Drag it:</p>
+      <div class="viz" id="viz-ef">
+        <div class="vhead">
+          <span class="vtitle">efSearch: recall vs latency</span>
+          <span class="vhint">the approximate-search trade-off</span>
+        </div>
+        <div class="controls">
+          <label>efSearch <input type="range" id="ef-v" min="8" max="400" step="2" value="64"></label>
+        </div>
+        <svg id="ef-svg" width="640" height="200" viewBox="0 0 640 200" role="img" aria-label="Interactive diagram: efSearch: recall vs latency"></svg>
+        <div class="readout" aria-live="polite" id="ef-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="complexity">
+      <h3><span class="idx">06</span> Complexity &amp; trade-offs</h3>
+      <table class="cmp">
+        <tr><th></th><th>Cost</th></tr>
+        <tr><td>Query</td><td><b>~O(log N)</b> — layer-by-layer navigation</td></tr>
+        <tr><td>Build</td><td><b>~O(N log N)</b> — each insert is a search</td></tr>
+        <tr><td>Memory</td><td><b>O(N · M)</b> — the graph stores M links per node on top of the vectors</td></tr>
+      </table>
+      <ul class="notes">
+        <li>The three-way tension is <b>recall ↔ query speed ↔ memory</b>. M and ef trade recall for speed/RAM; HNSW is fast and high-recall but <b>memory-hungry</b> and slow to rebuild/delete.</li>
+        <li>Vectors are often <a href="../mlops/model-acceleration.html">quantized</a> (e.g. product quantization) to shrink the memory footprint.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="alternatives">
+      <h3><span class="idx">07</span> HNSW vs other ANN indexes</h3>
+      <table class="cmp">
+        <tr><th>Index</th><th>Idea</th><th>Trade-off</th></tr>
+        <tr><td><b>Flat</b> (brute force)</td><td>Compare to every vector</td><td>Exact, simple; O(N) — fine only for small N</td></tr>
+        <tr><td><b>IVF</b> (inverted file)</td><td>Cluster vectors; search only the nearest few clusters</td><td>Less memory, fast; recall depends on #probes; needs training</td></tr>
+        <tr><td><b>HNSW</b> (graph)</td><td>Navigable small-world graph, hierarchical</td><td>Top recall &amp; speed; high memory, costly updates</td></tr>
+        <tr><td><b>IVF + PQ</b></td><td>Clusters + compressed vectors</td><td>Tiny memory at scale; lower recall</td></tr>
+      </table>
+      <p>HNSW is the default when recall and latency matter and you can afford the RAM; IVF/PQ wins when memory is the constraint at billion-scale.</p>
+    </section>
+
+    <section class="topic" id="code">
+      <h3><span class="idx">08</span> In code (FAISS)</h3>
+      <div class="formula"><span class="eq">import faiss, numpy as np</span>
+<span class="eq">d, M = 128, 32</span>                      <span class="eq"># vector dim, links per node</span>
+<span class="eq">index = faiss.IndexHNSWFlat(d, M)</span>   <span class="eq"># HNSW over flat (uncompressed) vectors</span>
+<span class="eq">index.hnsw.efConstruction = 200</span>     <span class="eq"># build-time pool</span>
+<span class="eq">index.add(vectors)</span>                  <span class="eq"># vectors: (N, d) float32 — builds the graph</span>
+
+<span class="eq">index.hnsw.efSearch = 64</span>            <span class="eq"># query-time pool (recall vs speed)</span>
+<span class="eq">D, I = index.search(query, k=5)</span>     <span class="eq"># → distances D, neighbor indices I</span></div>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">09</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>HNSW = hierarchy (skip list) + navigable small-world graph.</b> Sparse top layers teleport you near the target; dense base layer refines.</li>
+        <li><b>Search</b> is greedy descent: hop to the closest neighbor, drop a layer when stuck; <b>~O(log N)</b> instead of O(N).</li>
+        <li><b>Tune</b> with M (degree), efConstruction (build quality), efSearch (live recall↔latency).</li>
+        <li><b>Cost:</b> excellent recall/speed, but memory-hungry and awkward to update — quantize to shrink it.</li>
+        <li>The retrieval layer under <a href="../nlp/embeddings.html">Embeddings</a> + <a href="../nlp/retrieval-augmented-generation.html">RAG</a>; the approximate cousin of exact <a href="../machine-learning/k-nearest-neighbors.html">k-Nearest Neighbors</a>.</li>
+      </ul>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+/* ---- Viz 1: HNSW layered greedy search ---- */
+(function(){
+  const C={accent:"#22d3ee",node:"#5b9cff",good:"#4ade80",bad:"#f87171",q:"#ffb454",muted:"#9aa3b2",ink:"#e6e9ef",edge:"#2a2f3a"};
+  const svg=d3.select("#hn-svg"),W=640,H=360;
+  // base positions in a 0-100 space (deterministic)
+  const P=[
+    [12,30],[26,62],[20,16],[38,40],[33,78],[48,22],[52,58],[60,84],
+    [66,34],[74,66],[80,20],[86,50],[92,80],[58,12]
+  ].map((p,i)=>({id:i,x:p[0],y:p[1]}));
+  // layer membership (subset chain): L0=all, L1 subset, L2 subset of L1
+  const LYR=[ P.map(p=>p.id), [0,3,6,9,11,2], [0,9] ];   // index 0 = base
+  const ENTRY=0;                                         // top-layer entry node
+  const M=[3,2,2];                                       // links per node per layer (base..top)
+  function dist(a,b){const dx=a.x-b.x,dy=a.y-b.y;return Math.hypot(dx,dy);}
+  // build kNN edges per layer
+  function edgesFor(ids,m){
+    const ns=ids.map(i=>P[i]); const E=new Map(ids.map(i=>[i,[]]));
+    ns.forEach(a=>{
+      const near=ns.filter(b=>b.id!==a.id).sort((u,v)=>dist(a,u)-dist(a,v)).slice(0,m);
+      near.forEach(b=>{ if(!E.get(a.id).includes(b.id)) E.get(a.id).push(b.id);
+                        if(!E.get(b.id).includes(a.id)) E.get(b.id).push(a.id); });
+    });
+    return E;
+  }
+  const EDGE=LYR.map((ids,l)=>edgesFor(ids,M[l]));
+  // greedy search within a layer from `start` toward q; returns path of node ids
+  function greedy(l,start,q){
+    let cur=start, path=[cur], improved=true, guard=0;
+    while(improved && guard++<50){ improved=false; let best=cur,bd=dist(P[cur],q);
+      (EDGE[l].get(cur)||[]).forEach(nb=>{ const d=dist(P[nb],q); if(d<bd-1e-9){bd=d;best=nb;improved=true;} });
+      if(improved){cur=best;path.push(cur);} }
+    return path;
+  }
+  // full multi-layer plan → ordered steps [{layer, node, drop?}]
+  function plan(q){
+    const steps=[]; let entry=ENTRY;
+    for(let l=LYR.length-1;l>=0;l--){
+      const pth=greedy(l,entry,q);
+      pth.forEach((n,i)=>steps.push({layer:l,node:n,first:i===0}));
+      entry=pth[pth.length-1];           // descend at the local-best node
+      if(l>0) steps.push({layer:l,node:entry,drop:true});
+    }
+    return {steps, answer:entry};
+  }
+  // geometry: three stacked panels (top layer drawn highest)
+  const px=70,pw=520, ph=88, gap=14, top=14;
+  function panelY(l){ return top + (LYR.length-1-l)*(ph+gap); }   // l=2 at top
+  const X=x=>px + x/100*pw;
+  const Y=(l,y)=>panelY(l) + 10 + y/100*(ph-20);
+  let cur, PLAN, qx=76;
+  function q(){ return {x:qx, y:46}; }
+  function rebuild(){ PLAN=plan(q()); cur=0; draw(); }
+  function draw(){
+    svg.selectAll("*").remove();
+    const visited=new Set(PLAN.steps.slice(0,cur+1).filter(s=>!s.drop).map(s=>s.layer+":"+s.node));
+    const pathPts=[];
+    for(let l=LYR.length-1;l>=0;l--){
+      const py=panelY(l);
+      // panel
+      svg.append("rect").attr("x",px-18).attr("y",py).attr("width",pw+36).attr("height",ph).attr("rx",9)
+        .attr("fill", l===0?"rgba(34,211,238,.04)":"#0e1016").attr("stroke","#222833");
+      svg.append("text").attr("x",px-12).attr("y",py+15).attr("fill",C.muted).attr("font-size",10)
+        .text("layer "+l+(l===LYR.length-1?"  (entry · sparsest)":l===0?"  (base · densest)":""));
+      // edges
+      const ids=LYR[l];
+      ids.forEach(i=>{ (EDGE[l].get(i)||[]).forEach(j=>{ if(i<j){
+        svg.append("line").attr("x1",X(P[i].x)).attr("y1",Y(l,P[i].y)).attr("x2",X(P[j].x)).attr("y2",Y(l,P[j].y))
+          .attr("stroke",C.edge).attr("stroke-width",1); }});});
+      // query marker (projected into this panel)
+      svg.append("line").attr("x1",X(q().x)).attr("y1",py+6).attr("x2",X(q().x)).attr("y2",py+ph-6).attr("stroke",C.q).attr("stroke-dasharray","2 4").attr("stroke-opacity",.5);
+      // nodes
+      ids.forEach(i=>{ const on=visited.has(l+":"+i), p=P[i];
+        svg.append("circle").attr("cx",X(p.x)).attr("cy",Y(l,p.y)).attr("r",on?6:4.2)
+          .attr("fill",on?C.good:C.node).attr("fill-opacity",on?1:0.65).attr("stroke",on?"#0e1016":"none").attr("stroke-width",1.5); });
+    }
+    // draw the traversed path (within + across layers) up to cur
+    const seq=PLAN.steps.slice(0,cur+1);
+    let prev=null;
+    seq.forEach(s=>{ const p=P[s.node], pt=[X(p.x),Y(s.layer,p.y)];
+      if(prev){ svg.append("line").attr("x1",prev[0]).attr("y1",prev[1]).attr("x2",pt[0]).attr("y2",pt[1])
+        .attr("stroke",s.drop?C.accent:C.good).attr("stroke-width",2.2).attr("stroke-dasharray",s.drop?"4 3":null)
+        .attr("marker-end",null); }
+      prev=pt; });
+    // current node pulse
+    const c=PLAN.steps[cur]; if(c){ const p=P[c.node];
+      svg.append("circle").attr("cx",X(p.x)).attr("cy",Y(c.layer,p.y)).attr("r",9).attr("fill","none").attr("stroke",C.accent).attr("stroke-width",2); }
+    // answer marker when done
+    const done = cur>=PLAN.steps.length-1;
+    if(done){ const p=P[PLAN.answer]; const py=panelY(0);
+      svg.append("circle").attr("cx",X(p.x)).attr("cy",Y(0,p.y)).attr("r",8).attr("fill",C.good);
+      svg.append("text").attr("x",X(p.x)).attr("y",py+ph+ -2).attr("text-anchor","middle").attr("fill",C.good).attr("font-size",9).text("nearest ✓"); }
+    const s=PLAN.steps[cur];
+    const msg = s.drop ? `drop to layer ${s.layer-1} at the local-best node`
+      : s.first ? `layer ${s.layer}: enter at the entry point`
+      : `layer ${s.layer}: hop to a closer neighbor`;
+    d3.select("#hn-read").html(done
+      ? `<span style="color:${C.good}">▶</span> Reached the nearest neighbor in <b>${PLAN.steps.filter(x=>!x.drop).length} hops</b> across ${LYR.length} layers — vs scanning all ${P.length} vectors.`
+      : `<span style="color:${C.accent}">▶</span> ${msg} &nbsp;<span style="color:${C.muted}">(step ${cur+1}/${PLAN.steps.length})</span>`);
+  }
+  let timer=null;
+  function step(){ if(cur<PLAN.steps.length-1){cur++;draw();} else if(timer){clearInterval(timer);timer=null;} }
+  d3.select("#hn-step").on("click",()=>{ if(timer){clearInterval(timer);timer=null;} step(); });
+  d3.select("#hn-auto").on("click",()=>{ if(timer){clearInterval(timer);timer=null;return;} timer=setInterval(step,700); });
+  d3.select("#hn-reset").on("click",()=>{ if(timer){clearInterval(timer);timer=null;} cur=0; draw(); });
+  d3.select("#hn-qx").on("input",function(){ if(timer){clearInterval(timer);timer=null;} qx=+this.value; rebuild(); });
+  rebuild();
+})();
+
+/* ---- Viz 2: efSearch recall vs latency ---- */
+(function(){
+  const C={accent:"#22d3ee",good:"#4ade80",bad:"#f87171",muted:"#9aa3b2",ink:"#e6e9ef"};
+  const svg=d3.select("#ef-svg"),W=640,H=200;
+  const px=50,py=22,pw=W-150,ph=150, efmin=8,efmax=400;
+  const X=e=>px+(e-efmin)/(efmax-efmin)*pw;
+  // recall saturates with ef; latency grows ~linearly
+  const recall=e=>1-0.55*Math.exp(-e/55);          // → ~1.0
+  const latency=e=>0.12+e/efmax*0.95;               // normalized 0..~1
+  function draw(){
+    svg.selectAll("*").remove();
+    const e=+d3.select("#ef-v").property("value");
+    svg.append("line").attr("x1",px).attr("y1",py+ph).attr("x2",px+pw).attr("y2",py+ph).attr("stroke","#3a4150");
+    svg.append("text").attr("x",px+pw/2).attr("y",py+ph+18).attr("text-anchor","middle").attr("fill",C.muted).attr("font-size",10).text("efSearch →");
+    const es=d3.range(efmin,efmax+1,4);
+    const Yr=v=>py+ph-v*ph, Yl=v=>py+ph-Math.min(v,1)*ph;
+    svg.append("path").attr("d",d3.line().x(X).y(d=>Yr(recall(d)))(es)).attr("fill","none").attr("stroke",C.good).attr("stroke-width",2.4);
+    svg.append("path").attr("d",d3.line().x(X).y(d=>Yl(latency(d)))(es)).attr("fill","none").attr("stroke",C.bad).attr("stroke-width",2.4).attr("stroke-dasharray","5 3");
+    svg.append("text").attr("x",px+pw+8).attr("y",Yr(recall(efmax))+4).attr("fill",C.good).attr("font-size",10).text("recall");
+    svg.append("text").attr("x",px+pw+8).attr("y",Yl(latency(efmax))+4).attr("fill",C.bad).attr("font-size",10).text("latency");
+    svg.append("line").attr("x1",X(e)).attr("y1",py).attr("x2",X(e)).attr("y2",py+ph).attr("stroke",C.accent).attr("stroke-dasharray","3 3");
+    svg.append("circle").attr("cx",X(e)).attr("cy",Yr(recall(e))).attr("r",4.5).attr("fill",C.good);
+    svg.append("circle").attr("cx",X(e)).attr("cy",Yl(latency(e))).attr("r",4.5).attr("fill",C.bad);
+    d3.select("#ef-read").html(`efSearch <b>${e}</b> → recall <b style="color:${C.good}">${(recall(e)*100).toFixed(1)}%</b> · relative latency <b style="color:${C.bad}">${(latency(e)).toFixed(2)}×</b> — past the knee, recall barely moves but latency keeps climbing.`);
+  }
+  d3.select("#ef-v").on("input",draw);
+  draw();
+})();
+</script>
+</body>
+</html>

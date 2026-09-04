@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Neural Network Training</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Neural Network Training</h1>
+      <p>An architecture is only a hypothesis. <b>Training</b> is the procedure that turns it into a model: a forward pass produces a loss, backpropagation produces gradients, an optimizer nudges the weights, and the whole thing repeats for millions of steps. Almost everything that goes wrong in deep learning goes wrong <i>here</i> — in the learning rate, the initialization, the normalization, or the numerics. This page is the field manual for that loop.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Deep Learning</span>
+        <span class="pill">Optimization</span>
+        <span class="pill">Fundamentals</span>
+        <span class="pill">Recipes</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="overview" data-nav="The training loop">
+      <h3><span class="idx">01</span> The training loop</h3>
+      <p class="lede">Four stages, repeated. Everything else on this page is a modification to one of them.</p>
+      <div class="formula"><span class="eq">forward → loss → backward (gradients) → optimizer step → repeat</span></div>
+      <ul class="notes">
+        <li><b>Forward.</b> Push a mini-batch of inputs through the network, caching the intermediate activations that the backward pass will need.</li>
+        <li><b>Loss.</b> Reduce the batch's predictions and targets to one scalar. That scalar is the only thing the optimizer can see — if it does not encode what you care about, nothing downstream can fix it.</li>
+        <li><b>Backward.</b> Backpropagation computes <code>∂L/∂θ</code> for every parameter in a single reverse sweep.</li>
+        <li><b>Update.</b> The optimizer converts the gradient into a step, using its own state (momentum buffers, second-moment estimates), and writes new weights.</li>
+      </ul>
+      <div class="formula"><span class="lbl">empirical risk on a mini-batch B</span><span class="eq">L(θ) = (1/|B|) ∑<sub>i ∈ B</sub> ℓ( f<sub>θ</sub>(xᵢ), yᵢ )</span>
+<span class="lbl">one optimization step</span><span class="eq">gₜ = ∇<sub>θ</sub> L(θₜ₋₁)</span>        <span class="eq">θₜ = θₜ₋₁ − η · u(gₜ, state)</span></div>
+      <h4>Vocabulary that people get wrong</h4>
+      <ul class="notes">
+        <li>A <b>step</b> (or iteration) is one optimizer update, i.e. one mini-batch. An <b>epoch</b> is one full pass over the training set. Large-scale runs are budgeted in <i>steps</i> or <i>tokens</i>, not epochs.</li>
+        <li>The <b>training state</b> is more than the weights: optimizer buffers, the learning-rate schedule position, the data-loader position and RNG seeds all have to be checkpointed for a run to resume identically.</li>
+        <li>The gradient of a mini-batch is an unbiased but <b>noisy</b> estimate of the full-dataset gradient. That noise is not purely a nuisance — it is part of why SGD generalizes.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the loop is trivial; the difficulty is that every stage has a scale. Get the scale of the loss, the gradients, the step size or the numerics wrong and the loop still runs — it just learns nothing.</div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="loss" data-nav="Loss functions">
+      <h3><span class="idx">02</span> Loss functions</h3>
+      <p class="lede">The loss defines what "good" means. Pick it from the <b>geometry of the output</b>: a real number, a probability over classes, a set of independent labels, or a position in an embedding space.</p>
+      <table class="cmp">
+        <tr><th>Task</th><th>Loss</th><th>Form</th><th>Pairs with</th></tr>
+        <tr><td>Regression</td><td>MSE</td><td>mean (ŷ − y)²</td><td>linear output</td></tr>
+        <tr><td>Robust regression</td><td>Huber / MAE</td><td>quadratic near 0, linear far away</td><td>linear output, outliers present</td></tr>
+        <tr><td>Multi-class</td><td>Cross-entropy</td><td>−∑<sub>k</sub> y<sub>k</sub> log ŷ<sub>k</sub></td><td>softmax over logits</td></tr>
+        <tr><td>Multi-label</td><td>Binary cross-entropy</td><td>−∑<sub>k</sub> [y<sub>k</sub> log ŷ<sub>k</sub> + (1−y<sub>k</sub>) log(1−ŷ<sub>k</sub>)]</td><td>independent sigmoids</td></tr>
+        <tr><td>Class imbalance</td><td>Focal / weighted CE</td><td>down-weights easy examples</td><td>softmax or sigmoid</td></tr>
+        <tr><td>Embeddings, retrieval</td><td>Contrastive / triplet / InfoNCE</td><td>pull positives together, push negatives apart</td><td>normalized embeddings</td></tr>
+        <tr><td>Unaligned sequences</td><td>CTC</td><td>sums over all valid alignments</td><td>per-frame softmax</td></tr>
+      </table>
+      <h4>Why cross-entropy trains so cleanly</h4>
+      <ul class="notes">
+        <li>Compose softmax with cross-entropy and the gradient with respect to the <b>logits</b> collapses to <code>ŷ − y</code>: the error signal is simply "how much probability mass sat in the wrong place". No saturating derivative multiplies it away, which is exactly the failure mode of MSE-on-sigmoid.</li>
+        <li>Always compute it from logits, never from probabilities. Libraries fuse the log and the softmax through the <b>log-sum-exp</b> trick, subtracting the max logit before exponentiating so that large logits cannot overflow.</li>
+      </ul>
+      <div class="formula"><span class="lbl">softmax + cross-entropy, gradient w.r.t. logits z</span><span class="eq">ŷ<sub>k</sub> = e^{z<sub>k</sub>} / ∑<sub>j</sub> e^{z<sub>j</sub>}</span>        <span class="eq">∂L/∂z = ŷ − y</span>
+<span class="lbl">numerically safe log-sum-exp</span><span class="eq">log ∑<sub>j</sub> e^{z<sub>j</sub>} = m + log ∑<sub>j</sub> e^{z<sub>j</sub> − m},   m = max<sub>j</sub> z<sub>j</sub></span></div>
+      <div class="callout"><b>Takeaway:</b> the loss is the only channel through which your intent reaches the optimizer. If the metric you report and the loss you minimize disagree (accuracy vs cross-entropy, BLEU vs token likelihood), expect the model to optimize the loss and disappoint you on the metric.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="backprop" data-nav="Backpropagation">
+      <h3><span class="idx">03</span> Backpropagation</h3>
+      <p class="lede">Backprop is the chain rule scheduled in the cheapest possible order: one reverse sweep that hands every parameter its gradient.</p>
+      <div class="formula"><span class="lbl">per-layer gradients (δ = error signal at a layer)</span><span class="eq">δ<sup>L</sup> = ∇<sub>a</sub>L ⊙ σ′(z<sup>L</sup>)</span>        <span class="eq">δ<sup>ℓ</sup> = (W<sup>ℓ+1</sup>)ᵀ δ<sup>ℓ+1</sup> ⊙ σ′(z<sup>ℓ</sup>)</span>
+<span class="eq">∂L/∂W<sup>ℓ</sup> = δ<sup>ℓ</sup> (a<sup>ℓ−1</sup>)ᵀ</span>        <span class="eq">∂L/∂b<sup>ℓ</sup> = δ<sup>ℓ</sup></span></div>
+      <h4>Why reverse mode, and what it costs</h4>
+      <ul class="notes">
+        <li>Automatic differentiation can traverse the computation graph forwards or backwards. <b>Forward mode</b> costs one sweep per <i>input</i> dimension; <b>reverse mode</b> costs one sweep per <i>output</i> dimension. A loss has exactly one output and millions of parameters, so reverse mode wins by a factor of millions.</li>
+        <li>The backward pass costs roughly <b>2× the forward pass</b> in FLOPs, so a training step is about 3× an inference pass — the standard rule of thumb behind compute estimates.</li>
+        <li>Each layer contributes a <b>vector-Jacobian product</b>: you never build the Jacobian, you only multiply by it. That is why backprop is memory-heavy but not compute-catastrophic.</li>
+      </ul>
+      <h4>The memory bill</h4>
+      <ul class="notes">
+        <li>Every activation needed by a backward rule must be kept alive from the forward pass. Activation memory scales with <code>batch × depth × width</code> and usually dwarfs the parameter memory in large models.</li>
+        <li><b>Activation checkpointing</b> stores only a sparse set of activations and recomputes the rest during the backward pass — roughly <code>√n</code> memory for ~30% extra compute.</li>
+        <li>Frameworks build the graph automatically, but <code>detach</code>, in-place operations and non-differentiable ops silently cut it. A gradient that is <code>None</code> or zero is almost always a severed graph, not a maths problem.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> backprop is exact and cheap; what it is <i>not</i> is free of memory. Most "out of memory" failures are activation storage, and the first lever is batch size, the second is checkpointing.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="gd" data-nav="Landscape & learning rate">
+      <h3><span class="idx">04</span> The loss landscape and the learning rate</h3>
+      <p class="lede">Training is descent on a surface in millions of dimensions. The learning rate decides how big a step you take on it — and it is the single most consequential number in the run.</p>
+
+      <div class="viz" id="viz-nnt">
+        <div class="vhead">
+          <span class="vtitle">Gradient descent on a loss surface</span>
+          <span class="vhint">x ← x − lr · ∇loss · raise the learning rate until it overshoots</span>
+        </div>
+        <div class="controls">
+          <label>learning rate <input type="range" id="nnt-lr" min="0.1" max="6" step="0.1" value="1"></label>
+          <button class="btn" id="nnt-step">Step ▸</button>
+          <button class="btn ghost" id="nnt-reset">Reset</button>
+        </div>
+        <svg id="nnt-svg" width="640" height="280" viewBox="0 0 640 280" role="img" aria-label="Interactive diagram: Gradient descent on a loss surface"></svg>
+        <div class="readout" aria-live="polite" id="nnt-read"></div>
+      </div>
+
+      <h4>What the surface is actually like</h4>
+      <ul class="notes">
+        <li>In high dimensions, <b>local minima are rarely the obstacle</b> — a critical point is a minimum only if all curvature directions are positive, which becomes vanishingly unlikely. <b>Saddle points</b> and long, flat plateaus dominate, and momentum is what carries you off them.</li>
+        <li>The landscape is <b>ill-conditioned</b>: curvature varies wildly across directions. The largest stable step for gradient descent on a quadratic is <code>η &lt; 2/λ<sub>max</sub></code>, while progress along the flattest direction goes as <code>λ<sub>min</sub></code>. The ratio <code>λ<sub>max</sub>/λ<sub>min</sub></code> is why plain SGD zig-zags.</li>
+        <li>Deep networks have enormous <b>symmetry</b> — permute units, rescale a ReLU layer up and the next one down — so minima come in connected valleys, not isolated points.</li>
+        <li>Flat minima tend to generalize better than sharp ones, and small batches with a healthy learning rate bias the search towards them. See <a href="../math/optimization.html">Optimization</a> for the underlying theory.</li>
+      </ul>
+      <div class="formula"><span class="lbl">stability bound on a quadratic with curvature λ</span><span class="eq">θₜ₊₁ = θₜ − η λ θₜ = (1 − ηλ) θₜ</span>   converges iff   <span class="eq">0 &lt; η &lt; 2/λ</span></div>
+      <div class="callout"><b>Takeaway:</b> tune the learning rate before you tune anything else. A 3× change in <code>η</code> moves the loss curve more than a redesigned architecture will.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="optimizers" data-nav="Optimizers">
+      <h3><span class="idx">05</span> Optimizers: SGD, momentum, Adam, AdamW</h3>
+      <p class="lede">An optimizer is a rule for turning a noisy gradient into a step. All the popular ones add <b>memory of past gradients</b> — the differences are what they remember and how they use it.</p>
+
+      <h4>SGD and momentum</h4>
+      <ul class="notes">
+        <li>Plain SGD steps straight down the mini-batch gradient. It is unbiased, cheap in memory, and slow in ravines: it oscillates across the steep direction while creeping along the flat one.</li>
+        <li><b>Momentum</b> keeps an exponentially decayed running average of gradients. Consistent directions accumulate (an effective speed-up of about <code>1/(1−μ)</code>, ≈10× at <code>μ = 0.9</code>), while oscillating directions cancel.</li>
+        <li><b>Nesterov</b> evaluates the gradient after the momentum jump, giving a slightly better-damped correction.</li>
+      </ul>
+      <div class="formula"><span class="lbl">SGD with momentum</span><span class="eq">vₜ = μ vₜ₋₁ + gₜ</span>        <span class="eq">θₜ = θₜ₋₁ − η vₜ</span>   (typical μ = 0.9)</div>
+
+      <h4>Adam and the decoupled-decay fix</h4>
+      <ul class="notes">
+        <li><b>Adam</b> tracks a first moment (direction) and a second moment (per-parameter gradient scale), then divides one by the square root of the other. Parameters with small, rare gradients — embeddings, layer-norm gains — get large effective steps; noisy ones get small steps.</li>
+        <li>The bias correction matters: both moments start at zero, so early estimates are shrunk towards zero and must be divided by <code>1 − βᵗ</code>. Without it the first few hundred steps take wildly wrong-sized steps.</li>
+        <li><b>L2 penalty ≠ weight decay under Adam.</b> Adding <code>λθ</code> to the gradient sends it through the same <code>1/√v̂</code> division, so parameters with large gradients get <i>less</i> decay — the opposite of the intent. <b>AdamW</b> applies the decay directly to the weights, outside the adaptive rescaling, and is the default for transformers.</li>
+      </ul>
+      <div class="formula"><span class="lbl">Adam</span><span class="eq">mₜ = β₁ mₜ₋₁ + (1 − β₁) gₜ</span>        <span class="eq">vₜ = β₂ vₜ₋₁ + (1 − β₂) gₜ²</span>
+<span class="eq">m̂ₜ = mₜ / (1 − β₁ᵗ)</span>        <span class="eq">v̂ₜ = vₜ / (1 − β₂ᵗ)</span>        <span class="eq">θₜ = θₜ₋₁ − η · m̂ₜ / (√v̂ₜ + ε)</span>
+<span class="lbl">AdamW — decay decoupled from the adaptive term</span><span class="eq">θₜ = θₜ₋₁ − η ( m̂ₜ / (√v̂ₜ + ε) + λ θₜ₋₁ )</span>
+<span class="lbl">defaults</span><span class="eq">β₁ = 0.9,  β₂ = 0.999 (0.95 for large language models),  ε = 10⁻⁸</span></div>
+
+      <h4>Gradient clipping</h4>
+      <ul class="notes">
+        <li>Rare batches produce enormous gradients — a duplicated document, a degenerate sample, an unlucky attention pattern. One such step can undo thousands of good ones.</li>
+        <li><b>Global-norm clipping</b> rescales the whole gradient vector when its norm exceeds a threshold <code>c</code>, preserving direction and only shrinking magnitude. Clip by global norm, not per-tensor, or you distort the relative scale between layers.</li>
+        <li>Typical thresholds are <code>c = 1.0</code> for transformers and <code>0.25–5</code> for recurrent models. Log the <i>pre-clip</i> norm: a rising baseline is an early warning of divergence.</li>
+      </ul>
+      <div class="formula"><span class="lbl">clip by global norm</span><span class="eq">g ← g · min(1, c / ‖g‖₂)</span></div>
+      <table class="cmp">
+        <tr><th>Optimizer</th><th>State per parameter</th><th>Strength</th><th>Where it is the default</th></tr>
+        <tr><td>SGD</td><td>0</td><td>Cheapest; strong final generalization</td><td>Rarely alone</td></tr>
+        <tr><td>SGD + momentum</td><td>1 buffer</td><td>Best-tuned accuracy on convnets</td><td>Vision backbones</td></tr>
+        <tr><td>Adam</td><td>2 buffers</td><td>Robust to bad LR guesses, handles sparse gradients</td><td>Quick baselines, RL</td></tr>
+        <tr><td>AdamW</td><td>2 buffers</td><td>Adam plus regularization that actually works</td><td>Transformers, LLMs</td></tr>
+        <tr><td>Adafactor / 8-bit Adam</td><td>&lt; 2 buffers</td><td>Factored or quantized state to save memory</td><td>Very large models</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> AdamW is the safe default and the only sane choice for transformers; SGD with momentum, well tuned and well scheduled, still edges it out on convnets. Optimizer state costs memory — Adam doubles it, which matters at scale (<a href="distributed-training.html">Distributed Training</a>).</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="schedules" data-nav="LR schedules">
+      <h3><span class="idx">06</span> Learning-rate schedules and finding the LR</h3>
+      <p class="lede">A constant learning rate is almost never right. You want a large step while the loss surface is coarse, and a small one while you settle into a basin — plus a gentle start so the optimizer's own statistics can warm up.</p>
+
+      <p>Pick a schedule and drag the step position; the readout gives the current rate and the rule that produced it.</p>
+      <div class="viz" id="viz-sched">
+        <div class="vhead">
+          <span class="vtitle">Learning-rate schedules over a 1000-step run</span>
+          <span class="vhint">warmup fraction · schedule shape · where you are in the run</span>
+        </div>
+        <div class="controls">
+          <label>Schedule
+            <select id="sched-kind">
+              <option value="cosine">Warmup + cosine decay</option>
+              <option value="onecycle">One-cycle (triangular)</option>
+              <option value="step">Step decay</option>
+              <option value="invsqrt">Inverse square root</option>
+              <option value="constant">Constant</option>
+            </select>
+          </label>
+          <label>warmup % <input type="range" id="sched-warm" min="0" max="40" step="1" value="6"> <span id="sched-wval">6</span></label>
+          <label>step <input type="range" id="sched-t" min="1" max="1000" step="1" value="1"></label>
+        </div>
+        <svg id="sched-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Interactive diagram: learning-rate schedules including warmup, cosine decay, one-cycle, step decay and inverse square root"></svg>
+        <div class="readout" aria-live="polite" id="sched-read"></div>
+      </div>
+
+      <h4>Warmup, decay, and the shapes that matter</h4>
+      <ul class="notes">
+        <li><b>Warmup</b> ramps the rate from near zero over the first few hundred to few thousand steps. Early on, Adam's second-moment estimate is built from a handful of samples and its variance is huge; a full-size step taken on that estimate is what blows up deep transformers in the first minutes of training.</li>
+        <li><b>Cosine decay</b> anneals smoothly to (nearly) zero over the planned run length. It has no milestones to tune and is the standard for large models — but it commits you to a horizon, since stopping early leaves the rate high.</li>
+        <li><b>Step decay</b> cuts the rate by 10× at fixed milestones. Simple, still competitive on convnets, and the source of the characteristic staircase in loss curves.</li>
+        <li><b>One-cycle</b> ramps up to a peak well above the "safe" rate, then back down, often with momentum moving in the opposite direction. The high-rate phase acts as a regularizer and can cut training time substantially.</li>
+        <li><b>Inverse square root</b> decays as <code>1/√t</code> after warmup and is horizon-free, which is why it suits runs of unknown length.</li>
+      </ul>
+      <div class="formula"><span class="lbl">linear warmup then cosine, over T steps with T<sub>w</sub> warmup</span><span class="eq">ηₜ = η<sub>max</sub> · t / T<sub>w</sub>                                for t ≤ T<sub>w</sub></span>
+<span class="eq">ηₜ = η<sub>min</sub> + ½ (η<sub>max</sub> − η<sub>min</sub>) (1 + cos(π · (t − T<sub>w</sub>)/(T − T<sub>w</sub>)))   for t &gt; T<sub>w</sub></span>
+<span class="lbl">inverse square root</span><span class="eq">ηₜ = η<sub>max</sub> · √( T<sub>w</sub> / max(t, T<sub>w</sub>) )</span></div>
+
+      <h4>Finding the peak rate</h4>
+      <ul class="notes">
+        <li>The <b>range test</b>: run a few hundred steps while multiplying the learning rate exponentially each step, and plot loss against rate. The loss falls, bottoms out, then explodes. Pick roughly an order of magnitude below the explosion — often near the steepest descent point, not the minimum.</li>
+        <li>Sanity ranges: <code>1e-3</code> to <code>3e-4</code> for AdamW on transformers (smaller as models get bigger), <code>0.1</code> for SGD+momentum on convnets with batch 256, and <code>1e-5</code> to <code>5e-5</code> when <a href="fine-tuning-transfer-learning.html">fine-tuning</a> a pretrained model.</li>
+        <li>Never tune the learning rate against a schedule you will not use at full length — a rate that survives 200 steps of warmup may still diverge at step 5000.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> warm up, then decay to near zero by the end of the planned budget. If the loss spikes in the first thousand steps, lengthen warmup before lowering the peak rate.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="batching" data-nav="Batch size, memory, precision">
+      <h3><span class="idx">07</span> Batch size, memory, and mixed precision</h3>
+      <p class="lede">Batch size is a statistics knob disguised as a systems knob. It sets both the gradient's noise level and the hardware's utilization, and the two pull in opposite directions.</p>
+
+      <h4>What batch size actually changes</h4>
+      <ul class="notes">
+        <li>The gradient's standard error falls as <code>1/√|B|</code>. Doubling the batch halves the noise only by <code>√2</code>, but doubles the compute per step — so there are diminishing returns, and beyond a <b>critical batch size</b> you buy almost nothing.</li>
+        <li>Small batches inject gradient noise that behaves like a regularizer and biases the search towards flatter minima; very large batches often need extra regularization or longer training to match the same accuracy.</li>
+        <li>The <b>linear scaling rule</b>: when you multiply the batch size by <code>k</code>, multiply the learning rate by <code>k</code> too, so the total distance travelled per example stays constant. It holds well for SGD across a wide range and needs a warmup to survive the first steps. For Adam, a <code>√k</code> scaling is usually the better guess.</li>
+      </ul>
+      <div class="formula"><span class="lbl">gradient noise vs batch size</span><span class="eq">Var[ ĝ ] = σ² / |B|</span>        <span class="eq">SE[ ĝ ] ∝ 1/√|B|</span>
+<span class="lbl">linear scaling rule</span><span class="eq">|B| → k·|B|  ⟹  η → k·η   (with warmup)</span></div>
+
+      <h4>Fitting it in memory</h4>
+      <ul class="notes">
+        <li><b>Gradient accumulation</b> sums gradients over several micro-batches before stepping, reproducing a large batch on small hardware. Remember to divide by the number of micro-batches, or your effective learning rate silently multiplies.</li>
+        <li><b>Padding and packing.</b> Variable-length sequences are padded to a common length with an attention mask, which wastes compute proportional to the padding; <b>packing</b> concatenates short examples into one full-length sequence (with a segment mask) and can nearly double throughput on skewed length distributions.</li>
+        <li><b>Bucketing</b> by length before batching keeps padding waste low without changing the model at all.</li>
+      </ul>
+
+      <h4>Mixed precision and loss scaling</h4>
+      <ul class="notes">
+        <li>Store and compute in 16-bit (<code>fp16</code> or <code>bf16</code>) for matrix multiplies, keep a 32-bit <b>master copy</b> of the weights and accumulate in 32-bit. Roughly 2× throughput and half the activation memory, with no accuracy loss when done correctly.</li>
+        <li><code>fp16</code> has ~10 bits of mantissa and a narrow exponent range: small gradients <b>underflow to zero</b>. The fix is <b>loss scaling</b> — multiply the loss by a large constant <code>S</code> so gradients land in representable range, then divide the gradients by <code>S</code> before the optimizer step. Dynamic loss scaling raises <code>S</code> while steps are finite and halves it on any overflow.</li>
+        <li><code>bf16</code> has the same exponent range as <code>fp32</code> and needs no loss scaling; it trades mantissa bits for range, which is the right trade for gradients. It is the default on hardware that supports it.</li>
+        <li>Keep reductions — softmax, layer norm, loss accumulation — in 32-bit regardless. That is where precision actually bites.</li>
+      </ul>
+      <div class="formula"><span class="lbl">loss scaling (fp16)</span><span class="eq">L′ = S · L  ⟹  g′ = S · g</span>        <span class="eq">step on  g = g′ / S,  skip the step if any g′ is Inf or NaN</span></div>
+      <div class="callout"><b>Takeaway:</b> choose the largest batch that fits and keeps the accelerator busy, then set the learning rate <i>relative</i> to it. Never compare two runs with different batch sizes at the same learning rate — you changed two things.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="init" data-nav="Initialization">
+      <h3><span class="idx">08</span> Weight initialization</h3>
+      <p class="lede">Initialization decides whether the first forward pass produces usable numbers at all. The goal is simple: keep the <b>variance of activations and of gradients roughly constant across depth</b>.</p>
+
+      <h4>The variance argument</h4>
+      <ul class="notes">
+        <li>For a linear layer with <code>n<sub>in</sub></code> inputs and independent zero-mean weights, <code>Var(y) = n<sub>in</sub> · Var(w) · Var(x)</code>. If <code>n<sub>in</sub>·Var(w) &gt; 1</code>, activation magnitude grows geometrically with depth and saturates or overflows; if it is <code>&lt; 1</code>, the signal decays to nothing and so does the gradient.</li>
+        <li><b>Xavier/Glorot</b> compromises between the forward and backward conditions using both fan-in and fan-out — designed for symmetric, roughly linear-at-the-origin activations like tanh.</li>
+        <li><b>He/Kaiming</b> doubles the variance because ReLU zeroes half its inputs and therefore halves the variance passing through. Use it whenever the activation is ReLU-like.</li>
+      </ul>
+      <div class="formula"><span class="lbl">Xavier / Glorot (tanh, sigmoid)</span><span class="eq">Var(w) = 2 / (n<sub>in</sub> + n<sub>out</sub>)</span>        <span class="eq">uniform:  w ~ U[ −√(6/(n<sub>in</sub>+n<sub>out</sub>)),  +√(6/(n<sub>in</sub>+n<sub>out</sub>)) ]</span>
+<span class="lbl">He / Kaiming (ReLU, GELU)</span><span class="eq">Var(w) = 2 / n<sub>in</sub></span>        <span class="eq">normal:  w ~ N(0, √(2/n<sub>in</sub>))</span></div>
+
+      <h4>Practical rules</h4>
+      <ul class="notes">
+        <li><b>Biases start at zero</b> — there is no symmetry to break once the weights are random. The exception is an output bias set to the base rate of the data (for example <code>log(p/(1−p))</code> on an imbalanced binary task), which removes the pointless first phase where the model just learns the prior.</li>
+        <li><b>Zero-init the last layer of each residual branch</b> so every block starts as the identity. Deep residual stacks then begin with unit-scale signal end to end and train stably without heavy warmup.</li>
+        <li>Transformers commonly scale the residual-projection initialization by <code>1/√(2N)</code> for <code>N</code> layers, so that the variance added by <code>N</code> residual branches stays bounded.</li>
+        <li>Never initialize all weights to the same value: identical units receive identical gradients forever and the layer collapses to one unit.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> good initialization is not a small optimization — it is the difference between a network that trains and one that emits NaN on step 3. Normalization layers make you less sensitive to it, but they do not make you immune.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="activations" data-nav="Activations">
+      <h3><span class="idx">09</span> Activation functions</h3>
+      <p class="lede">Without a non-linearity, a stack of linear layers collapses to a single linear map — depth buys nothing. The activation is what makes depth mean something, and its <b>derivative</b> is what decides whether gradients survive it.</p>
+      <ul class="notes">
+        <li><b>ReLU</b> <code>max(0, x)</code> — derivative is exactly 1 on the positive side, so it never attenuates gradient there. Cheap, sparse, and the reason very deep networks became trainable. Its failure mode is the <b>dead unit</b>: a large negative bias pushes a unit below zero for every input, its gradient is permanently zero, and it never recovers.</li>
+        <li><b>Leaky ReLU / PReLU / ELU</b> keep a small slope (or a smooth exponential tail) on the negative side, so dead units can come back. Mostly a fix looking for a problem once you use a sane learning rate.</li>
+        <li><b>Sigmoid and tanh</b> saturate at both ends, where the derivative goes to zero. Stacking them multiplies small numbers and is the classic vanishing-gradient story. They survive where a bounded output is the point: gates in <a href="rnns-lstms.html">LSTMs</a>, probability outputs, attention masks.</li>
+        <li><b>GELU and SiLU/Swish</b> are smooth and non-monotonic near the origin, weighting the input by (roughly) how far above zero it is. They cost a little more and are the standard inside transformer feed-forward blocks.</li>
+        <li><b>Gated variants (GLU, SwiGLU)</b> split the projection in two and multiply one half through a sigmoid or SiLU gate. Modern LLM feed-forward blocks use these, sizing the hidden dimension down by ⅔ to keep the parameter count fixed.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the common activations</span><span class="eq">ReLU(x) = max(0, x)</span>        <span class="eq">SiLU(x) = x · σ(x)</span>        <span class="eq">GELU(x) = x · Φ(x) ≈ x · σ(1.702 x)</span>
+<span class="lbl">gated feed-forward</span><span class="eq">SwiGLU(x) = ( SiLU(x W₁) ⊙ (x W₂) ) W₃</span></div>
+      <div class="callout"><b>Takeaway:</b> ReLU for convnets, GELU/SiLU (or a gated variant) for transformers, saturating functions only where you need a bounded value. If a large fraction of a layer's units output zero for <i>every</i> batch, you have dead units and your learning rate was too high.</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="norm" data-nav="Normalization">
+      <h3><span class="idx">10</span> Normalization layers</h3>
+      <p class="lede">Normalization re-centres and re-scales activations mid-network so that each layer sees a stable input distribution. It buys larger learning rates, faster convergence, and much less sensitivity to initialization.</p>
+
+      <h4>The three formulations</h4>
+      <ul class="notes">
+        <li><b>BatchNorm</b> standardizes each <i>channel</i> using statistics over the batch (and spatial positions). It works beautifully on convnets and adds a mild regularizing noise — but the statistics depend on the batch, so tiny or heterogeneous batches break it, and it needs a separate inference path using running averages. That train/eval divergence is a perennial source of bugs.</li>
+        <li><b>LayerNorm</b> standardizes across the <i>feature</i> dimension of each example independently. Batch-independent, identical at train and eval time, and therefore the choice for sequence models, transformers and anything with batch size 1.</li>
+        <li><b>RMSNorm</b> drops the mean subtraction and rescales by the root-mean-square alone. Cheaper, one fewer reduction, empirically as good in large transformers — now the default in most modern LLMs.</li>
+        <li><b>GroupNorm</b> splits channels into groups and normalizes within each — batch-independent like LayerNorm, but keeps the per-channel structure convnets want. The usual swap for detection and segmentation, where batches are small.</li>
+      </ul>
+      <div class="formula"><span class="lbl">BatchNorm — statistics over (N, H, W) per channel</span><span class="eq">x̂ = (x − μ<sub>B</sub>) / √(σ<sub>B</sub>² + ε)</span>        <span class="eq">y = γ x̂ + β</span>
+<span class="lbl">LayerNorm — statistics over the feature axis, per example</span><span class="eq">μ = (1/d) ∑<sub>i</sub> xᵢ</span>   <span class="eq">σ² = (1/d) ∑<sub>i</sub> (xᵢ − μ)²</span>   <span class="eq">y = γ (x − μ)/√(σ² + ε) + β</span>
+<span class="lbl">RMSNorm — scale only, no centring</span><span class="eq">y = γ · x / √( (1/d) ∑<sub>i</sub> xᵢ² + ε )</span></div>
+
+      <h4>Placement matters</h4>
+      <ul class="notes">
+        <li><b>Post-norm</b> (normalize after the residual add) was the original transformer design and needs careful warmup — the residual stream is renormalized every block, so gradients to early layers are attenuated.</li>
+        <li><b>Pre-norm</b> (normalize the branch input, leave the residual stream untouched) gives gradients a clean identity path from the loss to the first layer and trains deep stacks with far less tuning. It is what essentially every modern large model uses.</li>
+        <li>Omit the conv/linear bias immediately before a normalization layer — it is cancelled by the mean subtraction and only wastes parameters.</li>
+        <li>Exclude normalization gains and biases from weight decay. Decaying <code>γ</code> towards zero throttles the layer for no benefit.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Norm</th><th>Statistics over</th><th>Batch-dependent?</th><th>Use it for</th></tr>
+        <tr><td>BatchNorm</td><td>Batch × spatial, per channel</td><td>Yes (running stats at eval)</td><td>Convnets with decent batch sizes</td></tr>
+        <tr><td>LayerNorm</td><td>Feature axis, per example</td><td>No</td><td>Transformers, RNNs, small batches</td></tr>
+        <tr><td>RMSNorm</td><td>Feature axis (scale only)</td><td>No</td><td>Large language models</td></tr>
+        <tr><td>GroupNorm</td><td>Channel groups × spatial</td><td>No</td><td>Detection, segmentation, batch ≤ 8</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> if the batch dimension is reliable, BatchNorm; if it is not, LayerNorm, RMSNorm or GroupNorm. And prefer pre-norm placement unless you have a reason not to.</div>
+    </section>
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="reg" data-nav="Regularization">
+      <h3><span class="idx">11</span> Regularization, early stopping, checkpointing</h3>
+      <p class="lede">Regularization is everything you do to stop the network memorizing the training set. In deep learning it is less about shrinking capacity than about <b>adding noise and constraints</b> during training.</p>
+
+      <h4>The main levers</h4>
+      <ul class="notes">
+        <li><b>Dropout</b> zeroes each activation independently with probability <code>p</code> during training and scales the survivors by <code>1/(1−p)</code>, so the expected activation is unchanged and inference needs no adjustment. It prevents units from co-adapting and approximates an ensemble over sub-networks. Large pretrained transformers often use <code>p = 0</code> because the data itself is the regularizer.</li>
+        <li><b>Weight decay</b> pulls weights towards zero every step. Under SGD it is equivalent to an L2 penalty; under Adam it is <i>not</i>, which is why you want the decoupled AdamW form. Typical values: <code>0.01–0.1</code> for AdamW on transformers, <code>1e-4</code> for SGD on convnets. Exclude biases and normalization parameters.</li>
+        <li><b>Label smoothing</b> replaces the one-hot target with a slightly softened distribution. It caps the logit gap the model chases, improves calibration and stops the network becoming over-confident on noisy labels; <code>α = 0.1</code> is the standard.</li>
+        <li><b>Data augmentation</b> is usually the strongest regularizer available, because it adds real information about the invariances you want. Crops, flips, colour jitter, mixup and cutmix in vision; span masking and noise in text.</li>
+        <li><b>Stochastic depth</b> randomly drops whole residual branches, and <b>weight averaging</b> (an exponential moving average of the weights, or averaging late checkpoints) buys a free accuracy bump by landing in a flatter part of the basin.</li>
+      </ul>
+      <div class="formula"><span class="lbl">inverted dropout (training)</span><span class="eq">y = (m ⊙ x) / (1 − p),   mᵢ ~ Bernoulli(1 − p)</span>
+<span class="lbl">label smoothing over K classes</span><span class="eq">y′<sub>k</sub> = (1 − α)·y<sub>k</sub> + α/K</span>
+<span class="lbl">decoupled weight decay</span><span class="eq">θ ← (1 − ηλ)·θ − η · (adaptive step)</span></div>
+
+      <h4>Early stopping and checkpointing</h4>
+      <ul class="notes">
+        <li><b>Early stopping</b> monitors validation loss and halts once it has failed to improve for a patience window. It is regularization by <i>time</i>: the model never gets the epochs it would need to memorize.</li>
+        <li>Always keep the <b>best</b> checkpoint by validation metric, not the last — validation loss frequently rises while accuracy is still climbing, so decide up front which quantity you are selecting on.</li>
+        <li>Checkpoint the full training state (weights, optimizer buffers, schedule step, data position, RNG) so a preempted run resumes rather than restarts. Save periodically by step count, and keep a rolling window plus the best.</li>
+        <li>See <a href="../machine-learning/regularization.html">Regularization</a> for the statistical framing and <a href="../machine-learning/bias-variance-tradeoff.html">Bias–Variance</a> for why any of it helps.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> add regularization only after you have confirmed the model <i>can</i> overfit. Regularizing an underfitting model is the most common way to waste a week.</div>
+    </section>
+
+    <!-- 12 ───────────────────────────────────────────── -->
+    <section class="topic" id="debug" data-nav="Debugging recipes">
+      <h3><span class="idx">12</span> Debugging a training run</h3>
+      <p class="lede">Training failures are not mysterious; they are a small set of recurring causes. Work through them in order and instrument the run so the evidence is already there when something breaks.</p>
+
+      <h4>The four checks, in order</h4>
+      <ul class="notes">
+        <li><b>Check the initial loss.</b> Before any training, a <code>K</code>-class classifier should report <code>ln K</code> (≈2.30 for 10 classes, ≈6.91 for 1000). A different starting value means your labels, your reduction or your output layer is wrong — not your optimizer.</li>
+        <li><b>Overfit one batch.</b> Take 8–32 examples, turn off augmentation, dropout and weight decay, and train until the loss reaches ~0. If it cannot, the bug is in the model, the loss or the data pipeline; no hyperparameter will save you. This single test catches most wiring errors.</li>
+        <li><b>Log gradient norms per layer.</b> A healthy run has update-to-weight ratios <code>‖Δθ‖/‖θ‖</code> around <code>10⁻³</code>. Orders of magnitude smaller means the layer is frozen or the signal is vanishing; orders larger means the step is too big.</li>
+        <li><b>Watch activation statistics.</b> Track the fraction of zero activations per layer (dead ReLUs) and the mean/variance drift through depth. Both diagnose initialization and normalization problems that the loss curve hides.</li>
+      </ul>
+      <div class="formula"><span class="lbl">sanity check at initialization</span><span class="eq">L₀ ≈ ln K   for uniform predictions over K classes</span>
+<span class="lbl">healthy update ratio</span><span class="eq">‖ η · Δθ ‖ / ‖ θ ‖  ≈ 10⁻³</span></div>
+
+      <h4>Symptoms → causes → fixes</h4>
+      <table class="cmp">
+        <tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr>
+        <tr><td>Loss is NaN or Inf</td><td>Exploding gradients; log(0); fp16 overflow; bad input values</td><td>Clip global norm; use log-sum-exp / stable losses; switch to bf16 or dynamic loss scaling; assert on input ranges</td></tr>
+        <tr><td>Loss flat from step 0</td><td>Learning rate ~0; frozen parameters; severed graph; labels shuffled relative to inputs</td><td>Print the LR actually used; check <code>requires_grad</code>; run the overfit-one-batch test</td></tr>
+        <tr><td>Loss spikes then recovers</td><td>Bad batch, or LR above the stability edge</td><td>Lengthen warmup, clip gradients, inspect the offending batch</td></tr>
+        <tr><td>Loss decreases then diverges</td><td>LR too high for the sharpening landscape; no decay schedule</td><td>Add cosine/step decay; lower peak LR by 3×</td></tr>
+        <tr><td>Train loss ↓, val loss ↑</td><td>Overfitting</td><td>More data or augmentation, dropout, weight decay, early stopping, smaller model</td></tr>
+        <tr><td>Both losses high and flat</td><td>Underfitting: too small, too regularized, too few steps</td><td>Bigger model, longer schedule, less weight decay, higher LR</td></tr>
+        <tr><td>Val loss much worse than test-time behaviour</td><td>Train/eval mismatch: dropout or BatchNorm mode, different preprocessing</td><td>Confirm eval mode is set; align normalization statistics both sides</td></tr>
+        <tr><td>Many units always zero</td><td>Dead ReLUs from too-large steps</td><td>Lower LR, He init, add normalization, or use GELU/leaky variants</td></tr>
+        <tr><td>Results change between runs</td><td>Unseeded RNG, non-deterministic kernels, data-loader ordering</td><td>Seed everything and report a mean over seeds rather than a best run</td></tr>
+        <tr><td>Suspiciously perfect validation</td><td>Leakage: duplicates across splits, or normalization fitted on all data</td><td>Deduplicate and split by group/time; fit preprocessing on train only</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> instrument first, guess second. Loss curves, per-layer gradient norms, learning rate and activation sparsity, logged every run, turn most debugging sessions into a ten-second glance at a chart.</div>
+    </section>
+
+    <!-- 13 ───────────────────────────────────────────── -->
+    <section class="topic" id="takeaways" data-nav="Pitfalls · what to remember">
+      <h3><span class="idx">13</span> Pitfalls and what to remember</h3>
+      <ul class="notes">
+        <li><b>The loop is four lines; the scales are everything.</b> Forward → loss → backward → step, over mini-batches, with an optimizer that carries state between steps.</li>
+        <li><b>Backprop is exact and cheap in compute, expensive in memory.</b> Activation storage, not FLOPs, is what usually decides your batch size.</li>
+        <li><b>Learning rate first, always.</b> Find the peak with a range test, warm up into it, decay to near zero by the end of the budget. If you change batch size, rescale the learning rate with it.</li>
+        <li><b>AdamW for transformers, SGD+momentum for convnets</b>, and exclude biases and norm parameters from weight decay in both.</li>
+        <li><b>Init and normalization keep signal alive through depth.</b> He init for ReLU-like activations, zero-init the last layer of residual branches, pre-norm placement, and a batch-independent norm whenever batches are small.</li>
+        <li><b>Clip gradients, prefer bf16, and keep reductions in fp32.</b> These three lines prevent most numerical blow-ups.</li>
+        <li><b>Regularize only after you can overfit.</b> Augmentation is usually stronger than any explicit penalty.</li>
+        <li><b>Common own-goals:</b> forgetting eval mode, forgetting to zero gradients, averaging accumulated micro-batches incorrectly, tuning on the test set, and comparing runs that differ in two things at once.</li>
+        <li>Everything here scales up through <a href="distributed-training.html">Distributed Training</a>, shrinks down through <a href="fine-tuning-transfer-learning.html">Fine-Tuning &amp; Transfer Learning</a>, and rests on the theory in <a href="../math/optimization.html">Optimization</a>.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> a training run is an experiment. Change one thing, log everything, keep the seed fixed, and let the curves — not intuition — tell you which stage of the loop is broken.</div>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+/* ───────────────────────── 04 · gradient descent on a 1-D loss ───────────────────────── */
+(function(){
+  const C={accent:"#f87171",a2:"#ffb454",good:"#4ade80",bad:"#f87171",ink:"#e6e9ef",muted:"#9aa3b2",line:"#2a2f3a"};
+  const svg=d3.select("#nnt-svg"),W=640,H=280;
+  const a=0.18,c=1.2, f=x=>a*(x-c)*(x-c)+0.4, grad=x=>2*a*(x-c);
+  const xmin=-6,xmax=9, px=40,py=24,pw=W-80,ph=210;
+  const X=v=>px+(v-xmin)/(xmax-xmin)*pw, Xc=v=>Math.max(px-12,Math.min(px+pw+12,X(v)));
+  const ymax=Math.max(f(xmin),f(xmax)), Y=v=>py+ph-(Math.min(v,ymax)/ymax)*ph;
+  let x=7, traj=[7];
+  function draw(){
+    svg.selectAll("*").remove();
+    const xs=d3.range(xmin,xmax+0.01,0.1);
+    svg.append("path").attr("d",d3.line().x(d=>X(d)).y(d=>Y(f(d)))(xs)).attr("fill","none").attr("stroke","#3a4150").attr("stroke-width",2);
+    svg.append("circle").attr("cx",X(c)).attr("cy",Y(f(c))).attr("r",3).attr("fill",C.good);
+    svg.append("text").attr("x",X(c)).attr("y",Y(f(c))+18).attr("text-anchor","middle").attr("fill",C.good).attr("font-size",9).text("min");
+    traj.forEach((tx,i)=>svg.append("circle").attr("cx",Xc(tx)).attr("cy",Y(f(tx))).attr("r",3).attr("fill",C.a2).attr("opacity",0.25+0.7*i/Math.max(traj.length,1)));
+    svg.append("circle").attr("cx",Xc(x)).attr("cy",Y(f(x))).attr("r",7).attr("fill",C.accent).attr("stroke","#0f1117").attr("stroke-width",1.5);
+    svg.append("text").attr("x",px).attr("y",16).attr("fill",C.muted).attr("font-size",11).text("loss surface (1-D)");
+    const lr=+d3.select("#nnt-lr").property("value");
+    const div=Math.abs(x)>25, conv=Math.abs(grad(x))<0.02;
+    d3.select("#nnt-read").html(`lr <b>${lr.toFixed(1)}</b> · x = <b>${x.toFixed(2)}</b> · loss = <b>${(div?'∞':f(x).toFixed(3))}</b> ${div?'<span style="color:#f87171">— diverging! lr too high</span>':conv?'<span style="color:#4ade80">— converged ✓</span>':''}`);
+  }
+  d3.select("#nnt-step").on("click",()=>{ const lr=+d3.select("#nnt-lr").property("value"); x=x-lr*grad(x); traj.push(x); if(traj.length>40)traj.shift(); draw(); });
+  d3.select("#nnt-reset").on("click",()=>{ x=7; traj=[7]; draw(); });
+  d3.select("#nnt-lr").on("input",draw);
+  draw();
+})();
+
+/* ───────────────────────── 06 · learning-rate schedule explorer ───────────────────────── */
+(function(){
+  const svg=d3.select("#sched-svg"), W=640, H=250;
+  const m={t:26,r:24,b:36,l:58}, iw=W-m.l-m.r, ih=H-m.t-m.b;
+  const g=svg.append("g").attr("transform",`translate(${m.l},${m.t})`);
+  const T=1000, PEAK=1;                       // rates drawn relative to the peak
+  const x=d3.scaleLinear().domain([1,T]).range([0,iw]);
+  const y=d3.scaleLinear().domain([0,1.08]).range([ih,0]);
+  const xAxisG=g.append("g").attr("transform",`translate(0,${ih})`).attr("color",C.muted);
+  const yAxisG=g.append("g").attr("color",C.muted);
+  const warmBand=g.append("rect").attr("y",0).attr("height",ih).attr("fill",C.B).attr("fill-opacity",.10);
+  const area=g.append("path").attr("fill",C.A).attr("fill-opacity",.13).attr("stroke","none");
+  const path=g.append("path").attr("fill","none").attr("stroke",C.A).attr("stroke-width",2.5);
+  const marker=g.append("line").attr("y1",0).attr("y2",ih).attr("stroke",C.good).attr("stroke-dasharray","3 3");
+  const dot=g.append("circle").attr("r",5).attr("fill",C.good);
+  g.append("text").attr("x",iw).attr("y",ih+30).attr("text-anchor","end").attr("fill",C.muted).attr("font-size",10.5).text("training step →");
+  g.append("text").attr("transform","rotate(-90)").attr("x",-ih/2).attr("y",-42).attr("text-anchor","middle").attr("fill",C.muted).attr("font-size",10.5).text("η / η_max");
+  const warmLabel=g.append("text").attr("y",-8).attr("fill",C.B).attr("font-size",10).text("warmup");
+
+  const MILE=[0.5,0.75,0.9];
+  function lr(t,kind,Tw){
+    if(Tw>0 && t<Tw) return PEAK*t/Tw;
+    const p=(t-Tw)/Math.max(T-Tw,1);          // progress after warmup, 0..1
+    if(kind==="constant") return PEAK;
+    if(kind==="cosine")   return PEAK*0.5*(1+Math.cos(Math.PI*Math.min(p,1)));
+    if(kind==="onecycle") return PEAK*Math.max(1-Math.min(p,1),0.01);
+    if(kind==="step")     return PEAK*Math.pow(0.1, MILE.filter(mi=>t/T>=mi).length);
+    if(kind==="invsqrt")  return PEAK*Math.sqrt(Math.max(Tw,1)/Math.max(t,Math.max(Tw,1)));
+    return PEAK;
+  }
+  const NAME={cosine:"warmup + cosine decay",onecycle:"one-cycle (triangular)",step:"step decay ×0.1 at 50/75/90%",invsqrt:"inverse square root",constant:"constant"};
+  const RULE={
+    cosine:"ηₜ = ½·η_max·(1 + cos(π·p))  after linear warmup",
+    onecycle:"linear ramp to η_max, then linear anneal to ≈0",
+    step:"ηₜ = η_max · 0.1^(milestones passed)",
+    invsqrt:"ηₜ = η_max · √(T_w / t)",
+    constant:"ηₜ = η_max"
+  };
+
+  function draw(){
+    const kind=d3.select("#sched-kind").property("value");
+    let wpct=+d3.select("#sched-warm").property("value");
+    if(kind==="onecycle" && wpct<10){ /* one-cycle wants a long ramp; leave the user's value but hint it */ }
+    document.getElementById("sched-wval").textContent=wpct;
+    const Tw=Math.round(T*wpct/100);
+    const t=+d3.select("#sched-t").property("value");
+    const data=d3.range(1,T+1,2).map(s=>({s, v:lr(s,kind,Tw)}));
+    path.datum(data).attr("d",d3.line().x(d=>x(d.s)).y(d=>y(d.v)));
+    area.datum(data).attr("d",d3.area().x(d=>x(d.s)).y0(ih).y1(d=>y(d.v)));
+    warmBand.attr("x",x(1)).attr("width",Math.max(0,x(Math.max(Tw,1))-x(1)));
+    warmLabel.attr("x",x(1)+4).style("opacity",Tw>20?1:0);
+    xAxisG.call(d3.axisBottom(x).ticks(6).tickFormat(d3.format("d")));
+    yAxisG.call(d3.axisLeft(y).ticks(5));
+    const v=lr(t,kind,Tw);
+    marker.attr("x1",x(t)).attr("x2",x(t));
+    dot.attr("cx",x(t)).attr("cy",y(v));
+    const phase = (Tw>0 && t<Tw) ? "warming up" : (v<0.05 ? "annealed" : "decaying");
+    d3.select("#sched-read").html(
+      `<b>${NAME[kind]}</b> · warmup <b>${Tw}</b> steps · at step <b>${t}</b> the rate is <b>${(v*100).toFixed(1)}%</b> of η<sub>max</sub> — <b style="color:${C.good}">${phase}</b>`+
+      `<br>${RULE[kind]}`
+    );
+  }
+  d3.select("#sched-kind").on("change",draw);
+  ["#sched-warm","#sched-t"].forEach(id=>d3.select(id).on("input",draw));
+  draw();
+})();
+</script>
+</body>
+</html>

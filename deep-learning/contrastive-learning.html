@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Contrastive Learning</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <h1>Contrastive Learning</h1>
+      <p>Learn useful image features with no labels at all. Take two random augmentations of the same image as a <b>positive pair</b>, treat every other image in the batch as a <b>negative</b>, and train an encoder so positives land close together and negatives spread apart. Throw away the contrastive head afterwards and the encoder's features rival supervised pretraining on downstream tasks.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Self-supervised</span>
+        <span class="pill">Representation learning</span>
+        <span class="pill">InfoNCE</span>
+        <span class="pill">Augmentation</span>
+      </div>
+    </header>
+
+    <section class="topic" id="overview">
+      <h3><span class="idx">01</span> The core idea: instance discrimination</h3>
+      <p class="lede">No classes, no captions — just the rule that an image is similar to itself and different from everything else.</p>
+      <p>Supervised learning needs a label for every image. Contrastive learning needs none. Its pretext task is <b>instance discrimination</b>: each image is implicitly its own class. The model never sees the word "cat", yet to push a cat's two crops together while keeping them apart from a thousand other images, it has no choice but to learn what <i>makes</i> a cat a cat — shape, texture, parts — features that transfer to real downstream tasks.</p>
+      <h4>The pipeline in one breath</h4>
+      <ol class="notes" style="padding-left:22px;">
+        <li>Sample a minibatch of <code>N</code> images.</li>
+        <li>Apply two independent random augmentations to each → <code>2N</code> views.</li>
+        <li>Encode every view with a shared backbone <code>f</code> (e.g. a ResNet) → features <code>h</code>.</li>
+        <li>Map <code>h</code> through a small projection head <code>g</code> → embeddings <code>z</code>.</li>
+        <li>Apply a contrastive loss in <code>z</code>-space: each view's positive is the other view of the same image; the rest are negatives.</li>
+        <li>Discard <code>g</code>; keep <code>f</code> and use <code>h</code> for downstream tasks.</li>
+      </ol>
+      <div class="callout"><b>One sentence:</b> contrastive learning turns "is this the same image as that one?" into a self-labelled classification problem, and the encoder learns transferable features as a side effect.</div>
+      <h4>Where it sits among the paradigms</h4>
+      <ul class="notes">
+        <li><b>vs supervised:</b> no human labels — the supervision signal is manufactured from the data itself via augmentation. See <a href="../machine-learning/learning-paradigms.html">Learning Paradigms</a> for the broader self-supervised family.</li>
+        <li><b>vs generative / reconstruction SSL:</b> autoencoders and masked-image models (MAE) learn by <i>reconstructing</i> pixels; contrastive methods never reconstruct — they only compare embeddings. Discriminating in feature space avoids wasting capacity on pixel-perfect detail.</li>
+        <li><b>The payoff is reuse:</b> the pretrained encoder is a starting point for <a href="fine-tuning-transfer-learning.html">fine-tuning &amp; transfer learning</a>, often with far fewer labels than training from scratch.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="augmentation">
+      <h3><span class="idx">02</span> Building pairs: augmentation is the pretext task</h3>
+      <p class="lede">The augmentation pipeline matters more than the architecture — it <i>defines</i> what "the same image" is allowed to mean.</p>
+      <p>A positive pair is just two random augmentations <code>t, t'</code> of one image <code>x</code>: <code>(t(x), t'(x))</code>. The encoder is being told "these two distorted views are the same thing — find a representation invariant to that distortion." The set of transforms therefore decides exactly which invariances the model acquires.</p>
+      <h4>The standard augmentation stack</h4>
+      <ul class="notes">
+        <li><b>Random resized crop</b> — sample a sub-region and resize to a fixed size. Forces invariance to scale and position and is the single most important transform.</li>
+        <li><b>Color jitter / distortion</b> — randomly perturb brightness, contrast, saturation, hue.</li>
+        <li><b>Random grayscale</b> — occasionally drop color entirely.</li>
+        <li><b>Gaussian blur</b> — soften high-frequency detail.</li>
+        <li><b>Random horizontal flip.</b></li>
+      </ul>
+      <div class="callout"><b>Crucial finding:</b> random crop and color distortion only work when applied <b>together</b>. With cropping alone the network cheats — two crops of one image share the same color histogram, so it can "solve" the task by matching average color without learning anything about content. Color distortion breaks that shortcut and forces real feature learning. Either transform alone is weak; the composition is what works.</div>
+      <p>Stronger augmentation = a harder pretext task = (up to a point) better representations. This is the contrastive analogue of how heavy masking makes <a href="vision-transformers.html">masked-image pretraining</a> hard enough to be useful.</p>
+    </section>
+
+    <section class="topic" id="nt-xent">
+      <h3><span class="idx">03</span> The NT-Xent / InfoNCE objective</h3>
+      <p class="lede">A normalized-temperature cross-entropy loss: a softmax that asks "out of everyone in the batch, which one is my positive?"</p>
+      <p>Work in <code>z</code>-space. Similarity is <b>cosine similarity</b> on the normalized embeddings:</p>
+      <div class="formula"><span class="eq">sim(u, v) = uᵀv / ( ‖u‖ · ‖v‖ )</span></div>
+      <p>Take a batch of <code>N</code> images, augment each twice → <code>2N</code> embeddings <code>z₁ … z₂ₙ</code>. For a positive pair <code>(i, j)</code> (the two views of one image), the loss for that <i>directed</i> pair is</p>
+      <div class="formula"><span class="eq">ℓ(i, j) = −log [ exp( sim(zᵢ, zⱼ) / τ ) / ∑ₖ₌₁²ᴺ 𝟙[k ≠ i] · exp( sim(zᵢ, zₖ) / τ ) ]</span></div>
+      <p>where <code>τ</code> is the temperature and <code>𝟙[k ≠ i]</code> excludes the anchor from being compared with itself. The denominator runs over <b>all</b> <code>2N − 1</code> other views: the one positive plus <code>2N − 2</code> negatives. Read it as a <b>(2N − 1)-way softmax classification</b> — the logits are the scaled similarities, and the correct "class" is the positive.</p>
+      <p>The total loss averages <code>ℓ</code> over every positive pair in both directions, since <code>ℓ(i, j) ≠ ℓ(j, i)</code> (each has its own anchor and denominator):</p>
+      <div class="formula"><span class="eq">L = (1 / 2N) · ∑ₖ₌₁ᴺ [ ℓ(2k−1, 2k) + ℓ(2k, 2k−1) ]</span></div>
+      <ul class="notes">
+        <li><b>Numerator</b> pulls the positive in: maximizing <code>sim(zᵢ, zⱼ)</code> shrinks the loss.</li>
+        <li><b>Denominator</b> pushes negatives away: every negative that is too similar inflates the sum and the loss.</li>
+        <li>This is exactly the <b>InfoNCE</b> objective (the "NCE" of contrastive predictive coding): a noise-contrastive estimator that lower-bounds the mutual information between the two views. The same loss shape powers cross-modal alignment in <a href="../models/clip.html">CLIP</a> and metric learning over <a href="../nlp/embeddings.html">embeddings</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="temperature">
+      <h3><span class="idx">04</span> Temperature τ: the hardness knob</h3>
+      <p class="lede">τ rescales similarities before the softmax, controlling how sharply the loss focuses on the hardest negatives.</p>
+      <p>Because logits are <code>sim / τ</code>, temperature stretches or compresses the gap between negatives:</p>
+      <ul class="notes">
+        <li><b>Low τ (sharp).</b> Dividing by a small number magnifies differences. The softmax concentrates almost all its weight — and gradient — on the <i>nearest</i> (hardest) negatives. The model is harshly penalized for any negative that creeps close to the anchor.</li>
+        <li><b>High τ (soft).</b> The distribution flattens; all negatives are weighted roughly uniformly, easy and hard alike. Gradients are gentler and the model tolerates nearby negatives.</li>
+      </ul>
+      <p>τ is one of the most sensitive hyperparameters in the whole recipe. The tuned default in the canonical image setup is small — around <code>τ ≈ 0.1</code> — with related methods using values roughly in the <code>0.07 – 0.5</code> range depending on batch size, backbone, and augmentation strength. The exact best value is configuration-dependent; treat it as a knob to tune, not a constant.</p>
+      <div class="callout"><b>Intuition:</b> τ trades off uniformity against hard-negative emphasis. Too low and training fixates on a few hard cases and can destabilize; too high and it stops discriminating finely. The viz below makes the softmax-over-negatives behavior tangible.</div>
+
+      <div class="viz" id="viz-temp">
+        <div class="vhead">
+          <span class="vtitle">Temperature &amp; the NT-Xent softmax over negatives</span>
+          <span class="vhint">Drag τ and the positive's similarity — watch the softmax weight (point size + color) shift onto the hardest negatives and the loss ℓ(i,j) update live</span>
+        </div>
+        <div class="controls">
+          <label>Temperature τ <input type="range" id="t-tau" min="0.03" max="1.0" step="0.01" value="0.1"></label>
+          <label>Positive similarity <input type="range" id="t-pos" min="0.3" max="0.99" step="0.01" value="0.8"></label>
+        </div>
+        <svg id="temp-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="NT-Xent softmax-weight visualization: an anchor embedding on a unit circle with its positive and negative points; lowering temperature concentrates softmax weight on the nearest negative."></svg>
+        <div id="temp-readout" class="vhint" style="margin-top:8px;"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="proj-head">
+      <h3><span class="idx">05</span> The projection head — and why you throw it away</h3>
+      <p class="lede">A tiny MLP maps features to the space where the loss lives. Counterintuitively, you keep the layer <i>before</i> it for downstream use.</p>
+      <p>The backbone produces a feature vector <code>h = f(x)</code>. A small projection head — typically one hidden layer with ReLU — maps it to the contrastive space:</p>
+      <div class="formula"><span class="eq">z = g(h) = W₂ · σ( W₁ · h )</span></div>
+      <p>The NT-Xent loss is computed on <code>z</code>. But for the actual downstream task — linear probing, fine-tuning — you discard <code>g</code> and use <code>h</code> instead.</p>
+      <div class="callout"><b>Slightly counterintuitive, and a key result:</b> the representation <i>before</i> the head (<code>h</code>) is substantially better for downstream tasks than the one the loss is applied to (<code>z</code>) — on the order of <b>10%+ higher</b> on linear evaluation. The head absorbs invariances the loss demands (e.g. throwing away color or orientation) that you do <i>not</i> want baked into your general-purpose encoder. By letting <code>g</code> soak up that augmentation-specific information, <code>h</code> stays richer.</div>
+      <p>So the head is a buffer: it specializes to the pretext task and is sacrificed, leaving the encoder general.</p>
+    </section>
+
+    <section class="topic" id="negatives">
+      <h3><span class="idx">06</span> Negatives &amp; batch size: more is better (and costly)</h3>
+      <p class="lede">The contrast is only as strong as the negatives you contrast against — and in-batch negatives tie that strength to batch size.</p>
+      <p>In the in-batch scheme, the negatives for any anchor are simply the other <code>2N − 2</code> views in the same minibatch. More negatives means a harder, more informative discrimination problem: the encoder must distinguish its positive from many more distractors, which sharpens the features.</p>
+      <ul class="notes">
+        <li><b>Large batches help.</b> A batch of <code>4096</code> images supplies thousands of in-batch negatives per anchor, and accuracy keeps climbing with batch size well past where ordinary supervised training plateaus.</li>
+        <li><b>The cost.</b> Such batches need the <b>LARS</b> optimizer (layer-wise adaptive rates keep huge-batch SGD stable), long training schedules, and a lot of accelerator memory. This is the practical price of in-batch negatives.</li>
+        <li>See <a href="neural-network-training.html">Neural-Network Training</a> for why batch size, learning-rate scaling, and optimizer choice interact this way.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="moco">
+      <h3><span class="idx">07</span> MoCo: decoupling negatives from batch size</h3>
+      <p class="lede">If big batches are the bottleneck, store negatives instead of recomputing them — a dynamic dictionary with a slowly-moving key encoder.</p>
+      <p>Momentum Contrast (MoCo) keeps a large pool of negatives without a large batch by maintaining a <b>queue</b> — a FIFO dictionary of recently encoded "keys". Each step enqueues the current batch's keys and dequeues the oldest, so a small batch still contrasts against thousands of stored negatives.</p>
+      <h4>Two encoders, one moving slowly</h4>
+      <p>The anchor ("query") is encoded by <code>f_q</code> with parameters <code>θ_q</code>, trained normally by gradient descent. The keys are encoded by a separate <b>momentum encoder</b> <code>f_k</code> whose weights are <i>not</i> updated by gradients but by an exponential moving average of the query encoder:</p>
+      <div class="formula"><span class="eq">θ_k ← m · θ_k + (1 − m) · θ_q ,</span>   <span class="eq">m ≈ 0.999</span></div>
+      <p>The large momentum makes <code>f_k</code> drift slowly, so keys enqueued many steps apart stay <b>consistent</b> — they were produced by nearly the same encoder. Without this, the queued negatives would be stale and inconsistent, and the contrast would break down.</p>
+      <table class="cmp">
+        <tr><th>Source of negatives</th><th>Mechanism</th><th>Trade-off</th></tr>
+        <tr><td>In-batch (end-to-end)</td><td>Other views in the same minibatch; both encoders trained by gradient</td><td>Consistent &amp; fresh, but #negatives capped by batch size → needs huge batches</td></tr>
+        <tr><td>Memory queue (MoCo)</td><td>FIFO dictionary of past keys + momentum key encoder</td><td>Many negatives at small batch; needs the momentum trick for consistency</td></tr>
+        <tr><td>Memory bank</td><td>Stored embedding per dataset image, updated when sampled</td><td>Scales to the whole dataset, but entries grow stale between updates</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="downstream">
+      <h3><span class="idx">08</span> Downstream evaluation: the linear probe</h3>
+      <p class="lede">How do you measure a label-free encoder? Freeze it and let a single linear layer do the talking.</p>
+      <p>The standard protocol is the <b>linear probe</b>:</p>
+      <ol class="notes" style="padding-left:22px;">
+        <li>Freeze the pretrained encoder <code>f</code> — its weights do not change.</li>
+        <li>Train <b>only</b> a single linear classifier on top of the frozen features <code>h</code>, using labels.</li>
+        <li>Report top-1 accuracy. Because the encoder is frozen, the number reflects the <i>quality of the features</i>, not the classifier.</li>
+      </ol>
+      <p>On the canonical image setup, a contrastively pretrained <a href="convolutional-networks.html">ResNet-50</a> reaches roughly <b>69.3% top-1</b> under linear evaluation — closing much of the gap to fully supervised training of the same backbone, with no labels used during pretraining.</p>
+      <ul class="notes">
+        <li><b>Fine-tuning.</b> Unfreeze the encoder and adapt end-to-end on the target task — usually beats the linear probe when labels are plentiful. See <a href="fine-tuning-transfer-learning.html">Fine-Tuning &amp; Transfer Learning</a>.</li>
+        <li><b>Semi-supervised / few-label.</b> Contrastive features shine when labels are scarce: fine-tuning on just 1% or 10% of labels recovers most of the fully-supervised accuracy — the headline practical win.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="compare">
+      <h3><span class="idx">09</span> The landscape: SimCLR, MoCo, supervised &amp; beyond</h3>
+      <p class="lede">Same core loss, different answers to "where do the negatives come from?" — and a branch that drops negatives entirely.</p>
+      <table class="cmp">
+        <tr><th></th><th>Negatives</th><th>Batch</th><th>Defining ingredients</th></tr>
+        <tr><td>SimCLR</td><td>In-batch (end-to-end)</td><td>Very large (≈4096)</td><td>Strong augmentation, NT-Xent, MLP projection head, LARS</td></tr>
+        <tr><td>MoCo</td><td>Memory queue</td><td>Small OK</td><td>Momentum key encoder, FIFO dictionary; v2 adds the MLP head + stronger aug</td></tr>
+        <tr><td>Supervised Contrastive</td><td>Labels define them</td><td>Large</td><td>All same-class samples are positives → bridges contrastive and supervised</td></tr>
+      </table>
+      <p><b>Supervised contrastive learning</b> is a telling hybrid: instead of a single positive per anchor, it treats <i>every</i> image of the same label as a positive and contrasts against other classes. It uses labels, yet keeps the InfoNCE geometry — a clean bridge between this page and classic supervised training.</p>
+      <h4>Where the field went next: drop the negatives</h4>
+      <ul class="notes">
+        <li><b>BYOL / SimSiam.</b> Non-contrastive: <i>no negatives at all.</i> A predictor network plus a <b>stop-gradient</b> on the target branch prevents the trivial collapse (all embeddings identical) that negatives normally guard against.</li>
+        <li><b>DINO.</b> Self-distillation with a momentum teacher, no negatives — yields ViT features with striking unsupervised segmentation properties; ties back to <a href="knowledge-distillation.html">Knowledge Distillation</a>.</li>
+        <li><b>Cross-modal contrast.</b> <a href="../models/clip.html">CLIP</a> applies the <i>same</i> InfoNCE loss across modalities — matching an image to its caption against a batch of mismatched captions — which powers zero-shot recognition in <a href="../llm/vision-language-models.html">vision-language models</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">10</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Labels not required.</b> Instance discrimination manufactures supervision: two augmentations of one image are a positive pair; everything else is a negative.</li>
+        <li><b>Augmentation is the task.</b> Random crop + color distortion <i>together</i> are essential — crop alone lets the network cheat on color statistics.</li>
+        <li><b>NT-Xent / InfoNCE</b> is a (2N − 1)-way softmax over cosine similarities: "pick my positive out of all the negatives."</li>
+        <li><b>Temperature τ</b> tunes hardness — low τ sharpens focus onto the hardest negatives; high τ spreads weight uniformly. ≈0.1 is a common default.</li>
+        <li><b>Keep <code>h</code>, drop <code>z</code>.</b> Apply the loss after the projection head but use the pre-head features downstream — they're 10%+ better.</li>
+        <li><b>Negatives = signal.</b> SimCLR buys them with huge batches; MoCo buys them with a queue + momentum encoder.</li>
+        <li><b>Evaluate by linear probe</b> on the frozen encoder (≈69.3% top-1 ResNet-50), then fine-tune — especially powerful with few labels.</li>
+        <li><b>The idea generalizes:</b> non-contrastive cousins (BYOL, SimSiam, DINO) drop negatives via stop-gradient, and CLIP carries InfoNCE across modalities.</li>
+      </ul>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+(function(){
+  const svg=d3.select("#temp-svg"), W=640, H=340;
+  // ---- scene geometry: a unit-circle embedding space on the left ----
+  const cx=170, cy=170, R=120;
+  // fixed angular layout of points on the unit circle (anchor at 0°).
+  // anchor, positive, then several negatives at varying angles (=> varying similarity).
+  const anchorAng = 0;
+  // negatives placed at angles whose cosine vs anchor gives a spread of similarities
+  const negAngs = [38, 62, 95, 130, 168, -150, -88, -50].map(d=>d*Math.PI/180);
+
+  function pt(ang){ return [cx + R*Math.cos(ang), cy - R*Math.sin(ang)]; }
+
+  function draw(){
+    const tau=+d3.select("#t-tau").property("value");
+    const posSim=+d3.select("#t-pos").property("value");   // user-set anchor·positive cosine
+    svg.selectAll("*").remove();
+
+    // similarities: positive is set directly by slider; negatives = cos(angle) vs anchor
+    const negSims = negAngs.map(a=>Math.cos(a));            // anchor at 0° → sim = cos(angle)
+    // logits = sim/τ over [positive, ...negatives]; softmax for the loss denominator term
+    const allSims = [posSim, ...negSims];
+    const logits = allSims.map(s=>s/tau);
+    const mx = Math.max(...logits);
+    const exps = logits.map(l=>Math.exp(l-mx));
+    const Z = exps.reduce((a,b)=>a+b,0);
+    const probs = exps.map(e=>e/Z);                         // softmax incl. positive
+    const pPos = probs[0];
+    const negProbs = probs.slice(1);
+    const loss = -Math.log(pPos);                           // ℓ(i,j) = -log softmax(positive)
+    // softmax weight among negatives only (what the "push-away" gradient is distributed over)
+    const negZ = negProbs.reduce((a,b)=>a+b,0) || 1e-9;
+    const negWeight = negProbs.map(p=>p/negZ);
+
+    // ---- left panel: embedding circle ----
+    svg.append("text").attr("x",cx-R).attr("y",26).attr("fill",C.muted).attr("font-size",11)
+       .text("embedding space (unit circle)");
+    svg.append("circle").attr("cx",cx).attr("cy",cy).attr("r",R)
+       .attr("fill","none").attr("stroke",C.line).attr("stroke-dasharray","3 4");
+
+    // anchor at the positive's location? no — anchor fixed; we draw the positive at an angle
+    // whose cosine equals posSim, on the upper arc, so dragging it visibly moves the point.
+    const posAng = Math.acos(Math.max(-1,Math.min(1,posSim)));   // 0..π
+    const [ax,ay]=pt(anchorAng);
+    const [px,py]=pt(posAng);
+
+    // lines anchor→negatives (weight = softmax weight among negatives)
+    negAngs.forEach((a,i)=>{
+      const [nx,ny]=pt(a);
+      svg.append("line").attr("x1",ax).attr("y1",ay).attr("x2",nx).attr("y2",ny)
+         .attr("stroke",C.bad).attr("stroke-opacity",0.15+0.7*negWeight[i])
+         .attr("stroke-width",0.8+5*negWeight[i]);
+    });
+    // line anchor→positive
+    svg.append("line").attr("x1",ax).attr("y1",ay).attr("x2",px).attr("y2",py)
+       .attr("stroke",C.good).attr("stroke-width",3).attr("stroke-opacity",0.9);
+
+    // negative points: radius & color ramp by softmax weight (hardest = nearest = most weight)
+    negAngs.forEach((a,i)=>{
+      const [nx,ny]=pt(a);
+      const w=negWeight[i];
+      svg.append("circle").attr("cx",nx).attr("cy",ny)
+         .attr("r",4+18*w)
+         .attr("fill",d3.interpolateInferno(0.25+0.6*w)).attr("fill-opacity",0.85)
+         .attr("stroke",C.bad).attr("stroke-width",1);
+      svg.append("title").text(`negative · sim=${negSims[i].toFixed(2)} · weight=${(w*100).toFixed(1)}%`);
+    });
+    // positive point
+    svg.append("circle").attr("cx",px).attr("cy",py).attr("r",8)
+       .attr("fill",C.good).attr("stroke","#0b0e14").attr("stroke-width",1.5);
+    svg.append("text").attr("x",px+11).attr("y",py+4).attr("fill",C.good).attr("font-size",11).text("positive");
+    // anchor point
+    svg.append("circle").attr("cx",ax).attr("cy",ay).attr("r",8)
+       .attr("fill",C.A).attr("stroke","#0b0e14").attr("stroke-width",1.5);
+    svg.append("text").attr("x",ax+11).attr("y",ay+4).attr("fill",C.A).attr("font-size",11).text("anchor");
+
+    // ---- right panel: softmax-weight bars over negatives ----
+    const bx=350, bw=W-bx-30, bTop=46, rowH=24;
+    svg.append("text").attr("x",bx).attr("y",26).attr("fill",C.muted).attr("font-size",11)
+       .text("softmax weight among negatives  →  where the push-away gradient goes");
+    // order negatives by similarity (hardest first) for a readable bar chart
+    const order=negSims.map((s,i)=>i).sort((a,b)=>negSims[b]-negSims[a]);
+    order.forEach((idx,row)=>{
+      const y=bTop+row*rowH;
+      const w=negWeight[idx];
+      svg.append("rect").attr("x",bx).attr("y",y).attr("width",bw).attr("height",rowH-7).attr("rx",3)
+         .attr("fill",C.line).attr("opacity",0.5);
+      svg.append("rect").attr("x",bx).attr("y",y).attr("width",Math.max(2,bw*w)).attr("height",rowH-7).attr("rx",3)
+         .attr("fill",d3.interpolateInferno(0.25+0.6*w));
+      svg.append("text").attr("x",bx-6).attr("y",y+rowH-12).attr("text-anchor","end")
+         .attr("font-size",9).attr("fill",C.muted).text(`sim ${negSims[idx].toFixed(2)}`);
+      svg.append("text").attr("x",bx+bw).attr("y",y+rowH-12).attr("text-anchor","end")
+         .attr("font-size",9).attr("fill",C.ink).text(`${(w*100).toFixed(1)}%`);
+    });
+
+    d3.select("#temp-readout").html(
+      `τ=<b>${tau.toFixed(2)}</b> · positive sim=<b>${posSim.toFixed(2)}</b> · `+
+      `softmax P(positive)=<b>${(pPos*100).toFixed(1)}%</b> · `+
+      `loss ℓ(i,j) = −log P(positive) = <b>${loss.toFixed(3)}</b>. `+
+      `Low τ piles weight on the nearest negative (hardest); high τ spreads it evenly.`
+    );
+  }
+  d3.select("#t-tau").on("input",draw);
+  d3.select("#t-pos").on("input",draw);
+  draw();
+})();
+</script>
+</body>
+</html>

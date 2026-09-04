@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Computer Control</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Computer Control</h1>
+      <p>The most general tool an agent can have is <b>a computer itself</b>. A computer-control agent reads a screen, decides where to click and what to type, and drives real GUIs, browsers, and terminals the way a person would — no bespoke API required, and none of the guarantees one would give.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Agentic AI</span>
+        <span class="pill">GUI agents</span>
+        <span class="pill">Multimodal</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="overview" data-nav="The task">
+      <h3><span class="idx">01</span> The task, and why it is hard</h3>
+      <p class="lede">Given a goal in natural language and a stream of observations of a running machine, emit low-level actions — mouse, keyboard, navigation — until the goal is achieved. It is <a href="agents.html#tools">tool use</a> where the tool is the whole desktop.</p>
+      <ul class="notes">
+        <li><b>Why bother:</b> most software exposes a UI and no usable API. Legacy line-of-business apps, internal dashboards, spreadsheets, sites behind logins. An agent that can drive the UI reaches all of it with one integration instead of hundreds.</li>
+        <li><b>What makes it different from ordinary tool use:</b> the interface is <b>not designed for a machine</b>. Affordances are visual, state is implicit, results are asynchronous, and there is no schema, no error code, and no idempotency.</li>
+        <li><b>The observation is huge and mostly irrelevant.</b> A screenshot is thousands of tokens of which a handful of pixels matter; a raw page can be tens of thousands of tokens of markup around one button.</li>
+        <li><b>Horizons are long.</b> Real tasks are 15–50 actions. With per-step reliability <code>p</code>, end-to-end success decays as <code>p<sup>n</sup></code>, so a 97%-per-step agent finishes a 30-step task barely a third of the time.</li>
+        <li><b>Actions are real.</b> Unlike a sandboxed reasoning chain, a mis-click sends the email, empties the folder, or completes the purchase.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the control problem</span><span class="eq">a<sub>t</sub> = π<sub>θ</sub>( g, o<sub>≤t</sub>, a<sub>&lt;t</sub> )</span>        <span class="eq">P(success) ≈ ∏<sub>t=1..n</sub> p<sub>t</sub></span>        <span class="eq">g = goal,  o = observation,  a = action</span></div>
+      <div class="callout"><b>One idea:</b> computer control converts a language problem into a <b>partially observed sequential control</b> problem. Everything difficult about it — grounding, horizon, recovery, safety — follows from that one change.</div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="loop" data-nav="Perceive–plan–act loop">
+      <h3><span class="idx">02</span> The perceive–plan–act loop</h3>
+      <p class="lede">Capture an observation → decide the next action → execute it → wait for the interface to settle → capture again. Step through a small task below.</p>
+
+      <h4>What happens on each turn</h4>
+      <ul class="notes">
+        <li><b>Perceive:</b> screenshot and/or structured tree of the active window, usually downscaled to a fixed resolution so coordinates stay in one frame of reference.</li>
+        <li><b>Plan:</b> the model updates its state — what has been done, what remains — and picks one action. Verbalising the expected result first is what makes error detection possible on the next turn.</li>
+        <li><b>Act:</b> the runtime executes the action against the OS or browser. Failures here are ordinary software failures: the element moved, the click landed on an overlay, the page was still loading.</li>
+        <li><b>Settle and verify:</b> wait for a stable frame, then compare what appeared against what was expected. Without this check, the agent happily continues from a state it never reached.</li>
+      </ul>
+
+      <div class="viz" id="viz-cc">
+        <div class="vhead">
+          <span class="vtitle">An agent operating a screen</span>
+          <span class="vhint">Each step: read the screen, choose a target, act</span>
+        </div>
+        <div class="controls">
+          <label>step <input type="range" id="cc-step" min="0" max="4" step="1" value="0"></label>
+          <button class="btn" id="cc-next">Next step ▸</button>
+        </div>
+        <svg id="cc-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Interactive diagram: An agent operating a screen"></svg>
+        <div class="readout" aria-live="polite" id="cc-read"></div>
+      </div>
+      <div class="callout">The loop is trivial; the <b>state estimate</b> is not. The agent must answer "am I where I think I am?" from pixels alone, every single turn — which is why an explicit expectation-then-check habit outperforms a longer plan.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="perception" data-nav="Observation spaces">
+      <h3><span class="idx">03</span> Observation spaces</h3>
+      <p class="lede">What exactly does the agent receive each turn? Four options, each trading <b>generality</b> against <b>precision and token cost</b>.</p>
+
+      <h4>Pixels — the screenshot</h4>
+      <ul class="notes">
+        <li>A <a href="../llm/vision-language-models.html">vision-language model</a> reads the rendered image directly. Universal: it works on canvas apps, remote desktops, video players, and native software with no accessibility support.</li>
+        <li>Cost is set by patchification — the image becomes <code>⌈W/P⌉ · ⌈H/P⌉</code> visual tokens — and small text is lost when the screenshot is downscaled to fit.</li>
+        <li>The output must be a <b>coordinate</b>, which is the hardest thing to get right.</li>
+      </ul>
+
+      <h4>Accessibility tree — the semantic skeleton</h4>
+      <ul class="notes">
+        <li>The OS or browser already exposes a tree of elements with roles, names, values, states, and bounding boxes — built for screen readers, reusable by agents.</li>
+        <li>Actions become element references rather than pixels, which removes coordinate error entirely. But coverage is uneven: custom widgets, canvas-drawn UIs, and sloppy apps report almost nothing useful.</li>
+      </ul>
+
+      <h4>DOM / raw markup — precise but enormous</h4>
+      <ul class="notes">
+        <li>On the web the full DOM gives exact selectors and hidden attributes. It is also the most verbose option by an order of magnitude and includes elements that are invisible or off-screen.</li>
+        <li>Practical use always means pruning to interactive, visible nodes and stripping styles and scripts.</li>
+      </ul>
+
+      <h4>Set-of-marks — the hybrid that usually wins</h4>
+      <ul class="notes">
+        <li>Detect the interactive elements (from the tree, the DOM, or an element detector), draw numbered boxes on the screenshot, and pass both the annotated image and the numbered legend.</li>
+        <li>The model then selects an <b>index</b>, not a coordinate — the layout stays visible while the action space becomes discrete and verifiable. This is the standard recipe for browser agents.</li>
+      </ul>
+
+      <table class="cmp">
+        <tr><th>Observation</th><th>Typical size</th><th>Generality</th><th>Precision of targeting</th><th>Breaks when…</th></tr>
+        <tr><td>Screenshot (pixels)</td><td>~1–2k visual tokens per frame</td><td>Any app, any OS, remote desktops</td><td>Coordinate regression — the weak link</td><td>text is downscaled below legibility</td></tr>
+        <tr><td>Accessibility tree</td><td>~1–10k text tokens, page-dependent</td><td>Where the app implements it</td><td>Exact — reference by element</td><td>custom or canvas-drawn widgets report nothing</td></tr>
+        <tr><td>Raw DOM</td><td>10k–100k+ tokens unpruned</td><td>Web only</td><td>Exact — CSS/XPath selectors</td><td>context blows up; visual layout is invisible in it</td></tr>
+        <tr><td>Text render / OCR</td><td>Small</td><td>Terminals, plain documents</td><td>Good for text, none for layout</td><td>the interface is graphical at all</td></tr>
+        <tr><td>Set-of-marks hybrid</td><td>image + a short numbered legend</td><td>Wherever elements can be detected</td><td>Discrete index — checkable before executing</td><td>detection misses an element (it becomes unclickable)</td></tr>
+      </table>
+
+      <p>Same screen, four different things handed to the model. Switch between them and note how the <i>action</i> the model has to produce changes with the representation.</p>
+      <div class="viz" id="viz-obs">
+        <div class="vhead">
+          <span class="vtitle">What the agent actually receives</span>
+          <span class="vhint">one screen · four observation spaces</span>
+        </div>
+        <div class="controls">
+          <label>observation
+            <select id="obs-sel">
+              <option value="pixels">Screenshot (pixels)</option>
+              <option value="axtree">Accessibility tree</option>
+              <option value="dom">Pruned DOM</option>
+              <option value="som">Set-of-marks</option>
+            </select>
+          </label>
+        </div>
+        <svg id="obs-svg" width="640" height="260" viewBox="0 0 640 260" role="img" aria-label="Interactive diagram: the same screen in four observation spaces"></svg>
+        <div class="readout" aria-live="polite" id="obs-read"></div>
+      </div>
+      <div class="callout">Structured observations are more reliable <b>where they exist</b>; pixels are the only thing that always exists. Serious systems fuse them — structure for targeting, pixels for layout, state, and everything the tree forgot to mention.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="actions" data-nav="Action spaces">
+      <h3><span class="idx">04</span> Action spaces</h3>
+      <p class="lede">Three levels of abstraction, and the choice constrains everything downstream: what the model must predict, what can be validated before execution, and how a failure is recovered.</p>
+
+      <h4>Coordinates — the lowest common denominator</h4>
+      <ul class="notes">
+        <li><code>click(x, y)</code>, <code>double_click</code>, <code>right_click</code>, <code>drag(x₁,y₁ → x₂,y₂)</code>, <code>type(text)</code>, <code>key("ctrl+s")</code>, <code>scroll(dx, dy)</code>, <code>wait(ms)</code>, <code>screenshot()</code>.</li>
+        <li>Works on anything, including remote desktops and games. Nothing can be validated in advance: <code>(x, y)</code> is either on the button or on the background.</li>
+      </ul>
+
+      <h4>Element references — the reliable middle</h4>
+      <ul class="notes">
+        <li><code>click(elem=17)</code>, <code>fill(elem=3, "text")</code>, <code>select(elem=9, "May")</code>. The runtime resolves the index to a real node and can refuse an invalid, invisible, or disabled target <i>before</i> anything happens.</li>
+        <li>Requires an element list, so it inherits whatever the accessibility tree or detector missed. Indices also change between frames — always re-index after the screen settles.</li>
+      </ul>
+
+      <h4>Code and API calls — skip the UI when you can</h4>
+      <ul class="notes">
+        <li>Let the agent write a short script or call a real endpoint: one deterministic action replaces twenty clicks, and it is testable, loggable, and re-runnable.</li>
+        <li>Hybrid policies do this by default and fall back to the GUI only where no programmatic path exists — the single biggest lever on both cost and reliability.</li>
+      </ul>
+
+      <table class="cmp">
+        <tr><th>Action space</th><th>Model must predict</th><th>Pre-execution validation</th><th>Steps per task</th><th>Best for</th></tr>
+        <tr><td>Coordinates</td><td>Pixel <code>(x, y)</code> + text</td><td>None</td><td>Highest</td><td>arbitrary desktops, remote sessions, canvas UIs</td></tr>
+        <tr><td>Element index</td><td>An integer from the legend</td><td>Index exists, visible, enabled</td><td>Same order, fewer mis-clicks</td><td>web and accessible native apps</td></tr>
+        <tr><td>Selector / query</td><td>A CSS or role+name query</td><td>Resolves to exactly one node</td><td>Similar</td><td>stable, well-structured pages</td></tr>
+        <tr><td>Code / API</td><td>A short program or request</td><td>Type check, dry run, diff</td><td>Far fewer</td><td>file ops, bulk edits, anything with an endpoint</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">from an element to a click point</span><span class="eq">ê = argmax<sub>e ∈ E</sub>  score( instruction, e )</span>        <span class="eq">(x, y) = ( e.x + e.w / 2 ,  e.y + e.h / 2 )</span></div>
+      <div class="callout">Prefer the <b>highest-level action that still works</b>. Every level up removes a class of error: coordinates can miss, indices cannot; indices can be stale, an API call cannot.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="grounding" data-nav="Grounding">
+      <h3><span class="idx">05</span> Grounding</h3>
+      <p class="lede"><b>Grounding</b> is the mapping from a phrase — "the Search button", "the second row's checkbox" — to a concrete, actionable target on screen. It is the component that most often decides whether a run succeeds.</p>
+      <ul class="notes">
+        <li><b>Coordinate regression</b> asks the model to emit <code>(x, y)</code> directly from the image. It is scored by whether the predicted point lands inside the target's bounding box, which makes small controls disproportionately hard.</li>
+        <li><b>Referring-expression selection</b> instead scores each candidate element against the phrase and picks the best — a ranking problem over a short list, which is far easier than regression over a continuous plane.</li>
+        <li><b>Resolution is a first-class hyperparameter.</b> Downscale for token cost and you lose the label you needed; keep native resolution and every frame is expensive. Cropping to the relevant region, or a coarse-then-fine second look, is the usual compromise.</li>
+        <li><b>Ambiguity is common</b>: three buttons say "Open", the label is an icon with no text, the target is off-screen and must be scrolled to first. A good policy resolves by context and position, and scrolls to search rather than guessing.</li>
+        <li>Grounding is a genuinely separate skill from planning. Many systems split them — a strong planner chooses <i>what</i>, a small specialised model chooses <i>where</i> — which is cheaper and measurably more accurate than one model doing both.</li>
+      </ul>
+      <div class="formula"><span class="lbl">grounding accuracy — measure it on its own</span><span class="eq">Acc = (1/N) ∑<sub>i</sub> 𝟙[ (x̂<sub>i</sub>, ŷ<sub>i</sub>) ∈ bbox<sub>i</sub> ]</span>        <span class="eq">visual tokens ≈ ⌈W/P⌉ · ⌈H/P⌉</span></div>
+      <div class="callout">Test grounding <b>in isolation</b>, on single-screenshot "where is X?" items. If it sits below ~90%, no amount of planning will rescue a 20-step task — <code>0.90<sup>20</sup> ≈ 12%</code>.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="training" data-nav="Training signals">
+      <h3><span class="idx">06</span> Training signals</h3>
+      <p class="lede">Prompting a general model gets a surprising distance. Going further means training on trajectories — and the scarcity of good trajectories is the field's real bottleneck.</p>
+
+      <h4>Behaviour cloning from trajectories</h4>
+      <ul class="notes">
+        <li>Collect sequences of (observation, action) from human demonstrations or from a stronger agent, and maximise the log-likelihood of the recorded action given the history. Simple, stable, and it teaches interface conventions no amount of text pretraining conveys.</li>
+        <li>Its known weakness is <b>compounding distribution shift</b>: the policy is only trained on states an expert visits, so its first mistake takes it somewhere it has never seen. Mitigations are the classic ones — collect corrections from the policy's own states, and deliberately include recovery trajectories.</li>
+        <li>Demonstrations are expensive, so pipelines synthesise them: script tasks with known solutions, mine screen recordings and tutorials into pseudo-actions, or replay a strong agent and keep only verified successes.</li>
+      </ul>
+
+      <h4>Reinforcement learning from task success</h4>
+      <ul class="notes">
+        <li>Give a reward only for a <b>verified</b> outcome — a file exists with the right contents, a form submitted, a database row changed — and optimise expected return. Execution-based verification is what makes the reward trustworthy; a model judging its own screenshot is not.</li>
+        <li>Add a step penalty so the policy prefers short routes, and shape lightly with subgoal checks to fight the sparse-reward problem on 30-step tasks. Credit assignment across such horizons is the core difficulty — see <a href="agentic-rl.html#credit">agentic RL</a>.</li>
+        <li>Environments must be <b>resettable and parallel</b>: containers or VM snapshots restored between episodes, or the agent's own side effects contaminate the next rollout.</li>
+      </ul>
+      <div class="formula"><span class="lbl">two objectives</span><span class="eq">BC:  max<sub>θ</sub>  ∑<sub>(o,a) ∈ D</sub> log π<sub>θ</sub>( a | g, o<sub>≤t</sub> )</span>
+<span class="eq">RL:  max<sub>θ</sub>  𝔼<sub>τ ∼ π<sub>θ</sub></sub> [ R(τ) ] ,   R(τ) = 𝟙[verified success] − λ · steps</span></div>
+      <div class="callout">Clone first, then reinforce. Behaviour cloning teaches the <b>interface</b> cheaply; reinforcement learning teaches <b>recovery and efficiency</b>, which demonstrations almost never contain because experts rarely make the mistakes the policy will.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="evaluation" data-nav="Evaluation, latency &amp; cost">
+      <h3><span class="idx">07</span> Evaluation, latency &amp; cost</h3>
+      <p class="lede">Screenshots make demos look wonderful. Only execution-verified task success on held-out tasks says anything.</p>
+
+      <h4>Environments and metrics</h4>
+      <ul class="notes">
+        <li>The standard shapes: <b>execution-verified desktop suites</b> (a few hundred real tasks across a browser, file manager, editor, and office apps, each with a scripted checker), <b>self-hosted web environments</b> that clone common site types so runs are reproducible and side effects are contained, <b>mobile UI task sets</b>, and <b>pure grounding datasets</b> that only ask for the location of a named element.</li>
+        <li>Report at minimum: <b>task success rate</b>, <b>steps taken versus a human reference</b>, <b>cost and wall-clock per task</b>, and the <b>failure taxonomy</b> — grounding miss, wrong plan, unrecovered error, timeout, refusal.</li>
+        <li>Read leaderboards carefully. Step budgets, screen resolution, whether the agent got credentials or a code path, and self-reported versus independently re-run numbers all move results by more than most model differences. <i>As of mid-2026</i>, reported end-to-end success on a widely used ~370-task desktop suite ranges from roughly the low 60s to the mid 80s percent depending on harness, against a human baseline near 72% — where the first published systems in 2024 were around 12%.</li>
+      </ul>
+
+      <h4>Latency and cost accounting</h4>
+      <ul class="notes">
+        <li>Every step pays for a fresh observation. At ~1–2k visual tokens per frame plus the growing transcript, a 30-step task easily crosses six figures of input tokens — and the accumulated history, not the current screen, is usually the larger half.</li>
+        <li>Wall-clock is dominated by three terms: model latency, interface settle time, and the retries. Perceived speed improves most from <b>fewer steps</b>, not a faster model — which is the strongest argument for code actions.</li>
+        <li>Standard economies: cache the stable prefix, drop or downscale old screenshots and keep only their summaries, batch independent checks, and let a small model handle grounding while a large one plans.</li>
+      </ul>
+      <div class="formula"><span class="lbl">what a task actually costs</span><span class="eq">C<sub>task</sub> = ∑<sub>t=1..n</sub> ( c<sub>obs</sub>(o<sub>t</sub>) + c<sub>ctx</sub>(t) + c<sub>out</sub> )</span>        <span class="eq">cost per success = C<sub>task</sub> / SR</span>        <span class="eq">step efficiency = n<sub>agent</sub> / n<sub>human</sub></span></div>
+      <div class="callout">A 90% agent at 40 steps and five minutes per task can be worth less than a 70% agent at 12 steps — because the failures are cheap to retry and the successes are cheap to produce.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="challenges" data-nav="Safety &amp; containment">
+      <h3><span class="idx">08</span> Safety &amp; containment</h3>
+      <p class="lede">This is the one agent setting where the model's mistakes are indistinguishable from a user's — same clicks, same credentials, same consequences. Safety here is engineering, not prompting.</p>
+
+      <h4>Irreversible actions</h4>
+      <ul class="notes">
+        <li>Classify actions before granting them: reversible (navigation, scrolling, reading), recoverable (edit a draft, move a file), and <b>irreversible</b> (send, pay, delete, deploy, grant access). Only the last class needs a gate, so the gate stays rare enough to be taken seriously.</li>
+        <li>Practical gates: an explicit confirmation showing <i>what</i> will happen to <i>what</i>, spend and rate caps enforced by the runtime, allow-listed domains and applications, and a preference for dry runs and drafts over direct execution.</li>
+      </ul>
+
+      <h4>Prompt injection through the interface</h4>
+      <ul class="notes">
+        <li>Every pixel and every DOM node is <b>untrusted input</b>. A page, a document, an email, an image, or a hidden element can contain text addressed to the agent — and a policy trained to follow on-screen instructions is exactly the wrong prior.</li>
+        <li>The dangerous combination is access to sensitive data, exposure to untrusted content, and an outbound channel. Remove any one of the three and exfiltration stops being possible.</li>
+        <li>Defences that hold up: keep observations strictly as data in the prompt, never as instructions; require the goal to come only from the user turn; confirm outbound actions (send, upload, post, navigate off the allow-list); and run injection-attempt suites as a standing regression test rather than a one-off audit.</li>
+      </ul>
+
+      <h4>Sandboxing</h4>
+      <ul class="notes">
+        <li>Run in a disposable VM or container with a snapshot to restore, a scoped network, a separate browser profile, and least-privilege credentials — short-lived, per-task, and never the operator's own session.</li>
+        <li>Log every observation and action for replay. Post-hoc debugging of a GUI agent without a frame-by-frame trace is guesswork.</li>
+      </ul>
+      <div class="callout"><b>Containment beats correctness.</b> Assume the policy will occasionally do the wrong thing; design so that the worst wrong thing available to it is cheap to undo.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="takeaways" data-nav="Pitfalls &amp; what to remember">
+      <h3><span class="idx">09</span> Pitfalls &amp; what to remember</h3>
+      <h4>Pitfalls</h4>
+      <ul class="notes">
+        <li><b>Judging by the demo.</b> Cherry-picked recordings hide the tail; only execution-verified success on held-out tasks counts.</li>
+        <li><b>Not measuring grounding separately.</b> A planning problem and a targeting problem look identical in an end-to-end failure log and need opposite fixes.</li>
+        <li><b>Clicking where an API exists.</b> Twenty clicks that could have been one call: slower, costlier, and far more failure-prone.</li>
+        <li><b>No settle-and-verify step.</b> Acting on a stale frame produces the most confusing failures in the whole field.</li>
+        <li><b>Unbounded loops.</b> Without step, time, and spend caps, a stuck agent will scroll a page forever at full token price.</li>
+        <li><b>Treating screen text as instructions.</b> The default assumption must be that some of it is hostile.</li>
+        <li><b>Testing with real credentials.</b> Evaluate in a snapshot-restorable sandbox, always.</li>
+      </ul>
+      <h4>What to remember</h4>
+      <ul class="notes">
+        <li><b>Observation space</b> (pixels · accessibility tree · DOM · set-of-marks) and <b>action space</b> (coordinates · element index · code) are the two design choices that determine everything else.</li>
+        <li>The loop is perceive → plan → act → <b>settle and verify</b>; the missing fourth stage is where most agents quietly fail.</li>
+        <li><b>Grounding</b> is the dominant per-step error, and per-step error compounds as <code>p<sup>n</sup></code> over a 15–50 step horizon.</li>
+        <li>Train by <b>cloning</b> trajectories first, then <b>reinforce</b> against verified task success with a step penalty.</li>
+        <li>Score on success, steps, and cost together — and contain the blast radius before optimising any of them.</li>
+        <li>Neighbours: <a href="agents.html">agents</a>, <a href="agent-skills.html">agent skills</a> for packaging reusable procedures, <a href="agentic-rl.html">agentic RL</a>, <a href="agentic-design-patterns.html">design patterns</a>, and <a href="../llm/vision-language-models.html">vision-language models</a>.</li>
+      </ul>
+      <div class="callout"><b>The whole page in one line:</b> pick the most structured observation and the highest-level action the environment allows, verify after every step, and sandbox as if the agent will be talked into something — because eventually it will be.</div>
+    </section>
+
+    <footer>
+      A personal collection of notes compiled from various sources. Visualizations are illustrative, built with D3.js — they convey the intuition, not exact production implementations.
+      <br>Built as interactive study notes · <span id="builddate"></span>
+    </footer>
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script>
+(function(){
+  const C={accent:"#fb923c",good:"#4ade80",blue:"#5b9cff",muted:"#9aa3b2",ink:"#e6e9ef",line:"#2a2f3a"};
+  const svg=d3.select("#cc-svg"),W=640;
+  const steps=[
+    {act:"observe", txt:"read screenshot — a search page", target:null},
+    {act:"click", txt:'click(the search box)', target:"box"},
+    {act:"type", txt:'type("best ML notes")', target:"box"},
+    {act:"click", txt:"click(Search)", target:"btn"},
+    {act:"click", txt:"click(first result)", target:"res"},
+  ];
+  function draw(){
+    svg.selectAll("*").remove();
+    const k=+d3.select("#cc-step").property("value"); const s=steps[k];
+    // mock browser window
+    svg.append("rect").attr("x",30).attr("y",16).attr("width",430).attr("height",210).attr("rx",8).attr("fill","#0f131b").attr("stroke","#2a2f3a");
+    svg.append("rect").attr("x",30).attr("y",16).attr("width",430).attr("height",24).attr("rx",8).attr("fill","#171a23");
+    [44,60,76].forEach((cx,i)=>svg.append("circle").attr("cx",cx).attr("cy",28).attr("r",4).attr("fill",["#fb7185","#fbbf24","#4ade80"][i]));
+    // search box
+    const box={x:60,y:70,w:280,h:34};
+    svg.append("rect").attr("x",box.x).attr("y",box.y).attr("width",box.w).attr("height",box.h).attr("rx",6).attr("fill","#15181f").attr("stroke",s.target==="box"?C.accent:"#2a2f3a").attr("stroke-width",s.target==="box"?2:1);
+    svg.append("text").attr("x",box.x+10).attr("y",box.y+22).attr("font-size",12).attr("fill",k>=2?C.ink:"#5d6675").attr("font-family","SF Mono,monospace").text(k>=2?"best ML notes":"Search…");
+    // button
+    const btn={x:350,y:70,w:90,h:34};
+    svg.append("rect").attr("x",btn.x).attr("y",btn.y).attr("width",btn.w).attr("height",btn.h).attr("rx",6).attr("fill",s.target==="btn"?"rgba(251,146,60,.25)":"rgba(91,156,255,.18)").attr("stroke",s.target==="btn"?C.accent:C.blue).attr("stroke-width",s.target==="btn"?2:1);
+    svg.append("text").attr("x",btn.x+btn.w/2).attr("y",btn.y+22).attr("text-anchor","middle").attr("font-size",12).attr("fill",C.ink).text("Search");
+    // results (after step 3)
+    if(k>=4){ ["ML Notes — interactive","Intro to ML","ML cheatsheet"].forEach((t,i)=>{ const ry=120+i*30; svg.append("rect").attr("x",60).attr("y",ry).attr("width",380).attr("height",26).attr("rx",5).attr("fill",i===0&&s.target==="res"?"rgba(251,146,60,.18)":"#15181f").attr("stroke",i===0&&s.target==="res"?C.accent:"#2a2f3a"); svg.append("text").attr("x",70).attr("y",ry+17).attr("font-size",11).attr("fill",i===0?C.blue:C.muted).text(t); }); }
+    else if(k>=1){ svg.append("text").attr("x",60).attr("y",150).attr("font-size",11).attr("fill","#5d6675").text("(results appear after search)"); }
+    // cursor on target
+    const tmap={box:[box.x+box.w-20,box.y+box.h/2], btn:[btn.x+btn.w/2,btn.y+btn.h/2], res:[250,133]};
+    if(s.target && tmap[s.target]){ const t=tmap[s.target]; svg.append("circle").attr("cx",t[0]).attr("cy",t[1]).attr("r",10).attr("fill","none").attr("stroke",C.accent).attr("stroke-width",2);
+      svg.append("text").attr("x",t[0]+4).attr("y",t[1]+22).attr("font-size",14).text("🖱"); }
+    // action panel
+    svg.append("rect").attr("x",478).attr("y",16).attr("width",132).attr("height",210).attr("rx",8).attr("fill","#15181f").attr("stroke","#2a2f3a");
+    svg.append("text").attr("x",544).attr("y",36).attr("text-anchor","middle").attr("fill",C.muted).attr("font-size",10).text("agent");
+    steps.forEach((st,i)=>{ const y=54+i*34; const on=i===k, done=i<k;
+      svg.append("circle").attr("cx",492).attr("cy",y).attr("r",5).attr("fill",done?C.good:on?C.accent:"#2a2f3a");
+      svg.append("text").attr("x",502).attr("y",y+4).attr("font-size",8.5).attr("fill",on?C.ink:done?C.muted:"#46506180").text(st.act); });
+    d3.select("#cc-read").html(`step <b>${k+1}/5</b> · <b style="color:${C.accent}">${s.act}</b> → ${s.txt}`);
+  }
+  d3.select("#cc-step").on("input",draw);
+  d3.select("#cc-next").on("click",()=>{ const v=Math.min(4,+d3.select("#cc-step").property("value")+1); d3.select("#cc-step").property("value",v); draw(); });
+  draw();
+})();
+
+(function(){
+  const C={accent:"#fb923c",good:"#4ade80",blue:"#5b9cff",muted:"#9aa3b2",ink:"#e6e9ef",dim:"#5d6675",line:"#2a2f3a"};
+  const svg=d3.select("#obs-svg");
+  const MONO="SF Mono,Menlo,monospace";
+  const els=[
+    {n:1, x:24, y:64,  w:190, h:26, kind:"textbox", label:"Search"},
+    {n:2, x:222,y:64,  w:62,  h:26, kind:"button",  label:"Go"},
+    {n:3, x:24, y:104, w:260, h:22, kind:"link",    label:"Interactive notes — index"},
+    {n:4, x:24, y:134, w:260, h:22, kind:"link",    label:"Study plan (draft)"},
+    {n:5, x:24, y:170, w:110, h:24, kind:"checkbox",label:"Only mine"},
+  ];
+  function screenPanel(marks){
+    svg.append("rect").attr("x",14).attr("y",14).attr("width",300).attr("height",232).attr("rx",8).attr("fill","#0f131b").attr("stroke",C.line);
+    svg.append("rect").attr("x",14).attr("y",14).attr("width",300).attr("height",22).attr("rx",8).attr("fill","#171a23");
+    [26,40,54].forEach((cx,i)=>svg.append("circle").attr("cx",cx).attr("cy",25).attr("r",3.5).attr("fill",["#fb7185","#fbbf24","#4ade80"][i]));
+    svg.append("text").attr("x",164).attr("y",29).attr("text-anchor","middle").attr("font-size",9).attr("fill",C.muted).text("notes · search");
+    els.forEach(e=>{
+      const g=svg.append("g").attr("transform","translate(14,14)");
+      const fill = e.kind==="button" ? "rgba(91,156,255,.18)" : e.kind==="link" ? "transparent" : "#15181f";
+      if(e.kind!=="link") g.append("rect").attr("x",e.x).attr("y",e.y).attr("width",e.w).attr("height",e.h).attr("rx",5).attr("fill",fill).attr("stroke",e.kind==="button"?C.blue:C.line);
+      g.append("text").attr("x",e.x+(e.kind==="button"?e.w/2:8)).attr("y",e.y+e.h/2+4)
+        .attr("text-anchor",e.kind==="button"?"middle":"start").attr("font-size",10)
+        .attr("fill",e.kind==="link"?C.blue:e.kind==="textbox"?C.dim:C.ink).text(e.label);
+      if(marks){
+        g.append("rect").attr("x",e.x-4).attr("y",e.y-4).attr("width",e.w+8).attr("height",e.h+8).attr("rx",4)
+          .attr("fill","none").attr("stroke",C.accent).attr("stroke-width",1).attr("stroke-dasharray","3,2");
+        g.append("rect").attr("x",e.x-4).attr("y",e.y-14).attr("width",14).attr("height",12).attr("rx",2).attr("fill",C.accent);
+        g.append("text").attr("x",e.x+3).attr("y",e.y-4.5).attr("text-anchor","middle").attr("font-size",8.5).attr("fill","#12151c").text(e.n);
+      }
+    });
+  }
+  function textPanel(title,lines,colorFn){
+    svg.append("rect").attr("x",328).attr("y",14).attr("width",298).attr("height",232).attr("rx",8).attr("fill","#15181f").attr("stroke",C.line);
+    svg.append("text").attr("x",340).attr("y",30).attr("font-size",9.5).attr("fill",C.muted).text(title);
+    lines.forEach((ln,i)=>{
+      svg.append("text").attr("x",340).attr("y",48+i*15.5).attr("font-size",9).attr("font-family",MONO)
+        .attr("fill",colorFn?colorFn(ln,i):C.ink).text(ln);
+    });
+  }
+  const views={
+    pixels(){
+      screenPanel(false);
+      textPanel("what the model receives",[
+        "[image  1280 × 800 → 1024 × 640]",
+        "≈ 1,400 visual tokens",
+        "",
+        "no element list, no labels,",
+        "no bounding boxes —",
+        "everything must be read",
+        "out of the pixels.",
+        "",
+        "action it must emit:",
+        "  click(x=142, y=91)",
+      ],(ln,i)=>i>=8?C.accent:C.ink);
+      return "Pixels: universal — works on any app or remote desktop — but the model has to regress a coordinate, and small text disappears when the frame is downscaled.";
+    },
+    axtree(){
+      screenPanel(false);
+      textPanel("accessibility tree (pruned)",[
+        "document \"notes · search\"",
+        "  textbox  name=\"Search\"  focused",
+        "  button   name=\"Go\"",
+        "  link     name=\"Interactive notes…\"",
+        "  link     name=\"Study plan (draft)\"",
+        "  checkbox name=\"Only mine\" checked=false",
+        "",
+        "roles · names · states · boxes",
+        "",
+        "action it must emit:",
+        "  click(role=button, name=\"Go\")",
+      ],(ln,i)=>i>=9?C.good:(i===7?C.muted:C.ink));
+      return "Accessibility tree: roles, names, and states with exact boxes — no coordinate error at all, but only as complete as the app's own accessibility support.";
+    },
+    dom(){
+      screenPanel(false);
+      textPanel("pruned DOM (interactive nodes)",[
+        "<input id=q  type=text  aria-label=Search>",
+        "<button class=go>Go</button>",
+        "<a href=/index>Interactive notes — index</a>",
+        "<a href=/plan>Study plan (draft)</a>",
+        "<input id=mine type=checkbox>",
+        "",
+        "unpruned this page is ~12k tokens;",
+        "styles, scripts and hidden nodes",
+        "dominate and must be stripped.",
+        "",
+        "action it must emit:",
+        "  click(selector=\"button.go\")",
+      ],(ln,i)=>i>=10?C.blue:(i>=6&&i<=8?C.muted:C.ink));
+      return "DOM: exact selectors and hidden attributes, web only — and by far the most verbose. Pruning to visible, interactive nodes is mandatory, and layout is invisible in it.";
+    },
+    som(){
+      screenPanel(true);
+      textPanel("annotated image + legend",[
+        "[image with numbered boxes]",
+        "",
+        "1  textbox   \"Search\"",
+        "2  button    \"Go\"",
+        "3  link      \"Interactive notes…\"",
+        "4  link      \"Study plan (draft)\"",
+        "5  checkbox  \"Only mine\"",
+        "",
+        "layout stays visible, the action",
+        "space is discrete and checkable.",
+        "",
+        "action it must emit:",
+        "  click(elem=2)",
+      ],(ln,i)=>i>=11?C.accent:(i>=8&&i<=9?C.muted:C.ink));
+      return "Set-of-marks: detect the interactive elements, draw numbered boxes, pass image + legend. The model picks an index — validatable before execution — while keeping the visual layout.";
+    },
+  };
+  function draw(){
+    svg.selectAll("*").remove();
+    const k=d3.select("#obs-sel").property("value");
+    d3.select("#obs-read").html(views[k]());
+  }
+  d3.select("#obs-sel").on("change",draw);
+  draw();
+})();
+</script>
+</body>
+</html>
