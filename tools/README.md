@@ -56,6 +56,38 @@ A raw grep for LaTeX (`\frac`, `\sum`, `$$`) can match viz `<script>` code
 (e.g. a JS template literal `$${value}`). When checking for LaTeX leakage,
 restrict to prose / `.formula` blocks, not `<script>` bodies.
 
+## wire_stats_part.py
+
+Attaches one finished part of the nine-part Statistics series to the site. The
+page-building agents are deliberately told not to touch shared state, so this is
+the one place it changes.
+
+```
+python3 tools/wire_stats_part.py <partNo> "<node id>" <file.html> "<title>" [<prev file.html>]
+# e.g.
+python3 tools/wire_stats_part.py 6 "Regression & Correlation" regression.html "Regression &amp; Correlation" hypothesis-testing.html
+```
+
+Four steps, each idempotent and each checked before it edits: set `link:` on the
+level-3 node in `data.js`; turn the hub's `<div class="card pending">` into a
+real `<a class="card">`; link any hub cheat-sheet `Part N` cells; and fill the
+previous part's empty right-hand pager `<span>` with the forward arrow.
+
+## verify_page.py
+
+The per-page house-rule gate, complementing `hierarchy_audit.py`'s whole-graph one.
+
+```
+python3 tools/verify_page.py math/statistics/*.html      # exits non-zero on any failure
+```
+
+Catches: a truncated file, unbalanced tags, a large inline `<script>` (page code
+belongs in a sibling `*.viz.js`), LaTeX in the prose, an `<svg>` missing
+`viewBox`/`role`/`aria-label`, and — the subtle one — lowercase Greek left
+unwrapped inside a `.lbl`, which the uppercase label style silently renders as a
+*different symbol* (η as H, δ as Δ). It strips `<script>` bodies before the LaTeX
+scan, avoiding the false positive noted above.
+
 ## How this capability should live
 
 This is a **reusable script**, not an agent that re-derives the rules each run.
