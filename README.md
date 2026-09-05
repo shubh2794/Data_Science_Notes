@@ -81,10 +81,10 @@ data-eng/MLOps/viz stubs).
 | MLOps & Deployment | `mlops/` | 🟡 LLMOps, Model Acceleration, A/B Testing, Federated Learning (originals Deploy/Monitor/CI-CD/Tracking = stubs) |
 | Speech & Audio | `speech/` | ✅ Speech Processing (1/1) |
 | Model Architectures | `models/` | ✅ BERT, GPT, CLIP, LayoutLM (v1/v2/v3), Donut (each with notes + research papers + visuals) — add more models here |
-| Math & Statistics | `math/` | 🟡 Linear Algebra (hub + 6 sub-topic pages: Vectors & Vector Spaces, Matrices & Rank, Systems/Determinants/Inverses, Projections & Least-Squares, Eigendecomposition & SVD, Quadratic Forms/Covariance/PCA), Optimization — Probability, Statistics, Calculus = stubs |
+| Math & Statistics | `math/` | 🟡 Linear Algebra (hub + 6 sub-topic pages: Vectors & Vector Spaces, Matrices & Rank, Systems/Determinants/Inverses, Projections & Least-Squares, Eigendecomposition & SVD, Quadratic Forms/Covariance/PCA), Calculus, Optimization — Probability, Statistics = stubs |
 | Programming & Tools | `programming-tools/` | ⏳ Scaffold nodes only |
-| Computer Vision | `computer-vision/` | ⏳ Scaffold nodes only |
-| Data Viz & Communication | `data-viz/` | ⏳ Scaffold nodes only |
+| Data Systems | `databases/` | 🟡 Vector Databases (HNSW) — relational/NoSQL, indexing, transactions, distributed storage, streaming, lakes, scaling patterns = stubs |
+| Data Viz & Communication | `data-viz/` | ⏳ Scaffold nodes only (Dashboards, Data Storytelling) |
 
 ## Architecture
 
@@ -104,8 +104,32 @@ The project is data-driven and static (no build step, opens over `file://`):
   only between currently-visible nodes, so the view stays readable as it grows.
   `index-force.html` keeps the original force-directed layout as a fallback.
 
-A notes page is therefore just: header + `section.topic` content + its own inline
-viz `<script>`, loading `../data.js → ../notes.js →` its viz.
+A notes page is therefore just: header + `section.topic` content + viz
+containers, loading `../data.js` → `../notes.js` → its own `*.viz.js`.
+**No page carries a large inline `<script>`** — every page's visualization code
+lives in a sibling file named after it (`calculus.html` → `calculus.viz.js`), and
+the landing graph's code is in `graph.js`.
+
+### Folders, sub-folders, and separate scripts
+
+Pages are **not** monolithic. A multi-part series gets its **own sub-folder** and
+splits its code out of the HTML:
+
+```
+math/statistics/
+├── index.html          # the hub / overview
+├── descriptive.html    # part 1  (content + viz containers only)
+├── descriptive.viz.js  # part 1's visualizations
+└── stats-viz.js        # helpers shared by every part of the series
+```
+
+A page in a sub-folder loads `../../notes.css`, `../../data.js`, `../../notes.js`,
+then the series helper, then its own `*.viz.js`. `data.js` keeps storing every
+`link` **relative to the ml-notes root** (`math/statistics/descriptive.html`);
+`notes.js` resolves each sidebar href against the *current* page's folder, so a
+page works at **any depth** — a sibling collapses to a bare filename, the graph
+becomes `../../index.html`. `tools/hierarchy_audit.py` walks domain folders
+recursively for the same reason.
 
 ## Conventions
 

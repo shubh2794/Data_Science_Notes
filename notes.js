@@ -19,12 +19,27 @@ const C = { A:"#5b9cff", B:"#ffb454", good:"#4ade80", bad:"#f87171", ink:"#e6e9e
   const nav = document.getElementById("sidebar");
   const cur = (typeof nodeForPath === "function") ? nodeForPath(location.pathname) : null;
 
+  /* Depth-aware links. Every `link` in data.js is relative to the ml-notes root
+     ("math/statistics/descriptive.html"), but a page may sit at any depth, so
+     resolve each href against the CURRENT page's folder instead of assuming one
+     level. For the depth-1 pages this returns exactly what the old code did:
+     a sibling in the same folder collapses to its bare filename, the graph is
+     "../index.html", a page in another folder is "../nlp/embeddings.html". */
+  const rel = (to) => {
+    const from = (cur && cur.link ? cur.link : "x.html").split("/").slice(0, -1);
+    const t = to.split("/");
+    let i = 0;
+    while (i < from.length && i < t.length - 1 && from[i] === t[i]) i++;
+    return "../".repeat(from.length - i) + t.slice(i).join("/");
+  };
+  const ROOT = () => rel("index.html");
+
   if (nav && cur) {
     const g = GROUPS[cur.group];
     const head = [
       `<div class="navtitle">${g.label}</div>`,
       `<div class="sub">Interactive notes · a collection from various sources</div>`,
-      `<a class="tocitem graphlink" href="../index.html?focus=${encodeURIComponent(cur.id)}"><span aria-hidden="true">🕸</span> Graph view</a>`,
+      `<a class="tocitem graphlink" href="${ROOT()}?focus=${encodeURIComponent(cur.id)}"><span aria-hidden="true">🕸</span> Graph view</a>`,
     ];
     // On this page — section outline (primary, open by default)
     const secs = [...document.querySelectorAll("section.topic[id]")];
@@ -33,8 +48,8 @@ const C = { A:"#5b9cff", B:"#ffb454", good:"#4ade80", bad:"#f87171", ink:"#e6e9e
     // sibling topics: same domain for a topic page; same parent (plus the parent hub) for a level-3 sub-topic page
     const parent = (typeof PARENT !== "undefined") ? PARENT[cur.id] : null;
     const sibIds = (cur.level === 3 && typeof subtree !== "undefined" && subtree[parent]) ? subtree[parent] : (tree[g.label] || []);
-    const item = id => `<a class="tocitem${id===cur.id?" active":""}" href="${meta[id].link.split("/").pop()}">${id}</a>`;
-    const sibs = (cur.level === 3 && meta[parent] && meta[parent].link ? `<a class="tocitem" href="${meta[parent].link.split("/").pop()}">↑ ${parent} · overview</a>` : "")
+    const item = id => `<a class="tocitem${id===cur.id?" active":""}" href="${rel(meta[id].link)}">${id}</a>`;
+    const sibs = (cur.level === 3 && meta[parent] && meta[parent].link ? `<a class="tocitem" href="${rel(meta[parent].link)}">↑ ${parent} · overview</a>` : "")
       + sibIds.filter(id => meta[id] && meta[id].link).map(item).join("");
     const sibCount = sibIds.filter(id => meta[id] && meta[id].link).length + (cur.level === 3 ? 1 : 0);
     // sub-topics (level 3) of a hub page
@@ -43,8 +58,8 @@ const C = { A:"#5b9cff", B:"#ffb454", good:"#4ade80", bad:"#f87171", ink:"#e6e9e
     // connections (bidirectional links from data.js)
     const nbrs = (typeof ADJ !== "undefined") ? [...(ADJ[cur.id] || [])].filter(id => meta[id]).sort() : [];
     const conns = nbrs.map(id => { const n = meta[id];
-      return n.link ? `<a class="tocitem" href="../${n.link}">${id}</a>`
-                    : `<a class="onpage" href="../index.html?focus=${encodeURIComponent(id)}">${id} 🕸</a>`; }).join("");
+      return n.link ? `<a class="tocitem" href="${rel(n.link)}">${id}</a>`
+                    : `<a class="onpage" href="${ROOT()}?focus=${encodeURIComponent(id)}">${id} 🕸</a>`; }).join("");
 
     const groups = [];
     if (onpage) groups.push(grp("On this page", onpage, true, secs.length));
@@ -108,7 +123,7 @@ const C = { A:"#5b9cff", B:"#ffb454", good:"#4ade80", bad:"#f87171", ink:"#e6e9e
     pos.forEach(p => svg.append("line").attr("x1",cx).attr("y1",cy).attr("x2",p[0]).attr("y2",p[1]).attr("stroke","#2a2f3a").attr("stroke-width",1));
     nbrs.forEach((id,i)=>{
       const n=meta[id], col=(GROUPS[n.group]||{}).color||"#888", p=pos[i], left=p[0] < cx-2;
-      const a=svg.append("a").attr("href", n.link ? ("../"+n.link) : ("../index.html?focus="+encodeURIComponent(id)));
+      const a=svg.append("a").attr("href", n.link ? rel(n.link) : (ROOT()+"?focus="+encodeURIComponent(id)));
       a.append("circle").attr("cx",p[0]).attr("cy",p[1]).attr("r",5).attr("fill",col).attr("fill-opacity",n.link?0.95:0.45)
         .attr("stroke",n.link?"#fff":"#555").attr("stroke-width",1).style("cursor","pointer");
       a.append("title").text(id + (n.link?"":" (in graph)"));

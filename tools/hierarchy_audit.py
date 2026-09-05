@@ -27,6 +27,7 @@ DOMAIN_FOLDERS = {
     "llm": "LLMs & Generative AI",
     "agentic": "Agentic AI",
     "data-engineering": "Data Engineering",
+    "databases": "Data Systems",
     "mlops": "MLOps & Deployment",
     "speech": "Speech & Audio",
 }
@@ -65,15 +66,23 @@ def load_data():
     return nodes, tree, cross, subtree
 
 
+def html_files(folder):
+    """Every .html under a domain folder, at ANY depth, as a ROOT-relative path.
+    Sub-topic series live in their own sub-folder (e.g. math/statistics/), so this
+    must recurse — a flat listdir would miss them and report them as missing."""
+    d = os.path.join(ROOT, folder)
+    if not os.path.isdir(d):
+        return
+    for dirpath, _dirnames, filenames in os.walk(d):
+        for f in sorted(filenames):
+            if f.endswith(".html"):
+                yield os.path.relpath(os.path.join(dirpath, f), ROOT).replace(os.sep, "/")
+
+
 def disk_pages():
     pages = set()
     for folder in DOMAIN_FOLDERS:
-        d = os.path.join(ROOT, folder)
-        if not os.path.isdir(d):
-            continue
-        for f in os.listdir(d):
-            if f.endswith(".html"):
-                pages.add(f"{folder}/{f}")
+        pages.update(html_files(folder))
     return pages
 
 
@@ -169,21 +178,16 @@ def audit():
     broken_inbody = []
     href_re = re.compile(r'(?:href|src)="([^"]+\.html[^"]*)"')
     for folder in DOMAIN_FOLDERS:
-        d = os.path.join(ROOT, folder)
-        if not os.path.isdir(d):
-            continue
-        for f in os.listdir(d):
-            if not f.endswith(".html"):
-                continue
-            page = os.path.join(d, f)
+        for rel_page in html_files(folder):
+            page = os.path.join(ROOT, rel_page)
             txt = open(page, encoding="utf-8").read()
             for m in href_re.finditer(txt):
                 tgt = m.group(1).split("#")[0].split("?")[0]
                 if tgt.startswith("http") or not tgt:
                     continue
-                resolved = os.path.normpath(os.path.join(d, tgt))
+                resolved = os.path.normpath(os.path.join(os.path.dirname(page), tgt))
                 if not os.path.exists(resolved):
-                    broken_inbody.append({"page": f"{folder}/{f}", "href": m.group(1)})
+                    broken_inbody.append({"page": rel_page, "href": m.group(1)})
     R["broken_inbody_links"] = broken_inbody
 
     # 11. near-duplicate node ids (same normalized stem) — possible merge candidates
