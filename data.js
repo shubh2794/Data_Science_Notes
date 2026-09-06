@@ -79,6 +79,7 @@ const nodes = [
   {id:"Pandas & NumPy", group:"prog", level:2, link:"programming/pandas-numpy.html", desc:"Vectorized arrays and dataframes for in-memory data manipulation. Hub page: why whole-array thinking wins and the shared performance ladder; the two libraries are sub-topics."},
   {id:"NumPy", group:"prog", level:3, link:"programming/numpy.html", desc:"The ndarray memory model — shape, dtype, strides, views vs copies, broadcasting, and axis reductions — the mental model every array library since has copied."},
   {id:"Pandas", group:"prog", level:3, link:"programming/pandas.html", desc:"Labelled, aligned tables on top of NumPy: Series/DataFrame and the Index, dtypes and Copy-on-Write, groupby (split-apply-combine), merge/join/concat, wide↔long reshaping, and missing data."},
+  {id:"Git & Version Control", group:"prog", level:2, desc:"Tracking the history of a project as a directed acyclic graph of immutable snapshots: the content-addressed object model, HEAD/branch/index/working-tree, branching and three-way merge vs rebase, bisect as binary search over history, and the data-science caveats — notebooks that diff badly, data too large to commit, and what reproducibility actually requires."},
   {id:"R", group:"prog", level:2, desc:"A statistics-first language strong in inference and visualization."},
   {id:"Apache Spark", group:"prog", level:2, desc:"Distributed computation for datasets too large for one machine."},
   {id:"Data Structures & Algorithms", group:"dsa", level:1, link:"dsa/data-structures-algorithms.html", desc:"The CS core: arrays, trees, graphs, sorting/searching, dynamic programming, and Big-O complexity analysis."},
@@ -233,7 +234,7 @@ const nodes = [
 const tree = {
   "Math & Statistics":["Linear Algebra","Probability","Statistics","Calculus","Optimization"],
   // Foundations — folded into the main tree so they render like any other domain
-  "Programming & Tools":["Python","SQL","Pandas & NumPy","R","Apache Spark"],
+  "Programming & Tools":["Python","SQL","Pandas & NumPy","Git & Version Control","R","Apache Spark"],
   "Data Structures & Algorithms":["Arrays & Strings","Trees & Graphs","Sorting & Searching","Dynamic Programming","Big-O Complexity"],
   "Data Systems":["Relational & SQL","NoSQL","Indexing","Transactions (ACID)","Sharding & Replication","Vector Databases (HNSW)","Hadoop & MapReduce","Streaming (Kafka)","Data Lakes","Distributed Storage","Warehouses & Lakehouses","Scalability","Load Balancing","Caching","Message Queues","CAP Theorem"],
   "Data Engineering":["ETL Pipelines","Data Warehousing","Feature Stores","Stream Processing","Data Preprocessing","Data Sampling & Imbalance","Data Quality & Governance","Differential Privacy"],
@@ -294,6 +295,10 @@ const cross = [
   ["k-Nearest Neighbors","Clustering (k-Means)"],
   ["Linear Algebra","Support Vector Machines"],["Linear Algebra","Linear & Logistic Regression"],
   ["Feature Stores","Model Deployment"],["Python","Pandas & NumPy"],
+  ["Git & Version Control","Python"],["Git & Version Control","Trees & Graphs"],
+  ["Git & Version Control","Sorting & Searching"],["Git & Version Control","CI/CD"],
+  ["Git & Version Control","Experiment Tracking"],["Git & Version Control","Data Quality & Governance"],
+  ["Git & Version Control","Model Deployment"],
   ["Python","Data Structures & Algorithms"],["Python","Big-O Complexity"],
   ["SQL","Data Warehousing"],["SQL","Descriptive Statistics"],["SQL","Apache Spark"],["SQL","ETL Pipelines"],["Apache Spark","Stream Processing"],
   ["Deep Learning","Machine Learning","isa"],["Language Models","RAG"],
