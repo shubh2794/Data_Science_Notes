@@ -46,7 +46,7 @@ const nodes = [
   {id:"Computer Vision", group:"cv", level:1, desc:"Recovering geometry, motion and meaning from images — the classical pipeline that runs from photons and lenses to features, correspondence and 3D structure. The learned view of vision lives in Deep Learning; this domain owns the geometry and signal processing it is built on."},
   {id:"Classical Vision", group:"cv", level:2, link:"vision/index.html", desc:"Hub page for the classical computer-vision series: the map of the subject, the pipeline that connects the parts, and a cheat sheet. Seven sub-topics below run from image formation to stereo and structure from motion."},
   {id:"Image Formation", group:"cv", level:3, link:"vision/image-formation.html", desc:"How a scene becomes an array of numbers: geometric primitives and 2D/3D transformations, the pinhole camera and projection, intrinsics and extrinsics, lens distortion, photometric formation and light transport, colour, and the sensor pipeline that ends in pixels."},
-  {id:"Image Processing", group:"cv", level:3, desc:"Operations on pixels before any interpretation: point operators and histogram equalisation, linear filtering and convolution, separable and Gaussian kernels, non-linear and bilateral filtering, median and rank filters, mathematical morphology, pyramids and multi-resolution, and geometric warping."},
+  {id:"Image Processing", group:"cv", level:3, link:"vision/image-processing.html", desc:"Operations on pixels before any interpretation: point operators and histogram equalisation, linear filtering and convolution, separable and Gaussian kernels, non-linear and bilateral filtering, median and rank filters, mathematical morphology, pyramids and multi-resolution, and geometric warping."},
   {id:"Frequency Domain", group:"cv", level:3, desc:"Images as signals: the Fourier transform and the DFT, the sampling theorem and aliasing, filtering as multiplication in the frequency domain, the convolution theorem, windowing, and the wavelet and DCT transforms that underpin image compression."},
   {id:"Features & Matching", group:"cv", level:3, desc:"Finding what is repeatable: edges and the Canny detector, corners and the Harris response, blob and scale-space detection, invariant descriptors, matching strategies and ratio tests, and robust fitting with RANSAC."},
   {id:"Segmentation", group:"cv", level:3, desc:"Partitioning an image into regions: thresholding and Otsu's method, region growing and split-and-merge, watershed, active contours, graph cuts and normalised cuts, mean shift, and superpixels."},
@@ -276,6 +276,7 @@ const subtree = {
 /* cross edges. 3rd element "isa" = hierarchy bridge (is-a / builds-on),
    oriented child → parent; rendered as a dotted arrow in the graph. */
 const cross = [
+  ["Image Processing","Eigendecomposition & SVD"],["Image Processing","Descriptive Statistics"],["Image Processing","Calculus"],
   ["Autoencoders & VAEs","Diffusion Models"],["Autoencoders & VAEs","GANs"],
   ["Autoencoders & VAEs","Dimensionality Reduction (PCA)"],["Autoencoders & VAEs","Contrastive Learning"],
   ["Autoencoders & VAEs","Feedforward / MLP"],
