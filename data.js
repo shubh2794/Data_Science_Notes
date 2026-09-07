@@ -144,6 +144,8 @@ const nodes = [
   {id:"Mixture of Experts", group:"dl", level:2, link:"deep-learning/mixture-of-experts.html", desc:"Sparse scaling: replace the dense FFN with many expert FFNs and route each token to only the top-k — huge parameter count, small per-token compute (Switch, Mixtral, DeepSeek)."},
   {id:"GANs", group:"dl", level:2, link:"deep-learning/generative-adversarial-networks.html", desc:"A generator and discriminator competing in a minimax game to synthesize realistic data."},
   {id:"Diffusion Models", group:"dl", level:2, link:"deep-learning/diffusion-models.html", desc:"Generate data by learning to reverse a gradual noising process — SOTA for image synthesis."},
+  {id:"Autoencoders & VAEs", group:"dl", level:2, desc:"Learning a compressed code by reconstructing the input: the undercomplete autoencoder and its relation to PCA, denoising and sparse variants, the variational autoencoder's latent distribution and the reparameterisation trick, the ELBO and its reconstruction/KL trade-off, posterior collapse, VQ-VAE's discrete codebook, and the latent space that modern diffusion models actually operate in."},
+  {id:"Model Interpretability", group:"ml", level:2, desc:"Explaining what a fitted model is doing: intrinsic vs post-hoc methods, permutation importance, partial dependence and ICE curves, local surrogates, Shapley values and their additive attribution, saliency and class-activation maps for vision models, attention as an explanation and why that is contested, and the gap between an explanation that is faithful and one that is merely plausible."},
   {id:"Graph Neural Networks", group:"dl", level:2, link:"deep-learning/graph-neural-networks.html", desc:"Deep learning on graphs via neighbor message passing."},
 
   // NLP
@@ -248,8 +250,8 @@ const tree = {
   "Data Structures & Algorithms":["Arrays & Strings","Trees & Graphs","Sorting & Searching","Dynamic Programming","Big-O Complexity"],
   "Data Systems":["Relational & SQL","NoSQL","Indexing","Transactions (ACID)","Sharding & Replication","Vector Databases (HNSW)","Hadoop & MapReduce","Streaming (Kafka)","Data Lakes","Distributed Storage","Warehouses & Lakehouses","Scalability","Load Balancing","Caching","Message Queues","CAP Theorem"],
   "Data Engineering":["ETL Pipelines","Data Warehousing","Feature Stores","Stream Processing","Data Preprocessing","Data Sampling & Imbalance","Data Quality & Governance","Differential Privacy"],
-  "Machine Learning":["Linear & Logistic Regression","k-Nearest Neighbors","Clustering (k-Means)","Dimensionality Reduction (PCA)","Support Vector Machines","Naive Bayes","Decision Trees & Ensembles","Regularization","Reinforcement Learning","Model Evaluation","Bias-Variance Tradeoff","Learning Paradigms","ML Algorithms Compared","Hyperparameter Tuning","ML Strategy"],
-  "Deep Learning":["Feedforward / MLP","CNNs","RNNs & LSTMs","Attention","Transformers","Mixture of Experts","GANs","Diffusion Models","Graph Neural Networks","Neural Network Training","Fine-Tuning & Transfer Learning","Knowledge Distillation","Distributed Training","Encoder vs Decoder Models","State Space Models","World Models & JEPA","DL Architectures Compared","Residual / Skip Connections","Contrastive Learning","End-to-End Deep Learning"],
+  "Machine Learning":["Linear & Logistic Regression","Model Interpretability","k-Nearest Neighbors","Clustering (k-Means)","Dimensionality Reduction (PCA)","Support Vector Machines","Naive Bayes","Decision Trees & Ensembles","Regularization","Reinforcement Learning","Model Evaluation","Bias-Variance Tradeoff","Learning Paradigms","ML Algorithms Compared","Hyperparameter Tuning","ML Strategy"],
+  "Deep Learning":["Feedforward / MLP","CNNs","Autoencoders & VAEs","RNNs & LSTMs","Attention","Transformers","Mixture of Experts","GANs","Diffusion Models","Graph Neural Networks","Neural Network Training","Fine-Tuning & Transfer Learning","Knowledge Distillation","Distributed Training","Encoder vs Decoder Models","State Space Models","World Models & JEPA","DL Architectures Compared","Residual / Skip Connections","Contrastive Learning","End-to-End Deep Learning"],
   "Computer Vision":["Classical Vision","Vision Transformers","Image Classification","Object Detection"],
   "NLP":["Tokenization","Embeddings","Language Models","RAG","Text Preprocessing","Named Entity Recognition","Machine Translation","Textual Entailment","Document Intelligence","Knowledge Graphs","Hidden Markov Models & CRFs","Text Classification","Text Summarization","Question Answering","NLP Evaluation Metrics"],
   "MLOps & Deployment":["Model Deployment","Monitoring & Drift","CI/CD","Experiment Tracking","LLMOps","Model Acceleration","Speculative Decoding","A/B Testing","Federated Learning"],
@@ -274,6 +276,12 @@ const subtree = {
 /* cross edges. 3rd element "isa" = hierarchy bridge (is-a / builds-on),
    oriented child → parent; rendered as a dotted arrow in the graph. */
 const cross = [
+  ["Autoencoders & VAEs","Diffusion Models"],["Autoencoders & VAEs","GANs"],
+  ["Autoencoders & VAEs","Dimensionality Reduction (PCA)"],["Autoencoders & VAEs","Contrastive Learning"],
+  ["Autoencoders & VAEs","Feedforward / MLP"],
+  ["Model Interpretability","Model Evaluation"],["Model Interpretability","Decision Trees & Ensembles"],
+  ["Model Interpretability","Attention"],["Model Interpretability","Linear Regression"],
+  ["World Models & JEPA","Contrastive Learning"],
   ["Classical Vision","CNNs"],["Classical Vision","Vision Transformers"],["Classical Vision","Image Classification"],
   ["Image Formation","Matrices & Rank"],["Image Formation","Systems, Determinants & Inverses"],
   ["Image Processing","CNNs"],["Image Processing","Image Classification"],
