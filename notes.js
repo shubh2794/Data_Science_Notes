@@ -2,20 +2,15 @@
    Requires data.js (GROUPS, tree, subtree, PARENT, meta, nodeForPath) loaded first.
    Responsibilities:
      • C  — color palette used by the inline per-page viz scripts
-     • builddate stamp
      • build the sidebar (sibling topics + "On this page") from data.js
      • scrollspy that highlights the current section
    The page only needs:
      <nav class="sidebar" id="sidebar"></nav>   (empty; filled here)
-     <span id="builddate"></span>               (in the footer)
    and to load:  ../data.js  →  ../notes.js  →  its own inline <script>. */
 
 const C = { A:"#5b9cff", B:"#ffb454", good:"#4ade80", bad:"#f87171", ink:"#e6e9ef", muted:"#9aa3b2", line:"#2a2f3a" };
 
 (function(){
-  const bd = document.getElementById("builddate");
-  if (bd) bd.textContent = new Date().toISOString().slice(0,10);
-
   const nav = document.getElementById("sidebar");
   const cur = (typeof nodeForPath === "function") ? nodeForPath(location.pathname) : null;
 
