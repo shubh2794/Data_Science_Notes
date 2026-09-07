@@ -154,8 +154,8 @@ const nodes = [
   {id:"BERT", group:"models", level:2, link:"models/bert.html", desc:"Bidirectional encoder Transformer pretrained with masked language modeling — the pretrain-then-finetune workhorse for NLP understanding tasks."},
 
   // Computer Vision
-  {id:"Image Classification", group:"dl", level:2, desc:"Assigning a label to a whole image — the canonical vision task."},
-  {id:"Object Detection", group:"dl", level:2, desc:"Locating and classifying multiple objects within an image (YOLO, Faster R-CNN)."},
+  {id:"Image Classification", group:"cv", level:2, desc:"Assigning a label to a whole image — the canonical vision task."},
+  {id:"Object Detection", group:"cv", level:2, desc:"Locating and classifying multiple objects within an image (YOLO, Faster R-CNN)."},
 
   // MLOps
   {id:"Model Deployment", group:"mlops", level:2, desc:"Serving models behind APIs, batch jobs, or on-device."},
@@ -238,7 +238,7 @@ const nodes = [
   {id:"Federated Learning", group:"mlops", level:2, link:"mlops/federated-learning.html", desc:"Train across many devices or silos without centralizing data — local updates aggregated into a shared model, for privacy and edge settings."},
   {id:"Differential Privacy", group:"deng", level:2, link:"data-engineering/differential-privacy.html", desc:"A formal privacy guarantee — add calibrated noise so outputs barely change when any single record is added or removed, bounding information leakage."},
   {id:"Contrastive Learning", group:"dl", level:2, link:"deep-learning/contrastive-learning.html", desc:"Learn representations by pulling positive pairs together and pushing negatives — especially hard negatives — apart. The InfoNCE/NT-Xent objective behind SimCLR, MoCo, and CLIP-style multimodal embeddings."},
-  {id:"Vision Transformers", group:"dl", level:2, link:"deep-learning/vision-transformers.html", desc:"Apply the Transformer directly to images: split a picture into fixed-size patches, linearly embed them as a token sequence (plus a [CLS] token and positional embeddings), and run a standard encoder. At scale ViT matches or beats CNNs — the backbone behind CLIP, modern detectors/segmenters, and most vision-language models."},
+  {id:"Vision Transformers", group:"cv", level:2, link:"vision/vision-transformers.html", desc:"Apply the Transformer directly to images: split a picture into fixed-size patches, linearly embed them as a token sequence (plus a [CLS] token and positional embeddings), and run a standard encoder. At scale ViT matches or beats CNNs — the backbone behind CLIP, modern detectors/segmenters, and most vision-language models."},
 ];
 
 const tree = {
@@ -249,8 +249,8 @@ const tree = {
   "Data Systems":["Relational & SQL","NoSQL","Indexing","Transactions (ACID)","Sharding & Replication","Vector Databases (HNSW)","Hadoop & MapReduce","Streaming (Kafka)","Data Lakes","Distributed Storage","Warehouses & Lakehouses","Scalability","Load Balancing","Caching","Message Queues","CAP Theorem"],
   "Data Engineering":["ETL Pipelines","Data Warehousing","Feature Stores","Stream Processing","Data Preprocessing","Data Sampling & Imbalance","Data Quality & Governance","Differential Privacy"],
   "Machine Learning":["Linear & Logistic Regression","k-Nearest Neighbors","Clustering (k-Means)","Dimensionality Reduction (PCA)","Support Vector Machines","Naive Bayes","Decision Trees & Ensembles","Regularization","Reinforcement Learning","Model Evaluation","Bias-Variance Tradeoff","Learning Paradigms","ML Algorithms Compared","Hyperparameter Tuning","ML Strategy"],
-  "Deep Learning":["Feedforward / MLP","CNNs","RNNs & LSTMs","Attention","Transformers","Mixture of Experts","GANs","Diffusion Models","Graph Neural Networks","Neural Network Training","Fine-Tuning & Transfer Learning","Knowledge Distillation","Distributed Training","Encoder vs Decoder Models","State Space Models","World Models & JEPA","DL Architectures Compared","Residual / Skip Connections","Contrastive Learning","Vision Transformers","End-to-End Deep Learning","Image Classification","Object Detection"],
-  "Computer Vision":["Classical Vision"],
+  "Deep Learning":["Feedforward / MLP","CNNs","RNNs & LSTMs","Attention","Transformers","Mixture of Experts","GANs","Diffusion Models","Graph Neural Networks","Neural Network Training","Fine-Tuning & Transfer Learning","Knowledge Distillation","Distributed Training","Encoder vs Decoder Models","State Space Models","World Models & JEPA","DL Architectures Compared","Residual / Skip Connections","Contrastive Learning","End-to-End Deep Learning"],
+  "Computer Vision":["Classical Vision","Vision Transformers","Image Classification","Object Detection"],
   "NLP":["Tokenization","Embeddings","Language Models","RAG","Text Preprocessing","Named Entity Recognition","Machine Translation","Textual Entailment","Document Intelligence","Knowledge Graphs","Hidden Markov Models & CRFs","Text Classification","Text Summarization","Question Answering","NLP Evaluation Metrics"],
   "MLOps & Deployment":["Model Deployment","Monitoring & Drift","CI/CD","Experiment Tracking","LLMOps","Model Acceleration","Speculative Decoding","A/B Testing","Federated Learning"],
   "Data Viz & Communication":["Dashboards","Data Storytelling"],
