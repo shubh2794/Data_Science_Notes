@@ -507,6 +507,127 @@ const VZ = (function () {
     return el;
   }
 
+  /* ── filtering & small numerics ────────────────────────────────────────
+     Promoted from part 2 (image-processing), whose corr2/conv2 were verified
+     against scipy.ndimage to 0.000e+00 across ALL FIVE border modes, and from
+     part 5 (segmentation) for jacobiEig. Parts 3, 4, 6 and 7 must use THESE
+     rather than rolling their own - a forked border-mode convention is the
+     failure this promotion exists to prevent.
+     Border modes: "zero" | "clamp" | "wrap" | "mirror" (whole-sample)
+                 | "symm" (half-sample).  conv2 = corr2 with a flipped kernel. */
+  const zeros = n => new Float64Array(n);
+
+function zeros2(h, w) { const A = []; for (let i = 0; i < h; i++) A.push(new Float64Array(w)); return A; }
+
+const flip2 = H => H.map(r => r.slice()).reverse().map(r => r.reverse());
+
+function bidx(i, n, mode) {
+    if (i >= 0 && i < n) return i;
+    if (n === 1) return 0;
+    switch (mode) {
+      case "zero": case "const": return -1;                  // caller substitutes cval
+      case "clamp": return i < 0 ? 0 : n - 1;
+      case "wrap": return ((i % n) + n) % n;
+      case "mirror": {                                        // period 2n − 2
+        const p = 2 * n - 2; let k = ((i % p) + p) % p;
+        return k < n ? k : p - k;
+      }
+      case "symm": {                                          // period 2n
+        const p = 2 * n; let k = ((i % p) + p) % p;
+        return k < n ? k : p - 1 - k;
+      }
+      default: return i < 0 ? 0 : n - 1;
+    }
+  }
+
+function at2(A, i, j, mode, cval) {
+    const ii = bidx(i, A.length, mode), jj = bidx(j, A[0].length, mode);
+    return (ii < 0 || jj < 0) ? (cval === undefined ? 0 : cval) : A[ii][jj];
+  }
+
+function corr2(A, H, mode, cval) {
+    const R = (H.length - 1) >> 1, C = (H[0].length - 1) >> 1;
+    const G = zeros2(A.length, A[0].length);
+    for (let i = 0; i < A.length; i++) for (let j = 0; j < A[0].length; j++) {
+      let s = 0;
+      for (let k = -R; k <= R; k++) for (let l = -C; l <= C; l++) s += at2(A, i + k, j + l, mode, cval) * H[k + R][l + C];
+      G[i][j] = s;
+    }
+    return G;
+  }
+
+function conv2(A, H, mode, cval) { return corr2(A, flip2(H), mode, cval); }
+
+function sepH(A, h, mode, cval) {
+    const R = (h.length - 1) >> 1, G = zeros2(A.length, A[0].length);
+    for (let i = 0; i < A.length; i++) for (let j = 0; j < A[0].length; j++) {
+      let s = 0; for (let l = -R; l <= R; l++) s += at2(A, i, j + l, mode, cval) * h[l + R];
+      G[i][j] = s;
+    }
+    return G;
+  }
+
+function sepV(A, h, mode, cval) {
+    const R = (h.length - 1) >> 1, G = zeros2(A.length, A[0].length);
+    for (let i = 0; i < A.length; i++) for (let j = 0; j < A[0].length; j++) {
+      let s = 0; for (let k = -R; k <= R; k++) s += at2(A, i + k, j, mode, cval) * h[k + R];
+      G[i][j] = s;
+    }
+    return G;
+  }
+
+const sep2 = (A, h, mode, cval) => sepV(sepH(A, h, mode, cval), h, mode, cval);
+
+function box(K) { const h = zeros(K); h.fill(1 / K); return h; }
+
+function binomial(n) {                               // row n of Pascal, normalised
+    const h = zeros(n + 1); let c = 1;
+    for (let k = 0; k <= n; k++) { h[k] = c; c = c * (n - k) / (k + 1); }
+    const s = h.reduce((a, b) => a + b, 0);
+    for (let k = 0; k <= n; k++) h[k] /= s;
+    return h;
+  }
+
+function gauss1(sigma, trunc) {                      // sampled, truncated, renormalised
+    const R = Math.max(1, Math.ceil((trunc === undefined ? 3 : trunc) * sigma));
+    const h = zeros(2 * R + 1); let s = 0;
+    for (let k = -R; k <= R; k++) { const v = Math.exp(-(k * k) / (2 * sigma * sigma)); h[k + R] = v; s += v; }
+    for (let k = 0; k < h.length; k++) h[k] /= s;
+    return h;
+  }
+
+function jacobiEig (Ain, iters) {
+  const n = Ain.length;
+  const A = Ain.map(r => r.slice());
+  const V = [];
+  for (let i = 0; i < n; i++) { V.push(new Array(n).fill(0)); V[i][i] = 1; }
+  for (let sweep = 0; sweep < (iters || 60); sweep++) {
+    let off = 0;
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) off += A[i][j] * A[i][j];
+    if (off < 1e-24) break;
+    for (let p = 0; p < n - 1; p++) for (let q = p + 1; q < n; q++) {
+      if (Math.abs(A[p][q]) < 1e-18) continue;
+      const theta = (A[q][q] - A[p][p]) / (2 * A[p][q]);
+      const t = Math.sign(theta || 1) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
+      const c = 1 / Math.sqrt(t * t + 1), s = t * c;
+      for (let k = 0; k < n; k++) {
+        const akp = A[k][p], akq = A[k][q];
+        A[k][p] = c * akp - s * akq; A[k][q] = s * akp + c * akq;
+      }
+      for (let k = 0; k < n; k++) {
+        const apk = A[p][k], aqk = A[q][k];
+        A[p][k] = c * apk - s * aqk; A[q][k] = s * apk + c * aqk;
+      }
+      for (let k = 0; k < n; k++) {
+        const vkp = V[k][p], vkq = V[k][q];
+        V[k][p] = c * vkp - s * vkq; V[k][q] = s * vkp + c * vkq;
+      }
+    }
+  }
+  const idx = d3.range(n).sort((a, b) => A[a][a] - A[b][b]);
+  return { values: idx.map(i => A[i][i]), vectors: idx.map(i => V.map(row => row[i])) };
+};
+
   return {
     clamp, lerp, deg, rad, linspace, fmt, sig,
     rng, randn, poisson,
@@ -518,6 +639,7 @@ const VZ = (function () {
     qFromAxisAngle, qToR, qMul, qConj, qNorm, qFromR, slerp, orthonormalise,
     K, camera, lookAt, fovFromF, fFromFov, distort, undistort,
     view3, painter, gridPlane, cubeMesh, axes3,
-    frame, axisB, axisL, gridX, gridY, legend, panel, clip, poly, arrow
+    frame, axisB, axisL, gridX, gridY, legend, panel, clip, poly, arrow,
+    zeros, zeros2, flip2, bidx, at2, corr2, conv2, sepH, sepV, sep2, box, binomial, gauss1, jacobiEig
   };
 })();
