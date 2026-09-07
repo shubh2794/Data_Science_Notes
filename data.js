@@ -343,7 +343,7 @@ const cross = [
   ["Model Evaluation","Linear & Logistic Regression"],["Model Evaluation","Decision Trees & Ensembles"],
   ["Descriptive Statistics","Statistics"],["Descriptive Statistics","Pandas & NumPy"],["Dashboards","Monitoring & Drift"],
   ["Linear Algebra","Embeddings"],["CNNs","Vision Transformers"],
-  ["NLP","Deep Learning","isa"],
+  ["NLP","Deep Learning","isa"],["Computer Vision","Deep Learning","isa"],
   ["Linear Algebra","Dimensionality Reduction (PCA)"],["Clustering (k-Means)","Dimensionality Reduction (PCA)"],
   ["Dimensionality Reduction (PCA)","Logistic Regression"],["Dimensionality Reduction (PCA)","Naive Bayes"],
   ["Reinforcement Learning","Feedforward / MLP"],["Reinforcement Learning","Optimization"],
