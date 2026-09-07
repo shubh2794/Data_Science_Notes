@@ -29,6 +29,7 @@
                    ST.chi2Pdf/chi2Cdf/chi2Quant(·, k) — chi-square, via gammaP
                    ST.fPdf/fCdf/fQuant(·, d1, d2) — Fisher F, via betaI
      · drawing     ST.frame(sel, W, H, m), ST.axisB(...), ST.axisL(...), ST.gridY, ST.gridX,
+                   ST.lineSeg(g, a, b, sx, sy, opt) — y = a + b·x, clipped to the frame,
                    ST.jitterY(a, ...), ST.cells(...) small-multiples layout, ST.legend(g, items, x, y)
      · misc        ST.linspace(a, b, k), ST.clamp(x, lo, hi)
      · text        ST.fmt(x, d), ST.sig(x, n), ST.pct(x, d)
@@ -515,6 +516,29 @@ const ST = (function () {
     g.append("g").attr("class", "gridlines").selectAll("line").data(x.ticks(ticks || 5)).join("line")
       .attr("y1", 0).attr("y2", ih).attr("x1", d => x(d)).attr("x2", d => x(d)).attr("stroke", SC.grid);
   }
+  /* A line y = a + b·x clipped to the plot rectangle. Written independently in
+     part 6's and part 7's page files before being promoted here on its third use
+     (part 9). The clipping matters: an unclipped <line> drawn from the domain
+     edges escapes the frame whenever |b| is large, and a steep fitted line is
+     exactly when you most want to see it. */
+  function lineSeg(g, a, b, sx, sy, opt) {
+    const o = Object.assign({ color: SC.a2, w: 2, dash: null, op: 1 }, opt || {});
+    const dx = sx.domain(), dyr = sy.domain();
+    const y0 = Math.min(dyr[0], dyr[1]), y1 = Math.max(dyr[0], dyr[1]);
+    let xa = dx[0], xb = dx[1];
+    if (Math.abs(b) > 1e-12) {
+      const u = (y0 - a) / b, v = (y1 - a) / b;
+      xa = Math.max(xa, Math.min(u, v));
+      xb = Math.min(xb, Math.max(u, v));
+    } else if (a < y0 || a > y1) return g.append("line");   // entirely outside — draw nothing
+    if (!(xb > xa)) return g.append("line");
+    const el = g.append("line")
+      .attr("x1", sx(xa)).attr("y1", sy(a + b * xa))
+      .attr("x2", sx(xb)).attr("y2", sy(a + b * xb))
+      .attr("stroke", o.color).attr("stroke-width", o.w).attr("stroke-opacity", o.op);
+    if (o.dash) el.attr("stroke-dasharray", o.dash);
+    return el;
+  }
   function jitterY(values, seed, amp) {      // deterministic nudge so coincident points stay visible
     const r = rng(seed || 7), a = (amp === undefined) ? 1 : amp;
     return values.map(() => (r() * 2 - 1) * a);
@@ -580,7 +604,7 @@ const ST = (function () {
     lnGamma, gammaP, lnChoose, binomPmf, binomCdf,
     betacf, betaI, tPdf, tCdf, tQuant,
     chi2Pdf, chi2Cdf, chi2Quant, fPdf, fCdf, fQuant,
-    frame, axisB, axisL, gridY, gridX, jitterY, cells, legend,
+    frame, axisB, axisL, gridY, gridX, jitterY, cells, legend, lineSeg,
     fmt, sig, pct, clamp, linspace
   };
 })();

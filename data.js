@@ -69,7 +69,7 @@ const nodes = [
   {id:"Regression & Correlation", group:"math", level:3, link:"math/statistics/regression.html", desc:"The inferential view of the fitted line: correlation and its traps, the regression effect and the fallacy named after it, inference on the slope, residual diagnostics, prediction vs confidence bands, extrapolation, and why r² is not a licence to claim causation."},
   {id:"Resampling (Bootstrap & Permutation)", group:"math", level:3, link:"math/statistics/resampling.html", desc:"Replacing distributional assumptions with computation: the bootstrap for standard errors and intervals, permutation tests for comparing groups, when resampling works and when it fails, and the connection to cross-validation."},
   {id:"Categorical Data & Chi-Square", group:"math", level:3, link:"math/statistics/categorical.html", desc:"Counts rather than measurements: two-way tables, conditional distributions, the chi-square tests of goodness-of-fit and independence, expected counts and residuals, odds ratios and relative risk, and Simpson's paradox."},
-  {id:"ANOVA & Multiple Comparisons", group:"math", level:3, desc:"Comparing several groups at once: the F test as a ratio of between- to within-group variance, its assumptions, and then the multiplicity problem — data snooping, family-wise error, Bonferroni and Tukey, and false discovery rate control."},
+  {id:"ANOVA & Multiple Comparisons", group:"math", level:3, link:"math/statistics/anova.html", desc:"Comparing several groups at once: the F test as a ratio of between- to within-group variance, its assumptions, and then the multiplicity problem — data snooping, family-wise error, Bonferroni and Tukey, and false discovery rate control."},
   {id:"Calculus", group:"math", level:2, link:"math/calculus.html", desc:"Limits, derivatives, Taylor expansion, series, integrals, and matrix differentials — the engine behind optimization and backpropagation."},
   {id:"Optimization", group:"math", level:2, link:"math/optimization.html", desc:"Finding parameters that minimize loss: gradient descent, convexity, momentum, Adam."},
 
@@ -288,6 +288,9 @@ const cross = [
   ["Categorical Data & Chi-Square","A/B Testing"],["Categorical Data & Chi-Square","Resampling (Bootstrap & Permutation)"],
   ["Categorical Data & Chi-Square","Producing Data & Sampling"],["Categorical Data & Chi-Square","Hypothesis Testing"],
   ["ANOVA & Multiple Comparisons","Hyperparameter Tuning"],
+  ["ANOVA & Multiple Comparisons","Model Evaluation"],["ANOVA & Multiple Comparisons","A/B Testing"],
+  ["ANOVA & Multiple Comparisons","Regression & Correlation"],["ANOVA & Multiple Comparisons","Resampling (Bootstrap & Permutation)"],
+  ["ANOVA & Multiple Comparisons","Categorical Data & Chi-Square"],["ANOVA & Multiple Comparisons","Hypothesis Testing"],
   ["Embeddings","Transformers"],["Transformers","Language Models"],
   ["Attention","Transformers"],["Attention","RNNs & LSTMs"],["Attention","Language Models"],
   ["Mixture of Experts","Transformers"],["Mixture of Experts","Feedforward / MLP"],["Mixture of Experts","Language Models"],
