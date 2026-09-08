@@ -144,7 +144,7 @@ const nodes = [
   {id:"Mixture of Experts", group:"dl", level:2, link:"deep-learning/mixture-of-experts.html", desc:"Sparse scaling: replace the dense FFN with many expert FFNs and route each token to only the top-k — huge parameter count, small per-token compute (Switch, Mixtral, DeepSeek)."},
   {id:"GANs", group:"dl", level:2, link:"deep-learning/generative-adversarial-networks.html", desc:"A generator and discriminator competing in a minimax game to synthesize realistic data."},
   {id:"Diffusion Models", group:"dl", level:2, link:"deep-learning/diffusion-models.html", desc:"Generate data by learning to reverse a gradual noising process — SOTA for image synthesis."},
-  {id:"Autoencoders & VAEs", group:"dl", level:2, desc:"Learning a compressed code by reconstructing the input: the undercomplete autoencoder and its relation to PCA, denoising and sparse variants, the variational autoencoder's latent distribution and the reparameterisation trick, the ELBO and its reconstruction/KL trade-off, posterior collapse, VQ-VAE's discrete codebook, and the latent space that modern diffusion models actually operate in."},
+  {id:"Autoencoders & VAEs", group:"dl", level:2, link:"deep-learning/autoencoders-vaes.html", desc:"Learning a compressed code by reconstructing the input: the undercomplete autoencoder and its relation to PCA, denoising and sparse variants, the variational autoencoder's latent distribution and the reparameterisation trick, the ELBO and its reconstruction/KL trade-off, posterior collapse, VQ-VAE's discrete codebook, and the latent space that modern diffusion models actually operate in."},
   {id:"Model Interpretability", group:"ml", level:2, desc:"Explaining what a fitted model is doing: intrinsic vs post-hoc methods, permutation importance, partial dependence and ICE curves, local surrogates, Shapley values and their additive attribution, saliency and class-activation maps for vision models, attention as an explanation and why that is contested, and the gap between an explanation that is faithful and one that is merely plausible."},
   {id:"Graph Neural Networks", group:"dl", level:2, link:"deep-learning/graph-neural-networks.html", desc:"Deep learning on graphs via neighbor message passing."},
 
@@ -276,6 +276,7 @@ const subtree = {
 /* cross edges. 3rd element "isa" = hierarchy bridge (is-a / builds-on),
    oriented child → parent; rendered as a dotted arrow in the graph. */
 const cross = [
+  ["Autoencoders & VAEs","CNNs"],["Autoencoders & VAEs","World Models & JEPA"],
   ["Frequency Domain","Image Processing"],["Frequency Domain","Eigendecomposition & SVD"],
   ["Frequency Domain","Quadratic Forms, Covariance & PCA"],["Frequency Domain","CNNs"],
   ["Segmentation","Clustering (k-Means)"],["Segmentation","Eigendecomposition & SVD"],

@@ -1,0 +1,1468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Autoencoders &amp; VAEs</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+<style>
+  /* small layouts this page uses, matching the newer pages in the knowledge base */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <h1>Autoencoders &amp; VAEs</h1>
+      <p>An autoencoder is a network trained to <b>copy its input to its output through a bottleneck it cannot fit the input into</b>. That sounds like a trivial task with a pointless obstacle, and it would be, except that the obstacle is the entire point: forced to throw information away, the network must decide <i>what</i> to throw away, and that decision is a model of the data. The first half of this page is about the deterministic version of that idea and the four different ways of imposing the obstacle — a narrow code, a sparsity penalty, added noise, a penalty on the encoder's Jacobian — each of which buys something different. The second half replaces the deterministic code with a <b>distribution</b>, which turns the same architecture into a probabilistic generative model with a real objective: a lower bound on the log-likelihood of the data. Everything difficult about the variational autoencoder — the trick that makes its gradient usable, the collapse that makes its latent variables vanish, the blur in its samples — follows from that one substitution.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Deep Learning</span>
+        <span class="pill">Representation learning</span>
+        <span class="pill">The PCA connection</span>
+        <span class="pill">Denoising &amp; the score</span>
+        <span class="pill">Manifolds</span>
+        <span class="pill">ELBO</span>
+        <span class="pill">Reparameterisation</span>
+        <span class="pill">Posterior collapse</span>
+        <span class="pill">VQ-VAE</span>
+        <span class="pill">21 visualizations</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="idea" data-nav="The idea &amp; scope">
+      <h3><span class="idx">01</span> A learned identity with something in the way</h3>
+      <p class="lede">Two networks, back to back, trained to undo each other. Nothing about that is interesting until you make it impossible.</p>
+
+      <div class="keyline">
+        <span>input <code>x</code> ∈ ℝ<sup>D</sup></span><i>→</i><span>encoder <code>f</code></span><i>→</i><span>code <code>h</code> ∈ ℝ<sup>d</sup></span><i>→</i><span>decoder <code>g</code></span><i>→</i><span>reconstruction <code>r</code> ∈ ℝ<sup>D</sup></span><i>→</i><span>loss <code>L(x, r)</code></span>
+      </div>
+
+      <h4>The whole model in one line</h4>
+      <ul class="notes">
+        <li>An autoencoder is a pair of maps <code>h = f(x)</code> and <code>r = g(h)</code>, trained by minimising a reconstruction loss <code>L(x, g(f(x)))</code>. There are no labels: <b>the target is the input</b>. That makes it self-supervised in the most literal sense.</li>
+        <li>Nothing else in the definition is fixed. <code>f</code> and <code>g</code> can be a single matrix each or a forty-layer convolutional stack; <code>L</code> can be squared error, cross-entropy, or a learned perceptual distance; the code <code>h</code> can be a real vector, a sparse vector, an integer index, or a probability distribution. Every named autoencoder in this page is one choice of those four things.</li>
+        <li>The output is usually thrown away. What is kept is <code>f</code> — the encoder — because the code it produces is a <b>representation</b>, and the training signal that produced it needed no annotation at all.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the autoencoder</span><span class="eq">h = f(x)          encoder,   f : ℝᴰ → ℝᵈ
+r = g(h) = g(f(x))  decoder,   g : ℝᵈ → ℝᴰ</span>
+<span class="lbl">and the objective, over the training set</span><span class="eq">minimise   J = (1/N) ∑<sub>i=1..N</sub> L( x⁽ⁱ⁾ , g(f(x⁽ⁱ⁾)) )        typically L(x, r) = ‖x − r‖²</span></div>
+
+      <h4>Why the unconstrained version is worthless</h4>
+      <ul class="notes">
+        <li>If <code>f</code> and <code>g</code> are unconstrained and have enough capacity, the global optimum is <code>g ∘ f = identity</code>, achieving zero loss and learning <b>nothing at all</b> about the data. The model has memorised a routing scheme, not a structure.</li>
+        <li>The pathological case is worth holding in mind even though it does not happen in practice: with a one-dimensional code and a sufficiently powerful nonlinear encoder, a network could in principle encode training example <code>x⁽ⁱ⁾</code> as the scalar <code>i</code> and have the decoder look up the table. Perfect reconstruction, zero understanding. Narrow does not mean informative.</li>
+        <li>So an autoencoder is only ever as good as the <b>constraint</b> you put on it. Every section from §03 to §11 is one such constraint, and the honest way to read them is as answers to the question "what am I forbidding, and what does forbidding it force the network to notice?"</li>
+      </ul>
+
+      <h4>The two forces, which is the sentence to remember</h4>
+      <div class="cards">
+        <div class="box good">
+          <div class="n">force 1</div>
+          <div class="t">Reconstruct</div>
+          <div class="g">Push <code>g(f(x))</code> toward <code>x</code> — but only for <code>x</code> drawn from the data. The autoencoder is never asked to reconstruct inputs that the data distribution does not produce, and that asymmetry is the whole source of its usefulness.</div>
+        </div>
+        <div class="box warn">
+          <div class="n">force 2</div>
+          <div class="t">Be insensitive</div>
+          <div class="g">A constraint or penalty that prefers a map which <i>ignores</i> its input: a narrow code, a sparsity penalty, injected noise, a small Jacobian, a KL pull toward a fixed prior. Alone it would produce a constant.</div>
+        </div>
+        <div class="box plain">
+          <div class="n">the compromise</div>
+          <div class="t">Sensitivity only where the data varies</div>
+          <div class="g">Neither force alone is useful. Together they force the code to be sensitive along the directions in which the data actually moves and insensitive to everything else — which is a local coordinate system for the data manifold (§11).</div>
+        </div>
+      </div>
+
+      <div class="viz" id="viz-arch">
+        <div class="vhead">
+          <span class="vtitle">The shape of the computation — drag the bottleneck and watch the tensor shapes and the parameter count</span>
+          <span class="vhint">the code is the only place the information has to fit through</span>
+        </div>
+        <div class="controls">
+          <label>input dim <code>D</code> <input type="range" id="ar-D" min="16" max="784" step="16" value="784" /><b id="ar-Dv" class="readout">784</b></label>
+          <label>code dim <code>d</code> <input type="range" id="ar-d" min="1" max="128" step="1" value="16" /><b id="ar-dv" class="readout">16</b></label>
+          <label>hidden width <input type="range" id="ar-h" min="16" max="512" step="16" value="256" /><b id="ar-hv" class="readout">256</b></label>
+          <label><input type="checkbox" id="ar-tied" /> tie the decoder weights, <code>W<sub>g</sub> = W<sub>f</sub>ᵀ</code></label>
+        </div>
+        <svg id="ae-arch" width="760" height="330" viewBox="0 0 760 330" role="img" aria-label="Diagram of an autoencoder: an input layer narrowing through a hidden layer to a code layer, then widening symmetrically back to a reconstruction, with layer widths drawn to scale and parameter counts annotated"></svg>
+        <div class="readout" aria-live="polite" id="ar-out"></div>
+      </div>
+
+      <div class="callout"><b>What this page does NOT cover, and where it lives.</b> This page owns the autoencoder family and the variational autoencoder. It deliberately does not re-teach any of the following, and links out instead.
+      <br>· <b>PCA</b> — the method, the eigendecomposition, the scree plot, whitening — belongs to <a href="../machine-learning/dimensionality-reduction-pca.html">Dimensionality Reduction (PCA)</a>. §04 uses the <i>relationship</i> between a linear autoencoder and PCA and assumes you can already compute the latter.
+      <br>· <b>Optimisers, initialisation, normalisation, weight decay, dropout, learning-rate schedules</b> belong to <a href="neural-network-training.html">Neural Network Training</a>. Autoencoders are ordinary feedforward networks and are trained with exactly those tools; nothing here is special.
+      <br>· <b>GANs</b> — the adversarial game, mode collapse, the Wasserstein critic — belong to <a href="generative-adversarial-networks.html">Generative Adversarial Networks</a>. §24 contrasts sample quality with GANs and does not re-derive them.
+      <br>· <b>Diffusion models</b> — the forward chain, the score, samplers, guidance — belong to <a href="diffusion-models.html">Diffusion Models</a>. §09 and §27 supply the piece that page depends on: the autoencoder whose latent space latent diffusion runs inside.
+      <br>· <b>Self-supervised learning by comparing pairs</b> — InfoNCE, augmentations, negatives, MoCo — belongs to <a href="contrastive-learning.html">Contrastive Learning</a>. Reconstruction and contrast are the two families; §15 names the difference and stops there.
+      <br>· <b>Likelihood, estimators and what maximum likelihood buys you</b> belong to <a href="../math/statistics/estimation.html#ml">Estimation</a>. <b>KL divergence, Jensen's inequality and why a bound is a bound</b> are set up in <a href="../math/calculus.html#integral">Calculus</a>. This page uses both and derives neither.
+      <br>· <b>Convolutional encoders and decoders</b> — strided convolution, transposed convolution, receptive fields — belong to <a href="convolutional-networks.html">Convolutional Networks</a>. Image autoencoders are built from those blocks; the blocks themselves are taught there.</div>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="family" data-nav="The family tree">
+      <h3><span class="idx">02</span> The family tree, and how to read the rest of this page</h3>
+      <p class="lede">Every autoencoder in the literature is the same two networks with a different answer to one question: <b>what stops <code>g ∘ f</code> from being the identity?</b> Read the table as a list of answers.</p>
+
+      <table class="cmp">
+        <tr><th style="width:16%">Variant</th><th style="width:26%">What blocks the identity</th><th>What it buys, and what it costs</th><th style="width:9%">Where</th></tr>
+        <tr><td><b>Undercomplete</b></td><td>The code is narrower than the input: <code>d &lt; D</code>.</td><td>The cheapest possible constraint, and with a linear decoder it lands exactly on the principal subspace. Costs you the ability to use a wide code at all, and says nothing about <i>which</i> narrow code you get.</td><td>§03–§05</td></tr>
+        <tr><td><b>Sparse</b></td><td>A penalty <code>Ω(h)</code> on the code, usually <code>λ‖h‖₁</code>.</td><td>Lets the code be wide — even overcomplete — while only a few units fire per example. Reads as a latent-variable model with a Laplace prior. Costs a hyperparameter and a scale ambiguity.</td><td>§07</td></tr>
+        <tr><td><b>Denoising</b></td><td>The input is corrupted; the <i>clean</i> input is the target.</td><td>The reconstruction cannot be a copy because the copy is wrong. What it learns is a vector field pointing back at the data manifold — which is the score. Costs a noise level you must choose.</td><td>§08–§09</td></tr>
+        <tr><td><b>Contractive</b></td><td>A penalty on <code>‖∂f/∂x‖²<sub>F</sub></code>, the encoder Jacobian.</td><td>Explicitly asks the code to be flat in every direction, so the directions where it is <i>not</i> flat are the manifold's tangent space. Costs a Jacobian computation and needs the decoder scale pinned down.</td><td>§10</td></tr>
+        <tr><td><b>Variational</b></td><td>The code is a <i>distribution</i>, pulled toward a fixed prior by a KL term.</td><td>Turns the whole thing into a generative model with a likelihood bound, so you can sample. Costs a gradient estimator, a bound gap, and a new failure mode (posterior collapse).</td><td>§16–§25</td></tr>
+        <tr><td><b>Vector-quantised</b></td><td>The code is snapped to the nearest of <code>K</code> learned vectors.</td><td>Discrete latents with a constant KL, so no collapse; hands the generative modelling to a separate prior over indices. Costs a non-differentiable step that has to be faked.</td><td>§26</td></tr>
+      </table>
+
+      <div class="callout"><b>Two halves, one hinge.</b> §03–§15 treat <code>h</code> as a <i>vector</i> and the model as a feature extractor: everything is deterministic, the objective is reconstruction, and there is no probability anywhere. §16 replaces <code>h</code> with a <i>distribution</i> <code>q(z | x)</code>, and from that single change the entire second half follows mechanically — a bound instead of a loss, a sampling step inside the forward pass, a prior instead of a penalty, and the ability to generate rather than only to encode.</div>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="undercomplete" data-nav="Undercomplete">
+      <h3><span class="idx">03</span> Undercomplete autoencoders</h3>
+      <p class="lede">Make the code narrower than the input and let the reconstruction loss decide what to keep. The simplest constraint there is, and the one everything else is measured against.</p>
+
+      <h4>The definition and the accounting</h4>
+      <ul class="notes">
+        <li>An autoencoder is <b>undercomplete</b> when <code>d &lt; D</code> and <b>overcomplete</b> when <code>d ≥ D</code>. Undercompleteness is a hard information constraint: <code>h</code> is a <code>d</code>-dimensional real vector, so at most a <code>d</code>-dimensional worth of variation can survive the round trip. Whatever else the network does, it cannot smuggle a <code>D</code>-dimensional input through a <code>d</code>-dimensional pipe without losing something.</li>
+        <li>Because the network is trained only on samples from the data distribution, the thing it chooses to lose is the variation <b>that the data does not have</b>. That is the entire trick, and it is why "compress and reconstruct" is a proxy for "find structure".</li>
+        <li>The loss is ordinary. For real-valued data, squared error; for data in <code>[0,1]</code>, binary cross-entropy; both are negative log-likelihoods of a decoder output distribution, which §13 makes explicit.</li>
+      </ul>
+      <div class="formula"><span class="lbl">undercomplete objective — this is the whole method</span><span class="eq">min<sub>f,g</sub>  E<sub>x~p̂</sub> ‖ x − g(f(x)) ‖²        subject to   dim(h) = d &lt; D</span></div>
+
+      <h4>What the bottleneck actually costs, exactly</h4>
+      <ul class="notes">
+        <li>For a <b>linear</b> decoder and squared loss, the minimum achievable error is not a matter of opinion: it is the variance the data has outside its top-<code>d</code> principal subspace, which is the sum of the trailing eigenvalues of the covariance. No amount of training beats it, and any nonlinear encoder paired with a linear decoder cannot beat it either.</li>
+        <li>That number is the <b>floor</b> against which every fancier autoencoder should be reported. A deep autoencoder that does not beat the PCA floor at the same <code>d</code> has not earned its parameters.</li>
+        <li>A nonlinear decoder can go below the floor, because the set it projects onto is a curved <code>d</code>-dimensional surface rather than a flat <code>d</code>-dimensional subspace. §05 is about how much that is worth.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the linear floor — eigenvalues of the data covariance, descending</span><span class="eq">min E‖x − g(f(x))‖²  =  ∑<sub>i=d+1</sub><sup>D</sup> <span class="keep">λ</span>ᵢ        when g is linear (or affine) and L is squared error</span></div>
+      <div class="callout"><b>Do not confuse two claims.</b> "The code has <code>d</code> dimensions" is a statement about a tensor's shape. "The code carries <code>d</code> dimensions' worth of information" is a statement about the function, and it is <i>false</i> in general — see the index-code argument in §01 and the capacity trap in §06. Shape is a necessary condition for a bottleneck, never a sufficient one.</div>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="pca" data-nav="The PCA connection">
+      <h3><span class="idx">04</span> The PCA connection — stated precisely, because the loose version is wrong</h3>
+      <p class="lede">A linear autoencoder trained with squared error finds the principal <b>subspace</b>. It does not find the principal <b>axes</b>. That distinction is the single most-repeated error about autoencoders, and it is easy to settle by measurement.</p>
+
+      <h4>The claim, in the only form that is true</h4>
+      <ul class="notes">
+        <li>Let the data be centred with covariance <code>S</code>, eigenvalues <code><span class="keep">λ</span>₁ ≥ … ≥ λ_D</code> and eigenvectors <code>v₁ … v_D</code>. Take a linear autoencoder <code>h = W₁x</code>, <code>r = W₂h</code> with <code>W₁ ∈ ℝ^{d×D}</code>, <code>W₂ ∈ ℝ^{D×d}</code>, trained to minimise <code>E‖x − W₂W₁x‖²</code>.</li>
+        <li>At any global minimum, the <b>composition</b> <code>W₂W₁</code> equals the orthogonal projector onto the span of <code>v₁ … v_d</code>, and the minimum value is <code>∑<sub>i&gt;d</sub> λᵢ</code>. Both of those are statements about <code>W₂W₁</code>, not about <code>W₁</code> or <code>W₂</code> separately.</li>
+        <li>Two conditions are needed for even that much. The data must be <b>centred</b> (or the maps affine) — see below — and the spectrum must have a <b>gap at the cut</b>, <code><span class="keep">λ</span>_d &gt; <span class="keep">λ</span>_{d+1}</code>. If the eigenvalues are tied across the boundary then the minimising <i>subspace</i> is itself not unique, because any subspace spanning the tied eigenvectors achieves the same loss. The minimum <i>value</i> <code>∑<sub>i&gt;d</sub> λᵢ</code> is unaffected either way.</li>
+        <li>Nothing pins down the factorisation. For any invertible <code>d×d</code> matrix <code>A</code>, the pair <code>(AW₁, W₂A⁻¹)</code> gives the identical loss. So the individual code coordinates are defined only up to an arbitrary invertible mixing: <b>not orthogonal, not unit-norm, not ordered by variance, not unique</b>.</li>
+        <li>PCA additionally fixes the axes: it returns an orthonormal, variance-ordered basis of the same subspace. That extra structure comes from the eigendecomposition, and the reconstruction loss alone contains no information that could produce it — because it is invariant to exactly the transformations that would destroy it.</li>
+      </ul>
+      <div class="formula"><span class="lbl">what is determined, and what is not</span><span class="eq">determined:    W₂W₁ = V_d V_dᵀ         the orthogonal projector onto span(v₁ … v_d)
+determined:    min loss = ∑<sub>i&gt;d</sub> <span class="keep">λ</span>ᵢ            the trailing eigenvalue mass
+
+NOT determined:  W₁ and W₂ separately —  (W₁, W₂) and (A W₁, W₂ A⁻¹) are the same model
+                 for every invertible A ∈ ℝ^{d×d}, a d² -parameter gauge freedom</span></div>
+
+      <div class="wrong"><span class="say">Often said:</span> "a linear autoencoder <i>is</i> PCA / learns the principal components." <span class="fix">Accurate version:</span> a linear autoencoder with squared loss spans the same subspace as PCA and reaches the same reconstruction error. Its weight matrices are <b>not</b> the principal components, and reading them as if they were — ordering them, interpreting one column as "the first factor" — is reading noise from an arbitrary change of basis.</div>
+
+      <h4>Measured, not asserted</h4>
+      <p>An 8-dimensional Gaussian with covariance eigenvalues fixed by construction, 4 000 samples, a linear autoencoder with <code>d = 3</code> trained to convergence with Adam in double precision. Sample eigenvalues: <code>8.8463, 4.0429, 1.9187, 0.9802, 0.5828, 0.3586, 0.1935, 0.0993</code>.</p>
+      <table class="grid2">
+        <tr><th style="width:38%">Quantity</th><th style="width:30%">Measured</th><th>Reading</th></tr>
+        <tr><td>Final loss, <code>d = 3</code></td><td class="num">2.21454</td><td>Equal to <code>λ₄+…+λ₈ = 2.21454</code> to five decimals. The autoencoder hits the PCA floor exactly.</td></tr>
+        <tr><td>Principal angles between <code>span(W₂)</code> and <code>span(v₁,v₂,v₃)</code></td><td class="num">≤ 2.6 × 10⁻⁵ °</td><td>The subspaces coincide to numerical precision. <b>This is the true part of the claim.</b></td></tr>
+        <tr><td><code>‖W₂W₁ − V₃V₃ᵀ‖<sub>F</sub></code></td><td class="num">7.6 × 10⁻⁶</td><td>The composition is the orthogonal projector, and it is idempotent to <code>6 × 10⁻⁸</code>.</td></tr>
+        <tr><td><code>W₂ᵀW₂</code></td><td class="mono">[[2.03, −1.42, 1.76],<br>&nbsp;[−1.42, 2.92, 0.15],<br>&nbsp;[1.76, 0.15, 2.79]]</td><td>Nowhere near a multiple of the identity: the decoder columns are neither orthogonal nor equal-norm. <b>This is the false part of the loose claim.</b></td></tr>
+        <tr><td><code>|cos|</code> between decoder columns and the PCA axes</td><td class="mono">[[0.53, 0.83, 0.18],<br>&nbsp;[0.55, 0.50, 0.67],<br>&nbsp;[0.05, 0.78, 0.62]]</td><td>Every learned direction is a blend of all three principal axes. No column is any single component.</td></tr>
+      </table>
+
+      <h4>What each extra constraint recovers — and what it does not</h4>
+      <table class="grid2">
+        <tr><th style="width:26%">Constraint added</th><th style="width:22%">Measured effect</th><th>Are the ordered PCA axes recovered?</th></tr>
+        <tr><td><b>Nothing</b> (plain squared loss)</td><td class="mono">W₂ᵀW₂ not diagonal</td><td><b>No.</b> Correct subspace, arbitrary basis within it.</td></tr>
+        <tr><td><b>Tied weights</b>, <code>W₂ = W₁ᵀ</code></td><td class="mono">W₁W₁ᵀ = I to 3 × 10⁻⁴</td><td><b>No.</b> Tying forces an <i>orthonormal</i> basis of the right subspace, but any <code>d×d</code> rotation of it is still optimal — measured <code>|cos|</code> against the PCA axes was <code>0.13, 0.68, 0.72</code> for the first learned direction alone.</td></tr>
+        <tr><td><b>Uniform weight decay</b>, <code>λ(‖W₁‖² + ‖W₂‖²)</code></td><td class="mono">W₂ᵀW₂ ≈ 0.9997 · I</td><td><b>No.</b> Same story: orthonormal, still rotated. Measured <code>|cos|</code> of the first column against the three axes: <code>0.69, 0.05, 0.72</code>.</td></tr>
+        <tr><td><b>Non-uniform</b> weight decay — a <i>different</i> <code>λᵢ</code> on each latent unit</td><td class="mono">|cos| diagonal = 1.0000,<br>off-diagonal ≤ 1.1 × 10⁻³</td><td><b>Yes.</b> Distinct penalties break the rotational symmetry and the axes become identifiable and ordered. The cost is a slightly worse fit: loss <code>2.21686</code> against the unregularised floor <code>2.21454</code>.</td></tr>
+      </table>
+      <div class="callout"><b>Why non-uniform decay works, in one sentence:</b> the gauge freedom <code>(AW₁, W₂A⁻¹)</code> survives only because the loss is blind to <code>A</code> — give each latent coordinate its own penalty and the loss stops being blind, so exactly one rotation of the subspace becomes optimal. The identifiability is bought from the regulariser, never from reconstruction.</div>
+
+      <h4>Two conditions the loose statement usually forgets</h4>
+      <ul class="notes">
+        <li><b>Centring.</b> PCA diagonalises the <i>covariance</i>; a bias-free linear autoencoder minimises error against the raw <i>second moment</i>. On the same data shifted off the origin, a bias-free autoencoder reached <code>3.69117</code> — exactly the trailing second-moment eigenvalues, and a different subspace — while the centred PCA floor was <code>2.21454</code>. Restore the biases and it recovers <code>2.21454</code> exactly. <b>Affine, or centred: pick one.</b></li>
+        <li><b>Squared error specifically.</b> The equivalence is a property of the <code>L²</code> geometry. Swap in cross-entropy, an <code>L¹</code> loss or a perceptual loss and the optimum is no longer the principal subspace, because you have changed what "close" means.</li>
+      </ul>
+
+      <div class="viz" id="viz-curve">
+        <div class="vhead">
+          <span class="vtitle">One bottleneck, two decoders — the linear one lands on the PCA line, the nonlinear one follows the curve</span>
+          <span class="vhint">both are trained live; the dashed line is the exact first principal direction, computed from the covariance</span>
+        </div>
+        <div class="controls">
+          <label>data curvature <input type="range" id="cv-curve" min="0" max="1.4" step="0.02" value="0.9" /><b id="cv-curvev" class="readout">0.90</b></label>
+          <label>noise off the curve <input type="range" id="cv-noise" min="0.01" max="0.30" step="0.01" value="0.07" /><b id="cv-noisev" class="readout">0.07</b></label>
+          <label>decoder
+            <select id="cv-model">
+              <option value="lin">linear · 2 → 1 → 2</option>
+              <option value="nl">nonlinear · 2 → 12 → 1 → 12 → 2, tanh</option>
+              <option value="both" selected>show both</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="cv-resid" /> draw the reconstruction residuals</label>
+          <button class="btn" id="cv-go">retrain</button>
+        </div>
+        <svg id="ae-curve" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Scatter of two-dimensional data lying near a curved one-dimensional manifold, with the first principal direction drawn as a straight dashed line and the nonlinear autoencoder's learned one-dimensional decoder image drawn as a curve following the data"></svg>
+        <div class="readout" aria-live="polite" id="cv-out"></div>
+      </div>
+
+      <div class="viz" id="viz-sweep">
+        <div class="vhead">
+          <span class="vtitle">Bottleneck width against reconstruction error, with the PCA floor drawn underneath</span>
+          <span class="vhint">the floor is <code>∑<sub>i&gt;d</sub> λᵢ</code>, computed exactly from the covariance eigenvalues — not fitted</span>
+        </div>
+        <div class="controls">
+          <label>spectrum decay <input type="range" id="sw-decay" min="0.30" max="0.95" step="0.01" value="0.62" /><b id="sw-decayv" class="readout">0.62</b></label>
+          <label>ambient dimension <code>D</code> <input type="range" id="sw-D" min="4" max="12" step="1" value="10" /><b id="sw-Dv" class="readout">10</b></label>
+          <label><input type="checkbox" id="sw-train" checked /> also train a linear autoencoder at each <code>d</code></label>
+        </div>
+        <svg id="ae-sweep" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Bar and line chart of reconstruction error against bottleneck width, with the exact PCA floor as bars and the trained linear autoencoder's error as points sitting on top of them, plus the eigenvalue spectrum inset"></svg>
+        <div class="readout" aria-live="polite" id="sw-out"></div>
+      </div>
+
+      <p>The rest of PCA — how to compute it, how to choose <code>d</code> from the explained-variance curve, whitening, the SVD route, kernel PCA — is <a href="../machine-learning/dimensionality-reduction-pca.html#pca-steps">its own page</a>. What matters here is that PCA is the <b>lower bound</b> an autoencoder must justify beating, and the exact sense in which a linear one does not beat it.</p>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="nonlinear" data-nav="Nonlinear = curved PCA">
+      <h3><span class="idx">05</span> The nonlinear generalisation: projecting onto a curved surface</h3>
+      <p class="lede">Replace the linear maps with networks and the flat <code>d</code>-dimensional subspace becomes a curved <code>d</code>-dimensional surface. That is the whole conceptual upgrade, and it is worth a lot when the data is curved and nothing at all when it is not.</p>
+
+      <h4>What changes and what does not</h4>
+      <ul class="notes">
+        <li>PCA projects onto the best-fitting <b>affine subspace</b>. A nonlinear autoencoder projects onto the best-fitting <b>image of the decoder</b>, <code>M = { g(h) : h ∈ ℝᵈ }</code> — a <code>d</code>-dimensional parametric surface embedded in <code>ℝᴰ</code>, which can bend.</li>
+        <li>The encoder is the map that assigns a coordinate on that surface, and the reconstruction is the surface point at that coordinate. So the pair <code>(f, g)</code> is a <b>chart and its inverse</b> for a learned surface: <code>g</code> is the parameterisation, <code>f</code> is the projection onto it.</li>
+        <li>What does <i>not</i> change: the projection is still lossy, still trained by squared error, and still only obliged to be accurate where the data is. Off the data, both PCA and the autoencoder are extrapolating — but the autoencoder extrapolates in whatever arbitrary way its nonlinearity happens to bend, which is far less predictable.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the same picture at two levels of generality</span><span class="eq">PCA                r = <span class="keep">μ</span> + V_d V_dᵀ (x − <span class="keep">μ</span>)      project onto a FLAT d-dimensional subspace
+autoencoder        r = g(f(x))                    project onto a CURVED d-dimensional surface  M = g(ℝᵈ)</span></div>
+
+      <h4>The numbers the figure in §04 produced</h4>
+      <ul class="notes">
+        <li>On the default curved dataset (curvature 0.90, noise 0.07), the exact <code>d = 1</code> PCA floor is <code><span class="keep">λ</span>₂ = 0.019541</code>. The <b>linear</b> autoencoder converged to <code>0.019541</code> — the floor, to six figures, which is the §04 claim made visible. The <b>nonlinear</b> autoencoder reached <code>0.004608</code>, about <b>76% below</b> it.</li>
+        <li>Turn the curvature slider to <code>0</code> — genuinely linear data — and the same nonlinear network reaches <code>0.004403</code> against a floor of <code>0.004426</code>: <b>0.5% better</b>, which is nothing. The nonlinearity is not free capability, it is capability that only pays when the data is curved.</li>
+        <li>Push the noise slider up instead and the advantage narrows the other way (at noise 0.30 the nonlinear model was 30% below the floor rather than 76%): once the off-manifold noise is comparable with the curvature, there is less curve left to follow.</li>
+      </ul>
+      <div class="callout"><b>The honest summary of "autoencoders are nonlinear PCA":</b> true as an analogy about <i>what is being projected onto</i>, false as a statement about the objective's solution set. PCA's answer is unique up to sign and rotation within eigenvalue ties; a nonlinear autoencoder's is not unique in any useful sense, has no ordering, no orthogonality and no closed form, and depends on initialisation. You gain the curve and you lose every guarantee.</div>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="capacity" data-nav="The capacity trap">
+      <h3><span class="idx">06</span> The capacity trap — how a bottleneck stops being a bottleneck</h3>
+      <p class="lede">Give the encoder and decoder enough capacity and they will find a way to be the identity, whatever the code's shape. This is the failure mode that every regulariser in §08–§11 exists to prevent.</p>
+
+      <h4>Three ways to lose the constraint</h4>
+      <ul class="notes">
+        <li><b>Overcomplete code</b> (<code>d ≥ D</code>). Now the identity is available even with linear layers: set <code>W₁</code> to any injective map and <code>W₂</code> to its left inverse. Zero loss, zero learning. Nothing in the objective prefers a useful solution over this one.</li>
+        <li><b>Too much capacity around a narrow code.</b> Even with <code>d = 1</code>, a sufficiently expressive encoder can build a space-filling map that packs the neighbourhood of the training set into one scalar, with the decoder undoing it. The pathological limit is the index code of §01. In practice you see a milder version: reconstruction improves while the code becomes uninterpretable and useless downstream.</li>
+        <li><b>Memorisation.</b> With enough parameters relative to data, a network can fit the training set exactly and reconstruct nothing else. Reconstruction error on <i>held-out</i> data is the diagnostic, and it is skipped depressingly often.</li>
+      </ul>
+
+      <h4>The test that actually detects it</h4>
+      <ul class="notes">
+        <li>A useful autoencoder is one whose reconstruction map is <b>close to the identity on the data and far from it off the data</b>. So probe it off the data: take points that are not plausible samples and see whether they come back unchanged.</li>
+        <li>If <code>g(f(x̃)) ≈ x̃</code> for an off-manifold <code>x̃</code>, the model has learned the identity in that region and knows nothing about the data distribution. If instead <code>g(f(x̃))</code> is pulled back onto the data, the model has learned <i>where the data lives</i> — which is what you wanted.</li>
+        <li>This is exactly the quantity §09 turns into a score estimate and §12 turns into a statement about manifolds. It is the single most informative thing you can measure about a trained autoencoder, and it costs one forward pass.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the diagnostic, in one line</span><span class="eq">on-manifold:    ‖ g(f(x)) − x ‖  small          ← every autoencoder achieves this
+off-manifold:   ‖ g(f(x̃)) − x̃ ‖  LARGE, and pointing back toward the data
+                                                  ← only a constrained one achieves this</span></div>
+
+      <div class="viz" id="viz-cap">
+        <div class="vhead">
+          <span class="vtitle">Probe it off the data — the constrained model pulls the grid back onto the curve, the overcomplete one leaves it alone</span>
+          <span class="vhint">grey grid = probe points, arrow tip = where the autoencoder sends them</span>
+        </div>
+        <div class="controls">
+          <label>code width <code>d</code>
+            <select id="cp-d">
+              <option value="1" selected>d = 1 · undercomplete</option>
+              <option value="2">d = 2 · complete (d = D)</option>
+              <option value="8">d = 8 · overcomplete</option>
+            </select>
+          </label>
+          <label>hidden width <input type="range" id="cp-h" min="4" max="40" step="2" value="16" /><b id="cp-hv" class="readout">16</b></label>
+          <label><input type="checkbox" id="cp-arrows" checked /> show the displacement field <code>g(f(x)) − x</code></label>
+          <button class="btn" id="cp-go">retrain</button>
+        </div>
+        <svg id="ae-capacity" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Two-dimensional data on a curve with a grid of probe points; arrows show where a trained autoencoder maps each probe point, pulling them onto the curve when the code is narrow and leaving them in place when the code is overcomplete"></svg>
+        <div class="readout" aria-live="polite" id="cp-out"></div>
+      </div>
+      <div class="callout"><b>The rule this figure makes concrete:</b> a bottleneck is a property of the learned <i>function</i>, not of the tensor's shape. Shrinking <code>d</code> is one way to get one; §08–§11 are four ways to get one <i>without</i> shrinking <code>d</code>, which is what lets a code be wide and informative at the same time.</div>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="depth" data-nav="Depth &amp; representational power">
+      <h3><span class="idx">07</span> Representational power, layer size and depth</h3>
+      <p class="lede">A one-hidden-layer encoder can approximate any code map, given enough units. A deeper one can approximate the useful ones with exponentially fewer. That gap is the whole argument for deep autoencoders.</p>
+
+      <h4>Why a shallow autoencoder is not enough, even though it is universal</h4>
+      <ul class="notes">
+        <li>The universal approximation theorem says a network with one hidden layer and enough units can approximate any reasonable function — including the identity along the data's domain. So a shallow autoencoder can certainly <b>represent</b> a good reconstruction.</li>
+        <li>But universality is about the <i>composition</i> <code>g ∘ f</code>, and what you want is a good <code>f</code>. With a single hidden layer split between encoder and decoder, the map from input to <b>code</b> is shallow, and you cannot then impose arbitrary structure on the code — sparsity, near-independence, a particular geometry — because the encoder is not expressive enough to satisfy the structure and stay informative at once.</li>
+        <li>Give the encoder at least one hidden layer of its own and it can approximate any input-to-code map arbitrarily well. That is the minimum architecture at which the phrase "learn a representation with property P" is even coherent.</li>
+      </ul>
+
+      <h4>What depth buys, stated at the right strength</h4>
+      <ul class="notes">
+        <li><b>Exponential savings in units, for some functions.</b> There are function families for which a depth-<code>k</code> network needs exponentially fewer units than a depth-2 one. This is a statement about <i>some</i> functions, not all of them, and it is the honest form of "depth helps".</li>
+        <li><b>Exponential savings in data, for some functions.</b> Similarly, depth can reduce the number of examples needed to learn certain structured maps, because it reuses sub-computations rather than re-learning them per region.</li>
+        <li><b>Experimentally.</b> Deep autoencoders compress much better than shallow or linear ones at the same code size — the classic result behind the 30-unit bottleneck that beat 30-component PCA on both reconstruction and downstream separability.</li>
+        <li><b>Historically:</b> deep autoencoders were often built by greedily pretraining a stack of shallow ones, each trained to reconstruct the previous one's hidden layer, then fine-tuning the whole stack. Modern initialisation and normalisation made that unnecessary — see <a href="neural-network-training.html#init">Initialization</a> — but it is why shallow autoencoders appear so often in older work even when a deep one was the goal.</li>
+      </ul>
+
+      <h4>Where the extra power comes from: folding</h4>
+      <ul class="notes">
+        <li>With piecewise-linear activations the encoder is a piecewise-linear map, and the input space is cut into <b>linear regions</b> on each of which the encoder is affine. Region count is a concrete, countable proxy for expressive power.</li>
+        <li>A single hidden layer of width <code>n</code> on a <code>D</code>-dimensional input cuts the space with <code>n</code> hyperplanes, giving <code>O(n^D)</code> regions — the count grows <b>polynomially</b> in width.</li>
+        <li>A second layer does not add cuts, it <b>folds</b>: it re-cuts every region the first layer produced. Region counts then compound across layers, which is where the exponential-in-depth statements come from.</li>
+      </ul>
+
+      <div class="viz" id="viz-depth">
+        <div class="vhead">
+          <span class="vtitle">Adding a layer folds the regions the previous layer made — count them</span>
+          <span class="vhint">random ReLU encoder, fixed seed, no training: this is a statement about what the architecture <i>can represent</i></span>
+        </div>
+        <div class="controls">
+          <label>hidden width <code>n</code> <input type="range" id="dp-n" min="3" max="16" step="1" value="8" /><b id="dp-nv" class="readout">8</b></label>
+          <label>hidden layers in the encoder <input type="range" id="dp-L" min="1" max="3" step="1" value="2" /><b id="dp-Lv" class="readout">2</b></label>
+          <label>weight seed <input type="range" id="dp-seed" min="1" max="12" step="1" value="3" /><b id="dp-seedv" class="readout">3</b></label>
+          <label><input type="checkbox" id="dp-edges" checked /> draw the region boundaries</label>
+        </div>
+        <svg id="ae-depth" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="The input plane of a random rectified-linear encoder coloured by which linear region each point falls in, with the region boundaries drawn, shown for one, two or three hidden layers"></svg>
+        <div class="readout" aria-live="polite" id="dp-out"></div>
+      </div>
+
+      <div class="callout"><b>Two honest caveats, both visible in the figure.</b> (1) The exponential-in-depth results are asymptotic and are stated for input dimension <code>D</code> growing; in the two-dimensional picture above, a <i>single</i> layer given the same parameter budget as the deep stack usually produces <b>more</b> regions, not fewer — the readout prints both counts so you can see it. Depth pays off in high dimension, not in the plane. (2) Representational power is not optimisation. Training the same toy manifold with a shallow and a deep autoencoder at a matched parameter budget, the deep one had the lower final reconstruction error in only <b>3 of 5</b> random seeds at most manifold frequencies — and at one setting only <b>1 of 5</b>. A real but small and seed-dependent advantage at this scale, and a good reason to distrust any single-run architecture comparison, including one on a page like this.</div>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="sparse" data-nav="Sparse autoencoders">
+      <h3><span class="idx">08</span> Sparse autoencoders — a wide code that is mostly zero</h3>
+      <p class="lede">Stop constraining the code's <b>width</b> and start constraining its <b>occupancy</b>. The code can then be larger than the input and still carry a bottleneck, because only a handful of its units are allowed to speak at once.</p>
+
+      <h4>The objective</h4>
+      <ul class="notes">
+        <li>Add a penalty <code>Ω(h)</code> on the code to the reconstruction loss. The standard choice is <code>L¹</code>, which is the only common norm that produces exact zeros rather than merely small values.</li>
+        <li>Use a rectified linear code layer, not a sigmoid or tanh one, if you want <i>actual</i> zeros: <code>ReLU</code> combined with an <code>L¹</code> pull puts units exactly at zero and keeps them there, which is what makes the code cheap to store and easy to read.</li>
+        <li>The autoencoder must now respond to statistical features of <i>this</i> dataset, because a generic identity map would activate everything and pay the full penalty.</li>
+      </ul>
+      <div class="formula"><span class="lbl">sparse autoencoder</span><span class="eq">J = L( x , g(f(x)) )  +  Ω(h)          with   h = f(x)
+
+Ω(h) = <span class="keep">λ</span> ‖h‖₁ = <span class="keep">λ</span> ∑ᵢ |hᵢ|            L¹ — produces exact zeros
+Ω(h) = <span class="keep">λ</span> ∑ᵢ KL( <span class="keep">ρ</span> ‖ <span class="keep">ρ̂</span>ᵢ )                the "target average activation" form, <span class="keep">ρ</span> ≈ 0.05
+                                     with  <span class="keep">ρ̂</span>ᵢ = mean activation of unit i over the batch</span></div>
+
+      <h4>The latent-variable reading, which is the one worth carrying</h4>
+      <ul class="notes">
+        <li>A sparsity penalty looks like a regulariser but is better understood as a <b>prior</b>. Suppose a generative model <code>p(x, h) = p(h) p(x | h)</code>. Approximating the intractable marginal <code>log p(x) = log ∑<sub>h</sub> p(h, x)</code> by a point estimate at a single likely <code>h</code> — the encoder's output — leaves you maximising <code>log p(h) + log p(x | h)</code>.</li>
+        <li>Choose a Laplace prior on each code unit and <code>−log p(h)</code> <b>is</b> an absolute-value penalty, up to a constant that does not depend on <code>h</code>. So <code>λ‖h‖₁</code> is not an arbitrary regulariser at all: it is the negative log-prior of a specific latent-variable model. A Student-<i>t</i> prior gives a different, also sparsity-inducing, penalty.</li>
+        <li>This reframes the objective: a sparse autoencoder is an approximate maximum-likelihood fit of a generative model with a sparse prior, and the features it learns are useful <i>because they describe the latent variables that explain the input</i> — not because a penalty made them tidy.</li>
+        <li>The reframing also explains why the usual Bayesian story does <b>not</b> apply. Weight decay corresponds to a prior over <i>parameters</i>, so it is a MAP approximation. A sparsity penalty depends on the <i>data</i> through <code>h = f(x)</code>, so it is not a prior over parameters in the formal sense at all. Calling it "just a regulariser" hides the difference.</li>
+      </ul>
+      <div class="formula"><span class="lbl">Laplace prior ⟺ L¹ penalty, exactly</span><span class="eq">p<sub>model</sub>(hᵢ) = (<span class="keep">λ</span>/2) e^(−<span class="keep">λ</span>|hᵢ|)
+
+−log p<sub>model</sub>(h) = <span class="keep">λ</span> ∑ᵢ |hᵢ| − log(<span class="keep">λ</span>/2) · d  =  Ω(h) + const</span></div>
+
+      <div class="viz" id="viz-sparse">
+        <div class="vhead">
+          <span class="vtitle">An overcomplete code, penalised — sweep <span class="keep">λ</span> and watch occupancy fall while error rises</span>
+          <span class="vhint">code width 24 against an input width of 12: with <span class="keep">λ</span> = 0 the identity is available and the code is useless</span>
+        </div>
+        <div class="controls">
+          <label>sparsity weight <span class="keep">λ</span> <input type="range" id="sp-lam" min="0" max="0.60" step="0.02" value="0.20" /><b id="sp-lamv" class="readout">0.20</b></label>
+          <label>atoms per example <input type="range" id="sp-k" min="1" max="4" step="1" value="2" /><b id="sp-kv" class="readout">2</b></label>
+          <button class="btn" id="sp-go">retrain</button>
+        </div>
+        <svg id="ae-sparse" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Three panels: a bar chart of one example's code activations showing most units at exactly zero, the learned decoder atoms as small curves, and a plot of active-unit count and reconstruction error against the sparsity weight"></svg>
+        <div class="readout" aria-live="polite" id="sp-out"></div>
+      </div>
+
+      <div class="callout"><b>Practical notes.</b> The <code>L¹</code> weight and the decoder's scale fight each other — the network can shrink <code>h</code> and inflate the decoder to dodge the penalty, so normalise the decoder columns (or tie the weights) or the sparsity is cosmetic. And measure occupancy directly: report the mean number of non-zero code units per example, not the value of the penalty term, which conflates sparsity with scale.</div>
+      <p>Sparse autoencoders have had a second life as an <b>interpretability</b> tool: train a wide, heavily sparse autoencoder on the internal activations of a large model and read the learned dictionary elements as candidate features. The mechanism is exactly the one above — an overcomplete code held down by an <code>L¹</code> penalty — applied to activations instead of data.</p>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="denoising" data-nav="Denoising autoencoders">
+      <h3><span class="idx">09</span> Denoising autoencoders — break the input, keep the target</h3>
+      <p class="lede">Do not penalise the model; give it a task it <b>cannot</b> solve by copying. Corrupt the input, ask for the clean original. The identity is now the wrong answer, so capacity stops being dangerous.</p>
+
+      <h4>The recipe</h4>
+      <ol class="notes">
+        <li>Sample a training example <code>x</code> from the data.</li>
+        <li>Sample a corrupted version <code>x̃</code> from a corruption process <code>C(x̃ | x)</code> — additive Gaussian noise, masking a random subset of coordinates to zero, salt-and-pepper, dropout on the input.</li>
+        <li>Train on the pair: encode <code>x̃</code>, decode, and compare against the <b>clean</b> <code>x</code>.</li>
+      </ol>
+      <div class="formula"><span class="lbl">denoising objective — note which argument is corrupted and which is not</span><span class="eq">plain AE      minimise  L( x , g(f( x  )) )
+denoising AE  minimise  L( x , g(f( x̃ )) ),     x̃ ~ C(x̃ | x)
+
+as an expectation:   − E<sub>x~p̂<sub>data</sub></sub>  E<sub>x̃~C(x̃|x)</sub>  log p<sub>decoder</sub>( x | h = f(x̃) )</span></div>
+      <ul class="notes">
+        <li>Nothing else changes. With a deterministic encoder the denoising autoencoder is an ordinary feedforward network with a stochastic data pipeline, trained with ordinary minibatch gradient descent.</li>
+        <li>The corruption is a <b>training-time</b> device. At deployment you feed clean inputs; the noise was only ever there to shape the function.</li>
+      </ul>
+
+      <h4>What it actually learns</h4>
+      <ul class="notes">
+        <li>Under squared error, the optimal reconstruction of a corrupted point is the <b>conditional mean of the clean points that could have produced it</b>: <code>r(x̃) = E[ x | x̃ ]</code>. That is a fact about squared loss, not about neural networks, and it is the key to everything in §10.</li>
+        <li>Because <code>x̃</code> is a noisy version of a point on the data manifold, that conditional mean sits back <i>on</i> the manifold — it is the centre of mass of the clean points consistent with what was observed. So <code>r(x̃) − x̃</code> is a vector <b>pointing from wherever you are toward where the data is</b>.</li>
+        <li>Collect those vectors over the whole input space and you have a field. The field is zero on the data manifold (nothing to correct) and grows as you move away from it. Training a denoising autoencoder is training that field.</li>
+        <li>The <b>noise level is a scale knob</b>, not a nuisance. Small noise probes the manifold's immediate neighbourhood and learns fine local structure; large noise probes far away and learns coarse global structure. This is precisely the reason <a href="diffusion-models.html#schedules">diffusion models sweep a whole schedule of noise levels</a> instead of picking one.</li>
+      </ul>
+
+      <div class="viz" id="viz-dae">
+        <div class="vhead">
+          <span class="vtitle">The optimal denoiser as a vector field — every arrow is <code>r(x̃) − x̃</code></span>
+          <span class="vhint">computed <i>exactly</i> as <code>E[x | x̃]</code> under the empirical data distribution — the optimum the network chases, not one particular fit</span>
+        </div>
+        <div class="controls">
+          <label>corruption <span class="keep">σ</span> <input type="range" id="dn-sig" min="0.04" max="0.60" step="0.01" value="0.16" /><b id="dn-sigv" class="readout">0.16</b></label>
+          <label>manifold
+            <select id="dn-shape">
+              <option value="wave" selected>a wave</option>
+              <option value="ring">a ring</option>
+              <option value="two">two separated arms</option>
+            </select>
+          </label>
+          <label>show
+            <select id="dn-show">
+              <option value="field" selected>the vector field</option>
+              <option value="dens">the smoothed density p<sub>σ</sub></option>
+              <option value="both">both</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="dn-len" checked /> scale arrows by magnitude</label>
+        </div>
+        <svg id="ae-dae" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="A grid of arrows over a two-dimensional plane, each pointing from its grid point toward the nearby one-dimensional data manifold, with arrow length shrinking to zero on the manifold itself"></svg>
+        <div class="readout" aria-live="polite" id="dn-out"></div>
+      </div>
+
+      <div class="callout"><b>Push <span class="keep">σ</span> to the top of its range and watch the story break down honestly.</b> At <code><span class="keep">σ</span> = 0.16</code> on the default wave, the arrows are <b>8.6×</b> longer off the manifold than on it and <b>all 462</b> off-manifold probes are moved closer to the data. Switch to the ring and set <code><span class="keep">σ</span> = 0.60</code> and only <b>289 of 435</b> are: the smoothing has fused the ring into a single blob, so the field now points at the <i>centre</i> of the ring — a place with no data at all. The field is the score of <code>p<sub><span class="keep">σ</span></sub></code>, and at large <code><span class="keep">σ</span></code> that is a genuinely different distribution. It also shows the general fact that the field vanishes at density <i>minima</i> as well as maxima, so a zero arrow does not by itself mean "on the data".</div>
+
+      <div class="callout"><b>Why this figure is the one that makes denoising click.</b> Nothing in the objective mentions manifolds, densities or geometry — it is a squared error between two vectors. The geometry is <i>emergent</i>: asking for the clean point given a noisy one is the same as asking "which way is the data from here?", and the answer to that question, at every point in space, <b>is</b> a model of the distribution.</div>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="score" data-nav="Denoising = the score">
+      <h3><span class="idx">10</span> The vector field <i>is</i> the score — the bridge to diffusion</h3>
+      <p class="lede">The arrows in §09 are not merely suggestive of a gradient. Under Gaussian corruption they <b>are</b> a gradient — of the log-density of the noised data — with an exactly known constant of proportionality.</p>
+
+      <h4>The identity</h4>
+      <ul class="notes">
+        <li>Let <code>p<sub>data</sub></code> be the data distribution and let the corruption be <code>x̃ = x + <span class="keep">σ</span>ε</code> with <code>ε ~ 𝒩(0, I)</code>. Write <code>p<sub>σ</sub></code> for the distribution of <code>x̃</code>, which is <code>p<sub>data</sub></code> convolved with a Gaussian of width <code><span class="keep">σ</span></code>.</li>
+        <li>Then the optimal squared-error denoiser and the score of <code>p<sub>σ</sub></code> are the same object, up to the factor <code><span class="keep">σ</span>²</code>. This is <b>Tweedie's formula</b>, and it is an exact identity — no approximation, no asymptotics, no assumptions about the network.</li>
+        <li>Consequently a trained denoising autoencoder is an <b>estimator of ∇ log p<sub>σ</sub></b>, and the reconstruction-minus-input vector is the estimate. That is the entire content of "denoising autoencoders learn the score".</li>
+      </ul>
+      <div class="formula"><span class="lbl">Tweedie's formula — the whole bridge, in one line</span><span class="eq">x̃ = x + <span class="keep">σ</span><span class="keep">ε</span>,  <span class="keep">ε</span> ~ 𝒩(0, I)      ⟹      E[ x | x̃ ]  =  x̃ + <span class="keep">σ</span>² ∇<sub>x̃</sub> log p<sub><span class="keep">σ</span></sub>(x̃)</span>
+
+<span class="lbl">so, rearranged, the autoencoder's displacement field</span><span class="eq">r(x̃) − x̃  =  <span class="keep">σ</span>² ∇<sub>x̃</sub> log p<sub><span class="keep">σ</span></sub>(x̃)          ← the score, scaled by the noise variance</span></div>
+
+      <p>The <a href="#denoising">§09 figure</a> computes both sides of that identity independently — the left from a weighted average of clean points, the right from the analytic gradient of the Gaussian mixture — and they agree to <b>machine precision</b>. Across six probe points spread over the plane the largest disagreement in any coordinate was <code>9.4 × 10⁻¹⁶</code>, and the analytic gradient matched a central finite difference of <code>log p<sub>σ</sub></code> to six decimals. It is an identity, and it behaves like one.</p>
+
+      <h4>What the identity is and is not</h4>
+      <ul class="notes">
+        <li><b>It is exact for the noised density <code>p<sub>σ</sub></code>, not for <code>p<sub>data</sub></code>.</b> At a fixed noise level you learn the score of a <i>blurred</i> version of the data. Regularised score matching at a fixed <code><span class="keep">σ</span></code> is therefore <b>not</b> a consistent estimator of <code>p<sub>data</sub></code>; you recover the blur along with the signal. Let <code><span class="keep">σ</span> → 0</code> as the sample size grows and consistency is restored.</li>
+        <li><b>It needs squared error and Gaussian corruption.</b> Masking noise, cross-entropy losses and discrete data all break the clean identity, though the qualitative "points back at the data" behaviour survives.</li>
+        <li><b>It does not say the field is a gradient in general.</b> For an arbitrary trained network there is no guarantee that <code>g(f(x)) − x</code> is the gradient of any function at all — only at the optimum, and only under the conditions above, does it coincide with one. Particular shallow parameterisations can be shown to give a genuine conservative field; general ones cannot.</li>
+      </ul>
+
+      <div class="viz" id="viz-score">
+        <div class="vhead">
+          <span class="vtitle">One noise level is one blurred view — sweep <span class="keep">σ</span> and watch which structure survives</span>
+          <span class="vhint">left: the smoothed density along a slice; right: score magnitude against distance from the manifold</span>
+        </div>
+        <div class="controls">
+          <label>noise <span class="keep">σ</span> <input type="range" id="sc-sig" min="0.02" max="0.70" step="0.01" value="0.16" /><b id="sc-sigv" class="readout">0.16</b></label>
+          <label>gap between the two arms <input type="range" id="sc-gap" min="0.20" max="1.20" step="0.02" value="0.60" /><b id="sc-gapv" class="readout">0.60</b></label>
+          <label><input type="checkbox" id="sc-tw" checked /> overlay the Tweedie check</label>
+        </div>
+        <svg id="ae-score" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left panel: the Gaussian-smoothed data density along a one-dimensional slice for the chosen noise level, showing two peaks merging as the noise grows. Right panel: the magnitude of the learned displacement field against distance from the manifold."></svg>
+        <div class="readout" aria-live="polite" id="sc-out"></div>
+      </div>
+
+      <div class="callout"><b>Why the diffusion page keeps pointing here.</b> A <a href="diffusion-models.html">diffusion model</a> is a denoising autoencoder trained at <i>every</i> noise level at once, with the level supplied as an input. Its training loss is the same squared error; its network output is the same displacement field; its sampler is nothing but repeatedly following that field downhill in noise. Everything in this section is the single-<code><span class="keep">σ</span></code> case of the machinery that page builds a schedule around — which is why <a href="diffusion-models.html#score">its score-matching section</a> and this one are the same theorem seen twice.</div>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="contractive" data-nav="Contractive autoencoders">
+      <h3><span class="idx">11</span> Contractive autoencoders — penalise the derivative directly</h3>
+      <p class="lede">Denoising asks the model to resist perturbations of finite size, empirically. A contractive autoencoder asks it to resist <b>infinitesimal</b> ones, analytically, by penalising the encoder's Jacobian.</p>
+
+      <h4>The penalty</h4>
+      <ul class="notes">
+        <li>Add the squared Frobenius norm of the encoder Jacobian <code>J = ∂f(x)/∂x</code>, evaluated at the training points. Because it is imposed only at the data, it forces the code to be flat everywhere <i>except</i> in the directions the data actually explores.</li>
+        <li>The name is literal: a linear operator is <b>contractive</b> when it maps the unit sphere inside itself, i.e. all its singular values are at most 1. Treating <code>J</code> as the local linear approximation of <code>f</code>, the penalty pushes each of those local operators toward being a contraction.</li>
+        <li>The compromise with the reconstruction term is the point. Reconstruction alone would give the identity; the penalty alone would give a constant. Together, <b>most</b> singular values of <code>J</code> fall below 1 and a handful do not — and the ones that do not span the directions the data varies in.</li>
+      </ul>
+      <div class="formula"><span class="lbl">contractive autoencoder</span><span class="eq">J = ∂f(x)/∂x      (d × D, the encoder Jacobian at x)
+
+J = L( x , g(f(x)) )  +  Ω(h, x),      Ω(h, x) = <span class="keep">λ</span> ‖ ∂f(x)/∂x ‖²<sub>F</sub> = <span class="keep">λ</span> ∑ᵢ ‖ ∇ₓ hᵢ ‖²</span></div>
+
+      <h4>Denoising and contractive, side by side</h4>
+      <table class="cmp">
+        <tr><th style="width:22%"></th><th>Denoising autoencoder</th><th>Contractive autoencoder</th></tr>
+        <tr><td><b>Resists</b></td><td>Finite-size perturbations, sampled</td><td>Infinitesimal perturbations, analytically</td></tr>
+        <tr><td><b>Applied to</b></td><td>The reconstruction <code>r = g(f(x))</code></td><td>The <b>encoder</b> <code>f(x)</code> — and empirically that is the better place for it when the features are to be used downstream</td></tr>
+        <tr><td><b>Cost</b></td><td>One extra noise draw per step, nothing else</td><td>A Jacobian; cheap for one hidden layer, expensive for a deep encoder</td></tr>
+        <tr><td><b>Relation</b></td><td colspan="2">In the limit of small Gaussian input noise, the denoising reconstruction error <i>is</i> a contractive penalty on the reconstruction function. The two are the same idea at two different scales.</td></tr>
+      </table>
+
+      <h4>Three things about the CAE that are easy to get wrong</h4>
+      <ul class="notes">
+        <li><b>It is only locally contractive.</b> Every perturbation of a training point <code>x</code> maps near <code>f(x)</code>, but two <i>distant</i> points can easily be mapped further apart than they started — and typically are, in the region between manifolds where the reconstruction function must have a large derivative to push points back.</li>
+        <li><b>Without a scale constraint the penalty is free to cheat.</b> Let the encoder multiply by a tiny constant <code><span class="keep">ε</span></code> and the decoder divide by it: <code>Ω</code> goes to zero while reconstruction stays perfect and nothing has been learned. The standard fix is to <b>tie the weights</b>, <code>W<sub>g</sub> = W<sub>f</sub>ᵀ</code>, which pins the scales together.</li>
+        <li><b>Depth makes it expensive.</b> The Jacobian of a deep encoder is a product of layer Jacobians and the penalty gets costly, so the classic recipe trains a stack of single-layer CAEs, each reconstructing the previous layer's code. The composition is contractive, but it is not the same object as jointly penalising the deep model's Jacobian — an approximation worth naming rather than glossing.</li>
+      </ul>
+
+      <div class="viz" id="viz-cae">
+        <div class="vhead">
+          <span class="vtitle">The Jacobian at a point — drag the probe and watch a circle become a needle</span>
+          <span class="vhint">the map shown is the exact optimal denoiser <code>r(x̃) = E[x | x̃]</code>, so its Jacobian is the one a converged model would have</span>
+        </div>
+        <div class="controls">
+          <label>corruption / smoothing <span class="keep">σ</span> <input type="range" id="ca-sig" min="0.04" max="0.40" step="0.01" value="0.08" /><b id="ca-sigv" class="readout">0.08</b></label>
+          <label>probe position along the curve <input type="range" id="ca-t" min="-1.10" max="1.10" step="0.02" value="0.50" /><b id="ca-tv" class="readout">0.50</b></label>
+          <label>lift the probe off the curve <input type="range" id="ca-off" min="0" max="0.60" step="0.01" value="0" /><b id="ca-offv" class="readout">0.00</b></label>
+          <label><input type="checkbox" id="ca-circ" checked /> show the image of a small circle</label>
+        </div>
+        <svg id="ae-cae" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="A curved one-dimensional data manifold with a probe point; a small circle around the probe is mapped by the reconstruction function's Jacobian into a thin ellipse aligned with the manifold's tangent direction, with the two singular values reported"></svg>
+        <div class="readout" aria-live="polite" id="ca-out"></div>
+      </div>
+
+      <div class="callout"><b>What the measurements say.</b> On the default curve at <code><span class="keep">σ</span> = 0.08</code>, probes sitting on the manifold give singular values around <code>(0.95–1.01, 0.000–0.017)</code>, and the top right-singular vector aligns with the analytic tangent to <code>|cos| ≥ 0.9997</code>. That is the CAE's whole claim, measured: <b>the surviving singular directions are the tangent directions</b>. Note also that <code><span class="keep">σ</span>₁</code> sometimes exceeds 1 — at <code><span class="keep">σ</span> = 0.30</code> it reaches <code>1.145</code> at the curve's inflection point, <code>t = 0</code>. The map is <i>not</i> globally a contraction, and the theory never claimed it was.</div>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="manifold" data-nav="Manifolds &amp; tangent spaces">
+      <h3><span class="idx">12</span> Learning manifolds — the conceptual heart of the whole family</h3>
+      <p class="lede">Every regulariser in §08–§11 is a different way of asking the same question, and the answer is always a <b>tangent space</b>. This section is the one to remember when the others have faded.</p>
+
+      <h4>The manifold hypothesis, in the form autoencoders use it</h4>
+      <ul class="notes">
+        <li>Real data concentrates near a low-dimensional manifold — or a small collection of them — embedded in a much higher-dimensional ambient space. Almost all of <code>ℝ<sup>784</sup></code> is noise, not handwriting.</li>
+        <li>A <code>d</code>-dimensional manifold has, at each point, a <code>d</code>-dimensional <b>tangent plane</b>: the space of directions you can move infinitesimally and stay on it. Characterising the manifold is largely the same job as characterising its tangent planes everywhere.</li>
+        <li>Many algorithms merely behave sensibly <i>on</i> the manifold. Autoencoders go further: they aim to learn its <b>structure</b>, which means learning a coordinate system on it. That is exactly what the code <code>h = f(x)</code> is.</li>
+      </ul>
+      <div class="callout"><b>The one-sentence version.</b> The two forces of §01 — reconstruct, and be insensitive — combine into a single instruction: <b>be sensitive only along the manifold and insensitive across it</b>. A code that obeys that instruction is a local coordinate system for the manifold, and every regulariser on this page is a different way of enforcing it.</div>
+
+      <h4>The picture in one dimension, which is worth more than the words</h4>
+      <ul class="notes">
+        <li>Plot the reconstruction function <code>r(x)</code> against the identity line. Wherever there is data, the two must cross — reconstruction is accurate there. Between the data, <code>r</code> is free.</li>
+        <li>There are more crossings than data points. With <code>N</code> isolated points the optimal denoiser crosses the identity <code>2N − 1</code> times: <code>N</code> <b>stable</b> crossings, one at each datum, with arrows pointing inward, and <code>N − 1</code> <b>unstable</b> ones between neighbouring points, with arrows pointing apart. The unstable crossings sit at the local <i>minima</i> of the smoothed density — the same fact that made the ring's centre a zero of the field in §09.</li>
+        <li>Because the model is asked to be <i>flat</i> near the data, each crossing is a stable point with a shallow slope, and the arrows <code>r(x) − x</code> on either side point <b>inward</b>. Between data points the function must swing steeply back to catch up with the identity — so <code>r′</code> is small on the data and large off it, which is the derivative statement of the same fact.</li>
+        <li>With zero-dimensional "manifolds" — isolated data points — the crossings are the data. With a one-dimensional manifold, the crossings become a curve. Nothing else changes.</li>
+      </ul>
+
+      <div class="viz" id="viz-mfd">
+        <div class="vhead">
+          <span class="vtitle">Reconstruction against identity, in one dimension — the crossings are the data</span>
+          <span class="vhint">exact optimal denoiser again; the arrows are <code>r(x) − x</code> — they point <i>inward</i> at every data point and <i>apart</i> at the midpoints between them</span>
+        </div>
+        <div class="controls">
+          <label>smoothing <span class="keep">σ</span> <input type="range" id="mf-sig" min="0.02" max="0.40" step="0.01" value="0.09" /><b id="mf-sigv" class="readout">0.09</b></label>
+          <label>data points
+            <select id="mf-set">
+              <option value="three" selected>three isolated points</option>
+              <option value="two">two points</option>
+              <option value="cluster">two points and a cluster</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="mf-deriv" /> plot the derivative <code>r′(x)</code> instead of the arrows</label>
+        </div>
+        <svg id="ae-manifold" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="A plot of the reconstruction function against the input in one dimension, together with the identity line; the two curves cross at each data point and the reconstruction function is flat there and steep between the data points"></svg>
+        <div class="readout" aria-live="polite" id="mf-out"></div>
+      </div>
+
+      <h4>Why a parametric encoder beats a nearest-neighbour graph</h4>
+      <ul class="notes">
+        <li>Classical manifold learning is largely non-parametric: build a nearest-neighbour graph over the training points, read a tangent plane off each neighbourhood, then stitch the local charts into a global coordinate system by solving an optimisation or a linear system. It works well when the samples cover the manifold densely.</li>
+        <li>The difficulty is <b>coverage</b>. If the manifold twists, a purely local method needs enough examples in every twist, because it can only generalise by interpolating between neighbours. It cannot extrapolate a pattern it has seen elsewhere.</li>
+        <li>And AI-scale manifolds twist violently. Translate an image by one pixel: a single coordinate <code>xᵢ</code> rises and falls once for every bright-dark alternation in the underlying image. The complexity of the <i>image content</i> becomes the complexity of the manifold generated by a transformation as simple as a shift.</li>
+        <li>A parametric encoder shares parameters across the whole space, so a tangent direction learned in one region constrains its estimate in another. That is the argument for distributed representations and depth here — not elegance, <b>sample efficiency on manifolds you could never cover</b>.</li>
+      </ul>
+      <div class="callout"><b>Connections out.</b> The tangent-space view is why a contractive encoder's leading singular vectors look like meaningful transformations of the input — a head turning, a limb moving — rather than noise. The same manifold framing, with a different loss, drives <a href="contrastive-learning.html">contrastive learning</a> (which never reconstructs and instead asks only that augmented views land nearby) and <a href="world-models-jepa.html">JEPA-style predictive embedding</a> (which predicts in representation space and skips the decoder entirely).</div>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="stochastic" data-nav="Stochastic encoders &amp; decoders">
+      <h3><span class="idx">13</span> Stochastic encoders and decoders — the hinge into the second half</h3>
+      <p class="lede">The decoder was always a probability distribution in disguise. Making that explicit costs nothing, explains where the loss functions came from, and is the exact step that leads to the variational autoencoder.</p>
+
+      <h4>The decoder as a distribution</h4>
+      <ul class="notes">
+        <li>The standard way to design any network's output layer is to declare an output distribution <code>p(y | x)</code> and minimise <code>−log p(y | x)</code>. An autoencoder is the same construction with <code>y = x</code>: declare <code>p<sub>decoder</sub>(x | h)</code> and minimise its negative log-likelihood.</li>
+        <li>Every loss on this page is that construction with a different distribution. Squared error is a Gaussian with fixed variance; binary cross-entropy is a Bernoulli through a sigmoid; a softmax output is a categorical. Nothing new is being introduced — the losses are being <b>named</b>.</li>
+        <li>The output coordinates are almost always taken to be <b>conditionally independent given <code>h</code></b>, which is what makes the likelihood a cheap sum over pixels. That assumption is also, as §24 will show, the direct cause of blurry samples.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the loss is a negative log-likelihood — and always was</span><span class="eq">p<sub>decoder</sub>(x | h) = 𝒩( x ; g(h), <span class="keep">σ</span>²I )      ⟹  −log p = ‖x − g(h)‖² / (2<span class="keep">σ</span>²) + const   ← squared error
+p<sub>decoder</sub>(x | h) = ∏ⱼ Bern( xⱼ ; g(h)ⱼ )     ⟹  −log p = −∑ⱼ [ xⱼ log gⱼ + (1−xⱼ) log(1−gⱼ) ]   ← cross-entropy</span></div>
+
+      <h4>The encoder as a distribution</h4>
+      <ul class="notes">
+        <li>The more radical move is to make the <i>encoder</i> stochastic too: replace the function <code>h = f(x)</code> with a distribution <code>p<sub>encoder</sub>(h | x)</code>. Sampling replaces evaluation, and the code becomes a cloud rather than a point.</li>
+        <li>Any latent-variable model <code>p<sub>model</sub>(h, x)</code> supplies both halves for free: the stochastic encoder is the posterior <code>p<sub>model</sub>(h | x)</code> and the stochastic decoder is the conditional <code>p<sub>model</sub>(x | h)</code>. Read backwards, an autoencoder with stochastic parts is trying to be a latent-variable model.</li>
+        <li>They need not be consistent. Two arbitrarily chosen conditionals <code>p<sub>encoder</sub></code> and <code>p<sub>decoder</sub></code> generally correspond to <b>no</b> joint distribution at all. Training denoising-style makes them asymptotically compatible given enough capacity and data; the variational autoencoder instead <i>constructs</i> a joint and derives a bound, which is why it comes with a likelihood guarantee and the deterministic models do not.</li>
+      </ul>
+      <div class="formula"><span class="lbl">deterministic and stochastic, side by side</span><span class="eq">deterministic:   h = f(x)                  r = g(h)
+stochastic:      h ~ p<sub>encoder</sub>(h | x)       x ~ p<sub>decoder</sub>(x | h)
+
+from a latent-variable model:   p<sub>encoder</sub>(h | x) = p<sub>model</sub>(h | x)     p<sub>decoder</sub>(x | h) = p<sub>model</sub>(x | h)</span></div>
+      <div class="callout"><b>This is the hinge.</b> §16 onwards takes exactly this step and then asks the obvious follow-up: if the encoder is supposed to be the posterior <code>p<sub>model</sub>(h | x)</code>, and that posterior is intractable, what happens if we train a network to <i>approximate</i> it and optimise a bound instead? The answer is the variational autoencoder.</div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="psd" data-nav="Predictive sparse decomposition">
+      <h3><span class="idx">14</span> Predictive sparse decomposition — learning to shortcut inference</h3>
+      <p class="lede">A halfway house between sparse coding, where the code is <i>solved for</i>, and an autoencoder, where it is <i>predicted</i>. It is also the cleanest early example of the idea that dominates the second half of this page: <b>train a network to imitate an expensive inference procedure</b>.</p>
+      <ul class="notes">
+        <li>Sparse coding infers a code by running an optimisation for every example: minimise <code>‖x − g(h)‖² + λ‖h‖₁</code> over <code>h</code>. Excellent codes, unusable latency.</li>
+        <li>PSD keeps that optimisation but adds a parametric encoder <code>f(x)</code> and a third term tying the two together. Training alternates between minimising over <code>h</code> and minimising over the parameters.</li>
+        <li>The optimisation over <code>h</code> becomes cheap because <code>f(x)</code> supplies a good starting point and the coupling term keeps <code>h</code> near it — around ten gradient steps is enough.</li>
+        <li>Note the subtlety: this is <b>not</b> "fit sparse coding, then fit a regressor to its outputs". The coupling term is present while the decoder is learned, so the decoder is pushed toward parameters for which a feed-forward encoder <i>can</i> predict good codes. The inference network shapes the generative model.</li>
+        <li>At deployment the iteration is dropped entirely and <code>f</code> alone computes the features. This is <b>learned approximate inference</b>, and it is the same trick the VAE uses: replace an intractable or expensive per-example inference with one forward pass of a trained network.</li>
+      </ul>
+      <div class="formula"><span class="lbl">predictive sparse decomposition</span><span class="eq">minimise   ‖ x − g(h) ‖²  +  <span class="keep">λ</span>‖h‖₁  +  <span class="keep">γ</span> ‖ h − f(x) ‖²
+
+   term 1   reconstruct x from the code
+   term 2   keep the code sparse
+   term 3   and keep the code predictable by the encoder f
+
+train:   alternate  min over h   /   min over the parameters of f and g
+deploy:  h = f(x),  one forward pass, no optimisation</span></div>
+      <div class="callout"><b>Why it is worth a section.</b> PSD can be read as maximising a lower bound on the log-likelihood of a directed sparse-coding model — the same shape of argument as the ELBO in §17. The lineage runs directly from here to the variational autoencoder's <b>inference network</b>, and to every modern "amortised inference" method.</div>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="uses" data-nav="What they are used for">
+      <h3><span class="idx">15</span> What deterministic autoencoders are actually used for</h3>
+      <p class="lede">Before the probabilistic half, a stocktake: the plain autoencoder earns its keep in four places, and is a poor choice in several others that it is nonetheless routinely used for.</p>
+
+      <h4>Where they work</h4>
+      <div class="cards">
+        <div class="box good">
+          <div class="n">use 1</div>
+          <div class="t">Dimensionality reduction</div>
+          <div class="g">The original application. A deep autoencoder with a 30-unit bottleneck beats 30-component PCA on reconstruction <i>and</i> produces a code whose classes fall into well-separated clusters. Compare against the PCA floor of §04 or the comparison is meaningless.</div>
+        </div>
+        <div class="box good">
+          <div class="n">use 2</div>
+          <div class="t">Information retrieval &amp; semantic hashing</div>
+          <div class="g">Reduce to a <b>low-dimensional binary</b> code and a database becomes a hash table: retrieve exact matches in <code>O(1)</code>, near matches by flipping bits. The trick that produces genuinely binary codes is to inject noise before a sigmoid and grow it over training, forcing the units to saturate to 0 or 1 to survive.</div>
+        </div>
+        <div class="box good">
+          <div class="n">use 3</div>
+          <div class="t">Denoising and restoration</div>
+          <div class="g">The one case where you actually want the decoder's output. §09's model, used for its intended purpose.</div>
+        </div>
+        <div class="box good">
+          <div class="n">use 4</div>
+          <div class="t">A learned compression front end</div>
+          <div class="g">Encode once, do all subsequent work in the small space. §27 is the industrial-scale version: latent diffusion runs its entire generative process inside an autoencoder's latent space.</div>
+        </div>
+      </div>
+
+      <h4>Where they disappoint</h4>
+      <ul class="notes">
+        <li><b>Anomaly detection by reconstruction error.</b> The plausible story — "anomalies reconstruct badly" — fails often in practice, because a high-capacity autoencoder frequently reconstructs unseen inputs <i>well</i> (§06 is the reason), and because reconstruction error is dominated by high-variance regions rather than by anomalousness. It is a reasonable baseline and a bad final answer; always check what §06's probe test says about your model first.</li>
+        <li><b>General-purpose representations for classification.</b> Reconstruction spends capacity on whatever carries the most variance, which is often exactly what you do not care about — lighting, background, texture. <a href="contrastive-learning.html">Contrastive</a> and masked-prediction objectives generally produce stronger linear-probe features because they can be told what to ignore.</li>
+        <li><b>Generation.</b> A deterministic autoencoder has no prior over its code, so there is nothing principled to sample. Feed it a random vector and you get an arbitrary point in a space whose occupied region you never characterised. This is precisely the gap the VAE fills.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th style="width:24%">Objective family</th><th>Signal</th><th>Good at</th><th>Weak at</th></tr>
+        <tr><td><b>Reconstruction</b> (this page)</td><td>Rebuild the input</td><td>Compression, denoising, retrieval codes, a latent space for something else</td><td>Ignoring nuisance variance; anything needing a sampleable prior</td></tr>
+        <tr><td><b><a href="contrastive-learning.html">Contrastive</a></b></td><td>Agree across augmentations, disagree across examples</td><td>Linear-probe accuracy; invariance you get to specify</td><td>Needs designed augmentations; no generative model at all</td></tr>
+        <tr><td><b>Masked prediction</b></td><td>Fill in what was hidden</td><td>Scales; no augmentation design needed; strong for text and images alike</td><td>Reconstruction target still spends capacity on low-level detail</td></tr>
+        <tr><td><b><a href="world-models-jepa.html">Predictive embedding</a></b></td><td>Predict a <i>representation</i>, not pixels</td><td>Skips pixel-level detail entirely by design</td><td>Needs care to avoid collapse; no decoder, so nothing to inspect</td></tr>
+      </table>
+    </section>
+
+    <!-- ═══ 16 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="lvm" data-nav="The latent-variable model">
+      <h3><span class="idx">16</span> The latent-variable model, and the two integrals that are impossible</h3>
+      <p class="lede">Declare that the data was <b>generated</b>: draw a code from a simple prior, push it through a network, add observation noise. Everything difficult about the VAE follows from the fact that this model is easy to sample from and impossible to evaluate.</p>
+
+      <h4>The generative story</h4>
+      <ul class="notes">
+        <li>Sample <code>z ~ p(z)</code>, almost always <code>𝒩(0, I)</code>. Push it through a <b>differentiable generator network</b> <code>g<sub>θ</sub></code>. Emit <code>x</code> from a simple distribution whose parameters that network produced: <code>p<sub>θ</sub>(x | z) = 𝒩(x ; g<sub>θ</sub>(z), <span class="keep">σ</span>²I)</code> for real data, or a product of Bernoullis for binary data.</li>
+        <li>The prior is deliberately trivial. All the structure comes from <code>g<sub>θ</sub></code>, which acts as a <b>nonlinear change of variables</b>: it takes a boring isotropic Gaussian in <code>ℝᵈ</code> and drapes it over a complicated <code>d</code>-dimensional surface in <code>ℝᴰ</code>.</li>
+        <li>You have seen the trivial case already. To sample <code>𝒩(<span class="keep">μ</span>, Σ)</code> you draw <code>z ~ 𝒩(0, I)</code> and compute <code>x = <span class="keep">μ</span> + Lz</code> with <code>L</code> the Cholesky factor. That is a one-layer generator network. Everything here is that idea with the affine map replaced by a deep one.</li>
+        <li>Two ways to use the generator, with different powers: have it <b>emit a sample</b> directly (continuous data only, but no need to write down a tractable output density), or have it <b>emit the parameters</b> of a conditional distribution (works for discrete data, but you have to pick a family a human can write down). VAEs take the second route; <a href="generative-adversarial-networks.html">GANs</a> take the first.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the model</span><span class="eq">z ~ p(z) = 𝒩(0, I<sub>d</sub>)                       the prior — fixed, simple, sampleable
+x ~ p<sub><span class="keep">θ</span></sub>(x | z) = 𝒩( x ; g<sub><span class="keep">θ</span></sub>(z), <span class="keep">σ</span>²I )            the decoder — a network emitting distribution parameters
+
+p<sub><span class="keep">θ</span></sub>(x) = ∫ p<sub><span class="keep">θ</span></sub>(x | z) p(z) dz                    the marginal likelihood — what we want to maximise
+p<sub><span class="keep">θ</span></sub>(z | x) = p<sub><span class="keep">θ</span></sub>(x | z) p(z) / p<sub><span class="keep">θ</span></sub>(x)               the posterior — what an encoder should compute</span></div>
+
+      <h4>Why both of those lines are hopeless</h4>
+      <ul class="notes">
+        <li><b>The marginal</b> is an integral over the whole latent space of a term involving a deep network. There is no closed form for anything but a linear <code>g</code>, and numerical quadrature dies in <code>d</code> dimensions. Monte-Carlo with samples from the prior is unbiased but catastrophically high-variance: nearly every <code>z</code> drawn from <code>p(z)</code> produces an <code>x</code> nothing like the one you are evaluating, so the estimate is dominated by a vanishing fraction of samples.</li>
+        <li><b>The posterior</b> is worse, because it contains the marginal in its denominator. And even its <i>shape</i> is bad. The figure below starts with a <b>non-monotone</b> decoder (<code><span class="keep">β</span> = −0.90</code>), and the exact posterior it produces has <b>two modes</b>: two entirely different codes explain the same observation equally well, and no Gaussian <code>q</code> can represent that. Drag <code><span class="keep">β</span></code> positive to make the decoder monotone and watch the second mode disappear; park it at <code><span class="keep">β</span> = −0.55</code> with <code>x = 0</code> and there are <b>three</b>.</li>
+        <li>Compare with the invertible route: if <code>g</code> were invertible with a cheap Jacobian determinant you could change variables and get <code>p(x)</code> exactly. That is a <a href="diffusion-models.html#idea">normalizing flow</a>, and the price is an architecture built entirely out of invertible layers. VAEs decline to pay it and approximate instead.</li>
+      </ul>
+
+      <div class="viz" id="viz-lvm">
+        <div class="vhead">
+          <span class="vtitle">A simple prior through a nonlinear decoder — and the two-humped posterior that results</span>
+          <span class="vhint">everything here is computed by quadrature on a fine grid, so the "intractable" quantities are exact and you can see what is being approximated</span>
+        </div>
+        <div class="controls">
+          <label>decoder shape <span class="keep">β</span> <input type="range" id="lv-b" min="-0.9" max="0.9" step="0.02" value="-0.90" /><b id="lv-bv" class="readout">-0.90</b></label>
+          <label>observation noise <span class="keep">σ</span> <input type="range" id="lv-sig" min="0.05" max="0.60" step="0.01" value="0.18" /><b id="lv-sigv" class="readout">0.18</b></label>
+          <label>observed <code>x</code> <input type="range" id="lv-x" min="-2.4" max="2.4" step="0.02" value="0.55" /><b id="lv-xv" class="readout">0.55</b></label>
+          <label><input type="checkbox" id="lv-gauss" checked /> overlay the best Gaussian fit to the posterior</label>
+        </div>
+        <svg id="ae-lvm" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Three linked panels: the Gaussian prior over the latent variable, the decoder curve mapping latent to data space, and the resulting marginal density over the data together with the exact posterior over the latent given one observation"></svg>
+        <div class="readout" aria-live="polite" id="lv-out"></div>
+      </div>
+
+      <div class="callout"><b>The plan, stated before it is executed.</b> Train a second network — an <b>inference network</b> or encoder — to output the parameters of a distribution <code>q<sub>φ</sub>(z | x)</code> that approximates the true posterior. Then optimise a quantity that (a) can be computed from <code>q</code>, <code>p(z)</code> and <code>p<sub>θ</sub>(x|z)</code> alone, and (b) is provably a lower bound on <code>log p<sub>θ</sub>(x)</code>. Push the bound up and you push the log-likelihood up too. That quantity is the ELBO, and §17 is nothing but its two derivations and one measurement.</div>
+    </section>
+
+    <!-- ═══ 17 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="elbo" data-nav="The ELBO">
+      <h3><span class="idx">17</span> The evidence lower bound — two decompositions and one gap</h3>
+      <p class="lede">One quantity, three equivalent ways to write it, and an exactly identified gap between it and the thing you actually wanted. Knowing all three forms is the difference between using the ELBO and understanding it.</p>
+
+      <h4>The bound</h4>
+      <ul class="notes">
+        <li>Pick any distribution <code>q(z | x)</code> over the latent. The log marginal likelihood splits <b>exactly</b> into two pieces: the ELBO, and the KL divergence from <code>q</code> to the true posterior.</li>
+        <li>KL is non-negative — that is <a href="../math/calculus.html#integral">Jensen's inequality</a>, and this page does not re-derive it. So the ELBO is a lower bound on <code>log p<sub>θ</sub>(x)</code>, with <b>equality exactly when <code>q(z|x) = p<sub>θ</sub>(z|x)</code></b>.</li>
+        <li>The identity is the load-bearing fact. Maximising the ELBO over <code><span class="keep">θ</span></code> pushes the likelihood up; maximising it over <code><span class="keep">φ</span></code> — the encoder's parameters — squeezes the gap shut. One objective, two jobs.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the exact decomposition — everything else on this page follows from this line</span><span class="eq">log p<sub><span class="keep">θ</span></sub>(x)  =  𝓛(<span class="keep">θ</span>, <span class="keep">φ</span>; x)  +  D<sub>KL</sub>( q<sub><span class="keep">φ</span></sub>(z|x) ‖ p<sub><span class="keep">θ</span></sub>(z|x) )
+
+   the first term    is the ELBO — computable from q, p(z) and p(x|z) alone, and what you optimise
+   the second term   is the gap  — non-negative, real, and never observed</span></div>
+
+      <h4>The two forms of the ELBO, and what each one is good for</h4>
+      <div class="formula"><span class="lbl">form A — joint plus entropy. this is the one that shows why q spreads out</span><span class="eq">𝓛 = E<sub>z~q</sub>[ log p<sub><span class="keep">θ</span></sub>(z, x) ]  +  H( q<sub><span class="keep">φ</span></sub>(z|x) )</span>
+<span class="lbl">form B — reconstruction minus KL. this is the one you implement</span><span class="eq">𝓛 = E<sub>z~q</sub>[ log p<sub><span class="keep">θ</span></sub>(x | z) ]  −  D<sub>KL</sub>( q<sub><span class="keep">φ</span></sub>(z|x) ‖ p(z) )
+
+   first term    reconstruction — how well the decoder rebuilds x from a sampled code
+   second term   regulariser    — how far the encoder's distribution strays from the prior</span></div>
+      <ul class="notes">
+        <li><b>Form A</b> is the classical variational form. The first term is the joint log-likelihood under the approximate posterior — exactly the EM objective, with an approximate posterior in place of the exact one. The second is the <b>entropy of <code>q</code></b>, and it explains the VAE's most distinctive behaviour: maximising entropy pushes the encoder's predicted noise <i>up</i>, so <code>q</code> covers many codes that could have produced <code>x</code> rather than collapsing to a single best guess. A deterministic autoencoder has no such term and does collapse to a point.</li>
+        <li><b>Form B</b> is what you write in code. It reads as a regularised autoencoder — reconstruct the input, and keep the code's distribution near the prior — which is why the VAE looks like an autoencoder at all. The resemblance is a consequence of the algebra, not the design.</li>
+        <li>Both forms are the same number. The second follows from the first by expanding <code>log p(z,x) = log p(x|z) + log p(z)</code> and folding <code>E<sub>q</sub>[log p(z)] + H(q)</code> into <code>−D<sub>KL</sub>(q ‖ p(z))</code>.</li>
+      </ul>
+
+      <h4>Measured on a model where the true answer is computable</h4>
+      <p>Take a linear-Gaussian latent model — <code>x = Wz + <span class="keep">μ</span> + <span class="keep">ε</span></code> with <code>z ~ 𝒩(0, I₂)</code>, <code><span class="keep">ε</span> ~ 𝒩(0, 0.25·I₄)</code> — for which the marginal <code>p(x) = 𝒩(<span class="keep">μ</span>, WWᵀ + <span class="keep">σ</span>²I)</code> and the posterior are both available in closed form. Every number below is computed twice, analytically and by Monte-Carlo, and they agree.</p>
+      <table class="grid2">
+        <tr><th style="width:44%">Quantity</th><th style="width:22%">Value</th><th>What it confirms</th></tr>
+        <tr><td>Exact <code>log p(x)</code>, from <code>𝒩(<span class="keep">μ</span>, WWᵀ + <span class="keep">σ</span>²I)</code></td><td class="num">−3.858298</td><td>The target. Available only because the model is linear.</td></tr>
+        <tr><td><code>E<sub>q</sub>[ log p(x|z) ]</code> for a deliberately poor <code>q</code></td><td class="num">−7.397065</td><td>The reconstruction term of form B.</td></tr>
+        <tr><td><code>D<sub>KL</sub>( q ‖ p(z) )</code>, closed form</td><td class="num">0.522155</td><td>Monte-Carlo over 2 × 10⁶ draws gave <code>0.522234</code>. The closed form is right.</td></tr>
+        <tr><td><b>ELBO</b>, form B: reconstruction − KL</td><td class="num">−7.919220</td><td rowspan="2">The two decompositions are the <b>same number to every digit double precision carries</b> — not approximately equal.</td></tr>
+        <tr><td><b>ELBO</b>, form A: <code>E<sub>q</sub>[log p(z,x)] + H(q)</code></td><td class="num">−7.919220</td></tr>
+        <tr><td>ELBO by Monte-Carlo, 4 × 10⁶ samples</td><td class="num">−7.9217 ± 0.0052</td><td>Consistent with the analytic value; the estimator is unbiased.</td></tr>
+        <tr><td>The gap, <code>D<sub>KL</sub>( q ‖ p(z|x) )</code></td><td class="num">4.060922</td><td rowspan="2">ELBO + gap reproduces <code>log p(x)</code> to <code>10⁻⁹</code>. <b>The decomposition is an identity, and the bound is genuine.</b></td></tr>
+        <tr><td>ELBO + gap</td><td class="num">−3.858298</td></tr>
+      </table>
+
+      <h4>How tight can the bound get? Not tight.</h4>
+      <ul class="notes">
+        <li>Optimising the same <b>diagonal</b> Gaussian <code>q</code> to its best possible setting raised the ELBO to <code>−3.872676</code> — a remaining slack of <code>0.014378</code> nats. The bound never closes, because the true posterior of this model is <b>correlated</b> (its covariance has off-diagonal entries of <code>−0.0235</code>) and a diagonal <code>q</code> cannot represent that.</li>
+        <li>The optimal <code>q</code>'s mean matched the exact posterior mean to all printed digits — <code>(0.42896, 0.67486)</code> — but its variances came out <b>too small</b>: <code>(0.12315, 0.14970)</code> against the true posterior's <code>(0.12675, 0.15407)</code>. That is the classic behaviour of reverse-KL variational inference: it is <b>mode-seeking</b> and systematically under-reports uncertainty.</li>
+        <li>So the number a VAE reports is a bound whose looseness you never observe, biased downward by exactly the amount your posterior family cannot express. Comparing two VAEs by their ELBOs compares bounds, not likelihoods — and the model with the better encoder can win while having the worse decoder.</li>
+      </ul>
+
+      <div class="viz" id="viz-elbo">
+        <div class="vhead">
+          <span class="vtitle">The bound and its gap — move <code>q</code> and watch the two stack up to <code>log p(x)</code> exactly</span>
+          <span class="vhint">the same linear-Gaussian model as the table, so every bar is analytic</span>
+        </div>
+        <div class="controls">
+          <label>q mean <code>m₁</code> <input type="range" id="eb-m1" min="-1.2" max="1.8" step="0.01" value="0.55" /><b id="eb-m1v" class="readout">0.55</b></label>
+          <label>q mean <code>m₂</code> <input type="range" id="eb-m2" min="-1.2" max="1.8" step="0.01" value="-0.30" /><b id="eb-m2v" class="readout">-0.30</b></label>
+          <label>q variance <code>v₁</code> <input type="range" id="eb-v1" min="0.02" max="1.20" step="0.01" value="0.30" /><b id="eb-v1v" class="readout">0.30</b></label>
+          <label>q variance <code>v₂</code> <input type="range" id="eb-v2" min="0.02" max="1.20" step="0.01" value="0.55" /><b id="eb-v2v" class="readout">0.55</b></label>
+          <button class="btn" id="eb-opt">jump to the best diagonal q</button>
+          <button class="btn ghost" id="eb-reset">reset</button>
+        </div>
+        <svg id="ae-elbo" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left: a stacked bar showing the ELBO plus the posterior gap summing exactly to the log marginal likelihood. Right: contours of the true posterior over the two latent dimensions with the diagonal Gaussian approximation drawn over them."></svg>
+        <div class="readout" aria-live="polite" id="eb-out"></div>
+      </div>
+
+      <div class="callout"><b>Three sentences to keep.</b> The ELBO is not an approximation to the log-likelihood — it is a <b>lower bound with an exactly identified deficit</b>, namely the KL from your encoder to the true posterior. Maximising it over the decoder improves the model; maximising it over the encoder improves the bound. And you never get to see how big the deficit is, which is why an ELBO is a poor number for comparing models that use different posterior families.</div>
+    </section>
+
+    <!-- ═══ 18 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="reparam" data-nav="Reparameterisation">
+      <h3><span class="idx">18</span> The reparameterisation trick — and the estimator it replaces</h3>
+      <p class="lede">The ELBO is an expectation over a distribution whose <b>parameters you are differentiating</b>. There are two ways to get a gradient through that, one of them usable. The difference between them is not a matter of taste; it is measurable, and this section measures it.</p>
+
+      <h4>The problem</h4>
+      <ul class="notes">
+        <li>The reconstruction term is <code>E<sub>z~q<sub>φ</sub>(z|x)</sub>[ log p<sub>θ</sub>(x|z) ]</code>. Estimating it is easy — draw a <code>z</code>, evaluate. Differentiating it with respect to <code><span class="keep">φ</span></code> is not, because <code><span class="keep">φ</span></code> controls <i>which</i> <code>z</code> you draw, and a sampling operation has no derivative.</li>
+        <li>Backpropagation needs a deterministic computational graph. A node that "returns a different number every time you ask" is not one.</li>
+      </ul>
+
+      <h4>Fix 1: reparameterise — move the randomness out of the path</h4>
+      <ul class="notes">
+        <li>Write the sample as a <b>deterministic function of the parameters and an independent noise draw</b>. For a diagonal Gaussian, <code>z = <span class="keep">μ</span> + <span class="keep">σ</span> ⊙ <span class="keep">ε</span></code> with <code><span class="keep">ε</span> ~ 𝒩(0, I)</code>. Now <code>z</code> is an ordinary differentiable node with two parameter inputs and one <i>constant</i> random input.</li>
+        <li>The crucial condition, and it is easy to violate: <b><code><span class="keep">ε</span></code>'s distribution must not depend on <code><span class="keep">φ</span></code></b>, and <code><span class="keep">φ</span></code> must not depend on <code><span class="keep">ε</span></code>. Given that, backpropagation runs straight through the sampler as if it were an add and a multiply.</li>
+        <li>What the resulting gradient means: <i>how would the output change if I nudged <code><span class="keep">μ</span></code> or <code><span class="keep">σ</span></code> and re-ran the sampler with the same <code><span class="keep">ε</span></code>?</i> The noise is held fixed across the perturbation, which is exactly why the estimator has low variance — it is a <b>pathwise</b> derivative, not a difference of two independent random draws.</li>
+        <li>The generalisation: any <code>z ~ p(z | ω)</code> that can be written <code>z = f(<span class="keep">ε</span>; ω)</code> with <code>f</code> continuous and differentiable almost everywhere can be reparameterised. This requires <code>z</code> to be <b>continuous</b>, which is the whole reason §26's discrete latents need something else.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the trick</span><span class="eq">before:   z ~ 𝒩( <span class="keep">μ</span><sub><span class="keep">φ</span></sub>(x) , diag <span class="keep">σ</span><sub><span class="keep">φ</span></sub>(x)² )                    ✗ no gradient path through the sample
+
+after:    <span class="keep">ε</span> ~ 𝒩(0, I)                                    ✓ randomness is now an INPUT
+          z = <span class="keep">μ</span><sub><span class="keep">φ</span></sub>(x) + <span class="keep">σ</span><sub><span class="keep">φ</span></sub>(x) ⊙ <span class="keep">ε</span>                       ✓ a differentiable node
+
+∇<sub><span class="keep">φ</span></sub> E<sub>q</sub>[ h(z) ]  =  E<sub><span class="keep">ε</span></sub>[ ∇<sub><span class="keep">φ</span></sub> h( <span class="keep">μ</span><sub><span class="keep">φ</span></sub> + <span class="keep">σ</span><sub><span class="keep">φ</span></sub> ⊙ <span class="keep">ε</span> ) ]        the PATHWISE estimator</span></div>
+
+      <h4>Fix 2: the score-function estimator, which is unbiased and unusable</h4>
+      <ul class="notes">
+        <li>There is a second route that needs no reparameterisation at all, derived by differentiating the expectation directly and applying the identity <code>∂p/∂ω = p · ∂ log p/∂ω</code>. It is known as REINFORCE, the score-function estimator, or the likelihood-ratio estimator.</li>
+        <li>It is fully general — it works for discrete <code>z</code>, for non-differentiable <code>h</code>, for anything you can sample and evaluate — and it is exactly unbiased.</li>
+        <li>And its variance is enormous, because it never looks <i>inside</i> <code>h</code>. It only correlates the scalar value <code>h(z)</code> with the direction <code>∇ log q(z)</code>, so it is effectively estimating a gradient from a random search. The pathwise estimator, by contrast, differentiates through <code>h</code> and gets the direction for free.</li>
+        <li>You can subtract any <b>baseline</b> <code>b</code> that does not depend on <code>z</code> without changing the expectation, since <code>E<sub>q</sub>[∇ log q(z)] = 0</code>. That reduces variance substantially and still does not close the gap.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the score-function (REINFORCE) estimator</span><span class="eq">∇<sub>ω</sub> E<sub>q<sub>ω</sub></sub>[ h(z) ]  =  ∫ h(z) ∇<sub>ω</sub> q<sub>ω</sub>(z) dz
+                     =  ∫ h(z) q<sub>ω</sub>(z) ∇<sub>ω</sub> log q<sub>ω</sub>(z) dz
+                     =  E<sub>q</sub>[ h(z) ∇<sub>ω</sub> log q<sub>ω</sub>(z) ]
+
+with a baseline:      E<sub>q</sub>[ ( h(z) − b ) ∇<sub>ω</sub> log q<sub>ω</sub>(z) ]        since E<sub>q</sub>[ ∇<sub>ω</sub> log q<sub>ω</sub>(z) ] = 0</span></div>
+
+      <h4>The measurement, because "high variance" is not an argument</h4>
+      <p>Both estimators, on the same problem — <code>h(z) = −½‖z − c‖²</code>, <code>q = 𝒩(<span class="keep">μ</span>, <span class="keep">σ</span>²I<sub>k</sub>)</code> at <code><span class="keep">μ</span> = 0</code>, <code>‖c‖ = 2</code>, <code><span class="keep">σ</span> = 1</code> — with 400 000 single-sample draws each. Both means agree with the exact gradient; only the variances differ. The table is total variance summed over the <code>k</code> coordinates.</p>
+      <table class="grid2">
+        <tr><th style="width:12%">latent dim <code>k</code></th><th style="width:20%">reparameterised</th><th style="width:20%">score function</th><th style="width:22%">score + optimal baseline</th><th>ratio, score ÷ reparameterised</th></tr>
+        <tr><td class="num">1</td><td class="num">0.999</td><td class="num">21.5</td><td class="num">9.4</td><td class="num">21.6 ×</td></tr>
+        <tr><td class="num">2</td><td class="num">2.001</td><td class="num">48.3</td><td class="num">16.2</td><td class="num">24.2 ×</td></tr>
+        <tr><td class="num">4</td><td class="num">3.995</td><td class="num">132.1</td><td class="num">32.0</td><td class="num">33.1 ×</td></tr>
+        <tr><td class="num">8</td><td class="num">8.004</td><td class="num">469.0</td><td class="num">76.1</td><td class="num">58.6 ×</td></tr>
+        <tr><td class="num">16</td><td class="num">15.997</td><td class="num">2 148.9</td><td class="num">212.5</td><td class="num">134.3 ×</td></tr>
+        <tr><td class="num">32</td><td class="num">31.986</td><td class="num">12 205.4</td><td class="num">674.3</td><td class="num">381.6 ×</td></tr>
+        <tr><td class="num">64</td><td class="num">64.009</td><td class="num">80 774.3</td><td class="num">2 367.5</td><td class="num">1 261.9 ×</td></tr>
+        <tr class="tot"><td class="num"><b>128</b></td><td class="num"><b>127.965</b></td><td class="num"><b>582 991.5</b></td><td class="num"><b>8 852.6</b></td><td class="num"><b>4 555.9 ×</b></td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>The reparameterised estimator's variance came out as exactly <code>k<span class="keep">σ</span>²</code></b> — read the second column: 0.999, 2.001, 3.995, 8.004, 15.997, 31.986, 64.009, 127.965. That closed form is specific to this quadratic <code>h</code>, where the pathwise gradient is simply <code>c − z</code>; what generalises is the <b>linear</b> growth in the latent dimension.</li>
+        <li>The score-function estimator's grows roughly <b>cubically</b>: each doubling of <code>k</code> multiplies it by about 7 by the time <code>k = 128</code>. With an optimal constant baseline the growth drops to roughly quadratic — better, and still hopeless.</li>
+        <li>Read the last column as a sample-count requirement. At <code>k = 128</code> the score-function estimator needs about <b>4 556 times as many samples</b> for the same standard error. A VAE with a 128-dimensional latent would need thousands of decoder passes per gradient step to match what reparameterisation gets from one.</li>
+        <li>The <code><span class="keep">σ</span></code> dependence runs the wrong way too. At <code>k = 8</code>, shrinking <code><span class="keep">σ</span></code> from 1.0 to 0.25 <i>reduced</i> the pathwise variance from <code>8.005</code> to <code>0.500</code> but <i>raised</i> the score-function variance from <code>466.8</code> to <code>721.9</code> — the ratio blows out from 58 × to <b>1 444 ×</b>. The score <code>(z − <span class="keep">μ</span>)/<span class="keep">σ</span>²</code> explodes as the posterior sharpens, which is precisely the regime a well-trained encoder ends up in.</li>
+        <li>Running both on the <i>actual</i> ELBO gradient of §17's model gives the same verdict: exact <code>∂𝓛/∂m = (0.226, 6.362)</code>, both estimators unbiased, total variance <code>21.1</code> pathwise against <code>691.7</code> score-function — <b>32.8 ×</b> — and <code>199.9</code> with a baseline, still <b>9.5 ×</b>.</li>
+      </ul>
+
+      <div class="viz" id="viz-rep">
+        <div class="vhead">
+          <span class="vtitle">Two computation graphs, and the gradient distributions they produce</span>
+          <span class="vhint">the histograms are measured live from single-sample draws; the vertical line is the exact gradient</span>
+        </div>
+        <div class="controls">
+          <label>latent dimension <code>k</code> <input type="range" id="rp-k" min="1" max="64" step="1" value="8" /><b id="rp-kv" class="readout">8</b></label>
+          <label>posterior width <span class="keep">σ</span> <input type="range" id="rp-sig" min="0.15" max="2.00" step="0.05" value="1.00" /><b id="rp-sigv" class="readout">1.00</b></label>
+          <label>samples <input type="range" id="rp-n" min="2000" max="60000" step="2000" value="20000" /><b id="rp-nv" class="readout">20000</b></label>
+          <label><input type="checkbox" id="rp-base" /> give the score-function estimator its optimal baseline</label>
+        </div>
+        <svg id="ae-reparam" width="760" height="440" viewBox="0 0 760 440" role="img" aria-label="Top: two computation graphs side by side, one routing the gradient through a sampling node that blocks it and one routing it around the sampler through a fixed noise input. Bottom: overlaid histograms of single-sample gradient estimates from the two estimators, the score-function one far wider than the reparameterised one."></svg>
+        <div class="readout" aria-live="polite" id="rp-out"></div>
+      </div>
+
+      <div class="callout"><b>What this justifies, precisely.</b> The claim is <i>not</i> that the score-function estimator is wrong — it is exactly unbiased, and it is the only option for discrete latents, which is why <a href="#vqvae">§26</a> needs a different device entirely. The claim is that its <b>variance makes it useless at the dimensions VAEs actually run at</b>, and the numbers above are the argument. Reparameterisation is the reason a VAE trains with <b>one</b> latent sample per data point per step.</div>
+    </section>
+
+    <!-- ═══ 19 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="vae" data-nav="The VAE, end to end">
+      <h3><span class="idx">19</span> The variational autoencoder, end to end</h3>
+      <p class="lede">Everything assembled: two networks, one sampling step, one closed-form KL, and a training loop that fits on a napkin.</p>
+
+      <h4>The forward pass</h4>
+      <ol class="notes">
+        <li><b>Encode.</b> The encoder network reads <code>x</code> and emits <b>two</b> vectors: a mean <code><span class="keep">μ</span><sub><span class="keep">φ</span></sub>(x)</code> and a log-variance <code>log <span class="keep">σ</span><sub><span class="keep">φ</span></sub>²(x)</code>, both of length <code>d</code>. Predicting the <i>log</i> variance is not cosmetic — it keeps the variance positive without a constraint and keeps its gradient well-scaled.</li>
+        <li><b>Sample.</b> Draw <code><span class="keep">ε</span> ~ 𝒩(0, I)</code> and set <code>z = <span class="keep">μ</span> + <span class="keep">σ</span> ⊙ <span class="keep">ε</span></code>. One sample per data point per step is standard, and §18 is the reason that is enough.</li>
+        <li><b>Decode.</b> The decoder network reads <code>z</code> and emits the parameters of <code>p<sub><span class="keep">θ</span></sub>(x | z)</code> — a mean for a Gaussian, logits for Bernoullis, whatever §20 says the data calls for.</li>
+        <li><b>Score.</b> Add the reconstruction log-likelihood and the negative KL. Both terms are computed in closed form except the reconstruction expectation, which is the one Monte-Carlo sample.</li>
+      </ol>
+      <div class="formula"><span class="lbl">the Gaussian KL, which is the term you never have to sample</span><span class="eq">q<sub><span class="keep">φ</span></sub>(z|x) = 𝒩( <span class="keep">μ</span>, diag <span class="keep">σ</span>² )      p(z) = 𝒩(0, I)
+
+D<sub>KL</sub>( q ‖ p )  =  ½ ∑<sub>j=1..d</sub> ( <span class="keep">σ</span>ⱼ² + <span class="keep">μ</span>ⱼ² − 1 − log <span class="keep">σ</span>ⱼ² )        exact, per dimension, no sampling</span>
+<span class="lbl">and the per-example objective actually minimised</span><span class="eq">− 𝓛 = − log p<sub><span class="keep">θ</span></sub>( x | z = <span class="keep">μ</span> + <span class="keep">σ</span>⊙<span class="keep">ε</span> )  +  ½ ∑ⱼ ( <span class="keep">σ</span>ⱼ² + <span class="keep">μ</span>ⱼ² − 1 − log <span class="keep">σ</span>ⱼ² )</span></div>
+
+      <h4>Reading the KL term</h4>
+      <ul class="notes">
+        <li>Each dimension contributes independently, and each contribution is <b>zero exactly when <code><span class="keep">μ</span>ⱼ = 0</code> and <code><span class="keep">σ</span>ⱼ = 1</code></b> — that is, when the encoder has said nothing about <code>x</code> in that dimension. This is the mechanism of posterior collapse in §22, visible in the formula.</li>
+        <li>The <code><span class="keep">μ</span>ⱼ²</code> term keeps codes near the origin, so the aggregate of all codes resembles the prior and sampling from <code>𝒩(0, I)</code> lands somewhere the decoder has seen. The <code><span class="keep">σ</span>ⱼ² − 1 − log <span class="keep">σ</span>ⱼ²</code> term is a well with its minimum at <code><span class="keep">σ</span>ⱼ = 1</code>, penalising both over-confidence and under-confidence.</li>
+        <li>Because the penalty is per-dimension and the reconstruction reward is shared, dimensions <b>compete</b>: a dimension is kept only if it earns more reconstruction than it costs in KL. §22 turns that sentence into an exact threshold.</li>
+      </ul>
+
+      <div class="viz" id="viz-vaekl">
+        <div class="vhead">
+          <span class="vtitle">The KL term, felt directly — drag <code>q</code> away from the prior and watch each dimension's cost</span>
+          <span class="vhint">the closed form is checked live against a Monte-Carlo estimate of the same divergence</span>
+        </div>
+        <div class="controls">
+          <label><span class="keep">μ</span>₁ <input type="range" id="vk-m1" min="-3" max="3" step="0.05" value="1.20" /><b id="vk-m1v" class="readout">1.20</b></label>
+          <label><span class="keep">μ</span>₂ <input type="range" id="vk-m2" min="-3" max="3" step="0.05" value="-0.60" /><b id="vk-m2v" class="readout">-0.60</b></label>
+          <label><span class="keep">σ</span>₁ <input type="range" id="vk-s1" min="0.10" max="2.50" step="0.02" value="0.40" /><b id="vk-s1v" class="readout">0.40</b></label>
+          <label><span class="keep">σ</span>₂ <input type="range" id="vk-s2" min="0.10" max="2.50" step="0.02" value="1.00" /><b id="vk-s2v" class="readout">1.00</b></label>
+          <button class="btn ghost" id="vk-zero">set q = the prior</button>
+        </div>
+        <svg id="ae-vae" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left: the unit-variance prior drawn as a circle in a two-dimensional latent space with the encoder's Gaussian drawn as an ellipse and a scatter of samples from it. Right: a bar chart splitting the KL divergence into its per-dimension mean and variance contributions."></svg>
+        <div class="readout" aria-live="polite" id="vk-out"></div>
+      </div>
+
+      <h4>The training step, in the order you would write it</h4>
+      <div class="formula"><span class="lbl">one minibatch</span><span class="eq">mu, logvar = encoder(x)                       # two heads, each d wide
+std        = exp(0.5 * logvar)
+eps        = randn_like(std)                  # ← the ONLY randomness, and it carries no gradient
+z          = mu + std * eps                   # ← the reparameterisation
+
+x_par      = decoder(z)
+recon      = negative_log_likelihood(x, x_par)          # per §20: MSE, or BCE, or …
+kl         = 0.5 * sum( exp(logvar) + mu**2 - 1 - logvar , dim=1 )
+
+loss       = mean( recon + <span class="keep">β</span> * kl )                     # <span class="keep">β</span> = 1 is the plain ELBO
+loss.backward();  optimiser.step()</span></div>
+      <ul class="notes">
+        <li><b>Sum over dimensions, mean over the batch.</b> Averaging the KL over latent dimensions instead of summing silently rescales <code><span class="keep">β</span></code> by <code>1/d</code> and is one of the most common quiet bugs in VAE code.</li>
+        <li><b>To generate</b>, discard the encoder: draw <code>z ~ 𝒩(0, I)</code>, decode, and either take the mean or sample from <code>p<sub><span class="keep">θ</span></sub>(x|z)</code>. Taking the mean gives a cleaner picture; sampling gives an honest one.</li>
+        <li><b>To encode</b>, discard the sampling: use <code><span class="keep">μ</span><sub><span class="keep">φ</span></sub>(x)</code> as the representation. The variance head is a training device, and at inference the mean is what downstream code wants.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 20 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="likelihood" data-nav="Decoder likelihoods">
+      <h3><span class="idx">20</span> The decoder's likelihood, and the scale trap hiding in it</h3>
+      <p class="lede">The choice of <code>p<sub>θ</sub>(x | z)</code> is not a detail. It fixes the relative weight of reconstruction against KL, and getting it wrong is the most common reason a VAE either ignores its latent or produces mush.</p>
+
+      <h4>The standard choices</h4>
+      <table class="cmp">
+        <tr><th style="width:18%">Data</th><th style="width:26%">Decoder distribution</th><th>Loss it produces</th><th>Watch out for</th></tr>
+        <tr><td>Real-valued</td><td><code>𝒩(g<sub><span class="keep">θ</span></sub>(z), <span class="keep">σ</span>²I)</code>, <code><span class="keep">σ</span></code> fixed</td><td><code>‖x − g(z)‖² / (2<span class="keep">σ</span>²)</code> plus a constant</td><td>The <code>1/(2<span class="keep">σ</span>²)</code> is a hidden <code><span class="keep">β</span></code>. See below.</td></tr>
+        <tr><td>Real-valued</td><td><code>𝒩(g(z), diag <span class="keep">σ</span><sub><span class="keep">θ</span></sub>(z)²)</code>, learned</td><td>Heteroscedastic Gaussian NLL</td><td>The variance head can run to zero on easy pixels and blow the loss to <code>−∞</code>. Clamp <code>log <span class="keep">σ</span>²</code>.</td></tr>
+        <tr><td>Binary in <code>{0,1}</code></td><td>Product of Bernoullis</td><td>Binary cross-entropy</td><td>Fine, and the original setting.</td></tr>
+        <tr><td>Continuous in <code>[0,1]</code></td><td>Bernoulli used anyway</td><td>"BCE" on non-binary targets</td><td><b>Not a valid density.</b> Extremely common, and it silently changes the objective — the continuous Bernoulli exists precisely to fix the missing normaliser.</td></tr>
+        <tr><td>Discrete, 256 levels</td><td>Categorical / discretised logistic</td><td>Cross-entropy over bins</td><td>Expensive but correct; standard in likelihood-focused work.</td></tr>
+      </table>
+
+      <h4>The scale trap, stated as arithmetic</h4>
+      <ul class="notes">
+        <li>Fixing the decoder variance to <code><span class="keep">σ</span>²</code> makes the reconstruction term <code>‖x − g(z)‖²/(2<span class="keep">σ</span>²)</code>. Relative to the KL, that is <b>identical to a <code><span class="keep">β</span></code>-VAE with <code><span class="keep">β</span> = 2<span class="keep">σ</span>²</code></b> and a plain squared-error reconstruction. There is no such thing as "no <code><span class="keep">β</span></code>" — there is only a <code><span class="keep">β</span></code> you chose implicitly.</li>
+        <li>So the widespread habit of writing <code>MSE + KL</code> is a specific and rarely-examined choice: <code><span class="keep">σ</span>² = 0.5</code>. On data scaled to <code>[0,1]</code> that is an enormous observation noise, the KL dominates, and the model collapses. On data with unit variance per dimension it is merely arbitrary.</li>
+        <li>Worse, <b>summing versus averaging over pixels</b> rescales the same knob by the number of pixels. A "mean squared error" reconstruction on a 784-pixel image is <code>784×</code> weaker relative to the KL than a summed one. Two codebases that look identical can sit at <code><span class="keep">β</span></code> values three orders of magnitude apart.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the same objective, three ways of writing it</span><span class="eq">−log 𝒩(x; g(z), <span class="keep">σ</span>²I) + KL   =   ‖x − g(z)‖² / (2<span class="keep">σ</span>²)  +  KL  +  (D/2)·log(2π<span class="keep">σ</span>²)
+                              ∝   ‖x − g(z)‖²  +  2<span class="keep">σ</span>² · KL          ← a <span class="keep">β</span>-VAE with <span class="keep">β</span> = 2<span class="keep">σ</span>²
+
+so:   small <span class="keep">σ</span>  →  small <span class="keep">β</span>  →  sharp reconstructions, latent barely regularised
+      large <span class="keep">σ</span>  →  large <span class="keep">β</span>  →  strong prior pull, blur, and eventually collapse (§22)</span></div>
+      <div class="callout"><b>The practical instruction.</b> Either <b>learn</b> <code><span class="keep">σ</span></code> as a single global parameter — one scalar, cheap, and it removes the arbitrariness by fitting the noise level to the data — or state your <code><span class="keep">β</span></code> explicitly and report it. Silently inheriting <code><span class="keep">β</span></code> from a reduction keyword is how VAE results become impossible to reproduce.</div>
+    </section>
+
+    <!-- ═══ 21 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="tradeoff" data-nav="Rate, distortion &amp; β-VAE">
+      <h3><span class="idx">21</span> The reconstruction–KL trade-off, and what <span class="keep">β</span> actually buys</h3>
+      <p class="lede">The ELBO's two terms pull in opposite directions, and the quantity they trade is <b>information</b>. Read the KL as a <b>rate</b> in nats and the whole thing becomes a rate–distortion problem, which is the framing that makes <code><span class="keep">β</span></code> stop looking arbitrary.</p>
+
+      <h4>Rate and distortion</h4>
+      <ul class="notes">
+        <li><b>Rate</b> <code>R = E<sub>x</sub>[ D<sub>KL</sub>( q(z|x) ‖ p(z) ) ]</code>, in nats: how many nats the encoder spends describing <code>x</code> beyond what the prior already said. It is an upper bound on the mutual information between <code>x</code> and <code>z</code> under the encoder.</li>
+        <li><b>Distortion</b> <code>D = −E<sub>x</sub>E<sub>q</sub>[ log p<sub>θ</sub>(x|z) ]</code>: how badly the decoder reconstructs given that description. For a fixed-variance Gaussian decoder this is just the mean squared error, rescaled.</li>
+        <li>The ELBO is <code>−(D + R)</code>. A <code><span class="keep">β</span></code>-VAE optimises <code>−(D + <span class="keep">β</span>R)</code>, which traces out <b>different points on the same rate–distortion frontier</b>. Two models with the same ELBO can sit at wildly different <code>(R, D)</code> — one that describes nothing and reconstructs badly, one that describes a lot and reconstructs well.</li>
+        <li>This is why "the ELBO went down" is a weak sentence. Report <code>R</code> and <code>D</code> separately, always.</li>
+      </ul>
+      <div class="formula"><span class="lbl">rate–distortion form of the objective</span><span class="eq">−𝓛 = D + R           R = E<sub>x</sub> D<sub>KL</sub>( q(z|x) ‖ p(z) )      D = − E<sub>x</sub> E<sub>q</sub> log p<sub><span class="keep">θ</span></sub>(x|z)
+
+<span class="keep">β</span>-VAE:  minimise  D + <span class="keep">β</span>R          <span class="keep">β</span> &lt; 1 → high rate, low distortion (autoencoder-like)
+                              <span class="keep">β</span> = 1 → the plain ELBO
+                              <span class="keep">β</span> &gt; 1 → low rate, high distortion (prior-like, disentanglement-seeking)</span></div>
+
+      <h4>A case where the frontier is exactly computable</h4>
+      <p>For a <b>linear</b> VAE — linear encoder, linear decoder with fixed noise <code><span class="keep">σ</span>²</code>, diagonal Gaussian posterior — the optimum of the <code><span class="keep">β</span></code>-weighted ELBO is available in closed form, one latent dimension per data eigen-direction. Every quantity below is exact.</p>
+      <div class="formula"><span class="lbl">the exact linear <span class="keep">β</span>-VAE optimum, per data eigen-direction with eigenvalue <span class="keep">λ</span>ᵢ</span><span class="eq">active  ⟺  <span class="keep">λ</span>ᵢ &gt; <span class="keep">β</span><span class="keep">σ</span>²
+
+decoder weight        wᵢ² = <span class="keep">λ</span>ᵢ − <span class="keep">β</span><span class="keep">σ</span>²                posterior variance  dᵢ = <span class="keep">β</span><span class="keep">σ</span>² / <span class="keep">λ</span>ᵢ
+posterior mean        mᵢ  = (wᵢ / <span class="keep">λ</span>ᵢ) · (vᵢᵀx)
+
+rate       Rᵢ = ½ log( <span class="keep">λ</span>ᵢ / (<span class="keep">β</span><span class="keep">σ</span>²) )       nats, for an ACTIVE dimension;  0 otherwise
+distortion Dᵢ = <span class="keep">β</span><span class="keep">σ</span>²                        for an active dimension;  <span class="keep">λ</span>ᵢ otherwise</span></div>
+      <ul class="notes">
+        <li>Read the rate line: an active dimension spends <code>½ log(<span class="keep">λ</span>ᵢ/<span class="keep">β</span><span class="keep">σ</span>²)</code> nats — <b>logarithmic</b> in how much variance it explains, so the tenth dimension is far cheaper to keep than the first was. Read the distortion line: an active dimension leaves exactly <code><span class="keep">β</span><span class="keep">σ</span>²</code> of error behind regardless of how much variance it carried.</li>
+        <li>The threshold is the whole story of §22 in one inequality. As <code><span class="keep">β</span></code> rises, <code><span class="keep">β</span><span class="keep">σ</span>²</code> climbs the eigenvalue spectrum and switches dimensions off one at a time, from the smallest upward.</li>
+        <li>At <code><span class="keep">β</span> = 1</code> this reduces to probabilistic PCA's classical solution — a latent direction is retained only if its eigenvalue exceeds the observation noise. The <code><span class="keep">β</span></code>-VAE simply moves that noise floor.</li>
+      </ul>
+
+      <div class="viz" id="viz-rate">
+        <div class="vhead">
+          <span class="vtitle">The rate–distortion frontier, traced by <span class="keep">β</span></span>
+          <span class="vhint">every point is the exact optimum of the <span class="keep">β</span>-weighted ELBO for a linear VAE — no training, no fitting</span>
+        </div>
+        <div class="controls">
+          <label><span class="keep">β</span> <input type="range" id="rd-beta" min="-2.0" max="2.0" step="0.02" value="0" /><b id="rd-betav" class="readout">1.00</b></label>
+          <label>decoder noise <span class="keep">σ</span>² <input type="range" id="rd-s2" min="0.05" max="1.00" step="0.01" value="0.30" /><b id="rd-s2v" class="readout">0.30</b></label>
+          <label>spectrum decay <input type="range" id="rd-decay" min="0.30" max="0.92" step="0.01" value="0.55" /><b id="rd-decayv" class="readout">0.55</b></label>
+        </div>
+        <svg id="ae-rate" width="760" height="390" viewBox="0 0 760 390" role="img" aria-label="Left: the rate-distortion frontier traced as beta varies, with the current beta marked. Right: the per-dimension rate in nats as a bar chart, with dimensions switching off as beta rises past their eigenvalue."></svg>
+        <div class="readout" aria-live="polite" id="rd-out"></div>
+      </div>
+
+      <h4><span class="keep">β</span> &gt; 1 and disentanglement</h4>
+      <ul class="notes">
+        <li>The <b><code><span class="keep">β</span></code>-VAE</b> was introduced to encourage <b>disentangled</b> representations: single latent units that respond to single generative factors — object identity, position, scale, lighting — and stay flat with respect to the others. Raising <code><span class="keep">β</span></code> above 1 measurably improves standard disentanglement scores on synthetic 2-D shape datasets, at a visible cost in reconstruction quality.</li>
+        <li>The mechanism is bandwidth starvation. A tight rate budget forces the encoder to spend nats on the factors that explain the most and to spend them in the cheapest available basis — and a factorised prior makes an axis-aligned basis cheap. But the linear analysis above shows the limit of that argument: raising <code><span class="keep">β</span></code> is guaranteed to <b>prune</b> dimensions; it is not guaranteed to <b>align</b> the survivors with anything meaningful.</li>
+        <li>The honest caveat, which the follow-up literature made unavoidable: unsupervised disentanglement is <b>not identifiable</b> without inductive bias or supervision, because a rotation of the latent space leaves a factorised Gaussian prior invariant. High <code><span class="keep">β</span></code> reliably buys you fewer active dimensions; whether it buys you <i>interpretable</i> ones depends on the data and the architecture, and needs to be measured rather than assumed. Note how exactly this mirrors §04: a rotationally symmetric objective cannot pin down a basis.</li>
+      </ul>
+
+      <div class="viz" id="viz-beta">
+        <div class="vhead">
+          <span class="vtitle">The latent space as <span class="keep">β</span> rises — three classes, and the code that has to describe them</span>
+          <span class="vhint">encoder means from the exact linear <span class="keep">β</span>-VAE optimum; the dashed circle is the prior's one-standard-deviation contour</span>
+        </div>
+        <div class="controls">
+          <label><span class="keep">β</span> <input type="range" id="bl-beta" min="-2.0" max="2.0" step="0.02" value="0" /><b id="bl-betav" class="readout">1.00</b></label>
+          <label>class separation <input type="range" id="bl-sep" min="0.4" max="3.0" step="0.05" value="1.60" /><b id="bl-sepv" class="readout">1.60</b></label>
+          <label>decoder noise <span class="keep">σ</span>² <input type="range" id="bl-s2" min="0.05" max="1.00" step="0.01" value="0.30" /><b id="bl-s2v" class="readout">0.30</b></label>
+          <label><input type="checkbox" id="bl-post" /> draw each point's posterior spread, not just its mean</label>
+        </div>
+        <svg id="ae-beta" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="A scatter of encoder means in the first two latent dimensions coloured by class, shrinking toward the origin and losing class separation as the KL weight beta is increased"></svg>
+        <div class="readout" aria-live="polite" id="bl-out"></div>
+      </div>
+
+      <div class="callout"><b>A measured surprise worth sitting with.</b> Sweeping the figure's <code><span class="keep">β</span></code> at the default separation, the between-class-to-within-class scatter ratio of the code does <b>not</b> fall monotonically. It goes <code>0.23</code> at <code><span class="keep">β</span> = 0.01</code>, <code>0.29</code> at <code>0.1</code>, <code>1.07</code> at <code>0.5</code>, and peaks at <code><b>2.49</b></code> at <code><span class="keep">β</span> = 1</code> — before collapsing to <code>0</code> once <code><span class="keep">β</span></code> passes <code>10</code> and nothing survives. Compressing <i>helped</i> the classes over that whole range, because the dimensions the KL switched off were carrying <b>within-class noise</b>, not class identity. The rate over the same range fell from <code>17.4</code> nats to <code>1.7</code>. So the useful reading of <code><span class="keep">β</span></code> is not "more prior pressure is worse for downstream tasks" but "<b>the rate budget decides which variance you keep</b>" — and whether that is the variance you wanted is a property of the data, not of the objective.</div>
+    </section>
+
+    <!-- ═══ 22 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="collapse" data-nav="Posterior collapse">
+      <h3><span class="idx">22</span> Posterior collapse — when the latent variable stops existing</h3>
+      <p class="lede">The encoder outputs <code><span class="keep">μ</span> = 0</code> and <code><span class="keep">σ</span> = 1</code> for <b>every</b> input, the KL term goes to zero, and the decoder learns to ignore <code>z</code> entirely. The ELBO looks fine. The model has become an unconditional density estimator with a very expensive random number generator attached.</p>
+
+      <h4>The mechanism, read straight off the objective</h4>
+      <ul class="notes">
+        <li>Each latent dimension contributes <code>½(<span class="keep">σ</span>ⱼ² + <span class="keep">μ</span>ⱼ² − 1 − log <span class="keep">σ</span>ⱼ²)</code> to the loss, minimised at exactly zero when <code><span class="keep">μ</span>ⱼ = 0, <span class="keep">σ</span>ⱼ = 1</code> — the setting that carries <b>no information about <code>x</code></b>. Ignoring a dimension is not a degenerate accident; it is a local optimum the objective actively rewards.</li>
+        <li>A dimension survives only if the reconstruction it enables is worth more than the KL it costs. Anything that reduces the value of the reconstruction — a weak signal, a heavy KL weight, or a decoder powerful enough to do well <i>without</i> <code>z</code> — tips that comparison.</li>
+        <li>The classic trigger is a <b>strong autoregressive decoder</b>. If the decoder can predict each element of <code>x</code> from the earlier ones almost as well as it could with <code>z</code>'s help, then <code>z</code> is nearly worthless and the model gladly pays zero KL for it. This is why collapse is far more common in text VAEs than in image ones.</li>
+      </ul>
+
+      <h4>Exactly when a dimension dies</h4>
+      <p>The linear VAE of §21 gives a clean threshold, and it is worth trusting because it can be checked against a trained model. Below, a 4-dimensional dataset with covariance eigenvalues <code>2.0107, 0.9735, 0.5024, 0.1972</code> and decoder noise <code><span class="keep">σ</span>² = 0.30</code>. Every row was produced by actually training a linear VAE with Adam to convergence and reading its per-dimension KL; the "predicted" column is <code>½ log(<span class="keep">λ</span>ᵢ / <span class="keep">β</span><span class="keep">σ</span>²)</code>.</p>
+      <table class="grid2">
+        <tr><th style="width:8%"><span class="keep">β</span></th><th style="width:11%"><code><span class="keep">β</span><span class="keep">σ</span>²</code></th><th style="width:27%">Trained per-dimension KL, nats</th><th style="width:27%">Predicted by the closed form</th><th style="width:13%">Distortion, trained / predicted</th><th>Active</th></tr>
+        <tr><td class="num">0.5</td><td class="num">0.150</td><td class="mono">1.2978 &nbsp;0.9351 &nbsp;0.6044 &nbsp;0.1368</td><td class="mono">1.2978 &nbsp;0.9351 &nbsp;0.6044 &nbsp;0.1368</td><td class="num">0.60000 / 0.60000</td><td class="num">4</td></tr>
+        <tr><td class="num">1.0</td><td class="num">0.300</td><td class="mono">0.9512 &nbsp;0.5886 &nbsp;0.2579 &nbsp;<b>0.0000</b></td><td class="mono">0.9512 &nbsp;0.5886 &nbsp;0.2578 &nbsp;<b>0.0000</b></td><td class="num">1.09723 / 1.09721</td><td class="num">3</td></tr>
+        <tr><td class="num">2.0</td><td class="num">0.600</td><td class="mono">0.6046 &nbsp;0.2420 &nbsp;<b>0.0000 &nbsp;0.0000</b></td><td class="mono">0.6046 &nbsp;0.2420 &nbsp;<b>0.0000 &nbsp;0.0000</b></td><td class="num">1.89966 / 1.89965</td><td class="num">2</td></tr>
+        <tr><td class="num">3.0</td><td class="num">0.900</td><td class="mono">0.4020 &nbsp;0.0392 &nbsp;<b>0.0000 &nbsp;0.0000</b></td><td class="mono">0.4019 &nbsp;0.0393 &nbsp;<b>0.0000 &nbsp;0.0000</b></td><td class="num">2.49966 / 2.49965</td><td class="num">2</td></tr>
+        <tr><td class="num">5.0</td><td class="num">1.500</td><td class="mono">0.1467 &nbsp;<b>0.0000 &nbsp;0.0000 &nbsp;0.0000</b></td><td class="mono">0.1465 &nbsp;<b>0.0000 &nbsp;0.0000 &nbsp;0.0000</b></td><td class="num">3.17270 / 3.17315</td><td class="num">1</td></tr>
+        <tr class="tot"><td class="num"><b>8.0</b></td><td class="num">2.400</td><td class="mono"><b>0.0000 &nbsp;0.0000 &nbsp;0.0000 &nbsp;0.0000</b></td><td class="mono"><b>0.0000 &nbsp;0.0000 &nbsp;0.0000 &nbsp;0.0000</b></td><td class="num">3.68383 / 3.68383</td><td class="num"><b>0</b></td></tr>
+      </table>
+      <div class="formula"><span class="lbl">the collapse condition, and what it implies</span><span class="eq">dimension i is used   ⟺   <span class="keep">λ</span>ᵢ  &gt;  <span class="keep">β</span><span class="keep">σ</span>²
+
+so:  KLᵢ = ½ log( <span class="keep">λ</span>ᵢ / <span class="keep">β</span><span class="keep">σ</span>² )  if used,  0 otherwise
+     raising <span class="keep">β</span> — or raising the decoder's noise <span class="keep">σ</span>² — walks the threshold up the spectrum,
+     killing dimensions one at a time from the smallest eigenvalue upward.</span></div>
+      <ul class="notes">
+        <li>At <code><span class="keep">β</span> = 8</code> the model has collapsed completely: zero rate, and a distortion of <code>3.68383</code>, which is <b>exactly the total variance of the data</b>. The reconstruction is the mean, every time. That is the endpoint the mechanism is heading toward.</li>
+        <li>The agreement between the trained model and the closed form — four decimal places in every cell — is the reason to believe the threshold rather than merely quote it. And it says something uncomfortable: collapse here is not an <b>optimisation</b> failure. The collapsed solution <i>is</i> the global optimum of the objective as written. If you do not want it, change the objective.</li>
+      </ul>
+
+      <div class="viz" id="viz-coll">
+        <div class="vhead">
+          <span class="vtitle">Collapse happening as the KL weight anneals up — and three ways to stop it</span>
+          <span class="vhint">the default target <code><span class="keep">β</span> = 4</code> at <code><span class="keep">σ</span>² = 0.30</code> kills <b>5 of 8</b> dimensions; switch on free bits and none of them die</span>
+        </div>
+        <div class="controls">
+          <label>target KL weight <span class="keep">β</span> <input type="range" id="pc-beta" min="0.2" max="10" step="0.1" value="4.0" /><b id="pc-betav" class="readout">4.0</b></label>
+          <label>decoder noise <span class="keep">σ</span>² <input type="range" id="pc-s2" min="0.05" max="0.80" step="0.01" value="0.30" /><b id="pc-s2v" class="readout">0.30</b></label>
+          <label>free bits <span class="keep">λ</span>, nats per dimension <input type="range" id="pc-free" min="0" max="1.2" step="0.05" value="0" /><b id="pc-freev" class="readout">0.00</b></label>
+          <label>anneal <input type="range" id="pc-t" min="0" max="100" step="1" value="100" /><b id="pc-tv" class="readout">100</b>%</label>
+          <button class="btn" id="pc-play">▶ run the anneal</button>
+        </div>
+        <svg id="ae-collapse" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left: eight curves showing each latent dimension's KL in nats as the KL weight is annealed upward during training, with dimensions dropping to exactly zero one after another. Right: a bar chart of the final per-dimension KL with the collapsed dimensions marked."></svg>
+        <div class="readout" aria-live="polite" id="pc-out"></div>
+      </div>
+
+      <h4>The mitigations, and what each one really does</h4>
+      <table class="cmp">
+        <tr><th style="width:20%">Fix</th><th style="width:34%">What it does</th><th>What it costs, and what it does not fix</th></tr>
+        <tr><td><b>KL annealing</b> (warm-up)</td><td>Start with the KL weight at 0 and ramp it to 1 over the first stretch of training. The model learns to use <code>z</code> while it is free, and by the time the KL bites, the decoder already depends on the latent.</td><td>Purely an <b>optimisation</b> fix: it changes which optimum you reach, not which optima exist. The schedule is another hyperparameter, and too fast a ramp collapses anyway. Its virtue is that the surrogate objective smoothly <i>becomes</i> the true ELBO.</td></tr>
+        <tr><td><b>Free bits</b></td><td>Replace each dimension's KL by <code>max(<span class="keep">λ</span>, KLⱼ)</code>. Below the threshold the penalty is constant, so there is no gradient pushing the dimension toward zero — every dimension is guaranteed at least <code><span class="keep">λ</span></code> nats.</td><td>Easier to set than an annealing schedule — one number, in nats. But the objective is no longer the ELBO, and the hinge introduces a <b>sharp</b> transition at the boundary where annealing has a smooth one.</td></tr>
+        <tr><td><b><span class="keep">β</span> &lt; 1</b></td><td>Simply weight the KL less. Directly lowers the threshold <code><span class="keep">β</span><span class="keep">σ</span>²</code>, so more dimensions clear it.</td><td>The latent no longer matches the prior, so ancestral sampling degrades. You have traded generation for reconstruction; §21's frontier is the trade.</td></tr>
+        <tr><td><b>Weaken the decoder</b></td><td>Restrict the decoder's context — word dropout on the inputs of an autoregressive text decoder, a smaller receptive field, dilated rather than full conditioning — so that it <i>cannot</i> do well without <code>z</code>.</td><td>Caps model quality by construction. Effective, and crude.</td></tr>
+        <tr><td><b>Skip connections</b> from <code>z</code></td><td>Feed <code>z</code> into every decoder layer instead of only the first, so the path from latent to output is short and the gradient signal that makes <code>z</code> useful is strong everywhere.</td><td>Architectural, cheap, and widely used. Does not change the objective at all.</td></tr>
+        <tr><td><b>Discrete latents</b> (§26)</td><td>Sidestep the mechanism entirely: with a uniform prior over <code>K</code> codes the KL is the <b>constant</b> <code>log K</code>, so there is no gradient toward "use fewer nats" and nothing to collapse.</td><td>Needs a surrogate gradient through the quantiser, and moves the generative modelling into a separate prior over indices.</td></tr>
+        <tr><td><b>Richer posteriors</b></td><td>Normalizing flows on <code>q</code>, or importance-weighted bounds (§25). A tighter bound means less pressure to simplify the posterior into nothing.</td><td>More machinery, more compute; helps the bound more than it helps collapse specifically.</td></tr>
+      </table>
+      <div class="callout"><b>Diagnose before you fix.</b> Log the <b>per-dimension</b> KL, not the total. A total of 12 nats can be 12 dimensions carrying 1 nat each or 2 dimensions carrying 6 while 30 sit at exactly zero, and those are entirely different models. The count of dimensions above about <code>0.01</code> nats is the single most useful number a VAE run can print.</div>
+    </section>
+
+    <!-- ═══ 23 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="latentspace" data-nav="Inside the latent space">
+      <h3><span class="idx">23</span> Inside the latent space — traversal, interpolation, and the holes</h3>
+      <p class="lede">The VAE's selling point over a plain autoencoder is that its code space is <b>organised</b>: a prior says where the codes should be, so you can walk around in it, interpolate, and sample. This section is about how far that promise actually goes.</p>
+
+      <h4>Three things you can do with a latent space, and what each shows</h4>
+      <ul class="notes">
+        <li><b>Traversal.</b> Fix all coordinates but one, sweep that one over a few standard deviations, and decode each point. If the model has found factors of variation, one coordinate moves one thing. This is the standard qualitative disentanglement check, and it is a check, not a proof.</li>
+        <li><b>Interpolation.</b> Encode two examples, walk along the segment between their codes, and decode. A well-organised latent gives a plausible sequence of intermediates; a badly organised one gives a cross-fade — which is what interpolating in <i>pixel</i> space always gives, and is therefore the thing to beat.</li>
+        <li><b>Ancestral sampling.</b> Draw <code>z ~ 𝒩(0, I)</code> and decode. This is the only one of the three that tests whether the <b>aggregate posterior</b> actually matches the prior, and it is the one that most often disappoints.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the aggregate posterior — the distribution your codes actually have</span><span class="eq">q(z) = E<sub>x~p<sub>data</sub></sub>[ q<sub><span class="keep">φ</span></sub>(z | x) ]  =  (1/N) ∑ᵢ q<sub><span class="keep">φ</span></sub>( z | x⁽ⁱ⁾ )
+
+the ELBO's KL term pushes each q<sub><span class="keep">φ</span></sub>(z|x) toward p(z) INDIVIDUALLY.
+It does NOT directly force the aggregate q(z) to equal p(z) — and it usually does not.</span></div>
+
+      <h4>The prior hole, which is why samples are worse than reconstructions</h4>
+      <ul class="notes">
+        <li>Sampling is only valid where the decoder was <b>trained</b>, and the decoder was trained on codes drawn from <code>q(z)</code>, not from <code>p(z)</code>. Wherever <code>p(z)</code> has mass and <code>q(z)</code> does not, you are asking the decoder about a region it has never seen. Those regions are <b>prior holes</b>.</li>
+        <li>The symptom is unmistakable and universal: reconstructions look fine, samples look worse. If you have ever concluded a VAE "works" from a reconstruction grid, this is the reason to be suspicious.</li>
+        <li>The mismatch is a direct consequence of what the objective asks for. Pushing every individual posterior toward the prior is not the same as making their <i>mixture</i> match the prior — the mixture can be lumpy while every component is nicely centred.</li>
+        <li>The standard fixes all amount to fitting a better prior: <b>learn</b> <code>p(z)</code> after training (a mixture, a flow, an autoregressive model), or use a <b>two-stage</b> VAE that fits a second small VAE to the codes. Both work, and both quietly concede that <code>𝒩(0, I)</code> was the wrong prior.</li>
+      </ul>
+
+      <div class="viz" id="viz-trav">
+        <div class="vhead">
+          <span class="vtitle">A latent traversal on a toy dataset whose generating factors are known exactly</span>
+          <span class="vhint">240 one-dimensional bumps parameterised by <b>position</b> and <b>width</b>; the encoder is the exact linear <span class="keep">β</span>-VAE optimum and the decoder is <code>E[x | z]</code> under its own aggregate posterior</span>
+        </div>
+        <div class="controls">
+          <label><code>z₁</code> <input type="range" id="tv-z1" min="-2.6" max="2.6" step="0.02" value="-1.40" /><b id="tv-z1v" class="readout">-1.40</b></label>
+          <label><code>z₂</code> <input type="range" id="tv-z2" min="-2.6" max="2.6" step="0.02" value="0.00" /><b id="tv-z2v" class="readout">0.00</b></label>
+          <label>traverse
+            <select id="tv-axis">
+              <option value="1" selected>z₁, holding z₂</option>
+              <option value="2">z₂, holding z₁</option>
+            </select>
+          </label>
+          <label><span class="keep">β</span> <input type="range" id="tv-beta" min="-0.7" max="2.3" step="0.05" value="0" /><b id="tv-betav" class="readout">1.00</b></label>
+        </div>
+        <svg id="ae-traverse" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Left: a scatter of encoder means in two latent dimensions coloured by the bump's true position, with a movable probe and the prior contour. Right: the decoded signal at the probe, and a strip of decoded signals along the chosen traversal axis showing the bump sliding or widening."></svg>
+        <div class="readout" aria-live="polite" id="tv-out"></div>
+      </div>
+
+      <div class="callout"><b>What this figure establishes, with numbers.</b> The two latent coordinates of this model correlate with the two <i>true</i> generating factors at <code>−0.994</code> (position) and <code>+0.987</code> (width) — a nearly perfect axis-aligned recovery, obtained with <b>no training at all</b>, purely from the eigendecomposition of the data covariance. That is worth holding next to §21's disentanglement discussion: the alignment here comes from the fact that position and width happen to be the top two principal directions of <i>this</i> dataset, not from any pressure the <code><span class="keep">β</span></code> term applied. Change the dataset and the alignment evaporates.</div>
+    </section>
+
+    <!-- ═══ 24 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="blur" data-nav="Why samples are blurry">
+      <h3><span class="idx">24</span> Why VAE samples are blurry — the honest reasons</h3>
+      <p class="lede">Blurriness is the single most-cited complaint about VAEs, and it is usually explained badly. There are three distinct causes, only one of which is really about variational inference, and the fix that actually works in production addresses none of them directly.</p>
+
+      <h4>Cause 1 — a squared-error decoder outputs a conditional mean, and means of sharp things are blurry</h4>
+      <ul class="notes">
+        <li>With a Gaussian decoder of fixed variance, the reconstruction term is squared error, and the value that minimises expected squared error is the <b>conditional mean</b> <code>E[x | z]</code>. If several genuinely different <code>x</code> share a code, the best possible output is their average — and the average of two sharp images with an edge in different places is one image with two faint edges.</li>
+        <li>This is not a failure of optimisation, or of the bound, or of the network. It is what the loss <b>asks for</b>. A perfect optimiser on a perfect architecture produces exactly this.</li>
+        <li>It also explains <i>which</i> details vanish: features occupying few pixels, or causing only small changes in brightness, contribute little to a squared error, so the model spends its capacity elsewhere. Squared error is a bad model of what people notice.</li>
+        <li>The effect is <b>measurable</b> and appears in the figure below. On the toy dataset of §23, whose signals all have peak height exactly <code>1.000</code>, the reconstruction's mean peak height falls from <code>0.997</code> at <code><span class="keep">β</span> = 0.2</code> to <code>0.953</code> at <code><span class="keep">β</span> = 10</code> and <code>0.768</code> at <code><span class="keep">β</span> = 200</code>. That last value is not arbitrary: it is <b>exactly the peak of the dataset mean</b>, because at that point the code carries nothing and the best reconstruction of everything is the average of everything. Meanwhile the number of training examples being averaged into each output climbs from <b>2.4</b> to <b>240</b> — the entire dataset.</li>
+      </ul>
+
+      <h4>Cause 2 — maximum likelihood is mode-covering</h4>
+      <ul class="notes">
+        <li>Maximising likelihood minimises <code>D<sub>KL</sub>(p<sub>data</sub> ‖ p<sub>model</sub>)</code>, which is infinite wherever the data has mass and the model has none. So the model is heavily punished for <b>missing</b> anything and only mildly punished for putting mass where there is no data. It spreads.</li>
+        <li>Some of the mass it spreads lands on things that are not images — including blurry ones. This is a property of the divergence, shared by every likelihood-trained generative model, not something specific to VAEs.</li>
+        <li>The contrast with a <a href="generative-adversarial-networks.html">GAN</a> is exactly here. An adversarial objective punishes generating anything the discriminator can call fake, and does not punish missing modes at all. That is why GANs are sharp <i>and</i> drop modes, and why VAEs cover the data <i>and</i> blur. It is one trade, seen from two sides.</li>
+      </ul>
+
+      <h4>Cause 3 — a factorised decoder cannot express what it is missing</h4>
+      <ul class="notes">
+        <li>The decoder emits <b>conditionally independent</b> outputs given <code>z</code>: every pixel is its own Gaussian or Bernoulli. So all correlation between pixels must be carried by <code>z</code>, and whatever <code>z</code>'s limited capacity cannot carry is emitted as independent per-pixel noise.</li>
+        <li>Given the choice between independent speckle and a smooth average, squared error picks the average every time. Independence in the output distribution therefore turns directly into smoothness in the output image.</li>
+        <li>And note the interaction with §22: the tighter the rate budget, the more that <code>z</code> cannot carry, and the more the decoder must fall back on averaging. <b>Blur and posterior collapse are the same phenomenon at two severities.</b></li>
+      </ul>
+
+      <div class="viz" id="viz-blur">
+        <div class="vhead">
+          <span class="vtitle">Blur, measured — how many examples is each output an average of?</span>
+          <span class="vhint">every signal in this dataset has peak height exactly 1.000, so the reconstruction's peak height is a direct sharpness meter</span>
+        </div>
+        <div class="controls">
+          <label><span class="keep">β</span> <input type="range" id="bl2-beta" min="-0.7" max="2.3" step="0.05" value="1.0" /><b id="bl2-betav" class="readout">10.00</b></label>
+          <label>example <input type="range" id="bl2-i" min="0" max="239" step="1" value="40" /><b id="bl2-iv" class="readout">40</b></label>
+          <label><input type="checkbox" id="bl2-contrib" checked /> show the examples being averaged</label>
+        </div>
+        <svg id="ae-blur" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left: one true signal overlaid with the decoder's reconstruction, which is visibly lower and wider, together with faint curves for the training examples being averaged into it. Right: mean peak height and effective number of averaged examples plotted against the KL weight."></svg>
+        <div class="readout" aria-live="polite" id="bl2-out"></div>
+      </div>
+
+      <h4>What actually fixes it in practice</h4>
+      <ul class="notes">
+        <li><b>Stop using a pixel-space likelihood.</b> The autoencoders used inside modern generative systems are trained with a <b>perceptual</b> loss plus a <b>patch-based adversarial</b> loss on top of the reconstruction term, precisely — and explicitly — to keep reconstructions on the image manifold and to avoid the blurriness that comes from relying on pixel-space <code>L¹</code> or <code>L²</code> objectives alone. The KL is kept, but as a <i>mild</i> regulariser on the latent rather than the dominant term.</li>
+        <li><b>Give the decoder a stronger output model.</b> A discretised logistic or autoregressive decoder can express pixel correlations directly instead of pushing them all through <code>z</code> — at the cost of inviting posterior collapse (§22).</li>
+        <li><b>Hand generation to something else.</b> Use the autoencoder only as a compressor and fit a separate, powerful prior over its latents: an autoregressive model over discrete codes (§26), or a <a href="diffusion-models.html#latent">diffusion model over continuous ones</a> (§27). This is the arrangement that won, and it is worth noticing that it does not fix the VAE's blur so much as <b>stop asking the VAE to generate</b>.</li>
+      </ul>
+      <div class="callout"><b>The sentence to retire.</b> "VAEs are blurry because they are variational." They are not: the bound's looseness is a separate issue (§17) and a deterministic autoencoder with the same squared-error decoder blurs in exactly the same way. They are blurry because a <b>factorised, squared-error output distribution asked to cover the data will output a conditional mean</b>. Change the output distribution and the blur goes with it — which is exactly what the systems in §27 did.</div>
+    </section>
+
+    <!-- ═══ 25 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="tighter" data-nav="Tighter bounds &amp; variants">
+      <h3><span class="idx">25</span> Tighter bounds, richer posteriors, and the rest of the family</h3>
+      <p class="lede">Every weakness identified so far has a named fix, and each fix buys one thing at the cost of another. This is the map.</p>
+
+      <h4>The importance-weighted bound</h4>
+      <ul class="notes">
+        <li>Draw <code>k</code> samples from <code>q(z|x)</code> instead of one, and average the importance ratios <b>inside</b> the logarithm rather than outside. The result is still a lower bound on <code>log p(x)</code>, it reduces to the ordinary ELBO at <code>k = 1</code>, and it gets <b>monotonically tighter as <code>k</code> grows</b>.</li>
+        <li>The interpretation is exactly importance sampling: <code>q</code> is a proposal distribution for estimating <code>p(x)</code>, and averaging <code>k</code> proposals before taking the log gives a better estimate of the evidence. Jensen's gap shrinks as the estimator's variance falls.</li>
+        <li>The cost is <code>k</code> decoder passes per data point. And the well-known catch: a tighter bound weakens the <i>gradient signal for the encoder</i>, so an IWAE can end up with a better bound and a worse inference network than a plain VAE. Tighter is not automatically better.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the importance-weighted bound</span><span class="eq">𝓛<sub>k</sub>(x) = E<sub>z⁽¹⁾…z⁽ᵏ⁾ ~ q(z|x)</sub> [ log ( (1/k) ∑<sub>i=1..k</sub>  p<sub><span class="keep">θ</span></sub>(x, z⁽ⁱ⁾) / q<sub><span class="keep">φ</span></sub>(z⁽ⁱ⁾ | x) ) ]
+
+𝓛₁ = the ordinary ELBO        𝓛₁ ≤ 𝓛₂ ≤ 𝓛₃ ≤ … ≤ log p<sub><span class="keep">θ</span></sub>(x)</span></div>
+
+      <h4>The rest of the toolbox</h4>
+      <table class="cmp">
+        <tr><th style="width:22%">Variant</th><th style="width:34%">What it changes</th><th>Why, and what it costs</th></tr>
+        <tr><td><b>Conditional VAE</b></td><td>Condition every part on a label or context: <code>q(z|x,c)</code>, <code>p(x|z,c)</code>, sometimes <code>p(z|c)</code>.</td><td>Controllable generation. The latent then only has to model what <code>c</code> does not — which, if <code>c</code> is informative, is another route to collapse.</td></tr>
+        <tr><td><b>Flow posterior</b></td><td>Push a diagonal Gaussian through invertible transforms so <code>q</code> can be correlated and non-Gaussian.</td><td>Directly attacks the gap measured in §17 — recall a diagonal <code>q</code> left <code>0.014</code> nats on the table on a <i>linear</i> 2-D problem. Costs invertible layers and Jacobian determinants.</td></tr>
+        <tr><td><b>Hierarchical VAE</b></td><td>Several stochastic layers, <code>z₁ → z₂ → … → x</code>, each conditioned on the one above.</td><td>The best likelihoods among VAEs; expressive coarse-to-fine latents. Notoriously hard to keep stable, and the top layers collapse first.</td></tr>
+        <tr><td><b>VQ-VAE</b> (§26)</td><td>Discrete latents from a learned codebook.</td><td>Removes collapse by construction; hands generation to a separate prior. Needs a surrogate gradient.</td></tr>
+        <tr><td><b>Adversarial autoencoder</b></td><td>Replace the KL with an adversarial critic that matches the <b>aggregate</b> posterior to the prior.</td><td>Attacks the prior hole of §23 directly, since it constrains <code>q(z)</code> rather than each <code>q(z|x)</code>. Inherits GAN instability.</td></tr>
+        <tr><td><b>Two-stage VAE</b></td><td>Train a VAE, then fit a second small model to its latent codes and sample from <i>that</i>.</td><td>The pragmatic version of "the prior was wrong". Cheap, effective, and a direct ancestor of §27's arrangement.</td></tr>
+        <tr><td><b><span class="keep">σ</span>-VAE / learned <span class="keep">σ</span></b></td><td>Learn the decoder's observation noise instead of fixing it.</td><td>Removes the arbitrary <code><span class="keep">β</span></code> of §20 by fitting it. One extra scalar; almost always worth it.</td></tr>
+      </table>
+      <div class="callout"><b>The pattern across all of them.</b> Every entry either <b>tightens the bound</b> (richer <code>q</code>, more samples), <b>fixes the prior</b> (adversarial, two-stage, learned prior), or <b>changes the likelihood</b> (learned <code><span class="keep">σ</span></code>, discrete outputs, perceptual losses). Those are the only three places the VAE can be wrong, so they are the only three places to look.</div>
+    </section>
+
+    <!-- ═══ 26 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="vqvae" data-nav="VQ-VAE &amp; discrete latents">
+      <h3><span class="idx">26</span> VQ-VAE — discrete latents, and a KL that cannot collapse</h3>
+      <p class="lede">Replace the continuous code with the <b>index of the nearest entry in a learned codebook</b>. The posterior becomes a one-hot categorical, the KL becomes a constant, posterior collapse becomes impossible, and the price is a step with no gradient.</p>
+
+      <h4>The construction</h4>
+      <ul class="notes">
+        <li>Keep a codebook <code>e₁ … e_K</code>, each a vector in <code>ℝ<sup>D<sub>e</sub></sup></code>. The encoder produces a continuous field <code>z<sub>e</sub>(x)</code> — a 1-D sequence for audio, a 2-D grid for images, a 3-D volume for video — and each position is <b>snapped to its nearest codebook entry</b>.</li>
+        <li>The posterior is deterministic and one-hot: probability 1 on the nearest entry, 0 on everything else. With a <b>uniform prior</b> over the <code>K</code> entries, the KL term of the ELBO is exactly <code>log K</code> — a constant, independent of the encoder's parameters, so it can simply be dropped from training.</li>
+        <li>That single fact is why VQ-VAE does not collapse. There is <b>no gradient pushing the rate toward zero</b>, because the rate is fixed by construction at <code>log K</code> nats per position. Compare §22, where the entire failure mode was that gradient.</li>
+      </ul>
+      <div class="formula"><span class="lbl">quantisation, and the KL it implies</span><span class="eq">q(z = k | x) = 1  for  k = argmin<sub>j</sub> ‖ z<sub>e</sub>(x) − e<sub>j</sub> ‖₂ ,   0 otherwise
+
+z<sub>q</sub>(x) = e<sub>k</sub>                                  ← what the decoder actually receives
+
+with a uniform prior p(z) = 1/K:   D<sub>KL</sub>( q ‖ p ) = log K,  a CONSTANT</span></div>
+
+      <h4>The gradient problem and the straight-through fix</h4>
+      <ul class="notes">
+        <li><code>argmin</code> has no useful derivative: zero almost everywhere, undefined on the boundaries. Exactly the situation §18 said the reparameterisation trick cannot handle, and the reason the score-function estimator would otherwise be the only option.</li>
+        <li>The <b>straight-through estimator</b> sidesteps it: in the forward pass send <code>z<sub>q</sub></code> to the decoder; in the backward pass copy the gradient at the decoder's input <i>unchanged</i> to the encoder's output. It is a deliberate lie about the derivative, justified by the fact that <code>z<sub>e</sub></code> and <code>z<sub>q</sub></code> live in the same space, so the direction that would improve the decoder is also a sensible direction to move the encoder.</li>
+        <li>Because that copied gradient bypasses the codebook, the codebook receives nothing from the reconstruction term and needs its own objective — which is where the second and third loss terms come from.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the three-term VQ-VAE loss;  sg[·] is stop-gradient — identity forwards, zero derivative</span><span class="eq">L = log p( x | z<sub>q</sub>(x) )  +  ‖ sg[z<sub>e</sub>(x)] − e ‖₂²  +  <span class="keep">β</span> ‖ z<sub>e</sub>(x) − sg[e] ‖₂²
+
+   term 1   reconstruction    trains the decoder, and the encoder via straight-through
+   term 2   codebook loss     moves each e toward the encoder outputs assigned to it — a k-means step
+   term 3   commitment loss   keeps the encoder near its chosen code, so the embedding
+                              volume cannot grow without bound</span></div>
+      <ul class="notes">
+        <li>Each term trains exactly one part: the decoder optimises the first, the <b>embeddings</b> optimise the second, and the <b>encoder</b> optimises the first and the third.</li>
+        <li><code><span class="keep">β</span> = 0.25</code> is the standard commitment weight, and results were reported to be insensitive across <code><span class="keep">β</span></code> from <code>0.1</code> to <code>2.0</code>. The right value does depend on the scale of the reconstruction loss.</li>
+        <li>An alternative to the second term is to update the codebook by an <b>exponential moving average</b> of the encoder outputs assigned to each entry — the same k-means step, done without an optimiser, and usually more stable.</li>
+        <li>The dominant practical failure is <b>codebook collapse</b>: a large fraction of entries are never selected and therefore never updated. Standard remedies are EMA updates, re-initialising dead entries from live encoder outputs, <code>L²</code>-normalising the codes, and lowering the code dimension.</li>
+      </ul>
+
+      <div class="viz" id="viz-vq">
+        <div class="vhead">
+          <span class="vtitle">Quantisation, the Voronoi cells it creates, and the gradient that is copied across it</span>
+          <span class="vhint">drag the codebook size and watch the rate <code>log K</code> and the quantisation error trade off</span>
+        </div>
+        <div class="controls">
+          <label>codebook size <code>K</code> <input type="range" id="vq-K" min="2" max="48" step="1" value="12" /><b id="vq-Kv" class="readout">12</b></label>
+          <label>k-means steps <input type="range" id="vq-it" min="0" max="30" step="1" value="14" /><b id="vq-itv" class="readout">14</b></label>
+          <label>probe <code>z<sub>e</sub></code> angle <input type="range" id="vq-th" min="0" max="360" step="1" value="35" /><b id="vq-thv" class="readout">35</b>°</label>
+          <label><input type="checkbox" id="vq-cells" checked /> shade the assignment cells</label>
+        </div>
+        <svg id="ae-vq" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="A two-dimensional encoder output space partitioned into Voronoi cells around learned codebook vectors, with one probe point shown snapping to its nearest code and a straight-through gradient arrow copied back to the unquantised point."></svg>
+        <div class="readout" aria-live="polite" id="vq-out"></div>
+      </div>
+
+      <h4>The two-stage arrangement, and the numbers</h4>
+      <ul class="notes">
+        <li>A VQ-VAE on its own is a <b>compressor</b>, not a generative model: it has no interesting prior over the code grid. Generation is a <b>second stage</b> — fit a powerful autoregressive model (originally a PixelCNN, later a transformer) over the grid of discrete indices, then sample indices from it and decode.</li>
+        <li>The reported image setting makes the compression concrete: <code>128 × 128 × 3</code> images encoded to a <code>32 × 32</code> grid of indices with <code>K = 512</code>, i.e. 9 bits per position. In bits that is <code>128·128·3·8 / (32·32·9) ≈ <b>42.6×</b></code>, and the reconstructions were reported to be only slightly blurrier than the originals.</li>
+        <li>Why the split helps: the autoregressive model no longer has to spend its capacity on pixel-level texture, which the decoder already handles, and can spend it on <b>global structure</b> instead. Sampling is also far cheaper — <code>1 024</code> positions rather than <code>49 152</code> subpixels.</li>
+        <li>The reported likelihoods are honest about the cost: on one benchmark a VAE reached <code>4.51</code> bits per dimension and the VQ-VAE <code>4.67</code>. Discretisation is not free — it buys stability and a tractable second stage, and pays in nats.</li>
+        <li>Later work stacked several resolutions of codes — a coarse grid for global structure and a finer one for detail, each with its own prior — which is the arrangement that produced high-fidelity samples at scale.</li>
+      </ul>
+      <div class="callout"><b>The idea that outlived the model.</b> "Encode into a grid of discrete tokens, then let a sequence model handle the distribution over tokens" is now the standard recipe for images, audio and video inside <a href="../llm/vision-language-models.html">vision-language models</a> — the tokeniser is a VQ-VAE descendant, and the prior is a transformer. The autoencoder half of this page turned out to be the durable half.</div>
+    </section>
+
+    <!-- ═══ 27 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="today" data-nav="Where this lands today">
+      <h3><span class="idx">27</span> Where this lands today — the latent space everything else runs in</h3>
+      <p class="lede">The autoencoder lost the generative-modelling contest and won something larger: it became the <b>coordinate system</b> that the winning generative models operate in. This is why the <a href="diffusion-models.html">diffusion page</a> keeps pointing back here.</p>
+
+      <h4>Latent diffusion, stage by stage</h4>
+      <ul class="notes">
+        <li><b>Stage one</b> is an autoencoder — this page's subject — trained with a reconstruction term, a <b>perceptual</b> loss and a <b>patch-based adversarial</b> objective, explicitly to keep reconstructions on the image manifold and to avoid the blur that a pure pixel-space <code>L¹</code> or <code>L²</code> loss produces (§24). It is regularised in one of two ways: a <b>slight KL penalty</b> toward a standard normal — a VAE with a very small <code><span class="keep">β</span></code>, deliberately mild so the latent does not lose information — or a <b>vector-quantisation layer</b> in the decoder, which is §26's construction absorbed into the architecture.</li>
+        <li><b>Stage two</b> trains a <a href="diffusion-models.html#training">diffusion model</a> entirely inside that latent space, and decodes once at the end. Everything the diffusion page says about schedules, samplers and guidance happens to <code>z</code>, not to pixels.</li>
+        <li>The economics: attention cost grows quadratically in the number of spatial positions, and every one of the tens of denoising steps pays it. Shrinking the canvas by a factor <code>f</code> per axis discounts <b>all</b> of them. That is the whole reason high-resolution text-to-image fits on one consumer GPU — and <a href="diffusion-models.html#latent">the diffusion page's §10</a> is the same story told from the other end.</li>
+      </ul>
+
+      <h4>The reconstruction ceiling, with real numbers</h4>
+      <p>The autoencoder is a hard ceiling: anything the encoder discards can never be recovered, however good the diffusion model is. The published "autoencoder zoo" for latent diffusion measures exactly that trade — reconstruction FID and PSNR against the downsampling factor <code>f</code> and the number of latent channels <code>c</code>, all trained on the same data and evaluated on the same set.</p>
+      <table class="grid2">
+        <tr><th style="width:12%">factor <code>f</code></th><th style="width:16%">regulariser</th><th style="width:12%">channels <code>c</code></th><th style="width:16%">reconstruction FID ↓</th><th style="width:14%">PSNR ↑</th><th>Reading</th></tr>
+        <tr><td class="num">2</td><td>KL</td><td class="num">2</td><td class="num">0.086</td><td class="num">32.47</td><td>Almost lossless — and almost no speedup, because the canvas barely shrank.</td></tr>
+        <tr><td class="num">4</td><td>KL</td><td class="num">3</td><td class="num">0.27</td><td class="num">27.53</td><td>The quality-first setting used for the sharpest results.</td></tr>
+        <tr class="tot"><td class="num"><b>8</b></td><td><b>KL</b></td><td class="num"><b>4</b></td><td class="num"><b>0.90</b></td><td class="num"><b>24.19</b></td><td><b>The workhorse.</b> A <code>512×512×3</code> image becomes <code>64×64×4</code> — <b>48×</b> fewer elements — for a reconstruction FID under 1.</td></tr>
+        <tr><td class="num">16</td><td>KL</td><td class="num">16</td><td class="num">0.87</td><td class="num">24.08</td><td>Same quality as <code>f = 8</code> only by quadrupling the channels — the information has to go somewhere.</td></tr>
+        <tr><td class="num">32</td><td>KL</td><td class="num">16</td><td class="num">7.30</td><td class="num">20.38</td><td>Too much compression: detail is gone and no second stage can put it back.</td></tr>
+        <tr><td class="num">8</td><td>VQ, <code>|Z|</code> = 16384</td><td class="num">4</td><td class="num">1.14</td><td class="num">23.07</td><td>The discrete variant at the same factor, slightly behind the KL one here.</td></tr>
+      </table>
+      <ul class="notes">
+        <li>Read the <code>f = 16</code> row against <code>f = 8</code>: squeezing four times harder in space needed four times as many channels to hold the same quality. <b>Compression is a budget, not a free lunch</b>, and the spatial-versus-channel split is a design choice, not a saving.</li>
+        <li>Read the <code>f = 32</code> row as the ceiling asserting itself: reconstruction FID jumps by <b>8×</b>. Whatever the diffusion model produces in that latent space, the decoder cannot render fine detail that the encoder threw away — which is exactly the "hard ceiling" the diffusion page warns about.</li>
+        <li>This is also the honest answer to "is Stable Diffusion's first stage a VAE?" It is an autoencoder with a <i>very</i> small KL regularisation term plus perceptual and adversarial reconstruction losses. Calling it a VAE is right about the architecture and misleading about the objective — the KL is there to keep the latent's variance bounded, not to make the model generative.</li>
+      </ul>
+
+      <div class="viz" id="viz-ladder">
+        <div class="vhead">
+          <span class="vtitle">The compression ladder — what a downsampling factor actually buys and costs</span>
+          <span class="vhint">element counts are exact arithmetic; the reconstruction numbers are the published measurements in the table above</span>
+        </div>
+        <div class="controls">
+          <label>image side <input type="range" id="ld-res" min="256" max="1024" step="64" value="512" /><b id="ld-resv" class="readout">512</b> px</label>
+          <label>attention cost model
+            <select id="ld-cost">
+              <option value="quad" selected>quadratic in positions (full attention)</option>
+              <option value="lin">linear in positions (convolution)</option>
+            </select>
+          </label>
+        </div>
+        <svg id="ae-ladder" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="A ladder of autoencoder downsampling factors showing, for each, the latent grid size, the element-count reduction, the relative attention cost per denoising step, and the published reconstruction FID."></svg>
+        <div class="readout" aria-live="polite" id="ld-out"></div>
+      </div>
+
+      <h4>The same idea everywhere else</h4>
+      <ul class="notes">
+        <li><b>Audio and speech.</b> Neural audio codecs are residual vector-quantised autoencoders; the tokens they emit are what audio and music language models actually model. Same two-stage split as §26.</li>
+        <li><b>Video.</b> A spatio-temporal autoencoder compresses time as well as space, and a transformer diffuses over the resulting latents — otherwise the sequence length is hopeless.</li>
+        <li><b>Multimodal models.</b> Image and audio tokenisers let a single sequence model consume and emit several modalities. The tokeniser is an autoencoder; the intelligence is the prior.</li>
+        <li><b>Interpretability.</b> Sparse autoencoders (§08) trained on a language model's internal activations, used to pull out candidate features. A twenty-year-old objective pointed at a new kind of data.</li>
+        <li><b>The road not taken.</b> <a href="world-models-jepa.html">JEPA-style</a> models argue you should predict in <i>representation</i> space and drop the decoder entirely, precisely to avoid spending capacity on pixel detail. That is a direct rejection of the reconstruction objective — and worth reading against §24, because it targets the same problem from the opposite direction.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 28 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="practice" data-nav="Practice">
+      <h3><span class="idx">28</span> Practice — recipes, diagnostics, and what to remember</h3>
+      <p class="lede">Everything above, compressed into things to do, things to measure, and things to stop believing.</p>
+
+      <h4>Choosing the model</h4>
+      <table class="grid2">
+        <tr><th style="width:34%">If you want…</th><th>Use</th></tr>
+        <tr><td>A compact representation for downstream models</td><td>An undercomplete or sparse autoencoder — or, more often these days, a <a href="contrastive-learning.html">contrastive</a> or masked-prediction objective, which spends less capacity on nuisance variance.</td></tr>
+        <tr><td>Denoising, inpainting, restoration</td><td>A denoising autoencoder (§09). If quality matters more than latency, a <a href="diffusion-models.html">diffusion model</a>, which is the same idea across all noise levels.</td></tr>
+        <tr><td>A smooth, sampleable latent space</td><td>A VAE. Report rate and distortion separately, and expect samples to be worse than reconstructions (§23).</td></tr>
+        <tr><td>Sharp samples above all</td><td>Not a plain VAE. A <a href="generative-adversarial-networks.html">GAN</a>, or a diffusion model, or a VAE whose reconstruction loss is perceptual and adversarial (§27).</td></tr>
+        <tr><td>Discrete tokens for a sequence model</td><td>VQ-VAE or a residual-VQ codec (§26), plus a transformer prior over the indices.</td></tr>
+        <tr><td>A latent space for a generative model to live in</td><td>An autoencoder with a perceptual + adversarial reconstruction loss and mild KL or VQ regularisation (§27). This is the industrial default.</td></tr>
+        <tr><td>To find interpretable features in a network's activations</td><td>A wide, heavily <code>L¹</code>-penalised sparse autoencoder on the activations (§08).</td></tr>
+      </table>
+
+      <h4>The diagnostics that are worth logging every run</h4>
+      <ul class="notes">
+        <li><b>Rate and distortion separately</b>, never just the ELBO. Two models with equal ELBOs can sit at opposite ends of §21's frontier.</li>
+        <li><b>Per-dimension KL</b>, and the count above ~<code>0.01</code> nats. This is the collapse detector, and the total hides it completely (§22).</li>
+        <li><b>Held-out reconstruction error</b>, against the PCA floor <code>∑<sub>i&gt;d</sub> λᵢ</code> at the same code size. If a deep autoencoder does not beat the floor, it has not earned its parameters (§04).</li>
+        <li><b>The off-manifold probe.</b> Feed inputs the model should not recognise and measure how far it moves them. Little movement means <code>g∘f</code> is near the identity and the model has learned nothing about the distribution (§06). Costs one forward pass.</li>
+        <li><b>The active fraction of the codebook</b>, for VQ models. Dead entries are the standard failure and they are invisible in the loss.</li>
+        <li><b>Samples <i>and</i> reconstructions, side by side.</b> A large gap between them is the prior hole of §23, and it is diagnostic rather than cosmetic.</li>
+      </ul>
+
+      <h4>The traps, in the order people fall into them</h4>
+      <div class="cards">
+        <div class="box bad">
+          <div class="n">trap 1</div>
+          <div class="t">An accidental <span class="keep">β</span></div>
+          <div class="g">Fixing the decoder variance, or averaging rather than summing over pixels, silently sets the KL weight — and the two together can be off by three orders of magnitude. State <code><span class="keep">β</span></code> explicitly, or learn <code><span class="keep">σ</span></code> (§20).</div>
+        </div>
+        <div class="box bad">
+          <div class="n">trap 2</div>
+          <div class="t">Averaging the KL over dimensions</div>
+          <div class="g"><code>mean</code> instead of <code>sum</code> across the latent axis divides the effective <code><span class="keep">β</span></code> by <code>d</code>. Sum over dimensions, mean over the batch. Every time.</div>
+        </div>
+        <div class="box bad">
+          <div class="n">trap 3</div>
+          <div class="t">Bernoulli likelihood on non-binary data</div>
+          <div class="g">"BCE" on targets in <code>[0,1]</code> is not a density, and the missing normaliser changes the objective. Use a continuous Bernoulli, a Gaussian, or a discretised logistic (§20).</div>
+        </div>
+        <div class="box bad">
+          <div class="n">trap 4</div>
+          <div class="t">Reading the weights as components</div>
+          <div class="g">A linear autoencoder's matrices are defined only up to an invertible mixing. Ordering them or interpreting one column as "the first factor" is reading an arbitrary change of basis (§04).</div>
+        </div>
+        <div class="box bad">
+          <div class="n">trap 5</div>
+          <div class="t">Anomaly detection by reconstruction error</div>
+          <div class="g">High-capacity autoencoders often reconstruct unseen inputs well, and the error is dominated by high-variance regions rather than by anomalousness. Run the §06 probe before trusting it.</div>
+        </div>
+        <div class="box bad">
+          <div class="n">trap 6</div>
+          <div class="t">Comparing models by ELBO</div>
+          <div class="g">An ELBO is a bound whose deficit depends on the posterior family. A model with a better encoder can win while having the worse decoder (§17).</div>
+        </div>
+        <div class="box bad">
+          <div class="n">trap 7</div>
+          <div class="t">Believing a traversal</div>
+          <div class="g">A tidy-looking traversal is a hypothesis. Unsupervised disentanglement is not identifiable without inductive bias, and rotations of the latent leave a factorised Gaussian prior invariant (§21).</div>
+        </div>
+        <div class="box bad">
+          <div class="n">trap 8</div>
+          <div class="t">Judging a VAE from reconstructions</div>
+          <div class="g">Reconstructions test the encoder–decoder pair. Only ancestral samples test whether the aggregate posterior matches the prior — and that is the part that usually fails (§23).</div>
+        </div>
+      </div>
+
+      <h4>A starting recipe that usually works</h4>
+      <ol class="notes">
+        <li>Standardise the data, and pick the decoder likelihood that matches it (§20). Learn a single global <code><span class="keep">σ</span></code> rather than guessing one.</li>
+        <li>Start with a latent size you expect to be <b>too large</b>, and let the per-dimension KL tell you how many dimensions the data actually supports. That number is far more informative than a guess.</li>
+        <li>Anneal the KL weight from 0 to its target over the first 10–30% of training, or use free bits at roughly <code>0.1–0.5</code> nats per dimension. Do one or the other from the start; retrofitting them after a collapse means retraining anyway.</li>
+        <li>Log per-dimension KL, rate, distortion, and held-out reconstruction from step one. Add sample grids next to reconstruction grids.</li>
+        <li>If samples are blurry and you care, change the <b>reconstruction loss</b> before you change anything else — perceptual, then adversarial (§24, §27). Do not reach for a bigger decoder.</li>
+        <li>If you need real generative quality, stop asking the autoencoder for it: freeze it and fit a strong prior over its latents — autoregressive over discrete codes, or diffusion over continuous ones (§26, §27).</li>
+      </ol>
+
+      <h4>What to remember</h4>
+      <ul class="notes">
+        <li>An autoencoder is a learned identity with an obstacle, and <b>the obstacle is the model</b>. Shape is not a bottleneck; the learned function is.</li>
+        <li>A linear autoencoder with squared loss spans the <b>principal subspace</b> and hits the PCA error floor exactly — and recovers <b>no basis at all</b> within it. Measured: principal angles under <code>3 × 10⁻⁵</code> degrees, decoder columns at <code>|cos| ≈ 0.5</code> to every principal axis.</li>
+        <li>Denoising and contraction are the same instruction at two scales, and the denoiser's displacement field is <b>exactly</b> <code><span class="keep">σ</span>²∇log p<sub><span class="keep">σ</span></sub></code> — verified here to <code>10⁻¹⁶</code>. That identity is the bridge to diffusion.</li>
+        <li>The ELBO is a lower bound with an exactly identified deficit, <code>D<sub>KL</sub>(q ‖ p(z|x))</code>, that you never get to observe. Verified on a toy model: ELBO <code>−7.919220</code> plus gap <code>4.060922</code> equals <code>log p(x) = −3.858298</code>, to <code>10⁻⁹</code>.</li>
+        <li>Reparameterisation is not elegance, it is <b>variance</b>. Measured at a 128-dimensional latent: <code>4 556×</code> more samples needed for the score-function estimator to match.</li>
+        <li>Posterior collapse is not an optimisation bug — the collapsed solution is often the global optimum. In the linear case a dimension dies exactly when <code><span class="keep">λ</span>ᵢ ≤ <span class="keep">β</span><span class="keep">σ</span>²</code>, confirmed against a trained model to four decimals.</li>
+        <li>Blur is what a factorised squared-error likelihood <b>asks for</b>: the optimal output is a conditional mean. Change the likelihood and the blur goes.</li>
+        <li>And the ending: the autoencoder is now the <b>coordinate system</b> that diffusion models and multimodal transformers run inside. It stopped being the generative model and became the space.</li>
+      </ul>
+      <div class="callout"><b>In one sentence:</b> force a network to rebuild its input through something it cannot fit the input into, and the shape of what survives is a model of the data — a subspace if the network is linear, a manifold if it is not, and a probability distribution if the code is one too.</div>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="autoencoders-vaes.viz.js"></script>
+</body>
+</html>
