@@ -50,7 +50,7 @@ const nodes = [
   {id:"Frequency Domain", group:"cv", level:3, link:"vision/frequency-domain.html", desc:"Images as signals: the Fourier transform and the DFT, the sampling theorem and aliasing, filtering as multiplication in the frequency domain, the convolution theorem, windowing, and the wavelet and DCT transforms that underpin image compression."},
   {id:"Features & Matching", group:"cv", level:3, link:"vision/features.html", desc:"Finding what is repeatable: edges and the Canny detector, corners and the Harris response, blob and scale-space detection, invariant descriptors, matching strategies and ratio tests, and robust fitting with RANSAC."},
   {id:"Segmentation", group:"cv", level:3, link:"vision/segmentation.html", desc:"Partitioning an image into regions: thresholding and Otsu's method, region growing and split-and-merge, watershed, active contours, graph cuts and normalised cuts, mean shift, and superpixels."},
-  {id:"Alignment & Motion", group:"cv", level:3, desc:"Putting images into correspondence: parametric motion models, homography estimation, image warping and stitching, optical flow with Lucas-Kanade and Horn-Schunck, the aperture problem, and coarse-to-fine tracking."},
+  {id:"Alignment & Motion", group:"cv", level:3, link:"vision/alignment-motion.html", desc:"Putting images into correspondence: parametric motion models, homography estimation, image warping and stitching, optical flow with Lucas-Kanade and Horn-Schunck, the aperture problem, and coarse-to-fine tracking."},
   {id:"Stereo & Structure from Motion", group:"cv", level:3, desc:"Recovering the third dimension: epipolar geometry and the fundamental matrix, rectification, stereo correspondence and disparity, triangulation, camera calibration, bundle adjustment, and the structure-from-motion pipeline."},
   {id:"NLP", group:"nlp", level:1, desc:"Natural Language Processing — teaching machines to understand and generate human language."},
   {id:"MLOps & Deployment", group:"mlops", level:1, desc:"The discipline of shipping, serving, and maintaining ML systems reliably in production."},
@@ -276,6 +276,8 @@ const subtree = {
 /* cross edges. 3rd element "isa" = hierarchy bridge (is-a / builds-on),
    oriented child → parent; rendered as a dotted arrow in the graph. */
 const cross = [
+  ["Alignment & Motion","Features & Matching"],["Alignment & Motion","Image Processing"],
+  ["Alignment & Motion","Eigendecomposition & SVD"],
   ["Autoencoders & VAEs","CNNs"],["Autoencoders & VAEs","World Models & JEPA"],
   ["Frequency Domain","Image Processing"],["Frequency Domain","Eigendecomposition & SVD"],
   ["Frequency Domain","Quadratic Forms, Covariance & PCA"],["Frequency Domain","CNNs"],
