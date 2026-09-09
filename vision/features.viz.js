@@ -904,7 +904,7 @@ const FTaperture = (function () {
     const EX = RX + 78, EY = 258, S2 = 46;
     g.append("text").attr("x", RX).attr("y", 214).attr("font-size", 10.5).attr("fill", VC.muted)
       .text("level ellipse ΔuᵀAΔu = c, axes 1/√λ");
-    const lv = 0.25 * hi;
+    const lv = 0.25 * hiQ;   /* level set of the QUADRATIC form, so its own scale */
     const A0 = Q.e.l0 > 1e-12 ? Math.sqrt(lv / Q.e.l0) : 1e6, A1 = Q.e.l1 > 1e-12 ? Math.sqrt(lv / Q.e.l1) : 1e6;
     const k = S2 / Math.max(A0, R), pts = [];
     for (let i = 0; i <= 96; i++) {

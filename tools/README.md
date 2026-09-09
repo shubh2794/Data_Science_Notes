@@ -88,6 +88,39 @@ unwrapped inside a `.lbl`, which the uppercase label style silently renders as a
 *different symbol* (η as H, δ as Δ). It strips `<script>` bodies before the LaTeX
 scan, avoiding the false positive noted above.
 
+
+## figure_harness.js
+
+Runs a page's figures **headlessly** and reports anything that breaks. `verify_page.py`
+reads the HTML as text and cannot tell you that a figure threw on load, drew nothing, or
+crashes when a slider hits its maximum. This can.
+
+```
+npm i --prefix /tmp/harness-deps jsdom canvas     # once
+node tools/figure_harness.js vision/features.html
+```
+
+It loads the page's own `<script src>` list in the page's own order (skipping `data.js`
+and `notes.js`), gives jsdom a real 2-D canvas — several pages raster images into one
+rather than emitting a `<rect>` per pixel — then:
+
+* fails on a **top-level throw**, which is the dangerous one: an uncaught error in a
+  top-level IIFE aborts the rest of the script, so **every figure after it silently
+  never renders**;
+* reports any `<svg>` that was never drawn into, and any empty `.readout`;
+* drives every `<select>` through all its options, every range to min/mid/max (snapped to
+  the step, as browsers do), every checkbox both ways, and clicks every button, reporting
+  any throw;
+* flags `NaN`, `undefined` or `Infinity` reaching a readout.
+
+Exits non-zero on any of those. **It earns its keep:** it found four real problems while
+`vision/frequency-domain.html` was being written, including a leakage demo whose weak tone
+sat exactly on a Dirichlet null so the figure silently proved the opposite of its caption
+— and on first run against the finished corpus it found `vision/features.html` throwing on
+load from an out-of-scope variable, which had blanked most of that page's figures.
+
+Recommended cadence: run it on any page whose `.viz.js` changed, before committing.
+
 ## How this capability should live
 
 This is a **reusable script**, not an agent that re-derives the rules each run.
