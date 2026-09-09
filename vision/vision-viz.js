@@ -628,6 +628,131 @@ function jacobiEig (Ain, iters) {
   return { values: idx.map(i => A[i][i]), vectors: idx.map(i => V.map(row => row[i])) };
 };
 
+  /* ── shared drawing helpers ────────────────────────────────────────────
+     Promoted after four pages independently wrote the same code: `cells` and the
+     panel box existed in FOUR copies, matText and raster in three. Parts 6 and 7
+     use these rather than adding a fifth.
+     NOTE `panelBox` is the titled bordered panel. It is NOT `box`, which is the
+     1-D box FILTER promoted from part 2, and it differs from `panel` only by
+     drawing the hairline rect. `cells` and `raster` both switch to a canvas
+     above a few thousand pixels — one <rect> per pixel is unusable at 64x64. */
+  /* one reusable offscreen canvas: `cells` and `raster` paint into it above a few
+     thousand pixels, because one <rect> per pixel is unusable at 64x64 and up. */
+  function minmax2(A) { let lo = Infinity, hi = -Infinity; for (const r of A) for (const v of r) { if (v < lo) lo = v; if (v > hi) hi = v; } return [lo, hi]; }
+
+  const CANV = (typeof document !== "undefined" && document.createElement)
+    ? document.createElement("canvas") : null;
+
+function matText(g, M, x, y, opt) {
+    const o = Object.assign({ size: 10, dp: 2, fill: VC.ink, lead: 12.5, label: null, pad: 6, colorOf: null }, opt || {});
+    const rows = M.map(r => r.map(v =>
+      (typeof v === "string" ? v : (Math.abs(v) < 5e-7 ? "0" : v.toFixed(o.dp))).padStart(o.pad)).join(" "));
+    const brL = ["⎡", "⎢", "⎣"], brR = ["⎤", "⎥", "⎦"];
+    const gg = g.append("g").attr("transform", `translate(${x},${y})`);
+    if (o.label) gg.append("text").attr("x", 0).attr("y", -o.lead).attr("font-size", 10)
+      .attr("fill", VC.muted).text(o.label);
+    rows.forEach((r, i) => {
+      const k = rows.length === 1 ? -1 : (i === 0 ? 0 : (i === rows.length - 1 ? 2 : 1));
+      const bl = k < 0 ? "[" : brL[k], br = k < 0 ? "]" : brR[k];
+      gg.append("text").attr("x", 0).attr("y", i * o.lead)
+        .attr("font-family", "SF Mono, Menlo, monospace").attr("font-size", o.size)
+        .attr("xml:space", "preserve")
+        .attr("fill", o.colorOf ? o.colorOf(i) : o.fill).text(bl + r + " " + br);
+    });
+    return gg;
+  }
+
+function kv(g, x, y, opt) {
+    const o = Object.assign({ lead: 15, keyW: 152, size: 11, dp: 3 }, opt || {});
+    let i = 0;
+    return function (k, v, color, bold) {
+      g.append("text").attr("x", x).attr("y", y + i * o.lead).attr("font-size", o.size)
+        .attr("fill", VC.muted).text(k);
+      g.append("text").attr("x", x + o.keyW).attr("y", y + i * o.lead).attr("font-size", o.size)
+        .attr("font-family", "SF Mono, Menlo, monospace").attr("fill", color || VC.ink)
+        .attr("font-weight", bold ? 600 : 400).text(v);
+      i++;
+    };
+  }
+
+function panelBox(g, x, y, w, h, title, opt) {
+    const o = Object.assign({ fill: "none", stroke: VC.line }, opt || {});
+    const gg = g.append("g").attr("transform", `translate(${x},${y})`);
+    gg.append("rect").attr("x", -0.5).attr("y", -0.5).attr("width", w + 1).attr("height", h + 1)
+      .attr("fill", o.fill).attr("stroke", o.stroke).attr("rx", 3);
+    if (title) gg.append("text").attr("x", 0).attr("y", -7).attr("font-size", 11)
+      .attr("fill", VC.ink).attr("font-weight", 600).text(title);
+    return gg;
+  }
+
+function cells(g, x0, y0, cw, W, H, colorOf) {
+    const gg = g.append("g").attr("transform", `translate(${x0},${y0})`);
+    /* Below a few thousand cells, individual <rect>s are fine and keep the DOM
+       inspectable. Above that they are not: several panels of 104 × 72 would put
+       tens of thousands of nodes on the page and every slider drag would rebuild
+       them. Larger grids are rasterised into one <image> instead, in exactly the
+       same user space, so overlays drawn afterwards line up unchanged. */
+    const ctx = (CANV && W * H > 2500) ? CANV.getContext("2d") : null;
+    if (ctx) {
+      CANV.width = W; CANV.height = H;
+      ctx.clearRect(0, 0, W, H);
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+        const c = colorOf(x, y);
+        if (!c || c === "none") continue;
+        ctx.fillStyle = c;
+        ctx.fillRect(x, y, 1, 1);
+      }
+      gg.append("image").attr("x", 0).attr("y", 0)
+        .attr("width", W * cw).attr("height", H * cw)
+        .attr("preserveAspectRatio", "none")
+        .attr("image-rendering", "pixelated")
+        .attr("href", CANV.toDataURL());
+      return gg;
+    }
+    const data = [];
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) data.push([x, y]);
+    gg.selectAll("rect").data(data).join("rect")
+      .attr("x", d => d[0] * cw).attr("y", d => d[1] * cw)
+      .attr("width", cw + 0.4).attr("height", cw + 0.4)
+      .attr("shape-rendering", "crispEdges")
+      .attr("fill", d => colorOf(d[0], d[1]))
+      .attr("fill-opacity", d => { const c = colorOf(d[0], d[1]); return (!c || c === "none") ? 0 : 1; });
+    return gg;
+  }
+
+function raster(g, A, x0, y0, w, h, opt) {
+    const o = Object.assign({ signed: false, lo: null, hi: null, gamma: 1 }, opt || {});
+    const H = A.length, W = A[0].length;
+    let lo = o.lo, hi = o.hi;
+    if (lo === null || hi === null) { const mm = minmax2(A); lo = (lo === null) ? mm[0] : lo; hi = (hi === null) ? mm[1] : hi; }
+    const cv = document.createElement("canvas");
+    cv.width = W; cv.height = H;
+    const ctx = cv.getContext("2d"), im = ctx.createImageData(W, H);
+    for (let i = 0; i < H; i++) for (let j = 0; j < W; j++) {
+      const p = 4 * (i * W + j);
+      let r, gg, b;
+      if (o.signed) {
+        const m = Math.max(Math.abs(lo), Math.abs(hi)) || 1;
+        const t = VZ.clamp(A[i][j] / m, -1, 1);
+        if (t >= 0) { r = 255 * (0.10 + 0.90 * t); gg = 255 * (0.13 + 0.57 * t); b = 255 * (0.18 + 0.15 * t); }
+        else { const u = -t; r = 255 * (0.10 + 0.26 * u); gg = 255 * (0.13 + 0.48 * u); b = 255 * (0.18 + 0.82 * u); }
+      } else {
+        let t = (hi - lo) > 1e-12 ? (A[i][j] - lo) / (hi - lo) : 0.5;
+        t = VZ.clamp(t, 0, 1);
+        if (o.gamma !== 1) t = Math.pow(t, o.gamma);
+        r = gg = b = 255 * t;
+      }
+      im.data[p] = r; im.data[p + 1] = gg; im.data[p + 2] = b; im.data[p + 3] = 255;
+    }
+    ctx.putImageData(im, 0, 0);
+    g.append("image").attr("x", x0).attr("y", y0).attr("width", w).attr("height", h)
+      .attr("preserveAspectRatio", "none").attr("image-rendering", "pixelated")
+      .attr("href", cv.toDataURL());
+    g.append("rect").attr("x", x0).attr("y", y0).attr("width", w).attr("height", h)
+      .attr("fill", "none").attr("stroke", VC.line);
+    return { lo: lo, hi: hi };
+  }
+
   return {
     clamp, lerp, deg, rad, linspace, fmt, sig,
     rng, randn, poisson,
@@ -640,6 +765,7 @@ function jacobiEig (Ain, iters) {
     K, camera, lookAt, fovFromF, fFromFov, distort, undistort,
     view3, painter, gridPlane, cubeMesh, axes3,
     frame, axisB, axisL, gridX, gridY, legend, panel, clip, poly, arrow,
-    zeros, zeros2, flip2, bidx, at2, corr2, conv2, sepH, sepV, sep2, box, binomial, gauss1, jacobiEig
+    zeros, zeros2, flip2, bidx, at2, corr2, conv2, sepH, sepV, sep2, box, binomial, gauss1, jacobiEig,
+    matText, kv, panelBox, cells, raster, minmax2
   };
 })();
