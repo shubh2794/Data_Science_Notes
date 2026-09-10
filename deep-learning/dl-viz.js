@@ -1,0 +1,717 @@
+/* dl-viz.js — the shared D3 + numeric library for the Deep Learning series
+   (deep-learning/*). This is the DL analogue of vision/vision-viz.js and of
+   math/statistics/stats-viz.js.
+
+   ── THE RULE ────────────────────────────────────────────────────────────────
+   Every later part of this series — Training, CNNs, RNNs, Attention,
+   Transformers, Residual connections — must CALL these functions rather than
+   re-implement them. A forked activation convention (three pages each with a
+   slightly different GELU), a forked softmax (one stable, one not), or a forked
+   cross-entropy sign is the specific failure this file exists to prevent. If a
+   later part needs a numeric that is GENERAL, promote it here and say so in a
+   comment; if it is specific to one figure, keep it inside that page's own
+   "<part>.viz.js" IIFE.
+
+   Load order on every consuming page:
+       ../vendor/d3.min.js → ../notes.css → ../data.js → ../notes.js
+       → dl-viz.js → <part>.viz.js
+   Nothing here draws by itself; it is a toolbox. Every consuming page supplies
+   its own <svg width height viewBox role aria-label> and these helpers only
+   ever append into an <svg> that already exists.
+
+   Two globals:
+
+   DC — palette, matching the custom properties in notes.css.
+
+   DL — namespace:
+     · scalars     DL.clamp, DL.lerp, DL.linspace, DL.fmt, DL.sig, DL.fmtE
+     · random      DL.rng(seed) → mulberry32; DL.randn(r); DL.shuffle(a, r)
+     · linear alg  DL.zeros, DL.zeros2, DL.eye, DL.matmul(A,B), DL.matvec(A,v),
+                   DL.vecmat(v,A), DL.transpose(A), DL.outer(a,b), DL.addRow(A,b),
+                   DL.dot, DL.frob, DL.applyEl
+     · activations DL.ACT — a registry keyed by name. Each entry is
+                     {key, label, f(x[,p]), df(x[,p]), range, zeroCentered,
+                      piecewiseLinear, note}
+                   relu · leaky · prelu · elu · gelu · geluTanh · geluSigmoid ·
+                   silu · sigmoid · tanh · softplus · hardtanh · abs · identity
+                   DL.act(key) → the entry; DL.actList(group) → ordered keys.
+                   NOTE gelu (exact, via erf) and geluTanh (the tanh surrogate)
+                   are DIFFERENT FUNCTIONS: max gap 4.73e−04 at x ≈ 2.70. The
+                   series teaches that gap; never silently swap one for the other.
+     · stable      DL.erf, DL.logSumExp(v), DL.softmax(v[,T]), DL.logSoftmax(v),
+                   DL.logSigmoid(z), DL.softplus(z), DL.sigmoid(z),
+                   DL.xent(logits, k), DL.bce(z, y), DL.mse(yhat, y)
+                   — every one of these is the OVERFLOW-SAFE form. The naive
+                     forms are exposed as DL.naive.* so the pages can show the
+                     two diverging; they are not for use anywhere else.
+     · tiny MLP    DL.mlpInit(sizes, {act, out, seed, scale}) → net
+                   DL.forward(net, X) → {z[], a[], yhat}
+                   DL.loss(net, X, Y) → scalar mean loss
+                   DL.backward(net, X, Y) → {dW[], db[], loss}
+                   DL.numGrad(net, X, Y, h) → the same shapes by central
+                     differences, for the finite-difference audit
+                   DL.sgdStep(net, g, lr)  — one step, for demo fitting only;
+                     the OPTIMISERS themselves are taught on the training page
+     · counting    DL.params(sizes), DL.macs(sizes), DL.regionsShallow(d, n),
+                   DL.regionsDeepLB(d, widths)
+     · drawing     DL.frame, DL.axisB, DL.axisL, DL.gridX, DL.gridY, DL.legend,
+                   DL.panelBox, DL.kv, DL.matText, DL.arrow, DL.curve, DL.clip,
+                   DL.cells, DL.netDiagram(g, sizes, opt)
+                                                                              */
+
+const DC = {
+  accent: "#5b9cff", a2: "#ffb454", good: "#4ade80", bad: "#f87171",
+  ink: "#e6e9ef", muted: "#9aa3b2", line: "#2a2f3a",
+  grid: "#1b2130", panel: "#171a23", panel2: "#1e222d", bg: "#0f1117",
+  violet: "#c084fc", teal: "#2dd4bf", rose: "#fb7185", lime: "#a3e635"
+};
+
+const DL = (function () {
+
+  /* ══ scalars ════════════════════════════════════════════════════════════ */
+  const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  function linspace(a, b, k) {
+    const out = [];
+    for (let i = 0; i < k; i++) out.push(a + (b - a) * (k === 1 ? 0 : i / (k - 1)));
+    return out;
+  }
+  function fmt(x, d) {
+    if (!isFinite(x)) return (x > 0 ? "+∞" : (x < 0 ? "−∞" : "—"));
+    const dd = (d === undefined) ? 2 : d;
+    const s = x.toFixed(dd);
+    return (parseFloat(s) === 0) ? (0).toFixed(dd) : s;    // never print "-0.00"
+  }
+  const sig = (x, n) => isFinite(x) ? Number(x.toPrecision(n || 3)).toString() : "—";
+  function fmtE(x, d) {                                    // 1.23e−7, Unicode minus
+    if (!isFinite(x)) return "—";
+    if (x === 0) return "0";
+    return x.toExponential(d === undefined ? 2 : d).replace("e-", "e−").replace("e+", "e+");
+  }
+  /* 12 345 678 → "12.3M" — parameter counts are read, not summed, in a caption */
+  function big(x) {
+    const a = Math.abs(x);
+    if (a >= 1e12) return (x / 1e12).toFixed(a >= 1e13 ? 0 : 1) + "T";
+    if (a >= 1e9) return (x / 1e9).toFixed(a >= 1e10 ? 0 : 1) + "B";
+    if (a >= 1e6) return (x / 1e6).toFixed(a >= 1e7 ? 0 : 1) + "M";
+    if (a >= 1e3) return (x / 1e3).toFixed(a >= 1e4 ? 0 : 1) + "k";
+    return String(Math.round(x));
+  }
+  const commas = x => Math.round(x).toString().replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+
+  /* ══ seeded randomness, so every reader sees the same picture ═══════════ */
+  function rng(seed) {                                     // mulberry32
+    let a = (seed >>> 0) || 1;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function randn(r) {                                      // Box–Muller, one draw
+    let u = 0, v = 0;
+    while (u === 0) u = r();
+    while (v === 0) v = r();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+  function shuffle(arr, r) {                               // Fisher–Yates, in place
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(r() * (i + 1));
+      const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+    }
+    return arr;
+  }
+
+  /* ══ dense linear algebra ═══════════════════════════════════════════════
+     Row-major arrays of arrays. The SERIES CONVENTION is the row convention:
+     a batch X is (N × d), one EXAMPLE PER ROW, and a layer is X·W + b with
+     W of shape (dᵢₙ × dₒᵤₜ). Column-convention sources write Wᵀx + b with W of
+     shape (dₒᵤₜ × dᵢₙ); the two are transposes of one another and mixing them
+     is the single most common shape bug in the series. Everything here is row
+     convention; where a page must show the other one it says so explicitly.  */
+  const zeros = n => new Array(n).fill(0);
+  function zeros2(m, n) { const A = []; for (let i = 0; i < m; i++) A.push(new Array(n).fill(0)); return A; }
+  function eye(n) { const A = zeros2(n, n); for (let i = 0; i < n; i++) A[i][i] = 1; return A; }
+  function transpose(A) {
+    const m = A.length, n = A[0].length, B = zeros2(n, m);
+    for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) B[j][i] = A[i][j];
+    return B;
+  }
+  function matmul(A, B) {                                  // (m×k)(k×n) → (m×n)
+    const m = A.length, k = B.length, n = B[0].length, C = zeros2(m, n);
+    for (let i = 0; i < m; i++) {
+      const Ai = A[i], Ci = C[i];
+      for (let p = 0; p < k; p++) {
+        const a = Ai[p]; if (a === 0) continue;
+        const Bp = B[p];
+        for (let j = 0; j < n; j++) Ci[j] += a * Bp[j];
+      }
+    }
+    return C;
+  }
+  const matvec = (A, v) => A.map(row => row.reduce((s, a, j) => s + a * v[j], 0));
+  function vecmat(v, A) {                                  // (1×m)(m×n) → length n
+    const n = A[0].length, out = zeros(n);
+    for (let i = 0; i < A.length; i++) { const vi = v[i]; if (!vi) continue; for (let j = 0; j < n; j++) out[j] += vi * A[i][j]; }
+    return out;
+  }
+  const outer = (a, b) => a.map(ai => b.map(bj => ai * bj));
+  const addRow = (A, b) => A.map(row => row.map((v, j) => v + b[j]));   // broadcast
+  const dot = (a, b) => a.reduce((s, v, i) => s + v * b[i], 0);
+  const frob = A => Math.sqrt(A.reduce((s, r) => s + r.reduce((t, v) => t + v * v, 0), 0));
+  const applyEl = (A, f) => A.map(r => r.map(f));
+
+  /* ══ the error function, for the EXACT GELU ═════════════════════════════
+     This is the rational-Chebyshev form of the complementary error function.
+     Verified in the build against Python's math.erf on a 0.01 grid over
+     |x| ≤ 6: max ABSOLUTE error 8.30e−08 (at x = −0.04), max RELATIVE error
+     2.73e−06 (at x = −0.02, where erf itself is ≈ 0.02 so the relative figure
+     is misleadingly large). Both are three to four orders of magnitude below
+     the ≈4.7e−04 gap between the exact GELU and its tanh surrogate, which is
+     the quantity the series actually asks this function to resolve.          */
+  function erf(x) {
+    const z = Math.abs(x);
+    const t = 1 / (1 + 0.5 * z);
+    const y = t * Math.exp(-z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 +
+      t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 +
+      t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
+    return x >= 0 ? 1 - y : y - 1;
+  }
+  const Phi = x => 0.5 * (1 + erf(x / Math.SQRT2));        // standard normal CDF
+  const phi = x => Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
+
+  /* ══ overflow-safe scalar primitives ════════════════════════════════════ */
+  function sigmoid(z) {                                    // never exp() a big positive
+    return z >= 0 ? 1 / (1 + Math.exp(-z)) : Math.exp(z) / (1 + Math.exp(z));
+  }
+  function softplus(z) {                                   // log(1 + eᶻ) = max(z,0) + log(1 + e^−|z|)
+    return Math.max(z, 0) + Math.log1p(Math.exp(-Math.abs(z)));
+  }
+  function logSigmoid(z) {                                 // = −softplus(−z)
+    return -softplus(-z);
+  }
+  function logSumExp(v) {
+    let m = -Infinity;
+    for (const x of v) if (x > m) m = x;
+    if (!isFinite(m)) return m;
+    let s = 0;
+    for (const x of v) s += Math.exp(x - m);
+    return m + Math.log(s);
+  }
+  function softmax(v, T) {
+    const t = (T === undefined || T === null) ? 1 : T;
+    if (t === 0) {                                          // the argmax limit
+      let m = -Infinity, k = 0;
+      v.forEach((x, i) => { if (x > m) { m = x; k = i; } });
+      return v.map((_, i) => (i === k ? 1 : 0));
+    }
+    const s = v.map(x => x / t);
+    let m = -Infinity;
+    for (const x of s) if (x > m) m = x;
+    const e = s.map(x => Math.exp(x - m));
+    const S = e.reduce((a, b) => a + b, 0);
+    return e.map(x => x / S);
+  }
+  function logSoftmax(v, T) {
+    const t = (T === undefined) ? 1 : T;
+    const s = v.map(x => x / t), L = logSumExp(s);
+    return s.map(x => x - L);
+  }
+  /* categorical cross-entropy from LOGITS and an integer class, in the stable
+     form −(z_k − logsumexp z). Passing probabilities here is the classic
+     double-softmax bug; this signature takes logits and nothing else.        */
+  const xent = (logits, k) => logSumExp(logits) - logits[k];
+  /* binary cross-entropy from a LOGIT and a 0/1 label:
+     −[y·logσ(z) + (1−y)·log(1−σ(z))] = softplus((1−2y)·z)                    */
+  const bce = (z, y) => softplus((1 - 2 * y) * z);
+  const mse = (yhat, y) => 0.5 * (yhat - y) * (yhat - y);
+
+  /* The naive forms, exposed ONLY so a figure can show them blowing up.
+     Nothing else in the series may call these.                              */
+  const naive = {
+    sigmoid: z => 1 / (1 + Math.exp(-z)),
+    logSigmoid: z => Math.log(1 / (1 + Math.exp(-z))),
+    softplus: z => Math.log(1 + Math.exp(z)),
+    softmax: v => { const e = v.map(Math.exp), S = e.reduce((a, b) => a + b, 0); return e.map(x => x / S); },
+    xent: (logits, k) => { const e = logits.map(Math.exp), S = e.reduce((a, b) => a + b, 0); return -Math.log(e[k] / S); },
+    bce: (z, y) => { const p = 1 / (1 + Math.exp(-z)); return -(y * Math.log(p) + (1 - y) * Math.log(1 - p)); }
+  };
+
+  /* ══ the activation registry ════════════════════════════════════════════
+     f and df are SCALAR. df at a kink returns the right derivative, which is
+     what every framework does; the pages say so where it matters.
+     `p` is the one shape parameter a family needs (leaky/PReLU slope, ELU α). */
+  const ACT = {
+    identity: {
+      key: "identity", label: "identity", group: "linear",
+      f: x => x, df: () => 1, range: "(−∞, ∞)", zeroCentered: true, piecewiseLinear: true,
+      note: "No non-linearity at all. Stacking these collapses the whole network to one affine map."
+    },
+    relu: {
+      key: "relu", label: "ReLU", group: "rectified",
+      f: x => x > 0 ? x : 0, df: x => x > 0 ? 1 : 0,
+      range: "[0, ∞)", zeroCentered: false, piecewiseLinear: true,
+      note: "max(0, x). Two linear pieces, one kink. Derivative is exactly 1 where active and exactly 0 where not."
+    },
+    leaky: {
+      key: "leaky", label: "leaky ReLU", group: "rectified", p: 0.01, pLabel: "slope",
+      f: (x, p) => x > 0 ? x : (p === undefined ? 0.01 : p) * x,
+      df: (x, p) => x > 0 ? 1 : (p === undefined ? 0.01 : p),
+      range: "(−∞, ∞)", zeroCentered: false, piecewiseLinear: true,
+      note: "A fixed small negative slope, so the derivative is never exactly zero."
+    },
+    prelu: {
+      key: "prelu", label: "PReLU", group: "rectified", p: 0.25, pLabel: "learned slope",
+      f: (x, p) => x > 0 ? x : (p === undefined ? 0.25 : p) * x,
+      df: (x, p) => x > 0 ? 1 : (p === undefined ? 0.25 : p),
+      range: "(−∞, ∞)", zeroCentered: false, piecewiseLinear: true,
+      note: "Leaky ReLU with the negative slope made a learned parameter, one per channel."
+    },
+    abs: {
+      key: "abs", label: "absolute value", group: "rectified",
+      f: x => Math.abs(x), df: x => x >= 0 ? 1 : -1,
+      range: "[0, ∞)", zeroCentered: false, piecewiseLinear: true,
+      note: "α = −1. Folds the input space about the unit's own hyperplane — the picture behind region counting."
+    },
+    elu: {
+      key: "elu", label: "ELU", group: "smooth", p: 1.0, pLabel: "<span class=\"keep\">α</span>",
+      f: (x, p) => { const a = (p === undefined ? 1 : p); return x > 0 ? x : a * (Math.exp(Math.min(x, 0)) - 1); },
+      df: (x, p) => { const a = (p === undefined ? 1 : p); return x > 0 ? 1 : a * Math.exp(Math.min(x, 0)); },
+      range: "(−α, ∞)", zeroCentered: false, piecewiseLinear: false,
+      note: "Exponential below zero: saturates to −α instead of to 0, pulling the mean activation toward zero."
+    },
+    softplus: {
+      key: "softplus", label: "softplus", group: "smooth",
+      f: z => softplus(z), df: z => sigmoid(z),
+      range: "(0, ∞)", zeroCentered: false, piecewiseLinear: false,
+      note: "log(1 + eᶻ), the smooth rectifier. Its derivative is exactly the logistic sigmoid."
+    },
+    gelu: {
+      key: "gelu", label: "GELU (exact)", group: "smooth",
+      f: x => x * Phi(x),
+      df: x => Phi(x) + x * phi(x),
+      range: "≈(−0.17, ∞)", zeroCentered: false, piecewiseLinear: false,
+      note: "x·Φ(x) with Φ the standard normal CDF. Non-monotone: minimum −0.169971 at x = −0.751792."
+    },
+    geluTanh: {
+      key: "geluTanh", label: "GELU (tanh form)", group: "smooth",
+      f: x => 0.5 * x * (1 + Math.tanh(Math.sqrt(2 / Math.PI) * (x + 0.044715 * x * x * x))),
+      df: x => {
+        const c = Math.sqrt(2 / Math.PI), u = c * (x + 0.044715 * x * x * x);
+        const t = Math.tanh(u), du = c * (1 + 3 * 0.044715 * x * x);
+        return 0.5 * (1 + t) + 0.5 * x * (1 - t * t) * du;
+      },
+      range: "≈(−0.17, ∞)", zeroCentered: false, piecewiseLinear: false,
+      note: "The tanh surrogate. A DIFFERENT function from the exact form: max gap 4.73e−04 at x ≈ 2.70."
+    },
+    geluSigmoid: {
+      key: "geluSigmoid", label: "GELU (sigmoid form)", group: "smooth",
+      f: x => x * sigmoid(1.702 * x),
+      df: x => { const s = sigmoid(1.702 * x); return s + x * 1.702 * s * (1 - s); },
+      range: "≈(−0.17, ∞)", zeroCentered: false, piecewiseLinear: false,
+      note: "x·σ(1.702x), the cheapest surrogate and much the least accurate: max gap 2.03e−02 at x ≈ −2.27."
+    },
+    silu: {
+      key: "silu", label: "SiLU / swish", group: "smooth", p: 1.0, pLabel: "<span class=\"keep\">β</span>",
+      f: (x, p) => x * sigmoid((p === undefined ? 1 : p) * x),
+      df: (x, p) => { const b = (p === undefined ? 1 : p), s = sigmoid(b * x); return s + b * x * s * (1 - s); },
+      range: "≈(−0.28, ∞)", zeroCentered: false, piecewiseLinear: false,
+      note: "x·σ(βx). Non-monotone: minimum −0.278465 at x = −1.278465 for β = 1. β → ∞ recovers ReLU."
+    },
+    sigmoid: {
+      key: "sigmoid", label: "logistic sigmoid", group: "saturating",
+      f: z => sigmoid(z), df: z => { const s = sigmoid(z); return s * (1 - s); },
+      range: "(0, 1)", zeroCentered: false, piecewiseLinear: false,
+      note: "Two-sided saturation, output not centred at zero, maximum derivative only 0.25."
+    },
+    tanh: {
+      key: "tanh", label: "tanh", group: "saturating",
+      f: z => Math.tanh(z), df: z => 1 - Math.tanh(z) * Math.tanh(z),
+      range: "(−1, 1)", zeroCentered: true, piecewiseLinear: false,
+      note: "2σ(2z) − 1: the same shape, rescaled to be zero-centred with unit slope at the origin."
+    },
+    hardtanh: {
+      key: "hardtanh", label: "hard tanh", group: "saturating",
+      f: z => Math.max(-1, Math.min(1, z)), df: z => (z > -1 && z < 1) ? 1 : 0,
+      range: "[−1, 1]", zeroCentered: true, piecewiseLinear: true,
+      note: "clip(z, −1, 1). Piecewise linear and bounded — three pieces, two kinks."
+    }
+  };
+  const act = k => ACT[k] || ACT.relu;
+  function actList(group) {
+    const order = ["identity", "relu", "leaky", "prelu", "abs", "elu", "softplus",
+      "gelu", "geluTanh", "geluSigmoid", "silu", "sigmoid", "tanh", "hardtanh"];
+    return group ? order.filter(k => ACT[k].group === group) : order;
+  }
+  /* maxout is NOT element-wise, so it cannot live in ACT: it consumes k
+     pre-activations and emits one. Given a (k × 1) group of z values it is
+     just the max; the pieces are the argmax cells.                          */
+  const maxout = zs => Math.max.apply(null, zs);
+
+  /* ══ a tiny dense MLP: forward, loss, exact backward, numeric backward ═══
+     sizes = [d_in, h1, …, d_out]. Weights are (dᵢₙ × dₒᵤₜ), inputs are rows.
+     out: "linear" (mean squared error), "sigmoid" (binary cross-entropy from
+     the logit) or "softmax" (categorical cross-entropy from the logits).
+     Y for "linear" is (N × dₒᵤₜ); for "sigmoid" (N × 1) of 0/1; for "softmax"
+     an array of N integer class indices.
+     The backward pass here is verified against DL.numGrad in the build; the
+     ALGORITHM is taught on deep-learning/neural-network-training.html and is
+     not re-derived by any figure that calls this.                            */
+  function mlpInit(sizes, opt) {
+    const o = Object.assign({ act: "relu", out: "linear", seed: 7, scale: null, p: undefined }, opt || {});
+    const r = rng(o.seed), W = [], b = [];
+    for (let l = 0; l + 1 < sizes.length; l++) {
+      const nin = sizes[l], nout = sizes[l + 1];
+      const s = (o.scale === null) ? Math.sqrt(2 / nin) : o.scale;
+      const Wl = zeros2(nin, nout);
+      for (let i = 0; i < nin; i++) for (let j = 0; j < nout; j++) Wl[i][j] = s * randn(r);
+      W.push(Wl); b.push(zeros(nout));
+    }
+    return { sizes: sizes.slice(), W: W, b: b, act: o.act, out: o.out, p: o.p, L: sizes.length - 1 };
+  }
+  function forward(net, X) {
+    const g = act(net.act).f, z = [], a = [X];
+    let h = X;
+    for (let l = 0; l < net.L; l++) {
+      const zl = addRow(matmul(h, net.W[l]), net.b[l]);
+      z.push(zl);
+      h = (l === net.L - 1) ? zl : applyEl(zl, x => g(x, net.p));
+      if (l < net.L - 1) a.push(h);
+    }
+    return { z: z, a: a, logits: z[net.L - 1] };
+  }
+  function predict(net, X) {
+    const f = forward(net, X);
+    if (net.out === "sigmoid") return f.logits.map(r => [sigmoid(r[0])]);
+    if (net.out === "softmax") return f.logits.map(r => softmax(r));
+    return f.logits;
+  }
+  function lossFrom(net, logits, Y) {
+    const N = logits.length;
+    let s = 0;
+    for (let i = 0; i < N; i++) {
+      if (net.out === "softmax") s += xent(logits[i], Y[i]);
+      else if (net.out === "sigmoid") s += bce(logits[i][0], Y[i][0]);
+      else for (let j = 0; j < logits[i].length; j++) s += mse(logits[i][j], Y[i][j]);
+    }
+    return s / N;
+  }
+  const loss = (net, X, Y) => lossFrom(net, forward(net, X).logits, Y);
+
+  function backward(net, X, Y) {
+    const g = act(net.act), N = X.length;
+    const f = forward(net, X);
+    const L = net.L;
+    /* δ at the OUTPUT layer. For all three (output unit, loss) pairs the
+       maximum-likelihood pairing makes this exactly (prediction − target),
+       which is the whole point of §17 on the page. */
+    let d = zeros2(N, net.sizes[L]);
+    for (let i = 0; i < N; i++) {
+      if (net.out === "softmax") {
+        const p = softmax(f.logits[i]);
+        for (let j = 0; j < p.length; j++) d[i][j] = (p[j] - (j === Y[i] ? 1 : 0)) / N;
+      } else if (net.out === "sigmoid") {
+        d[i][0] = (sigmoid(f.logits[i][0]) - Y[i][0]) / N;
+      } else {
+        for (let j = 0; j < f.logits[i].length; j++) d[i][j] = (f.logits[i][j] - Y[i][j]) / N;
+      }
+    }
+    const dW = [], db = [];
+    for (let l = L - 1; l >= 0; l--) {
+      const A = f.a[l];                                     // input to layer l
+      dW[l] = matmul(transpose(A), d);
+      db[l] = d[0].map((_, j) => d.reduce((s, row) => s + row[j], 0));
+      if (l > 0) {
+        const back = matmul(d, transpose(net.W[l]));
+        const zprev = f.z[l - 1];
+        d = back.map((row, i) => row.map((v, j) => v * g.df(zprev[i][j], net.p)));
+      }
+    }
+    return { dW: dW, db: db, loss: lossFrom(net, f.logits, Y) };
+  }
+  /* central differences over every parameter — O(P) forward passes, only ever
+     used to CHECK backward(), never inside a figure's animation loop.        */
+  function numGrad(net, X, Y, h) {
+    const hh = h || 1e-5, dW = [], db = [];
+    for (let l = 0; l < net.L; l++) {
+      dW[l] = zeros2(net.sizes[l], net.sizes[l + 1]);
+      db[l] = zeros(net.sizes[l + 1]);
+      for (let i = 0; i < net.sizes[l]; i++) for (let j = 0; j < net.sizes[l + 1]; j++) {
+        const o = net.W[l][i][j];
+        net.W[l][i][j] = o + hh; const Lp = loss(net, X, Y);
+        net.W[l][i][j] = o - hh; const Lm = loss(net, X, Y);
+        net.W[l][i][j] = o;
+        dW[l][i][j] = (Lp - Lm) / (2 * hh);
+      }
+      for (let j = 0; j < net.sizes[l + 1]; j++) {
+        const o = net.b[l][j];
+        net.b[l][j] = o + hh; const Lp = loss(net, X, Y);
+        net.b[l][j] = o - hh; const Lm = loss(net, X, Y);
+        net.b[l][j] = o;
+        db[l][j] = (Lp - Lm) / (2 * hh);
+      }
+    }
+    return { dW: dW, db: db };
+  }
+  function sgdStep(net, g, lr) {
+    for (let l = 0; l < net.L; l++) {
+      for (let i = 0; i < net.sizes[l]; i++)
+        for (let j = 0; j < net.sizes[l + 1]; j++) net.W[l][i][j] -= lr * g.dW[l][i][j];
+      for (let j = 0; j < net.sizes[l + 1]; j++) net.b[l][j] -= lr * g.db[l][j];
+    }
+    return net;
+  }
+  function cloneNet(net) {
+    return Object.assign({}, net, {
+      W: net.W.map(A => A.map(r => r.slice())),
+      b: net.b.map(v => v.slice())
+    });
+  }
+
+  /* ══ counting ═══════════════════════════════════════════════════════════ */
+  /* parameters of a dense chain, biases included */
+  function params(sizes, bias) {
+    const wb = (bias === false) ? 0 : 1;
+    let p = 0;
+    for (let l = 0; l + 1 < sizes.length; l++) p += sizes[l] * sizes[l + 1] + wb * sizes[l + 1];
+    return p;
+  }
+  /* multiply–accumulate count for ONE example, forward only. A MAC is one
+     multiply plus one add; the FLOP count quoted in papers is usually 2×MAC. */
+  function macs(sizes) {
+    let m = 0;
+    for (let l = 0; l + 1 < sizes.length; l++) m += sizes[l] * sizes[l + 1];
+    return m;
+  }
+  /* Exact maximum number of linear regions of a ONE-hidden-layer ReLU net with
+     d inputs and n units: ∑_{j=0}^{min(d,n)} C(n, j)  (Zaslavsky). Uses exact
+     integer binomials while they fit in a double, then floats.               */
+  function binom(n, k) {
+    if (k < 0 || k > n) return 0;
+    k = Math.min(k, n - k);
+    let r = 1;
+    for (let i = 1; i <= k; i++) r = r * (n - k + i) / i;
+    return r;
+  }
+  function regionsShallow(d, n) {
+    let s = 0;
+    for (let j = 0; j <= Math.min(d, n); j++) s += binom(n, j);
+    return s;
+  }
+  /* Montúfar-style LOWER bound for a deep rectifier net with d inputs and
+     hidden widths [n₁ … n_L], all n ≥ d:
+         (∏_{l<L} ⌊n_l/d⌋^d) · ∑_{j=0}^{d} C(n_L, j)
+     Note it is a lower bound on the MAXIMUM over parameters — an existence
+     claim about one weight setting, not a statement about a trained net.     */
+  function regionsDeepLB(d, widths) {
+    let prod = 1;
+    for (let l = 0; l + 1 < widths.length; l++) prod *= Math.pow(Math.floor(widths[l] / d), d);
+    return prod * regionsShallow(d, widths[widths.length - 1]);
+  }
+
+  /* ══ drawing ════════════════════════════════════════════════════════════
+     Same contract as the vision series: the <svg> already exists in the HTML
+     with its viewBox / role / aria-label; these only append into it.         */
+  function frame(sel, W, H, m) {
+    const mm = Object.assign({ l: 46, r: 16, t: 14, b: 34 }, m || {});
+    const svg = (typeof sel === "string") ? d3.select(sel) : sel;
+    svg.selectAll("*").remove();
+    const g = svg.append("g").attr("transform", `translate(${mm.l},${mm.t})`);
+    return { svg: svg, g: g, m: mm, iw: W - mm.l - mm.r, ih: H - mm.t - mm.b };
+  }
+  function axisB(g, x, ih, ticks, label, fmtFn) {
+    const ax = g.append("g").attr("class", "axis").attr("transform", `translate(0,${ih})`)
+      .call(fmtFn ? d3.axisBottom(x).ticks(ticks || 6).tickFormat(fmtFn) : d3.axisBottom(x).ticks(ticks || 6));
+    if (label) g.append("text").attr("x", x.range()[1]).attr("y", ih + 31).attr("text-anchor", "end")
+      .attr("font-size", 11).attr("fill", DC.muted).text(label);
+    return ax;
+  }
+  function axisL(g, y, ticks, label, fmtFn) {
+    const ax = g.append("g").attr("class", "axis")
+      .call(fmtFn ? d3.axisLeft(y).ticks(ticks || 5).tickFormat(fmtFn) : d3.axisLeft(y).ticks(ticks || 5));
+    if (label) g.append("text").attr("x", 0).attr("y", -6).attr("text-anchor", "start")
+      .attr("font-size", 11).attr("fill", DC.muted).text(label);
+    return ax;
+  }
+  function gridY(g, y, iw, ticks) {
+    g.append("g").attr("class", "gridlines").selectAll("line").data(y.ticks(ticks || 5)).join("line")
+      .attr("x1", 0).attr("x2", iw).attr("y1", d => y(d)).attr("y2", d => y(d)).attr("stroke", DC.grid);
+  }
+  function gridX(g, x, ih, ticks) {
+    g.append("g").attr("class", "gridlines").selectAll("line").data(x.ticks(ticks || 5)).join("line")
+      .attr("y1", 0).attr("y2", ih).attr("x1", d => x(d)).attr("x2", d => x(d)).attr("stroke", DC.grid);
+  }
+  function legend(g, items, x, y, opts) {
+    const o = Object.assign({ gap: 15, size: 9, font: 10.5, vertical: true, step: 96 }, opts || {});
+    const gl = g.append("g").attr("transform", `translate(${x},${y})`);
+    items.forEach((it, i) => {
+      const dx = o.vertical ? 0 : i * o.step, dy = o.vertical ? i * o.gap : 0;
+      if (it.dash) {
+        gl.append("line").attr("x1", dx).attr("x2", dx + o.size).attr("y1", dy).attr("y2", dy)
+          .attr("stroke", it.color).attr("stroke-width", 2).attr("stroke-dasharray", it.dash);
+      } else {
+        gl.append("rect").attr("x", dx).attr("y", dy - o.size / 2).attr("width", o.size)
+          .attr("height", o.size).attr("rx", 2).attr("fill", it.color)
+          .attr("fill-opacity", it.op === undefined ? 0.9 : it.op);
+      }
+      gl.append("text").attr("x", dx + o.size + 6).attr("y", dy + 3.5)
+        .attr("font-size", o.font).attr("fill", DC.muted).text(it.label);
+    });
+    return gl;
+  }
+  function panelBox(g, x, y, w, h, title, opt) {
+    const o = Object.assign({ fill: "none", stroke: DC.line }, opt || {});
+    const gg = g.append("g").attr("transform", `translate(${x},${y})`);
+    gg.append("rect").attr("x", -0.5).attr("y", -0.5).attr("width", w + 1).attr("height", h + 1)
+      .attr("fill", o.fill).attr("stroke", o.stroke).attr("rx", 3);
+    if (title) gg.append("text").attr("x", 0).attr("y", -7).attr("font-size", 11)
+      .attr("fill", DC.ink).attr("font-weight", 600).text(title);
+    return gg;
+  }
+  function kv(g, x, y, opt) {
+    const o = Object.assign({ lead: 15, keyW: 152, size: 11, dp: 3 }, opt || {});
+    let i = 0;
+    return function (k, v, color, bold) {
+      g.append("text").attr("x", x).attr("y", y + i * o.lead).attr("font-size", o.size)
+        .attr("fill", DC.muted).text(k);
+      g.append("text").attr("x", x + o.keyW).attr("y", y + i * o.lead).attr("font-size", o.size)
+        .attr("font-family", "SF Mono, Menlo, monospace").attr("fill", color || DC.ink)
+        .attr("font-weight", bold ? 600 : 400).text(v);
+      i++;
+    };
+  }
+  function matText(g, M, x, y, opt) {
+    const o = Object.assign({ size: 10, dp: 2, fill: DC.ink, lead: 12.5, label: null, pad: 6, colorOf: null }, opt || {});
+    const rows = M.map(r => r.map(v =>
+      (typeof v === "string" ? v : (Math.abs(v) < 5e-7 ? "0" : v.toFixed(o.dp))).padStart(o.pad)).join(" "));
+    const brL = ["⎡", "⎢", "⎣"], brR = ["⎤", "⎥", "⎦"];
+    const gg = g.append("g").attr("transform", `translate(${x},${y})`);
+    if (o.label) gg.append("text").attr("x", 0).attr("y", -o.lead).attr("font-size", 10)
+      .attr("fill", DC.muted).text(o.label);
+    rows.forEach((r, i) => {
+      const k = rows.length === 1 ? -1 : (i === 0 ? 0 : (i === rows.length - 1 ? 2 : 1));
+      const bl = k < 0 ? "[" : brL[k], br = k < 0 ? "]" : brR[k];
+      gg.append("text").attr("x", 0).attr("y", i * o.lead)
+        .attr("font-family", "SF Mono, Menlo, monospace").attr("font-size", o.size)
+        .attr("xml:space", "preserve")
+        .attr("fill", o.colorOf ? o.colorOf(i) : o.fill).text(bl + r + " " + br);
+    });
+    return gg;
+  }
+  function arrow(g, x1, y1, x2, y2, opt) {
+    const o = Object.assign({ color: DC.a2, w: 1.6, head: 6, dash: null, op: 1 }, opt || {});
+    const el = g.append("line").attr("x1", x1).attr("y1", y1).attr("x2", x2).attr("y2", y2)
+      .attr("stroke", o.color).attr("stroke-width", o.w).attr("stroke-opacity", o.op);
+    if (o.dash) el.attr("stroke-dasharray", o.dash);
+    const a = Math.atan2(y2 - y1, x2 - x1), h = o.head;
+    g.append("path").attr("d", `M${x2},${y2} L${x2 - h * Math.cos(a - 0.4)},${y2 - h * Math.sin(a - 0.4)} L${x2 - h * Math.cos(a + 0.4)},${y2 - h * Math.sin(a + 0.4)} Z`)
+      .attr("fill", o.color).attr("fill-opacity", o.op);
+    return el;
+  }
+  function curve(g, pts, opt) {
+    const o = Object.assign({ stroke: DC.accent, w: 1.8, dash: null, op: 1, fill: "none" }, opt || {});
+    const d = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(2) + "," + p[1].toFixed(2)).join(" ");
+    const el = g.append("path").attr("d", d + (o.fill === "none" ? "" : " Z"))
+      .attr("fill", o.fill).attr("fill-opacity", o.fill === "none" ? 0 : (o.fillOp === undefined ? 0.18 : o.fillOp))
+      .attr("stroke", o.stroke).attr("stroke-width", o.w).attr("stroke-opacity", o.op)
+      .attr("stroke-linejoin", "round");
+    if (o.dash) el.attr("stroke-dasharray", o.dash);
+    return el;
+  }
+  /* A rectangular clip. The rect is in the USER SPACE OF THE REFERENCING
+     ELEMENT, not page space: inside an already-translated <g> it starts at
+     (0, 0). Getting this wrong clips the whole drawing away silently.        */
+  function clip(svg, id, x, y, w, h) {
+    svg.append("defs").append("clipPath").attr("id", id)
+      .append("rect").attr("x", x).attr("y", y).attr("width", w).attr("height", h);
+    return "url(#" + id + ")";
+  }
+  const CANV = (typeof document !== "undefined" && document.createElement)
+    ? document.createElement("canvas") : null;
+  function cells(g, x0, y0, cw, W, H, colorOf) {
+    const gg = g.append("g").attr("transform", `translate(${x0},${y0})`);
+    const ctx = (CANV && W * H > 2500 && CANV.getContext) ? CANV.getContext("2d") : null;
+    if (ctx) {
+      CANV.width = W; CANV.height = H;
+      ctx.clearRect(0, 0, W, H);
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+        const c = colorOf(x, y);
+        if (!c || c === "none") continue;
+        ctx.fillStyle = c; ctx.fillRect(x, y, 1, 1);
+      }
+      gg.append("image").attr("x", 0).attr("y", 0)
+        .attr("width", W * cw).attr("height", H * cw)
+        .attr("preserveAspectRatio", "none").attr("image-rendering", "pixelated")
+        .attr("href", CANV.toDataURL());
+      return gg;
+    }
+    const data = [];
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) data.push([x, y]);
+    gg.selectAll("rect").data(data).join("rect")
+      .attr("x", d => d[0] * cw).attr("y", d => d[1] * cw)
+      .attr("width", cw + 0.4).attr("height", cw + 0.4)
+      .attr("shape-rendering", "crispEdges")
+      .attr("fill", d => colorOf(d[0], d[1]) || "none")
+      .attr("fill-opacity", d => { const c = colorOf(d[0], d[1]); return (!c || c === "none") ? 0 : 1; });
+    return gg;
+  }
+  /* The layer-and-edge picture every part of this series draws at least once.
+     sizes = [d_in, …, d_out]; returns {nodes, cols} in the given box so the
+     caller can annotate particular units.                                    */
+  function netDiagram(g, sizes, opt) {
+    const o = Object.assign({
+      x: 0, y: 0, w: 300, h: 200, r: 7, maxShow: 8, labels: null,
+      edgeOp: 0.35, edgeColor: DC.line, nodeFill: DC.panel2,
+      nodeStroke: [DC.accent, DC.a2, DC.good], showEdges: true, edgeWidth: 1
+    }, opt || {});
+    const gg = g.append("g").attr("transform", `translate(${o.x},${o.y})`);
+    const cols = sizes.map((n, l) => {
+      const shown = Math.min(n, o.maxShow);
+      const gapx = sizes.length > 1 ? o.w / (sizes.length - 1) : 0;
+      const cx = l * gapx;
+      const step = o.h / (shown + 1);
+      const nodes = [];
+      for (let i = 0; i < shown; i++) nodes.push({ x: cx, y: step * (i + 1), i: i, l: l });
+      return { cx: cx, n: n, shown: shown, nodes: nodes, truncated: n > o.maxShow };
+    });
+    if (o.showEdges) {
+      for (let l = 0; l + 1 < cols.length; l++) {
+        const E = [];
+        cols[l].nodes.forEach(a => cols[l + 1].nodes.forEach(b => E.push([a, b])));
+        gg.append("g").selectAll("line").data(E).join("line")
+          .attr("x1", d => d[0].x).attr("y1", d => d[0].y)
+          .attr("x2", d => d[1].x).attr("y2", d => d[1].y)
+          .attr("stroke", typeof o.edgeColor === "function" ? (d => o.edgeColor(d[0], d[1])) : o.edgeColor)
+          .attr("stroke-width", o.edgeWidth).attr("stroke-opacity", o.edgeOp);
+      }
+    }
+    cols.forEach((c, l) => {
+      const col = o.nodeStroke[Math.min(l, o.nodeStroke.length - 1)];
+      const stroke = (l === 0) ? o.nodeStroke[0] : (l === cols.length - 1 ? o.nodeStroke[o.nodeStroke.length - 1] : (o.nodeStroke[1] || col));
+      gg.append("g").selectAll("circle").data(c.nodes).join("circle")
+        .attr("cx", d => d.x).attr("cy", d => d.y).attr("r", o.r)
+        .attr("fill", o.nodeFill).attr("stroke", stroke).attr("stroke-width", 1.4);
+      if (c.truncated) gg.append("text").attr("x", c.cx).attr("y", o.h - 2)
+        .attr("text-anchor", "middle").attr("font-size", 12).attr("fill", DC.muted).text("⋮");
+      if (o.labels) gg.append("text").attr("x", c.cx).attr("y", -10)
+        .attr("text-anchor", "middle").attr("font-size", 10.5).attr("fill", DC.muted)
+        .text(o.labels[l] === undefined ? "" : o.labels[l]);
+    });
+    return { g: gg, cols: cols };
+  }
+
+  return {
+    clamp, lerp, linspace, fmt, sig, fmtE, big, commas,
+    rng, randn, shuffle,
+    zeros, zeros2, eye, transpose, matmul, matvec, vecmat, outer, addRow, dot, frob, applyEl,
+    erf, Phi, phi,
+    sigmoid, softplus, logSigmoid, logSumExp, softmax, logSoftmax, xent, bce, mse, naive,
+    ACT, act, actList, maxout,
+    mlpInit, forward, predict, loss, backward, numGrad, sgdStep, cloneNet,
+    params, macs, binom, regionsShallow, regionsDeepLB,
+    frame, axisB, axisL, gridX, gridY, legend, panelBox, kv, matText, arrow, curve, clip,
+    cells, netDiagram
+  };
+})();
