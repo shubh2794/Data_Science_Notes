@@ -54,6 +54,42 @@
                      the OPTIMISERS themselves are taught on the training page
      · counting    DL.params(sizes), DL.macs(sizes), DL.regionsShallow(d, n),
                    DL.regionsDeepLB(d, widths)
+     · stats       DL.mean(a), DL.variance(a[,ddof]), DL.std(a[,ddof]),
+                   DL.standardise(X) → {X, mu, sd}            [added by part 2]
+     · linear fit  DL.logistic(X, y, steps, lr, l2) → {w, b}; DL.logit(m, x);
+                   DL.accuracy(m, X, y); DL.logisticLoss(m, X, y) — the stable
+                   mean cross-entropy, so a separating fit reports a large
+                   FINITE number                                [part 2]
+     · spectra     DL.eig2sym(a,b,c) → {lo, hi, vlo, vhi, cond}  — EXACT, for
+                   the conditioning claims; DL.powerIter(A) → top |λ|;
+                   DL.specNorm(A) → ‖A‖₂, the top SINGULAR value, which is the
+                   quantity that governs a product of Jacobians [part 2]
+     · averaging   DL.ewma(series, β, correct) — v_t = βv_{t−1} + (1−β)θ_t with
+                   the optional bias correction v_t/(1−βᵗ)      [part 2]
+     · optimisers  DL.OPT — a registry keyed by name, each
+                     {key, label, hp, init(n) → state, step(state, g, hp) → dx}
+                   where dx is ADDED to the parameters. DL.optList() orders it.
+                   sgd · momentum · momentumEwma · nesterov · adagrad ·
+                   rmsprop · adam · adamw.
+                   NOTE "momentum" is the ACCUMULATION form v ← βv + g and
+                   "momentumEwma" is v ← βv + (1−β)g. They are different
+                   algorithms: the first multiplies the effective step by
+                   1/(1−β) — ten times at β = 0.9 — and the second does not.
+                   The series teaches that gap; never silently swap them.
+                   Adam's coupled L2 and AdamW's decoupled decay are likewise
+                   separate entries because they are separate algorithms.
+     · schedules   DL.lrAt(kind, t, {peak, total, warm, floor, step, gamma,
+                   power}) — constant · cosine · linear · step · exp · power ·
+                   invsqrt · onecycle, with LINEAR warmup applied as a prefix
+                   to every one of them                         [part 2]
+     · norm layers DL.batchNorm(X, γ, β, eps[, stats]) → {Y, mu, va,
+                   vaUnbiased} — pass `stats` for EVAL mode; the biased (1/N)
+                   variance normalises the batch and the unbiased (1/(N−1))
+                   one is what belongs in the running estimate.
+                   DL.layerNorm(X, γ, β, eps), DL.rmsNorm(X, γ, eps) — these
+                   normalise ACROSS a row and so never depend on the batch.
+     · clipping    DL.clipValue(g, c) — changes the DIRECTION;
+                   DL.clipNorm(g, c) → {g, norm, scaled, factor} — does not
      · drawing     DL.frame, DL.axisB, DL.axisL, DL.gridX, DL.gridY, DL.legend,
                    DL.panelBox, DL.kv, DL.matText, DL.arrow, DL.curve, DL.clip,
                    DL.cells, DL.netDiagram(g, sizes, opt)
@@ -511,6 +547,353 @@ const DL = (function () {
     return prod * regionsShallow(d, widths[widths.length - 1]);
   }
 
+  /* ══ statistics on flat arrays ══════════════════════════════════════════
+     Added by part 2 (Training). Sample (1/n) moments unless ddof is given;
+     the BATCH-NORM distinction between the 1/m used to normalise and the
+     1/(m−1) used for the RUNNING estimate is why ddof is exposed at all.   */
+  const mean = a => a.reduce((s, x) => s + x, 0) / a.length;
+  function variance(a, ddof) {
+    const m = mean(a), d = (ddof === undefined ? 0 : ddof);
+    return a.reduce((s, x) => s + (x - m) * (x - m), 0) / Math.max(1, a.length - d);
+  }
+  const std = (a, ddof) => Math.sqrt(variance(a, ddof));
+  /* column-wise standardisation of an (N × d) row-major batch. Promoted from
+     neural-networks.viz.js in part 2, which needed the same routine for the
+     input-conditioning figure — one concept, one implementation.            */
+  function standardise(X) {
+    const d = X[0].length, N = X.length, mu = zeros(d), sd = zeros(d);
+    for (const r of X) for (let j = 0; j < d; j++) mu[j] += r[j] / N;
+    for (const r of X) for (let j = 0; j < d; j++) sd[j] += (r[j] - mu[j]) * (r[j] - mu[j]) / N;
+    for (let j = 0; j < d; j++) sd[j] = Math.sqrt(sd[j]) || 1;
+    return { X: X.map(r => r.map((v, j) => (v - mu[j]) / sd[j])), mu: mu, sd: sd };
+  }
+
+  /* A logistic classifier fitted by full-batch gradient descent on the
+     cross-entropy, with an optional L2 penalty. Promoted from
+     neural-networks.viz.js by part 2, which needed the identical routine for
+     the empirical-risk figure: the POINT of both figures is that the fitting
+     procedure is held fixed while something else varies, which only works if
+     it is literally the same code. X is (N × d), y a 0/1 array.              */
+  function logistic(X, y, steps, lr, l2) {
+    const d = X[0].length, N = X.length;
+    const w = zeros(d);
+    let b = 0;
+    const S = steps || 400, LR = lr === undefined ? 0.5 : lr, L2 = l2 === undefined ? 1e-3 : l2;
+    for (let t = 0; t < S; t++) {
+      const gw = zeros(d);
+      let gb = 0;
+      for (let i = 0; i < N; i++) {
+        const e = sigmoid(dot(w, X[i]) + b) - y[i];
+        for (let j = 0; j < d; j++) gw[j] += e * X[i][j];
+        gb += e;
+      }
+      for (let j = 0; j < d; j++) w[j] -= LR * (gw[j] / N + L2 * w[j]);
+      b -= LR * gb / N;
+    }
+    return { w: w, b: b };
+  }
+  const logit = (model, x) => dot(model.w, x) + model.b;
+  function accuracy(model, X, y) {
+    let n = 0;
+    for (let i = 0; i < X.length; i++) if ((logit(model, X[i]) >= 0 ? 1 : 0) === y[i]) n++;
+    return n / X.length;
+  }
+  /* mean binary cross-entropy of a linear model, from the LOGIT — the stable
+     form, so a perfectly separating fit reports a large finite number and not
+     an infinity.                                                             */
+  function logisticLoss(model, X, y) {
+    let s = 0;
+    for (let i = 0; i < X.length; i++) s += bce(logit(model, X[i]), y[i]);
+    return s / X.length;
+  }
+
+  /* ══ spectra ════════════════════════════════════════════════════════════
+     eig2sym: the EXACT eigendecomposition of a symmetric 2×2. Every
+     conditioning claim in the series is checked against this rather than
+     asserted, and a 2×2 has a closed form so there is no excuse not to.
+       [a b; b c] → {lo, hi, vlo, vhi, cond}                                  */
+  function eig2sym(a, b, c) {
+    const tr = a + c, det = a * c - b * b;
+    const disc = Math.sqrt(Math.max(0, tr * tr / 4 - det));
+    const hi = tr / 2 + disc, lo = tr / 2 - disc;
+    let vhi, vlo;
+    if (Math.abs(b) > 1e-14) {
+      vhi = [hi - c, b]; vlo = [lo - c, b];
+    } else {                                    // already diagonal
+      vhi = (a >= c) ? [1, 0] : [0, 1];
+      vlo = (a >= c) ? [0, 1] : [1, 0];
+    }
+    const nz = v => { const n = Math.hypot(v[0], v[1]) || 1; return [v[0] / n, v[1] / n]; };
+    return { lo: lo, hi: hi, vlo: nz(vlo), vhi: nz(vhi), cond: (lo === 0 ? Infinity : hi / lo) };
+  }
+  /* top |eigenvalue| of a square matrix by power iteration — the spectral
+     norm of a SYMMETRIC matrix, and for a general one the top |λ|, which is
+     NOT the same as ‖A‖₂ (that is σ_max). Used by the Jacobian-product
+     figures, which say which of the two they mean.                          */
+  function powerIter(A, iters, seed) {
+    const n = A.length, r = rng(seed || 5);
+    let v = new Array(n).fill(0).map(() => randn(r));
+    let lam = 0;
+    for (let t = 0; t < (iters || 200); t++) {
+      const w = matvec(A, v);
+      const nw = Math.hypot.apply(null, w) || 1;
+      v = w.map(x => x / nw);
+      lam = dot(v, matvec(A, v));
+    }
+    return { lambda: lam, v: v };
+  }
+  /* largest singular value: power iteration on AᵀA. ‖A‖₂ = max singular
+     value = the largest factor by which A can stretch ANY vector, which is
+     the quantity that governs whether a product of Jacobians explodes.       */
+  function specNorm(A, iters, seed) {
+    const AtA = matmul(transpose(A), A);
+    return Math.sqrt(Math.max(0, powerIter(AtA, iters || 200, seed).lambda));
+  }
+
+  /* ══ exponentially weighted moving average ══════════════════════════════
+     v_t = β·v_{t−1} + (1−β)·θ_t, v₀ = 0, with the OPTIONAL bias correction
+     v̂_t = v_t / (1 − βᵗ). Returns both tracks so a figure can draw the gap.
+     This is the mechanism every adaptive optimiser below reuses.             */
+  function ewma(series, beta, correct) {
+    let v = 0;
+    const raw = [], cor = [];
+    for (let t = 1; t <= series.length; t++) {
+      v = beta * v + (1 - beta) * series[t - 1];
+      raw.push(v);
+      cor.push(v / (1 - Math.pow(beta, t)));
+    }
+    return correct ? cor : raw;
+  }
+
+  /* ══ the optimisers ═════════════════════════════════════════════════════
+     Promoted into the shared library by part 2 so that every later part —
+     the residual page's warmup demo, the transformer page's schedule — uses
+     the SAME update rules rather than a re-typed variant.
+
+     Contract. Each entry is
+        {key, label, hp: [names], init(n) → state, step(state, g, hp) → dx}
+     where g is a flat array of gradients, dx is the flat array to ADD to the
+     parameters (so the caller does θ ← θ + dx and never has to remember a
+     sign), and state.t is the 1-based step counter, incremented by step().
+
+     Two conventions collide in the literature for momentum, and they are
+     DIFFERENT ALGORITHMS with the same name:
+        accumulation form   v ← βv + g          dx = −ηv
+        EWMA form           v ← βv + (1−β)g     dx = −ηv
+     At steady state under a constant gradient the first gives v = g/(1−β)
+     and the second gives v = g: the accumulation form multiplies the
+     effective step by 1/(1−β), a factor of TEN at β = 0.9. Both are provided
+     ("momentum" is the accumulation form, matching the common framework
+     default; "momentumEwma" is the other) because the page teaches the gap.
+     Adam's first moment is the EWMA form, with the bias correction supplying
+     the same normalisation that (1−β) does here.                             */
+  const OPT = {
+    sgd: {
+      key: "sgd", label: "SGD", hp: ["lr"],
+      init: n => ({ t: 0, n: n }),
+      step: (s, g, h) => { s.t++; return g.map(gi => -h.lr * gi); }
+    },
+    momentum: {
+      key: "momentum", label: "momentum (accumulation form)", hp: ["lr", "beta"],
+      init: n => ({ t: 0, n: n, v: zeros(n) }),
+      step: (s, g, h) => {
+        s.t++;
+        for (let i = 0; i < g.length; i++) s.v[i] = h.beta * s.v[i] + g[i];
+        return s.v.map(v => -h.lr * v);
+      }
+    },
+    momentumEwma: {
+      key: "momentumEwma", label: "momentum (EWMA form)", hp: ["lr", "beta"],
+      init: n => ({ t: 0, n: n, v: zeros(n) }),
+      step: (s, g, h) => {
+        s.t++;
+        for (let i = 0; i < g.length; i++) s.v[i] = h.beta * s.v[i] + (1 - h.beta) * g[i];
+        return s.v.map(v => -h.lr * v);
+      }
+    },
+    /* Nesterov in the "lookahead already applied" rewriting used by the
+       frameworks: the gradient handed in is evaluated at the CURRENT point
+       and the extrapolation is folded into the update, which is algebraically
+       the same trajectory as evaluating ∇J(θ + βv) and stepping by v.        */
+    nesterov: {
+      key: "nesterov", label: "Nesterov momentum", hp: ["lr", "beta"],
+      init: n => ({ t: 0, n: n, v: zeros(n) }),
+      step: (s, g, h) => {
+        s.t++;
+        const dx = [];
+        for (let i = 0; i < g.length; i++) {
+          const vPrev = s.v[i];
+          s.v[i] = h.beta * vPrev + g[i];
+          dx.push(-h.lr * (g[i] + h.beta * s.v[i]));
+        }
+        return dx;
+      }
+    },
+    adagrad: {
+      key: "adagrad", label: "AdaGrad", hp: ["lr", "eps"],
+      init: n => ({ t: 0, n: n, r: zeros(n) }),
+      step: (s, g, h) => {
+        s.t++;
+        const e = h.eps === undefined ? 1e-8 : h.eps, dx = [];
+        for (let i = 0; i < g.length; i++) {
+          s.r[i] += g[i] * g[i];
+          dx.push(-h.lr * g[i] / (Math.sqrt(s.r[i]) + e));
+        }
+        return dx;
+      }
+    },
+    rmsprop: {
+      key: "rmsprop", label: "RMSProp", hp: ["lr", "beta2", "eps"],
+      init: n => ({ t: 0, n: n, r: zeros(n) }),
+      step: (s, g, h) => {
+        s.t++;
+        const b2 = h.beta2 === undefined ? 0.999 : h.beta2, e = h.eps === undefined ? 1e-8 : h.eps, dx = [];
+        for (let i = 0; i < g.length; i++) {
+          s.r[i] = b2 * s.r[i] + (1 - b2) * g[i] * g[i];
+          dx.push(-h.lr * g[i] / (Math.sqrt(s.r[i]) + e));
+        }
+        return dx;
+      }
+    },
+    adam: {
+      key: "adam", label: "Adam", hp: ["lr", "beta1", "beta2", "eps", "correct", "l2"],
+      init: n => ({ t: 0, n: n, m: zeros(n), v: zeros(n) }),
+      step: (s, g, h) => {
+        s.t++;
+        const b1 = h.beta1 === undefined ? 0.9 : h.beta1,
+          b2 = h.beta2 === undefined ? 0.999 : h.beta2,
+          e = h.eps === undefined ? 1e-8 : h.eps,
+          on = (h.correct === undefined) ? true : !!h.correct,
+          c1 = on ? (1 - Math.pow(b1, s.t)) : 1,
+          c2 = on ? (1 - Math.pow(b2, s.t)) : 1, dx = [];
+        for (let i = 0; i < g.length; i++) {
+          /* COUPLED L2: the penalty enters the gradient, so it is scaled by
+             1/√v̂ along with everything else. That is the behaviour AdamW
+             exists to undo; see the "adamw" entry.                           */
+          const gi = g[i] + (h.l2 ? h.l2 * (h.theta ? h.theta[i] : 0) : 0);
+          s.m[i] = b1 * s.m[i] + (1 - b1) * gi;
+          s.v[i] = b2 * s.v[i] + (1 - b2) * gi * gi;
+          dx.push(-h.lr * (s.m[i] / c1) / (Math.sqrt(s.v[i] / c2) + e));
+        }
+        return dx;
+      }
+    },
+    /* DECOUPLED weight decay. The decay term is subtracted from the
+       parameters directly and never passes through the 1/√v̂ rescaling, so
+       every coordinate decays at the same rate λ regardless of its gradient
+       history. h.theta must be supplied — the decay is a function of the
+       CURRENT parameters, which is exactly what makes it not a gradient.     */
+    adamw: {
+      key: "adamw", label: "AdamW (decoupled decay)", hp: ["lr", "beta1", "beta2", "eps", "wd"],
+      init: n => ({ t: 0, n: n, m: zeros(n), v: zeros(n) }),
+      step: (s, g, h) => {
+        s.t++;
+        const b1 = h.beta1 === undefined ? 0.9 : h.beta1,
+          b2 = h.beta2 === undefined ? 0.999 : h.beta2,
+          e = h.eps === undefined ? 1e-8 : h.eps,
+          c1 = 1 - Math.pow(b1, s.t), c2 = 1 - Math.pow(b2, s.t),
+          wd = h.wd || 0, th = h.theta, dx = [];
+        for (let i = 0; i < g.length; i++) {
+          s.m[i] = b1 * s.m[i] + (1 - b1) * g[i];
+          s.v[i] = b2 * s.v[i] + (1 - b2) * g[i] * g[i];
+          dx.push(-h.lr * ((s.m[i] / c1) / (Math.sqrt(s.v[i] / c2) + e) + wd * (th ? th[i] : 0)));
+        }
+        return dx;
+      }
+    }
+  };
+  const optList = () => ["sgd", "momentum", "momentumEwma", "nesterov", "adagrad", "rmsprop", "adam", "adamw"];
+
+  /* ══ learning-rate schedules ════════════════════════════════════════════
+     lrAt(kind, t, o) with t ZERO-BASED and o = {peak, total, warm, floor,
+     step (period), gamma, power}. Warmup is LINEAR from 0 to peak over the
+     first o.warm steps and is applied to every kind, because that is how it
+     is used in practice: warmup is a prefix, not a schedule of its own.      */
+  function lrAt(kind, t, o) {
+    const p = o.peak === undefined ? 1 : o.peak, T = o.total || 1000,
+      w = o.warm || 0, fl = o.floor === undefined ? 0 : o.floor;
+    if (w > 0 && t < w) return p * (t / w);
+    const u = clamp((t - w) / Math.max(1, T - w), 0, 1);       // progress after warmup
+    switch (kind) {
+      case "constant": return p;
+      case "cosine": return fl + (p - fl) * 0.5 * (1 + Math.cos(Math.PI * u));
+      case "linear": return fl + (p - fl) * (1 - u);
+      case "step": {
+        const per = o.step || Math.max(1, Math.floor(T / 4)), gm = o.gamma === undefined ? 0.1 : o.gamma;
+        return p * Math.pow(gm, Math.floor((t - w) / per));
+      }
+      case "exp": {
+        const per = o.step || Math.max(1, Math.floor(T / 4)), gm = o.gamma === undefined ? 0.1 : o.gamma;
+        return p * Math.pow(gm, (t - w) / per);
+      }
+      case "power": {            // η₀ / (1 + t/s)^c
+        const sN = o.step || Math.max(1, Math.floor(T / 10)), c = o.power === undefined ? 1 : o.power;
+        return p / Math.pow(1 + (t - w) / sN, c);
+      }
+      case "invsqrt": {          // the transformer schedule: peak at t = w, then t^(−1/2)
+        const w1 = Math.max(w, 1);
+        return p * Math.sqrt(w1 / Math.max(t, w1));
+      }
+      case "onecycle": {         // up to the peak at 30 %, cosine down, then a tail
+        const a = 0.3;
+        return u < a ? fl + (p - fl) * (u / a)
+          : fl * 0.04 + (p - fl * 0.04) * 0.5 * (1 + Math.cos(Math.PI * (u - a) / (1 - a)));
+      }
+      default: return p;
+    }
+  }
+
+  /* ══ normalisation layers ═══════════════════════════════════════════════
+     Row convention throughout: X is (N × d), one example per ROW.
+     batchNorm normalises DOWN a column (across the batch, per feature);
+     layerNorm and rmsNorm normalise ACROSS a row (per example, over the
+     features) and therefore do not depend on the batch at all — which is the
+     whole reason sequence models use them.                                   */
+  function batchNorm(X, gamma, beta, eps, stats) {
+    const N = X.length, d = X[0].length, e = eps === undefined ? 1e-5 : eps;
+    const mu = zeros(d), va = zeros(d);
+    if (stats) {                                   // EVAL mode: fixed statistics
+      for (let j = 0; j < d; j++) { mu[j] = stats.mu[j]; va[j] = stats.va[j]; }
+    } else {                                       // TRAIN mode: this batch
+      for (let j = 0; j < d; j++) {
+        for (let i = 0; i < N; i++) mu[j] += X[i][j] / N;
+        for (let i = 0; i < N; i++) va[j] += (X[i][j] - mu[j]) * (X[i][j] - mu[j]) / N;
+      }
+    }
+    const Y = X.map(r => r.map((v, j) =>
+      (gamma ? gamma[j] : 1) * (v - mu[j]) / Math.sqrt(va[j] + e) + (beta ? beta[j] : 0)));
+    /* the UNBIASED (1/(N−1)) variance is what goes into the running estimate,
+       while the BIASED (1/N) one above is what normalises the batch — the two
+       differ by N/(N−1) and frameworks really do use different ones here.     */
+    const vaU = zeros(d);
+    if (!stats) for (let j = 0; j < d; j++)
+      for (let i = 0; i < N; i++) vaU[j] += (X[i][j] - mu[j]) * (X[i][j] - mu[j]) / Math.max(1, N - 1);
+    return { Y: Y, mu: mu, va: va, vaUnbiased: vaU };
+  }
+  function layerNorm(X, gamma, beta, eps) {
+    const e = eps === undefined ? 1e-5 : eps;
+    return X.map(r => {
+      const m = mean(r), v = variance(r);
+      return r.map((x, j) => (gamma ? gamma[j] : 1) * (x - m) / Math.sqrt(v + e) + (beta ? beta[j] : 0));
+    });
+  }
+  function rmsNorm(X, gamma, eps) {
+    const e = eps === undefined ? 1e-5 : eps;
+    return X.map(r => {
+      const ms = r.reduce((s, x) => s + x * x, 0) / r.length;
+      const inv = 1 / Math.sqrt(ms + e);
+      return r.map((x, j) => (gamma ? gamma[j] : 1) * x * inv);
+    });
+  }
+
+  /* ══ gradient clipping ══════════════════════════════════════════════════ */
+  const clipValue = (g, c) => g.map(x => clamp(x, -c, c));
+  function clipNorm(g, c) {                        // preserves DIRECTION exactly
+    const n = Math.sqrt(g.reduce((s, x) => s + x * x, 0));
+    const f = (n > c) ? c / n : 1;
+    return { g: g.map(x => x * f), norm: n, scaled: f < 1, factor: f };
+  }
+
   /* ══ drawing ════════════════════════════════════════════════════════════
      Same contract as the vision series: the <svg> already exists in the HTML
      with its viewBox / role / aria-label; these only append into it.         */
@@ -711,6 +1094,9 @@ const DL = (function () {
     ACT, act, actList, maxout,
     mlpInit, forward, predict, loss, backward, numGrad, sgdStep, cloneNet,
     params, macs, binom, regionsShallow, regionsDeepLB,
+    mean, variance, std, standardise, eig2sym, powerIter, specNorm,
+    ewma, OPT, optList, lrAt, batchNorm, layerNorm, rmsNorm, clipValue, clipNorm,
+    logistic, logit, accuracy, logisticLoss,
     frame, axisB, axisL, gridX, gridY, legend, panelBox, kv, matText, arrow, curve, clip,
     cells, netDiagram
   };

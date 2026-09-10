@@ -36,44 +36,6 @@
 /* ══════════ page-local helpers (deliberately NOT in dl-viz.js) ══════════ */
 const NN = (function () {
 
-  /* A logistic classifier fitted by plain full-batch gradient descent on the
-     cross-entropy. Used only by figure 3, where the POINT is that the
-     classifier never changes and only its input does — so it must be the
-     identical routine in every panel. Returns {w, b, acc(X, y)}.            */
-  function logistic(X, y, steps, lr, l2) {
-    const d = X[0].length, N = X.length;
-    let w = new Array(d).fill(0), b = 0;
-    const S = steps || 400, LR = lr === undefined ? 0.5 : lr, L2 = l2 === undefined ? 1e-3 : l2;
-    for (let t = 0; t < S; t++) {
-      const gw = new Array(d).fill(0);
-      let gb = 0;
-      for (let i = 0; i < N; i++) {
-        const z = DL.dot(w, X[i]) + b, e = DL.sigmoid(z) - y[i];
-        for (let j = 0; j < d; j++) gw[j] += e * X[i][j];
-        gb += e;
-      }
-      for (let j = 0; j < d; j++) w[j] -= LR * (gw[j] / N + L2 * w[j]);
-      b -= LR * gb / N;
-    }
-    return { w: w, b: b };
-  }
-  function accuracy(model, X, y) {
-    let n = 0;
-    for (let i = 0; i < X.length; i++) {
-      const p = DL.dot(model.w, X[i]) + model.b >= 0 ? 1 : 0;
-      if (p === y[i]) n++;
-    }
-    return n / X.length;
-  }
-  /* column-wise standardisation, so the fitted classifier is comparable
-     across representations whose scales differ by orders of magnitude       */
-  function standardise(X) {
-    const d = X[0].length, N = X.length, mu = new Array(d).fill(0), sd = new Array(d).fill(0);
-    for (const r of X) for (let j = 0; j < d; j++) mu[j] += r[j] / N;
-    for (const r of X) for (let j = 0; j < d; j++) sd[j] += (r[j] - mu[j]) * (r[j] - mu[j]) / N;
-    for (let j = 0; j < d; j++) sd[j] = Math.sqrt(sd[j]) || 1;
-    return X.map(r => r.map((v, j) => (v - mu[j]) / sd[j]));
-  }
 
   /* a p-piece sawtooth on [0, 1], built from p rectified units. Exact, and
      used by figures 7 and 18 — the SAME function, so the two agree.        */
@@ -93,7 +55,7 @@ const NN = (function () {
   }
   const hue = (i, n) => d3.interpolateTurbo(((i * 0.6180339887) % 1));
 
-  return { logistic, accuracy, standardise, sawtooth, countRegions, hue };
+  return { sawtooth, countRegions, hue };
 })();
 
 /* ═════════════════ 1 · #chain-svg — the chain and its budget ═════════════════ */
@@ -412,11 +374,11 @@ const NN = (function () {
     const idx = d3.range(D.X.length), tr = idx.filter(i => i % 2 === 0), te = idx.filter(i => i % 2 === 1);
 
     const T = transform(rep, D.X, D.y, h);
-    const rawS = NN.standardise(D.X), repS = NN.standardise(T.Z);
-    const mRaw = NN.logistic(tr.map(i => rawS[i]), tr.map(i => D.y[i]), 600, 0.8);
-    const mRep = NN.logistic(tr.map(i => repS[i]), tr.map(i => D.y[i]), 600, 0.8);
-    const aRaw = NN.accuracy(mRaw, te.map(i => rawS[i]), te.map(i => D.y[i]));
-    const aRep = NN.accuracy(mRep, te.map(i => repS[i]), te.map(i => D.y[i]));
+    const rawS = DL.standardise(D.X).X, repS = DL.standardise(T.Z).X;
+    const mRaw = DL.logistic(tr.map(i => rawS[i]), tr.map(i => D.y[i]), 600, 0.8);
+    const mRep = DL.logistic(tr.map(i => repS[i]), tr.map(i => D.y[i]), 600, 0.8);
+    const aRaw = DL.accuracy(mRaw, te.map(i => rawS[i]), te.map(i => D.y[i]));
+    const aRep = DL.accuracy(mRep, te.map(i => repS[i]), te.map(i => D.y[i]));
 
     const F = DL.frame(svg, W, H, { l: 16, r: 14, t: 26, b: 10 });
     const G = F.g, PS = 250;
@@ -2482,9 +2444,9 @@ const NN = (function () {
     return [mxS, mxL, rough, Math.sqrt(rough)];
   }
   function score(feats, y, tr, te) {
-    const Z = NN.standardise(feats);
-    const m = NN.logistic(tr.map(i => Z[i]), tr.map(i => y[i]), 600, 0.6, 2e-3);
-    return NN.accuracy(m, te.map(i => Z[i]), te.map(i => y[i]));
+    const Z = DL.standardise(feats).X;
+    const m = DL.logistic(tr.map(i => Z[i]), tr.map(i => y[i]), 600, 0.6, 2e-3);
+    return DL.accuracy(m, te.map(i => Z[i]), te.map(i => y[i]));
   }
 
   function draw() {
