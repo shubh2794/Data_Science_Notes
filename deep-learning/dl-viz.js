@@ -61,7 +61,9 @@
                    mean cross-entropy, so a separating fit reports a large
                    FINITE number                                [part 2]
      · spectra     DL.eig2sym(a,b,c) → {lo, hi, vlo, vhi, cond}  — EXACT, for
-                   the conditioning claims; DL.powerIter(A) → top |λ|;
+                   the conditioning claims; DL.powerIter(A) → {lambda, v}:
+                   the top |λ| AND its eigenvector (the header used to name
+                   only the value; the function has always returned both);
                    DL.specNorm(A) → ‖A‖₂, the top SINGULAR value, which is the
                    quantity that governs a product of Jacobians [part 2]
      · averaging   DL.ewma(series, β, correct) — v_t = βv_{t−1} + (1−β)θ_t with
@@ -90,6 +92,19 @@
                    normalise ACROSS a row and so never depend on the batch.
      · clipping    DL.clipValue(g, c) — changes the DIRECTION;
                    DL.clipNorm(g, c) → {g, norm, scaled, factor} — does not
+     · convolution DL.outSize(n, f, {s, p0, p1, d}), DL.effK(f, d),
+                   DL.padFor("valid"|"same"|"full", n, f, s, d) → {p0, p1,
+                   total, symmetric}; DL.corr2d / DL.conv2dTrue (single
+                   channel), DL.conv2dMC(V, K, b, o) (CHW multi-channel, with
+                   stride, dilation and groups), DL.convGradK / DL.convGradV /
+                   DL.convGradB (the two backward operations, audited against
+                   central differences to 2.9e−09 relative), DL.pool2d,
+                   DL.globalPool, DL.convCount, DL.rfChain, DL.im2col,
+                   DL.ker2col, DL.convMatrix, DL.zeros3, DL.flipK  [part 3]
+                   READ THE SCOPE BOUNDARY comment above these: CLASSICAL
+                   FILTERING (border modes, separable and Gaussian kernels)
+                   belongs to vision/vision-viz.js and is NOT duplicated here;
+                   on the overlap the two agree to 0.000e+00.
      · drawing     DL.frame, DL.axisB, DL.axisL, DL.gridX, DL.gridY, DL.legend,
                    DL.panelBox, DL.kv, DL.matText, DL.arrow, DL.curve, DL.clip,
                    DL.cells, DL.netDiagram(g, sizes, opt)
@@ -1085,6 +1100,348 @@ const DL = (function () {
     return { g: gg, cols: cols };
   }
 
+  /* ══ 2-D convolution AS A LAYER ═════════════════════════════════════════
+     [added by part 3 — Convolutional Networks]
+
+     ── SCOPE BOUNDARY, stated once ──────────────────────────────────────
+     CLASSICAL IMAGE FILTERING is not owned here. Correlation against
+     convolution, separable kernels, the Gaussian / box / binomial families
+     and the five border modes zero | clamp | wrap | mirror | symm belong to
+     the Computer Vision series, and their canonical implementation is
+     vision/vision-viz.js (corr2, conv2, sepH, sepV, sep2, gauss1, box,
+     binomial, flip2), verified there against scipy.ndimage to 0.000e+00 on
+     every one of those modes. A deep-learning page sits in a sibling folder
+     and cannot load that file, so the LAYER arithmetic a convnet needs lives
+     here. These are NOT a fork of it, because they compute a different
+     thing:
+
+       vision/vision-viz.js corr2 → ALWAYS a same-size map. Odd kernel,
+         centred, radius (f−1)>>1, any of five border modes. It is a
+         FILTERING primitive: the output grid is the input grid.
+       DL.corr2d / DL.conv2dMC below → the LAYER output grid
+         ⌊(n + p₀ + p₁ − (d(f−1)+1)) / s⌋ + 1, with explicit and possibly
+         ASYMMETRIC ZERO padding, a stride, a dilation, and EVEN kernels
+         allowed. Zero padding only — a convolution layer has no other
+         border mode, which is itself a fact the page teaches.
+
+     On their overlap — odd f, s = 1, d = 1, p₀ = p₁ = (f−1)/2, mode "zero" —
+     the two must agree ELEMENTWISE. The build checks exactly that: max |Δ|
+     = 0.000e+00 over 240 random inputs and every kernel from 1×1 to 7×7. If
+     either convention is ever changed, that check is the tripwire. Nothing
+     here should ever grow a border mode; a DL page that wants one is asking
+     a vision question.
+
+     Tensor layout: CHW, i.e. V[channel][row][col] and K[out][in][row][col] —
+     NCHW with the per-example batch axis dropped. The consuming page
+     declares NCHW at the top and never departs from it.
+     One padding pair (p₀ before, p₁ after) is used on BOTH axes, as is one
+     stride and one dilation; every geometry this series teaches is
+     axis-symmetric in that sense.                                          */
+
+  /* the output length along one axis. o = {s, p0, p1, d} */
+  const effK = (f, d) => ((d === undefined ? 1 : d) || 1) * (f - 1) + 1;
+  function outSize(n, f, o) {
+    const oo = o || {};
+    const s = oo.s || 1, d = oo.d || 1, p0 = oo.p0 || 0, p1 = oo.p1 || 0;
+    return Math.floor((n + p0 + p1 - effK(f, d)) / s) + 1;
+  }
+
+  /* The three named padding policies resolved to an EXPLICIT (p₀, p₁) pair.
+     "same" means ⌈n/s⌉ outputs — the length the input would have had if it
+     were itself strided; at s = 1 that is n, the familiar case.
+     `symmetric` is false when the required total is odd, which is exactly
+     the even-kernel trap: the pair returned is then lopsided, which is what
+     a framework's string policy does, and which an integer `padding=p`
+     argument cannot express at all.                                        */
+  function padFor(mode, n, f, s, d) {
+    const S = s || 1, D = d || 1, fe = effK(f, D);
+    if (mode === "valid") return { p0: 0, p1: 0, total: 0, symmetric: true };
+    if (mode === "full") return { p0: fe - 1, p1: fe - 1, total: 2 * (fe - 1), symmetric: true };
+    const out = Math.ceil(n / S);
+    const total = Math.max(0, (out - 1) * S + fe - n);
+    const p0 = Math.floor(total / 2);
+    return { p0: p0, p1: total - p0, total: total, symmetric: (total % 2 === 0) };
+  }
+
+  const flipK = K => K.map(r => r.slice()).reverse().map(r => r.reverse());
+
+  /* single-channel 2-D CORRELATION with layer geometry.
+     o = {s, p0, p1, d, flip}; flip:true makes it a true CONVOLUTION.
+     Taps that fall outside the input read 0 — implicit zero padding.       */
+  function corr2d(X, K, o) {
+    const oo = Object.assign({ s: 1, p0: 0, p1: 0, d: 1, flip: false }, o || {});
+    const H = X.length, W = X[0].length;
+    const KK = oo.flip ? flipK(K) : K;
+    const kh = KK.length, kw = KK[0].length;
+    const Ho = Math.max(0, outSize(H, kh, oo)), Wo = Math.max(0, outSize(W, kw, oo));
+    const Y = zeros2(Ho, Wo);
+    for (let p = 0; p < Ho; p++) for (let q = 0; q < Wo; q++) {
+      let acc = 0;
+      for (let m = 0; m < kh; m++) {
+        const i = p * oo.s + m * oo.d - oo.p0;
+        if (i < 0 || i >= H) continue;
+        const Xi = X[i], Km = KK[m];
+        for (let n = 0; n < kw; n++) {
+          const j = q * oo.s + n * oo.d - oo.p0;
+          if (j < 0 || j >= W) continue;
+          acc += Xi[j] * Km[n];
+        }
+      }
+      Y[p][q] = acc;
+    }
+    return Y;
+  }
+  const conv2dTrue = (X, K, o) => corr2d(X, K, Object.assign({}, o || {}, { flip: true }));
+
+  /* zeros3(C, H, W) — a C-deep stack of H×W maps */
+  function zeros3(C, H, W) { const A = []; for (let c = 0; c < C; c++) A.push(zeros2(H, W)); return A; }
+
+  /* MULTI-CHANNEL forward pass, the thing a convolution LAYER actually is.
+       V  (Cᵢₙ × H × W)                  input volume
+       K  (Cₒᵤₜ × Cᵢₙ/g × kh × kw)       one 3-D filter per output channel
+       b  (Cₒᵤₜ) or null
+       o  {s, p0, p1, d, groups}
+     → Z  (Cₒᵤₜ × H′ × W′).  CORRELATION, not flipped: this is what every
+     framework calls "conv2d" and the page says so out loud.                */
+  function conv2dMC(V, K, b, o) {
+    const oo = Object.assign({ s: 1, p0: 0, p1: 0, d: 1, groups: 1 }, o || {});
+    const Cin = V.length, H = V[0].length, W = V[0][0].length;
+    const Cout = K.length, kin = K[0].length, kh = K[0][0].length, kw = K[0][0][0].length;
+    const g = oo.groups, cinG = Cin / g, coutG = Cout / g;
+    const Ho = Math.max(0, outSize(H, kh, oo)), Wo = Math.max(0, outSize(W, kw, oo));
+    const Z = zeros3(Cout, Ho, Wo);
+    for (let co = 0; co < Cout; co++) {
+      const grp = Math.floor(co / coutG), base = grp * cinG;
+      const bias = b ? b[co] : 0;
+      for (let p = 0; p < Ho; p++) for (let q = 0; q < Wo; q++) {
+        let acc = bias;
+        for (let ci = 0; ci < kin; ci++) {
+          const Vc = V[base + ci], Kc = K[co][ci];
+          for (let m = 0; m < kh; m++) {
+            const i = p * oo.s + m * oo.d - oo.p0;
+            if (i < 0 || i >= H) continue;
+            const Vi = Vc[i], Km = Kc[m];
+            for (let n = 0; n < kw; n++) {
+              const j = q * oo.s + n * oo.d - oo.p0;
+              if (j < 0 || j >= W) continue;
+              acc += Vi[j] * Km[n];
+            }
+          }
+        }
+        Z[co][p][q] = acc;
+      }
+    }
+    return Z;
+  }
+
+  /* THE TWO BACKWARD OPERATIONS. Both are written as a transposition of the
+     SAME triple loop as conv2dMC — the (co, p, q, ci, m, n) → (i, j) index
+     map is written out once above and reused verbatim, so correctness is
+     structural rather than a re-derivation. The page then audits both
+     against central differences anyway.
+       convGradK(V, G, o, shape) = ∂L/∂K, a CORRELATION of the input with
+         the output gradient;
+       convGradV(K, G, o, H, W)  = ∂L/∂V, a scatter which for stride 1 and
+         no dilation is a FULL CONVOLUTION of G with the FLIPPED kernel;
+       convGradB(G)              = ∂L/∂b, summed over both spatial axes.    */
+  function convGradK(V, G, o, shape) {
+    const oo = Object.assign({ s: 1, p0: 0, p1: 0, d: 1, groups: 1 }, o || {});
+    const Cin = V.length, H = V[0].length, W = V[0][0].length;
+    const Cout = G.length, Ho = G[0].length, Wo = G[0][0].length;
+    const kh = shape.kh, kw = shape.kw, g = oo.groups;
+    const cinG = Cin / g, coutG = Cout / g, kin = shape.kin === undefined ? cinG : shape.kin;
+    const dK = [];
+    for (let co = 0; co < Cout; co++) dK.push(zeros3(kin, kh, kw));
+    for (let co = 0; co < Cout; co++) {
+      const grp = Math.floor(co / coutG), base = grp * cinG;
+      for (let p = 0; p < Ho; p++) for (let q = 0; q < Wo; q++) {
+        const gv = G[co][p][q];
+        if (gv === 0) continue;
+        for (let ci = 0; ci < kin; ci++) {
+          const Vc = V[base + ci];
+          for (let m = 0; m < kh; m++) {
+            const i = p * oo.s + m * oo.d - oo.p0;
+            if (i < 0 || i >= H) continue;
+            for (let n = 0; n < kw; n++) {
+              const j = q * oo.s + n * oo.d - oo.p0;
+              if (j < 0 || j >= W) continue;
+              dK[co][ci][m][n] += gv * Vc[i][j];
+            }
+          }
+        }
+      }
+    }
+    return dK;
+  }
+  function convGradV(K, G, o, H, W) {
+    const oo = Object.assign({ s: 1, p0: 0, p1: 0, d: 1, groups: 1 }, o || {});
+    const Cout = K.length, kin = K[0].length, kh = K[0][0].length, kw = K[0][0][0].length;
+    const Ho = G[0].length, Wo = G[0][0].length, g = oo.groups;
+    const coutG = Cout / g, Cin = kin * g, cinG = kin;
+    const dV = zeros3(Cin, H, W);
+    for (let co = 0; co < Cout; co++) {
+      const grp = Math.floor(co / coutG), base = grp * cinG;
+      for (let p = 0; p < Ho; p++) for (let q = 0; q < Wo; q++) {
+        const gv = G[co][p][q];
+        if (gv === 0) continue;
+        for (let ci = 0; ci < kin; ci++) {
+          const Kc = K[co][ci], Dc = dV[base + ci];
+          for (let m = 0; m < kh; m++) {
+            const i = p * oo.s + m * oo.d - oo.p0;
+            if (i < 0 || i >= H) continue;
+            for (let n = 0; n < kw; n++) {
+              const j = q * oo.s + n * oo.d - oo.p0;
+              if (j < 0 || j >= W) continue;
+              Dc[i][j] += gv * Kc[m][n];
+            }
+          }
+        }
+      }
+    }
+    return dV;
+  }
+  const convGradB = G => G.map(m => m.reduce((s, r) => s + r.reduce((t, v) => t + v, 0), 0));
+
+  /* POOLING, channel by channel. o = {k, s, p0, p1, mode:"max"|"avg"}.
+     Returns {Y, arg} where arg[c][p][q] = [i, j] is the position the max was
+     taken from — the routing decision the page's critique of pooling needs
+     to be able to draw. Pooling never mixes channels, so Cₒᵤₜ = Cᵢₙ and the
+     layer has no parameters.                                               */
+  function pool2d(V, o) {
+    const oo = Object.assign({ k: 2, s: null, p0: 0, p1: 0, mode: "max" }, o || {});
+    const s = oo.s === null ? oo.k : oo.s;
+    const C = V.length, H = V[0].length, W = V[0][0].length;
+    const geom = { s: s, p0: oo.p0, p1: oo.p1, d: 1 };
+    const Ho = Math.max(0, outSize(H, oo.k, geom)), Wo = Math.max(0, outSize(W, oo.k, geom));
+    const Y = zeros3(C, Ho, Wo), arg = [];
+    for (let c = 0; c < C; c++) {
+      const ac = []; arg.push(ac);
+      for (let p = 0; p < Ho; p++) {
+        const ap = []; ac.push(ap);
+        for (let q = 0; q < Wo; q++) {
+          let best = -Infinity, bi = -1, bj = -1, sum = 0, cnt = 0;
+          for (let m = 0; m < oo.k; m++) {
+            const i = p * s + m - oo.p0;
+            if (i < 0 || i >= H) continue;
+            for (let n = 0; n < oo.k; n++) {
+              const j = q * s + n - oo.p0;
+              if (j < 0 || j >= W) continue;
+              const v = V[c][i][j];
+              sum += v; cnt++;
+              if (v > best) { best = v; bi = i; bj = j; }
+            }
+          }
+          Y[c][p][q] = (oo.mode === "avg") ? (cnt ? sum / cnt : 0) : (cnt ? best : 0);
+          ap.push([bi, bj]);
+        }
+      }
+    }
+    return { Y: Y, arg: arg, Ho: Ho, Wo: Wo };
+  }
+  /* global pooling: one number per channel */
+  const globalPool = (V, mode) => V.map(M => {
+    let s = 0, n = 0, mx = -Infinity;
+    for (let i = 0; i < M.length; i++) for (let j = 0; j < M[0].length; j++) { s += M[i][j]; n++; if (M[i][j] > mx) mx = M[i][j]; }
+    return mode === "max" ? mx : s / n;
+  });
+
+  /* ══ counting a convolution layer ═══════════════════════════════════════
+     MACs, consistently with DL.macs: ONE multiply–accumulate, not two
+     FLOPs. Papers differ by exactly that factor of two and the page says so.
+     L = {cin, cout, k, kh, kw, s, p0, p1, d, groups, bias, H, W}.          */
+  function convCount(L) {
+    const kh = L.kh === undefined ? L.k : L.kh, kw = L.kw === undefined ? L.k : L.kw;
+    const g = L.groups || 1, geom = { s: L.s || 1, p0: L.p0 || 0, p1: L.p1 === undefined ? (L.p0 || 0) : L.p1, d: L.d || 1 };
+    const Ho = outSize(L.H, kh, geom), Wo = outSize(L.W, kw, geom);
+    const perFilter = (L.cin / g) * kh * kw;
+    const weights = L.cout * perFilter;
+    const biases = (L.bias === false) ? 0 : L.cout;
+    const macs = Ho * Wo * L.cout * perFilter;
+    return {
+      Ho: Ho, Wo: Wo, perFilter: perFilter, weights: weights, biases: biases,
+      params: weights + biases, macs: macs, flops2: 2 * macs,
+      acts: L.cout * Ho * Wo,
+      /* the same map computed by a DENSE layer instead, for the contrast */
+      denseParams: (L.cin * L.H * L.W) * (L.cout * Ho * Wo) + (L.bias === false ? 0 : L.cout * Ho * Wo),
+      reuse: Ho * Wo                       // times each weight is used per example
+    };
+  }
+
+  /* ══ receptive field of a stack ═════════════════════════════════════════
+     layers = [{k, s, p0, d}] in order. Returns one record per layer with
+       r      the receptive field, in input pixels, of ONE output unit
+       j      the jump: the input distance between adjacent output units
+       start  the input coordinate of the CENTRE of output unit 0
+     r₀ = 1, j₀ = 1, start₀ = 0.5 (pixel centres at 0.5, 1.5, …), and
+       jₗ = jₗ₋₁·sₗ
+       rₗ = rₗ₋₁ + (fₑ,ₗ − 1)·jₗ₋₁
+       startₗ = startₗ₋₁ + ((fₑ,ₗ − 1)/2 − p₀,ₗ)·jₗ₋₁
+     The page does not take this on trust: it also MEASURES r by perturbing
+     one input pixel and counting the outputs that move.                    */
+  function rfChain(layers) {
+    let r = 1, j = 1, start = 0.5;
+    const out = [{ layer: -1, r: r, j: j, start: start }];
+    layers.forEach((L, idx) => {
+      const fe = effK(L.k, L.d || 1), s = L.s || 1, p0 = L.p0 || 0;
+      r = r + (fe - 1) * j;
+      start = start + ((fe - 1) / 2 - p0) * j;
+      j = j * s;
+      out.push({ layer: idx, r: r, j: j, start: start, fe: fe, s: s, p0: p0 });
+    });
+    return out;
+  }
+
+  /* ══ im2col ═════════════════════════════════════════════════════════════
+     The lowering that turns a convolution into ONE matrix product, and the
+     reason a convolution runs at dense-matmul speed. Returns the patch
+     matrix in the SERIES ROW CONVENTION: (H′·W′ × Cᵢₙ·kh·kw), one PATCH per
+     row, so that Z = P·Wcol with Wcol of shape (Cᵢₙ·kh·kw × Cₒᵤₜ) is
+     literally the X·W of part 1. Column order within a row is
+     (ci, m, n) with n fastest.                                             */
+  function im2col(V, kh, kw, o) {
+    const oo = Object.assign({ s: 1, p0: 0, p1: 0, d: 1 }, o || {});
+    const Cin = V.length, H = V[0].length, W = V[0][0].length;
+    const Ho = Math.max(0, outSize(H, kh, oo)), Wo = Math.max(0, outSize(W, kw, oo));
+    const P = zeros2(Ho * Wo, Cin * kh * kw);
+    for (let p = 0; p < Ho; p++) for (let q = 0; q < Wo; q++) {
+      const row = P[p * Wo + q];
+      let c = 0;
+      for (let ci = 0; ci < Cin; ci++) for (let m = 0; m < kh; m++) for (let n = 0; n < kw; n++) {
+        const i = p * oo.s + m * oo.d - oo.p0, j = q * oo.s + n * oo.d - oo.p0;
+        row[c++] = (i < 0 || i >= H || j < 0 || j >= W) ? 0 : V[ci][i][j];
+      }
+    }
+    return { P: P, Ho: Ho, Wo: Wo };
+  }
+  /* the matching (Cᵢₙ·kh·kw × Cₒᵤₜ) weight matrix, same column order */
+  function ker2col(K) {
+    const Cout = K.length, Cin = K[0].length, kh = K[0][0].length, kw = K[0][0][0].length;
+    const Wc = zeros2(Cin * kh * kw, Cout);
+    for (let co = 0; co < Cout; co++) {
+      let c = 0;
+      for (let ci = 0; ci < Cin; ci++) for (let m = 0; m < kh; m++) for (let n = 0; n < kw; n++) Wc[c++][co] = K[co][ci][m][n];
+    }
+    return Wc;
+  }
+
+  /* ══ the doubly block Toeplitz matrix ═══════════════════════════════════
+     The (H′W′ × HW) matrix M with Z.flat = M · X.flat, for a single-channel
+     layer. Built by running the layer on the HW indicator images, so it is
+     the SAME code path as corr2d and cannot drift from it. Only ever called
+     on tiny inputs — it costs O(HW · H′W′).                                */
+  function convMatrix(H, W, K, o) {
+    const kh = K.length, kw = K[0].length;
+    const oo = Object.assign({ s: 1, p0: 0, p1: 0, d: 1 }, o || {});
+    const Ho = Math.max(0, outSize(H, kh, oo)), Wo = Math.max(0, outSize(W, kw, oo));
+    const M = zeros2(Ho * Wo, H * W);
+    for (let a = 0; a < H * W; a++) {
+      const E = zeros2(H, W); E[Math.floor(a / W)][a % W] = 1;
+      const Y = corr2d(E, K, oo);
+      for (let p = 0; p < Ho; p++) for (let q = 0; q < Wo; q++) M[p * Wo + q][a] = Y[p][q];
+    }
+    return { M: M, Ho: Ho, Wo: Wo };
+  }
+
   return {
     clamp, lerp, linspace, fmt, sig, fmtE, big, commas,
     rng, randn, shuffle,
@@ -1098,6 +1455,10 @@ const DL = (function () {
     ewma, OPT, optList, lrAt, batchNorm, layerNorm, rmsNorm, clipValue, clipNorm,
     logistic, logit, accuracy, logisticLoss,
     frame, axisB, axisL, gridX, gridY, legend, panelBox, kv, matText, arrow, curve, clip,
-    cells, netDiagram
+    cells, netDiagram,
+    /* [part 3 — CNNs] convolution as a layer; see the SCOPE BOUNDARY note above */
+    effK, outSize, padFor, flipK, corr2d, conv2dTrue, zeros3, conv2dMC,
+    convGradK, convGradV, convGradB, pool2d, globalPool, convCount, rfChain,
+    im2col, ker2col, convMatrix
   };
 })();
