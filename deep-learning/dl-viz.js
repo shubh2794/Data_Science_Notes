@@ -105,6 +105,38 @@
                    FILTERING (border modes, separable and Gaussian kernels)
                    belongs to vision/vision-viz.js and is NOT duplicated here;
                    on the overlap the two agree to 0.000e+00.
+     · spectra 2  DL.eigGeneral(A) → {re[], im[], rho} for a GENERAL real
+                   square matrix, by complex shifted QR with deflation —
+                   DL.powerIter names only the dominant REAL eigenvalue and
+                   stalls on a conjugate pair, and a recurrent weight matrix
+                   routinely has one. DL.specRad(A) = the spectral radius,
+                   the number that decides whether a recurrent gradient
+                   vanishes or explodes; DL.scaleToRho(A, r); DL.matPow(A, k).
+                   DL.eigSym(A) → {w desc, Q} full symmetric eigendecomposition
+                   (cyclic Jacobi); DL.pinvSym(A, rcond); DL.ridge(X, Y, λ).
+                   Verified against numpy.linalg.eigvals to 6.5e−14 relative
+                   on ρ over 24 matrices, including complex pairs, a defective
+                   Jordan block and a companion matrix.            [part 4]
+     · recurrence DL.CELL — a registry keyed by name: vanilla · gru · lstm.
+                   Each entry is {key, label, gates, nGate, init(dₓ,dₕ,opt),
+                   forward(p,X,s0) → st, backward(p,st,dH) → g, nParam}.
+                   READ THE SEQUENCE LAYOUT comment above them before using
+                   any of it: a sequence is TIME-MAJOR, (T × d), one time
+                   step per ROW, and U (dₓ×dₕ), W (dₕ×dₕ), V (dₕ×d_y), so a
+                   step is zₜ = hₜ₋₁W + xₜU + b. Column-convention sources
+                   transpose all three.
+                   DL.seqInit/seqForward/seqLoss/seqBPTT wrap a cell with the
+                   shared output head; DL.seqBPTTtrunc(k) is the TEXTBOOK
+                   truncation (each loss reaches back k steps) and
+                   DL.seqBPTTchunk(k) is the CHUNKED form a framework runs
+                   (state carried across a window boundary, gradient not).
+                   They are different algorithms with different biases and
+                   the series teaches the gap; never swap one for the other.
+                   DL.seqNumGrad is the central-difference audit,
+                   DL.stateJac(net, X, k) measures ∂h_T/∂h_k by perturbation
+                   for ANY cell, DL.cellParams(kind, dₓ, dₕ, biasSets) is the
+                   exact parameter count, DL.jacFD(f, x) a generic numeric
+                   Jacobian.                                       [part 4]
      · drawing     DL.frame, DL.axisB, DL.axisL, DL.gridX, DL.gridY, DL.legend,
                    DL.panelBox, DL.kv, DL.matText, DL.arrow, DL.curve, DL.clip,
                    DL.cells, DL.netDiagram(g, sizes, opt)
@@ -1442,6 +1474,628 @@ const DL = (function () {
     return { M: M, Ho: Ho, Wo: Wo };
   }
 
+/* ══ RECURRENT LAYERS ═══════════════════════════════════════════════════
+   [added by part 4 — RNNs & LSTMs]
+
+   ── SEQUENCE LAYOUT, declared once ───────────────────────────────────
+   A single sequence is TIME-MAJOR, one TIME STEP PER ROW. This is the
+   series row convention with the batch axis N = 1 dropped:
+
+       X  is (T × dₓ)      xₜ = X[t]    a ROW vector
+       H  is (T × dₕ)      hₜ = H[t]
+       a batch would be (N, T, d); every function here takes ONE sequence.
+
+   Weights keep the (dᵢₙ × dₒᵤₜ) shape of the rest of the library:
+
+       U (dₓ × dₕ)   input  → hidden
+       W (dₕ × dₕ)   hidden → hidden      (the matrix that is REUSED)
+       V (dₕ × d_y)  hidden → output
+
+   so one step is       zₜ = hₜ₋₁·W + xₜ·U + b        row vectors on the LEFT.
+
+   COLUMN-CONVENTION sources — including most textbooks and slide decks —
+   write zₜ = W hₜ₋₁ + U xₜ + b. Their U, W, V are the TRANSPOSES of these.
+   Mixing the two is the single most common shape bug in a hand-derived
+   BPTT and is why the layout is stated here rather than in a figure.     */
+
+/* generic numeric Jacobian, ∂f/∂x by CENTRAL differences.
+   f: (Float array in) → (Float array out). Returns (m × n), m = |f(x)|. */
+function jacFD(f, x, eps) {
+  const h = eps === undefined ? 1e-5 : eps;
+  const n = x.length, y0 = f(x), m = y0.length;
+  const J = zeros2(m, n);
+  for (let j = 0; j < n; j++) {
+    const xp = x.slice(), xm = x.slice();
+    xp[j] += h; xm[j] -= h;
+    const a = f(xp), b = f(xm);
+    for (let i = 0; i < m; i++) J[i][j] = (a[i] - b[i]) / (2 * h);
+  }
+  return J;
+}
+
+/* ── eigenvalues of a GENERAL real square matrix ──────────────────────
+   DL.powerIter only ever returns the DOMINANT REAL eigenvalue and stalls
+   on a complex pair; DL.eig2sym is exact but only 2×2 symmetric. The
+   spectral radius of a recurrent weight matrix is the quantity that
+   decides whether a gradient vanishes or explodes, and that matrix is
+   neither symmetric nor guaranteed to have a real dominant eigenvalue —
+   a rotation-like W has a complex conjugate pair. So: complex shifted QR
+   with deflation. n ≤ ~24; the cost is irrelevant at that size.        */
+function eigGeneral(A, opt) {
+  const o = Object.assign({ iters: 500, tol: 1e-13 }, opt || {});
+  const n = A.length;
+  if (n === 1) return { re: [A[0][0]], im: [0], rho: Math.abs(A[0][0]) };
+  /* complex working copy */
+  let Hr = A.map(r => r.slice()), Hi = zeros2(n, n);
+  const re = new Array(n).fill(0), im = new Array(n).fill(0);
+  const csqrt = (a, b) => {                        // principal √(a+bi)
+    const m = Math.hypot(a, b);
+    if (m === 0) return [0, 0];
+    const r = Math.sqrt((m + a) / 2);
+    let i = Math.sqrt(Math.max(0, (m - a) / 2));
+    if (b < 0) i = -i;
+    return [r, i];
+  };
+  for (let m = n - 1; m > 0; m--) {
+    let it = 0;
+    for (; it < o.iters; it++) {
+      const off = Math.hypot(Hr[m][m - 1], Hi[m][m - 1]);
+      const sc = Math.hypot(Hr[m][m], Hi[m][m]) + Math.hypot(Hr[m - 1][m - 1], Hi[m - 1][m - 1]);
+      if (off <= o.tol * (sc + 1e-300)) break;
+      /* Wilkinson shift from the trailing 2×2 [[a b],[c d]] */
+      const ar = Hr[m - 1][m - 1], ai = Hi[m - 1][m - 1];
+      const br = Hr[m - 1][m], bi = Hi[m - 1][m];
+      const cr = Hr[m][m - 1], ci = Hi[m][m - 1];
+      const dr = Hr[m][m], di = Hi[m][m];
+      const tr = ar - dr, ti = ai - di;            // a − d
+      const hr = tr / 2, hi = ti / 2;
+      const bcr = br * cr - bi * ci, bci = br * ci + bi * cr;   // b·c
+      const rr = hr * hr - hi * hi + bcr, ri = 2 * hr * hi + bci; // h² + bc
+      const [sr, si] = csqrt(rr, ri);
+      /* the two roots are d + h ± √(h²+bc); pick the one nearer d */
+      const p1r = hr + sr, p1i = hi + si, p2r = hr - sr, p2i = hi - si;
+      const useP1 = Math.hypot(p1r, p1i) <= Math.hypot(p2r, p2i);
+      let mur = dr + (useP1 ? p1r : p2r), mui = di + (useP1 ? p1i : p2i);
+      if (!isFinite(mur) || !isFinite(mui)) { mur = dr; mui = di; }
+      if (it > 0 && it % 23 === 0) { mur = dr + 0.7 * Math.abs(Hr[m][m - 1]); mui = di; } // exceptional
+      /* H − μI */
+      for (let i = 0; i <= m; i++) { Hr[i][i] -= mur; Hi[i][i] -= mui; }
+      /* complex QR by modified Gram–Schmidt on the leading (m+1) block */
+      const k = m + 1;
+      const Qr = zeros2(k, k), Qi = zeros2(k, k), Rr = zeros2(k, k), Ri = zeros2(k, k);
+      const vr = [], vi = [];
+      for (let j = 0; j < k; j++) { vr.push(Hr.slice(0, k).map(r => r[j])); vi.push(Hi.slice(0, k).map(r => r[j])); }
+      for (let j = 0; j < k; j++) {
+        for (let p = 0; p < j; p++) {
+          let dr2 = 0, di2 = 0;                      // conj(q_p)·v_j
+          for (let i = 0; i < k; i++) { dr2 += Qr[i][p] * vr[j][i] + Qi[i][p] * vi[j][i]; di2 += Qr[i][p] * vi[j][i] - Qi[i][p] * vr[j][i]; }
+          Rr[p][j] = dr2; Ri[p][j] = di2;
+          for (let i = 0; i < k; i++) {
+            vr[j][i] -= dr2 * Qr[i][p] - di2 * Qi[i][p];
+            vi[j][i] -= dr2 * Qi[i][p] + di2 * Qr[i][p];
+          }
+        }
+        let nn = 0; for (let i = 0; i < k; i++) nn += vr[j][i] * vr[j][i] + vi[j][i] * vi[j][i];
+        nn = Math.sqrt(nn);
+        Rr[j][j] = nn; Ri[j][j] = 0;
+        const inv = nn > 1e-300 ? 1 / nn : 0;
+        for (let i = 0; i < k; i++) { Qr[i][j] = vr[j][i] * inv; Qi[i][j] = vi[j][i] * inv; }
+      }
+      /* H ← R·Q + μI */
+      const Nr = zeros2(k, k), Ni = zeros2(k, k);
+      for (let i = 0; i < k; i++) for (let j = 0; j < k; j++) {
+        let sr2 = 0, si2 = 0;
+        for (let p = i; p < k; p++) { sr2 += Rr[i][p] * Qr[p][j] - Ri[i][p] * Qi[p][j]; si2 += Rr[i][p] * Qi[p][j] + Ri[i][p] * Qr[p][j]; }
+        Nr[i][j] = sr2; Ni[i][j] = si2;
+      }
+      for (let i = 0; i < k; i++) for (let j = 0; j < k; j++) { Hr[i][j] = Nr[i][j]; Hi[i][j] = Ni[i][j]; }
+      for (let i = 0; i < k; i++) { Hr[i][i] += mur; Hi[i][i] += mui; }
+    }
+    re[m] = Hr[m][m]; im[m] = Hi[m][m];
+  }
+  re[0] = Hr[0][0]; im[0] = Hi[0][0];
+  let rho = 0;
+  for (let i = 0; i < n; i++) rho = Math.max(rho, Math.hypot(re[i], im[i]));
+  return { re: re, im: im, rho: rho };
+}
+const specRad = A => eigGeneral(A).rho;
+
+/* rescale a square matrix so that its spectral radius is exactly target */
+function scaleToRho(A, target) {
+  const r = specRad(A);
+  const f = r > 1e-12 ? target / r : 0;
+  return A.map(row => row.map(v => v * f));
+}
+function matPow(A, k) {
+  let R = eye(A.length), B = A.map(r => r.slice()), e = k;
+  while (e > 0) { if (e & 1) R = matmul(R, B); B = matmul(B, B); e >>= 1; }
+  return R;
+}
+
+/* ── the three recurrent CELLS, one interface ─────────────────────────
+   Every cell exposes the same four things, so a figure can swap one for
+   another without knowing which it holds:
+
+     nParam(dₓ, dₕ)                 exact parameter count, ONE bias set
+     init(dₓ, dₕ, opt) → p          seeded parameters
+     forward(p, X, s0) → st         st.H is (T × dₕ); st keeps what the
+                                    backward pass needs and nothing else
+     backward(p, st, dH) → g        dH is (T × dₕ), the gradient ARRIVING
+                                    at each hₜ from outside the cell;
+                                    g holds one entry per parameter array
+                                    plus g.dh0 (and g.dc0 for the LSTM).
+
+   The output head (V, c) is deliberately OUTSIDE the cell: all three
+   share it, which is what makes a like-for-like comparison honest.     */
+
+/* NOTE on the option objects below: they are merged with Object.assign, and
+   Object.assign COPIES an explicit `undefined`, overwriting the default. Every
+   option test therefore uses `== null` rather than `=== null`, so that passing
+   {wScale: undefined} — which a caller does naturally with a conditional —
+   falls back to the default instead of silently producing a NaN matrix. This
+   bug was found by the figure harness on part 4 and is worth not repeating. */
+function seqRandn(m, n, r, s) {
+  const A = zeros2(m, n);
+  for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) A[i][j] = randn(r) * s;
+  return A;
+}
+const dsig = a => a * (1 - a);                     // σ′ from the OUTPUT
+const dtanh = a => 1 - a * a;                      // tanh′ from the OUTPUT
+function addOuter(A, u, v) {                       // A += uᵀv, u and v rows
+  for (let i = 0; i < u.length; i++) { const ui = u[i]; if (ui === 0) continue; const Ai = A[i]; for (let j = 0; j < v.length; j++) Ai[j] += ui * v[j]; }
+}
+function addTo(a, b) { for (let i = 0; i < a.length; i++) a[i] += b[i]; return a; }
+
+/* ---- vanilla (Elman) cell: hₜ = tanh(hₜ₋₁W + xₜU + b) ---------------- */
+function rnnCellInit(dx, dh, opt) {
+  const o = Object.assign({ seed: 3, uScale: null, wScale: null, rho: null }, opt || {});
+  const r = rng(o.seed);
+  const U = seqRandn(dx, dh, r, o.uScale == null ? Math.sqrt(1 / dx) : o.uScale);
+  let W = seqRandn(dh, dh, r, o.wScale == null ? Math.sqrt(1 / dh) : o.wScale);
+  if (o.rho != null) W = scaleToRho(W, o.rho);
+  return { kind: "vanilla", dx: dx, dh: dh, U: U, W: W, b: zeros(dh) };
+}
+function rnnCellForward(p, X, h0) {
+  const T = X.length, H = [], Hprev = [];
+  let h = h0 ? h0.slice() : zeros(p.dh);
+  for (let t = 0; t < T; t++) {
+    Hprev.push(h);
+    const z = p.b.slice(), x = X[t];
+    for (let i = 0; i < p.dh; i++) { const hi = h[i]; if (hi !== 0) { const Wi = p.W[i]; for (let j = 0; j < p.dh; j++) z[j] += hi * Wi[j]; } }
+    for (let i = 0; i < p.dx; i++) { const xi = x[i]; if (xi !== 0) { const Ui = p.U[i]; for (let j = 0; j < p.dh; j++) z[j] += xi * Ui[j]; } }
+    h = z.map(Math.tanh);
+    H.push(h);
+  }
+  return { kind: "vanilla", X: X, H: H, Hprev: Hprev, T: T };
+}
+function rnnCellBackward(p, st, dH) {
+  const T = st.T, dU = zeros2(p.dx, p.dh), dW = zeros2(p.dh, p.dh), db = zeros(p.dh);
+  let dnext = zeros(p.dh);
+  for (let t = T - 1; t >= 0; t--) {
+    const h = st.H[t], hp = st.Hprev[t], x = st.X[t];
+    const dz = new Array(p.dh);
+    for (let j = 0; j < p.dh; j++) dz[j] = (dH[t][j] + dnext[j]) * dtanh(h[j]);
+    addOuter(dW, hp, dz); addOuter(dU, x, dz); addTo(db, dz);
+    dnext = vecmat(dz, transpose(p.W));
+  }
+  return { dU: dU, dW: dW, db: db, dh0: dnext };
+}
+
+/* ---- LSTM cell ------------------------------------------------------
+     fₜ = σ(hₜ₋₁W_f + xₜU_f + b_f)      iₜ = σ(… W_i, U_i, b_i)
+     gₜ = tanh(… W_g, U_g, b_g)          oₜ = σ(… W_o, U_o, b_o)
+     cₜ = fₜ ⊙ cₜ₋₁ + iₜ ⊙ gₜ            hₜ = oₜ ⊙ tanh(cₜ)
+   ONE bias set per gate — see DL.cellParams for the frameworks that
+   carry two and the parameter count that follows.                       */
+const LSTM_GATES = ["f", "i", "g", "o"];
+function lstmCellInit(dx, dh, opt) {
+  const o = Object.assign({ seed: 3, uScale: null, wScale: null, forgetBias: 1 }, opt || {});
+  const r = rng(o.seed);
+  const p = { kind: "lstm", dx: dx, dh: dh, U: {}, W: {}, b: {} };
+  LSTM_GATES.forEach(k => {
+    p.U[k] = seqRandn(dx, dh, r, o.uScale == null ? Math.sqrt(1 / dx) : o.uScale);
+    p.W[k] = seqRandn(dh, dh, r, o.wScale == null ? Math.sqrt(1 / dh) : o.wScale);
+    p.b[k] = zeros(dh).map(() => (k === "f" ? (o.forgetBias == null ? 1 : o.forgetBias) : 0));
+  });
+  return p;
+}
+function gateAffine(p, k, hp, x, dh) {
+  const z = p.b[k].slice(), Wk = p.W[k], Uk = p.U[k];
+  for (let i = 0; i < hp.length; i++) { const hi = hp[i]; if (hi !== 0) { const Wi = Wk[i]; for (let j = 0; j < dh; j++) z[j] += hi * Wi[j]; } }
+  for (let i = 0; i < x.length; i++) { const xi = x[i]; if (xi !== 0) { const Ui = Uk[i]; for (let j = 0; j < dh; j++) z[j] += xi * Ui[j]; } }
+  return z;
+}
+function lstmCellForward(p, X, h0, c0) {
+  const T = X.length, dh = p.dh;
+  const st = { kind: "lstm", X: X, T: T, H: [], Hprev: [], C: [], Cprev: [], F: [], I: [], G: [], O: [], TC: [] };
+  let h = h0 ? h0.slice() : zeros(dh), c = c0 ? c0.slice() : zeros(dh);
+  for (let t = 0; t < T; t++) {
+    st.Hprev.push(h); st.Cprev.push(c);
+    const f = gateAffine(p, "f", h, X[t], dh).map(sigmoid);
+    const i = gateAffine(p, "i", h, X[t], dh).map(sigmoid);
+    const g = gateAffine(p, "g", h, X[t], dh).map(Math.tanh);
+    const o = gateAffine(p, "o", h, X[t], dh).map(sigmoid);
+    const cn = new Array(dh), tc = new Array(dh), hn = new Array(dh);
+    for (let j = 0; j < dh; j++) { cn[j] = f[j] * c[j] + i[j] * g[j]; tc[j] = Math.tanh(cn[j]); hn[j] = o[j] * tc[j]; }
+    st.F.push(f); st.I.push(i); st.G.push(g); st.O.push(o); st.C.push(cn); st.TC.push(tc); st.H.push(hn);
+    h = hn; c = cn;
+  }
+  return st;
+}
+function lstmCellBackward(p, st, dH, dCend) {
+  const dh = p.dh, T = st.T;
+  const dU = {}, dW = {}, db = {};
+  LSTM_GATES.forEach(k => { dU[k] = zeros2(p.dx, dh); dW[k] = zeros2(dh, dh); db[k] = zeros(dh); });
+  let dhn = zeros(dh), dcn = dCend ? dCend.slice() : zeros(dh);
+  for (let t = T - 1; t >= 0; t--) {
+    const f = st.F[t], i = st.I[t], g = st.G[t], o = st.O[t], tc = st.TC[t];
+    const hp = st.Hprev[t], cp = st.Cprev[t], x = st.X[t];
+    const zf = new Array(dh), zi = new Array(dh), zg = new Array(dh), zo = new Array(dh), dcNext = new Array(dh);
+    for (let j = 0; j < dh; j++) {
+      const dhj = dH[t][j] + dhn[j];
+      const dcj = dhj * o[j] * dtanh(tc[j]) + dcn[j];
+      zo[j] = dhj * tc[j] * dsig(o[j]);
+      zf[j] = dcj * cp[j] * dsig(f[j]);
+      zi[j] = dcj * g[j] * dsig(i[j]);
+      zg[j] = dcj * i[j] * dtanh(g[j]);
+      dcNext[j] = dcj * f[j];
+    }
+    const dzs = { f: zf, i: zi, g: zg, o: zo };
+    const dhp = zeros(dh);
+    LSTM_GATES.forEach(k => {
+      addOuter(dW[k], hp, dzs[k]); addOuter(dU[k], x, dzs[k]); addTo(db[k], dzs[k]);
+      const Wk = p.W[k];
+      for (let a = 0; a < dh; a++) { let s = 0; const Wa = Wk[a]; for (let j = 0; j < dh; j++) s += dzs[k][j] * Wa[j]; dhp[a] += s; }
+    });
+    dhn = dhp; dcn = dcNext;
+  }
+  return { dU: dU, dW: dW, db: db, dh0: dhn, dc0: dcn };
+}
+
+/* ---- GRU cell -------------------------------------------------------
+     zₜ = σ(hₜ₋₁W_z + xₜU_z + b_z)        UPDATE gate
+     rₜ = σ(hₜ₋₁W_r + xₜU_r + b_r)        RESET gate
+     c̃ₜ = tanh((rₜ ⊙ hₜ₋₁)W_c + xₜU_c + b_c)
+     hₜ = zₜ ⊙ c̃ₜ + (1 − zₜ) ⊙ hₜ₋₁
+   NOTE the polarity: here zₜ is HOW MUCH NEW. Several standard sources
+   and most framework implementations write hₜ = zₜ⊙hₜ₋₁ + (1−zₜ)⊙c̃ₜ,
+   in which zₜ is HOW MUCH OLD. The two are the same model with z ↦ 1−z
+   (the gate simply learns the opposite sign); the page says which it
+   means every time it prints a gate value.                              */
+const GRU_GATES = ["z", "r", "c"];
+function gruCellInit(dx, dh, opt) {
+  const o = Object.assign({ seed: 3, uScale: null, wScale: null }, opt || {});
+  const r = rng(o.seed);
+  const p = { kind: "gru", dx: dx, dh: dh, U: {}, W: {}, b: {} };
+  GRU_GATES.forEach(k => {
+    p.U[k] = seqRandn(dx, dh, r, o.uScale == null ? Math.sqrt(1 / dx) : o.uScale);
+    p.W[k] = seqRandn(dh, dh, r, o.wScale == null ? Math.sqrt(1 / dh) : o.wScale);
+    p.b[k] = zeros(dh);
+  });
+  return p;
+}
+function gruCellForward(p, X, h0) {
+  const dh = p.dh, T = X.length;
+  const st = { kind: "gru", X: X, T: T, H: [], Hprev: [], Z: [], R: [], Q: [], Ct: [] };
+  let h = h0 ? h0.slice() : zeros(dh);
+  for (let t = 0; t < T; t++) {
+    st.Hprev.push(h);
+    const z = gateAffine(p, "z", h, X[t], dh).map(sigmoid);
+    const r = gateAffine(p, "r", h, X[t], dh).map(sigmoid);
+    const q = new Array(dh);
+    for (let j = 0; j < dh; j++) q[j] = r[j] * h[j];
+    const ct = gateAffine(p, "c", q, X[t], dh).map(Math.tanh);
+    const hn = new Array(dh);
+    for (let j = 0; j < dh; j++) hn[j] = z[j] * ct[j] + (1 - z[j]) * h[j];
+    st.Z.push(z); st.R.push(r); st.Q.push(q); st.Ct.push(ct); st.H.push(hn);
+    h = hn;
+  }
+  return st;
+}
+function gruCellBackward(p, st, dH) {
+  const dh = p.dh, T = st.T;
+  const dU = {}, dW = {}, db = {};
+  GRU_GATES.forEach(k => { dU[k] = zeros2(p.dx, dh); dW[k] = zeros2(dh, dh); db[k] = zeros(dh); });
+  let dnext = zeros(dh);
+  for (let t = T - 1; t >= 0; t--) {
+    const z = st.Z[t], r = st.R[t], q = st.Q[t], ct = st.Ct[t], hp = st.Hprev[t], x = st.X[t];
+    const dhv = new Array(dh), dzr = new Array(dh), drc = new Array(dh), dhp = zeros(dh);
+    for (let j = 0; j < dh; j++) {
+      dhv[j] = dH[t][j] + dnext[j];
+      dzr[j] = dhv[j] * (ct[j] - hp[j]) * dsig(z[j]);
+      drc[j] = dhv[j] * z[j] * dtanh(ct[j]);
+      dhp[j] += dhv[j] * (1 - z[j]);                    // the CARRY path
+    }
+    addOuter(dW.c, q, drc); addOuter(dU.c, x, drc); addTo(db.c, drc);
+    const dq = vecmat(drc, transpose(p.W.c));
+    const drr = new Array(dh);
+    for (let j = 0; j < dh; j++) { drr[j] = dq[j] * hp[j] * dsig(r[j]); dhp[j] += dq[j] * r[j]; }
+    addOuter(dW.r, hp, drr); addOuter(dU.r, x, drr); addTo(db.r, drr);
+    addOuter(dW.z, hp, dzr); addOuter(dU.z, x, dzr); addTo(db.z, dzr);
+    addTo(dhp, vecmat(drr, transpose(p.W.r)));
+    addTo(dhp, vecmat(dzr, transpose(p.W.z)));
+    dnext = dhp;
+  }
+  return { dU: dU, dW: dW, db: db, dh0: dnext };
+}
+
+/* the registry the figures index into */
+const CELL = {
+  vanilla: {
+    key: "vanilla", label: "vanilla RNN", gates: [], nGate: 1,
+    init: rnnCellInit, forward: rnnCellForward, backward: rnnCellBackward,
+    nParam: (dx, dh) => dx * dh + dh * dh + dh
+  },
+  lstm: {
+    key: "lstm", label: "LSTM", gates: LSTM_GATES, nGate: 4,
+    init: lstmCellInit, forward: lstmCellForward, backward: lstmCellBackward,
+    nParam: (dx, dh) => 4 * (dx * dh + dh * dh + dh)
+  },
+  gru: {
+    key: "gru", label: "GRU", gates: GRU_GATES, nGate: 3,
+    init: gruCellInit, forward: gruCellForward, backward: gruCellBackward,
+    nParam: (dx, dh) => 3 * (dx * dh + dh * dh + dh)
+  }
+};
+const cellList = () => ["vanilla", "gru", "lstm"];
+/* exact parameter count, with the bias convention made explicit:
+   biasSets = 1 is the textbook cell; biasSets = 2 is what a framework that
+   carries a separate input bias and hidden bias actually allocates.      */
+function cellParams(kind, dx, dh, biasSets) {
+  const g = CELL[kind].nGate, bs = biasSets === undefined ? 1 : biasSets;
+  return { gates: g, U: g * dx * dh, W: g * dh * dh, b: g * bs * dh,
+           total: g * (dx * dh + dh * dh + bs * dh) };
+}
+
+/* ── the flat parameter view, so ONE finite-difference audit covers all
+     three cells and the output head as well ─────────────────────────── */
+function cellFlatten(p) {
+  const names = [], out = [];
+  const push = (nm, A) => { if (Array.isArray(A[0])) { for (let i = 0; i < A.length; i++) for (let j = 0; j < A[0].length; j++) { names.push(nm + "[" + i + "][" + j + "]"); out.push(A[i][j]); } } else { for (let i = 0; i < A.length; i++) { names.push(nm + "[" + i + "]"); out.push(A[i]); } } };
+  const gs = CELL[p.kind].gates;
+  if (gs.length === 0) { push("U", p.U); push("W", p.W); push("b", p.b); }
+  else gs.forEach(k => { push("U" + k, p.U[k]); push("W" + k, p.W[k]); push("b" + k, p.b[k]); });
+  return { names: names, v: out };
+}
+function cellUnflatten(p, v) {
+  let k = 0;
+  const pull = A => { if (Array.isArray(A[0])) { for (let i = 0; i < A.length; i++) for (let j = 0; j < A[0].length; j++) A[i][j] = v[k++]; } else { for (let i = 0; i < A.length; i++) A[i] = v[k++]; } };
+  const gs = CELL[p.kind].gates;
+  if (gs.length === 0) { pull(p.U); pull(p.W); pull(p.b); }
+  else gs.forEach(g => { pull(p.U[g]); pull(p.W[g]); pull(p.b[g]); });
+  return p;
+}
+function cellGradFlatten(p, g) {
+  const out = [];
+  const push = A => { if (Array.isArray(A[0])) { for (let i = 0; i < A.length; i++) for (let j = 0; j < A[0].length; j++) out.push(A[i][j]); } else { for (let i = 0; i < A.length; i++) out.push(A[i]); } };
+  const gs = CELL[p.kind].gates;
+  if (gs.length === 0) { push(g.dU); push(g.dW); push(g.db); }
+  else gs.forEach(k => { push(g.dU[k]); push(g.dW[k]); push(g.db[k]); });
+  return out;
+}
+function cellClone(p) {
+  const q = JSON.parse(JSON.stringify(p));
+  return q;
+}
+
+/* ── a whole sequence MODEL: a cell plus the shared output head ───────
+     sₜ = hₜ·V + c          aₜ = out(sₜ)          L = ∑ₜ Lₜ
+   out ∈ {"sigmoid" (per-unit BCE), "softmax" (cross-entropy),
+          "linear" (½‖·‖² summed over units)}.  In ALL THREE the gradient
+   at the pre-activation is the same expression, ∂Lₜ/∂sₜ = aₜ − yₜ; the
+   page derives why, and the audit below is what proves it.              */
+function seqInit(kind, dx, dh, dy, opt) {
+  const o = Object.assign({ seed: 3, out: "sigmoid", vScale: null }, opt || {});
+  const p = CELL[kind].init(dx, dh, o);
+  const r = rng(o.seed + 8191);
+  return { cell: kind, dx: dx, dh: dh, dy: dy, out: o.out, p: p,
+           V: seqRandn(dh, dy, r, o.vScale == null ? Math.sqrt(1 / dh) : o.vScale), c: zeros(dy) };
+}
+function seqForward(net, X, h0, c0) {
+  const st = (net.cell === "lstm") ? CELL.lstm.forward(net.p, X, h0, c0) : CELL[net.cell].forward(net.p, X, h0);
+  const S = [], A = [];
+  for (let t = 0; t < st.T; t++) {
+    const s = vecmat(st.H[t], net.V).map((v, j) => v + net.c[j]);
+    S.push(s);
+    A.push(net.out === "softmax" ? softmax(s) : (net.out === "sigmoid" ? s.map(sigmoid) : s));
+  }
+  st.S = S; st.A = A;
+  return st;
+}
+function seqLossAt(net, a, s, y) {
+  let L = 0;
+  if (net.out === "softmax") { const ls = logSoftmax(s); for (let j = 0; j < y.length; j++) L -= y[j] * ls[j]; }
+  else if (net.out === "sigmoid") { for (let j = 0; j < y.length; j++) L += softplus(s[j]) - y[j] * s[j]; }  // stable BCE
+  else { for (let j = 0; j < y.length; j++) L += 0.5 * (a[j] - y[j]) * (a[j] - y[j]); }
+  return L;
+}
+function seqLoss(net, X, Y, st) {
+  const s = st || seqForward(net, X);
+  let L = 0;
+  for (let t = 0; t < s.T; t++) if (Y[t]) L += seqLossAt(net, s.A[t], s.S[t], Y[t]);
+  return L;
+}
+/* the head's own gradients, and the dH it hands the cell */
+function seqHead(net, st, Y) {
+  const dV = zeros2(net.dh, net.dy), dc = zeros(net.dy), dH = [], dS = [];
+  for (let t = 0; t < st.T; t++) {
+    const ds = zeros(net.dy);
+    /* ∂Lₜ/∂sₜ. For the sigmoid and linear heads this is aₜ − yₜ outright. For
+       the SOFTMAX head it is (∑ⱼ yⱼ)·aₜ − yₜ, which collapses to aₜ − yₜ only
+       when the target is a genuine distribution. Writing the general form
+       costs one sum and removes a silent failure when a target is a count. */
+    if (Y[t]) {
+      let m = 1;
+      if (net.out === "softmax") { m = 0; for (let j = 0; j < net.dy; j++) m += Y[t][j]; }
+      for (let j = 0; j < net.dy; j++) ds[j] = m * st.A[t][j] - Y[t][j];
+    }
+    dS.push(ds);
+    addOuter(dV, st.H[t], ds); addTo(dc, ds);
+    dH.push(vecmat(ds, transpose(net.V)));
+  }
+  return { dV: dV, dc: dc, dH: dH, dS: dS };
+}
+/* FULL BPTT — every loss reaches every earlier step it can */
+function seqBPTT(net, X, Y, st) {
+  const s = st || seqForward(net, X);
+  const hd = seqHead(net, s, Y);
+  const g = CELL[net.cell].backward(net.p, s, hd.dH);
+  g.dV = hd.dV; g.dc = hd.dc; g.loss = seqLoss(net, X, Y, s); g.st = s; g.dH = hd.dH;
+  return g;
+}
+/* TRUNCATED BPTT, textbook form: the loss at step t is allowed to reach
+   back k steps and no further. Implemented exactly — one restricted
+   backward sweep per t — so the comparison against seqBPTT is the
+   truncation bias itself and not an artefact of some other difference. */
+function seqBPTTtrunc(net, X, Y, k, st) {
+  const s = st || seqForward(net, X);
+  const hd = seqHead(net, s, Y);
+  const T = s.T, acc = null;
+  let tot = null;
+  for (let t = 0; t < T; t++) {
+    const lo = Math.max(0, t - k + 1);
+    const sub = sliceState(s, lo, t + 1);
+    const dH = [];
+    for (let u = lo; u <= t; u++) dH.push(u === t ? hd.dH[t].slice() : zeros(net.dh));
+    const g = CELL[net.cell].backward(net.p, sub, dH);
+    tot = tot === null ? g : addGrads(tot, g);
+  }
+  tot.dV = hd.dV; tot.dc = hd.dc; tot.loss = seqLoss(net, X, Y, s); tot.st = s;
+  return tot;
+}
+/* CHUNKED TBPTT, the form frameworks actually run: split the sequence
+   into non-overlapping windows of k, carry the STATE across a boundary
+   but not the GRADIENT. Cheaper than the textbook form and MORE biased. */
+function seqBPTTchunk(net, X, Y, k, st) {
+  const s = st || seqForward(net, X);
+  const hd = seqHead(net, s, Y);
+  const T = s.T;
+  let tot = null;
+  for (let lo = 0; lo < T; lo += k) {
+    const hi = Math.min(T, lo + k);
+    const sub = sliceState(s, lo, hi);
+    const dH = [];
+    for (let u = lo; u < hi; u++) dH.push(hd.dH[u].slice());
+    const g = CELL[net.cell].backward(net.p, sub, dH);
+    tot = tot === null ? g : addGrads(tot, g);
+  }
+  tot.dV = hd.dV; tot.dc = hd.dc; tot.loss = seqLoss(net, X, Y, s); tot.st = s;
+  return tot;
+}
+function sliceState(st, lo, hi) {
+  const o = { kind: st.kind, T: hi - lo, X: st.X.slice(lo, hi), H: st.H.slice(lo, hi), Hprev: st.Hprev.slice(lo, hi) };
+  ["C", "Cprev", "F", "I", "G", "O", "TC", "Z", "R", "Q", "Ct"].forEach(k => { if (st[k]) o[k] = st[k].slice(lo, hi); });
+  return o;
+}
+function addGrads(a, b) {
+  const addA = (X, Y) => { if (Array.isArray(X[0])) { for (let i = 0; i < X.length; i++) for (let j = 0; j < X[0].length; j++) X[i][j] += Y[i][j]; } else for (let i = 0; i < X.length; i++) X[i] += Y[i]; };
+  ["dU", "dW", "db"].forEach(k => {
+    if (Array.isArray(a[k])) addA(a[k], b[k]);
+    else Object.keys(a[k]).forEach(g => addA(a[k][g], b[k][g]));
+  });
+  return a;
+}
+/* central-difference audit of EVERY parameter of the cell and the head */
+function seqNumGrad(net, X, Y, h) {
+  const eps = h === undefined ? 1e-6 : h;
+  const flat = cellFlatten(net.p), v = flat.v.slice();
+  const dCell = new Array(v.length);
+  for (let i = 0; i < v.length; i++) {
+    const o = v[i];
+    v[i] = o + eps; cellUnflatten(net.p, v); const Lp = seqLoss(net, X, Y);
+    v[i] = o - eps; cellUnflatten(net.p, v); const Lm = seqLoss(net, X, Y);
+    v[i] = o; dCell[i] = (Lp - Lm) / (2 * eps);
+  }
+  cellUnflatten(net.p, v);
+  const dV = zeros2(net.dh, net.dy);
+  for (let i = 0; i < net.dh; i++) for (let j = 0; j < net.dy; j++) {
+    const o = net.V[i][j];
+    net.V[i][j] = o + eps; const Lp = seqLoss(net, X, Y);
+    net.V[i][j] = o - eps; const Lm = seqLoss(net, X, Y);
+    net.V[i][j] = o; dV[i][j] = (Lp - Lm) / (2 * eps);
+  }
+  const dc = zeros(net.dy);
+  for (let j = 0; j < net.dy; j++) {
+    const o = net.c[j];
+    net.c[j] = o + eps; const Lp = seqLoss(net, X, Y);
+    net.c[j] = o - eps; const Lm = seqLoss(net, X, Y);
+    net.c[j] = o; dc[j] = (Lp - Lm) / (2 * eps);
+  }
+  return { flat: dCell, names: flat.names, dV: dV, dc: dc };
+}
+/* ∂h_T/∂h_k for ANY cell — the object the whole long-range argument is
+   about. Measured by re-running the cell from a perturbed state, so it
+   makes no assumption the analytic backward pass might share.           */
+function stateJac(net, X, k, eps, h0, c0) {
+  const dh = net.dh;
+  const base = { h: h0 ? h0.slice() : zeros(dh), c: c0 ? c0.slice() : zeros(dh) };
+  const st0 = (net.cell === "lstm") ? CELL.lstm.forward(net.p, X.slice(0, k), base.h, base.c) : CELL[net.cell].forward(net.p, X.slice(0, k), base.h);
+  const hk = k === 0 ? base.h : st0.H[k - 1];
+  const ck = (net.cell === "lstm") ? (k === 0 ? base.c : st0.C[k - 1]) : null;
+  const tail = X.slice(k);
+  const f = hv => {
+    const s = (net.cell === "lstm") ? CELL.lstm.forward(net.p, tail, hv, ck) : CELL[net.cell].forward(net.p, tail, hv);
+    return s.H[s.T - 1];
+  };
+  return jacFD(f, hk, eps === undefined ? 1e-5 : eps);
+}
+
+/* ── full symmetric eigendecomposition, cyclic Jacobi ─────────────────
+   DL.eig2sym is exact but 2×2 only and DL.powerIter returns one pair.
+   The context-vector capacity argument needs the WHOLE spectrum of a
+   small symmetric matrix, and so does any singular-value question posed
+   as ρ(AᵀA). Returns eigenvalues DESCENDING with matching columns of Q,
+   so A = Q·diag(w)·Qᵀ.                                                  */
+function eigSym(Ain, iters) {
+  const n = Ain.length, A = Ain.map(r => r.slice()), Q = eye(n);
+  const N = iters === undefined ? 60 : iters;
+  for (let sweep = 0; sweep < N; sweep++) {
+    let off = 0;
+    for (let p = 0; p < n; p++) for (let q = p + 1; q < n; q++) off += A[p][q] * A[p][q];
+    if (off < 1e-30) break;
+    for (let p = 0; p < n; p++) for (let q = p + 1; q < n; q++) {
+      if (Math.abs(A[p][q]) < 1e-300) continue;
+      const theta = (A[q][q] - A[p][p]) / (2 * A[p][q]);
+      const t = Math.sign(theta || 1) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
+      const c = 1 / Math.sqrt(t * t + 1), s = t * c;
+      for (let k = 0; k < n; k++) {
+        const akp = A[k][p], akq = A[k][q];
+        A[k][p] = c * akp - s * akq; A[k][q] = s * akp + c * akq;
+      }
+      for (let k = 0; k < n; k++) {
+        const apk = A[p][k], aqk = A[q][k];
+        A[p][k] = c * apk - s * aqk; A[q][k] = s * apk + c * aqk;
+      }
+      for (let k = 0; k < n; k++) {
+        const qkp = Q[k][p], qkq = Q[k][q];
+        Q[k][p] = c * qkp - s * qkq; Q[k][q] = s * qkp + c * qkq;
+      }
+    }
+  }
+  const idx = [];
+  for (let i = 0; i < n; i++) idx.push(i);
+  idx.sort((a, b) => A[b][b] - A[a][a]);
+  const w = idx.map(i => A[i][i]);
+  const V = zeros2(n, n);
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) V[i][j] = Q[i][idx[j]];
+  return { w: w, Q: V };
+}
+/* Moore–Penrose pseudo-inverse of a SYMMETRIC matrix, with the usual
+   relative cut-off on the eigenvalues. */
+function pinvSym(A, rcond) {
+  const { w, Q } = eigSym(A), n = w.length;
+  const cut = (rcond === undefined ? 1e-10 : rcond) * Math.max(...w.map(Math.abs), 1e-300);
+  const D = zeros2(n, n);
+  for (let i = 0; i < n; i++) D[i][i] = Math.abs(w[i]) > cut ? 1 / w[i] : 0;
+  return matmul(matmul(Q, D), transpose(Q));
+}
+/* ridge solve of  min ‖X·B − Y‖² + λ‖B‖² , X (N×p), Y (N×q) → B (p×q) */
+function ridge(X, Y, lam) {
+  const Xt = transpose(X), G = matmul(Xt, X), p = G.length;
+  for (let i = 0; i < p; i++) G[i][i] += (lam === undefined ? 1e-8 : lam);
+  return matmul(pinvSym(G, 1e-14), matmul(Xt, Y));
+}
+
   return {
     clamp, lerp, linspace, fmt, sig, fmtE, big, commas,
     rng, randn, shuffle,
@@ -1459,6 +2113,11 @@ const DL = (function () {
     /* [part 3 — CNNs] convolution as a layer; see the SCOPE BOUNDARY note above */
     effK, outSize, padFor, flipK, corr2d, conv2dTrue, zeros3, conv2dMC,
     convGradK, convGradV, convGradB, pool2d, globalPool, convCount, rfChain,
-    im2col, ker2col, convMatrix
+    im2col, ker2col, convMatrix,
+    /* [part 4 — RNNs & LSTMs] recurrence; see the SEQUENCE LAYOUT note above */
+    jacFD, eigGeneral, specRad, scaleToRho, matPow, eigSym, pinvSym, ridge,
+    CELL, cellList, cellParams, cellFlatten, cellUnflatten, cellGradFlatten, cellClone,
+    seqRandn, seqInit, seqForward, seqLoss, seqLossAt, seqHead,
+    seqBPTT, seqBPTTtrunc, seqBPTTchunk, seqNumGrad, stateJac, sliceState, addGrads
   };
 })();
