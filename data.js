@@ -415,6 +415,7 @@ const cross = [
   ["Encoder vs Decoder Models","Transformers"],["Encoder vs Decoder Models","Language Models"],
   ["State Space Models","Transformers"],["State Space Models","RNNs & LSTMs"],
   ["RNNs & LSTMs","Machine Translation"],["RNNs & LSTMs","Embeddings"],["RNNs & LSTMs","Encoder vs Decoder Models"],
+  ["Attention","Machine Translation"],["Attention","Vision Transformers"],["Attention","Mixture of Experts"],["Attention","State Space Models"],["Attention","Encoder vs Decoder Models"],
   ["World Models & JEPA","Reinforcement Learning"],["World Models & JEPA","Feedforward / MLP"],
   ["DL Architectures Compared","Transformers"],["DL Architectures Compared","CNNs"],["DL Architectures Compared","State Space Models"],
   ["Text Preprocessing","Tokenization"],["Text Preprocessing","Embeddings"],["Text Preprocessing","Named Entity Recognition"],["Text Preprocessing","Language Models"],

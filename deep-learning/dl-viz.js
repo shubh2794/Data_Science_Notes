@@ -137,6 +137,26 @@
                    for ANY cell, DL.cellParams(kind, dₓ, dₕ, biasSets) is the
                    exact parameter count, DL.jacFD(f, x) a generic numeric
                    Jacobian.                                       [part 4]
+     · attention   DL.softmaxRows(S) — row-wise, overflow-safe, and NaN on an
+                   all-masked row ON PURPOSE; DL.softmaxJac(p) = diag(p) − ppᵀ
+                   and DL.softmaxJacFrob(p); DL.entropyOf(p) in NATS and
+                   DL.perplexityOf(p) = eᴴ, the effective number of keys.
+                   DL.splitHeads(M, h) / DL.mergeHeads(T) — heads split the
+                   LAST axis into ADJACENT blocks and this is the ONLY place
+                   that reshape may happen. DL.causalMask, DL.padMask,
+                   DL.windowMask(n, w, {causal, dil, sinks}), DL.addMasks —
+                   every mask ADDITIVE, 0 or −Infinity, never a large finite
+                   constant (DL.maskConst records why, per precision).
+                   DL.sdpa(Q,K,V,{mask,scale}) → {S,A,Z}; DL.mhaInit /
+                   DL.mhaForward / DL.mhaBackward — a bare attention block,
+                   no residual, no norm, no FFN (those are part 6's), with g
+                   KV heads so MHA, GQA and MQA are one code path
+                   (DL.kvHeadOf); audited against central differences to
+                   4.5e−09 relative. DL.numGradMats(loss, mats) is that audit.
+                   DL.mhaParams, DL.attnMacs, DL.macCrossover, DL.kvCacheElems,
+                   DL.decodeIntensity — counting, in MACs, matching DL.macs and
+                   DL.convCount.  READ THE ATTENTION LAYOUT LAW above them.
+                                                                     [part 5]
      · drawing     DL.frame, DL.axisB, DL.axisL, DL.gridX, DL.gridY, DL.legend,
                    DL.panelBox, DL.kv, DL.matText, DL.arrow, DL.curve, DL.clip,
                    DL.cells, DL.netDiagram(g, sizes, opt)
@@ -2096,6 +2116,302 @@ function ridge(X, Y, lam) {
   return matmul(pinvSym(G, 1e-14), matmul(Xt, Y));
 }
 
+/* ══ ATTENTION ══════════════════════════════════════════════════════════
+   [part 5 — Attention]  Promoted here rather than kept page-local because
+   part 6 (Transformers) is built out of exactly these calls, and a forked
+   softmax-over-a-row or a forked head reshape is the specific class of bug
+   THE RULE at the top of this file exists to prevent.
+
+   ── THE ATTENTION LAYOUT LAW, declared once ─────────────────────────────
+   It extends part 1's ROW convention and part 4's TIME-MAJOR sequence
+   layout and never departs from either.
+
+     one sequence      X   is (n × d_model)    one TOKEN per ROW
+     projections       W_Q, W_K  (d_model × h·d_k)   W_V (d_model × h·d_v)
+                       W_O       (h·d_v × d_model)
+     so a projection is  X·W , the row vector on the LEFT, exactly as in
+     part 1's  z = x·W + b.
+
+     HEADS SPLIT THE LAST AXIS, and nothing else.  (n × h·d_k) is cut into
+     h blocks of d_k ADJACENT columns; head j owns columns [j·d_k,(j+1)·d_k).
+     splitHeads / mergeHeads are exact inverses and are the ONLY place this
+     reshape may happen. Doing it by hand is where a multi-head
+     implementation forks its convention silently: an interleaved split
+     (stride h) also "works", produces a different model, and never throws.
+
+     scores            S = Q·Kᵀ / √d_k            (n_q × n_k), per head
+     weights           A = softmax over each ROW of S + mask
+     head output       Z = A·V                    (n_q × d_v)
+     block output      Y = concat_j(Z_j) · W_O    (n_q × d_model)
+
+     A mask is ADDITIVE and its forbidden entries are −Infinity, never a
+     large finite constant — see maskConst() for why, and note that
+     softmaxRows returns NaN for an all-masked row ON PURPOSE.
+
+     A batch is (N, n, d), batch axis first, and every figure on part 5
+     uses N = 1, exactly as part 4 did.
+
+   Cost is counted in MACs — multiply–accumulates — matching DL.macs,
+   DL.convCount and part 4's attnMacs-equivalent. Sources quoting "FLOPs"
+   usually mean MACs; those that mean literal operations quote 2×.       */
+
+/* Row-wise softmax of a matrix, in the overflow-safe form. An all-masked
+   row (every entry −Infinity) yields NaN, which is the CORRECT and loud
+   behaviour: the quantity is undefined. Do not paper over it.           */
+function softmaxRows(S) {
+  return S.map(row => {
+    let m = -Infinity;
+    for (let j = 0; j < row.length; j++) if (row[j] > m) m = row[j];
+    if (!isFinite(m)) return row.map(() => NaN);        // all −∞ ⇒ undefined
+    let s = 0; const e = new Array(row.length);
+    for (let j = 0; j < row.length; j++) { e[j] = Math.exp(row[j] - m); s += e[j]; }
+    for (let j = 0; j < row.length; j++) e[j] /= s;
+    return e;
+  });
+}
+/* The softmax Jacobian ∂pᵢ/∂sⱼ = pᵢ(δᵢⱼ − pⱼ), returned as a full matrix.
+   It is singular by construction (p is in its null space transposed) and
+   it goes to ZERO at both ends: uniform p and one-hot p both kill it.   */
+function softmaxJac(p) {
+  const n = p.length, J = zeros2(n, n);
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) J[i][j] = p[i] * ((i === j ? 1 : 0) - p[j]);
+  return J;
+}
+function softmaxJacFrob(p) {                 // ‖diag(p) − ppᵀ‖_F, without the matrix
+  /* grouped so that every term is non-negative: the algebraically equal
+     form  √(Σp² − 2Σp³ + (Σp²)²)  cancels to 1e−08 relative near uniform. */
+  let S2 = 0; for (let i = 0; i < p.length; i++) S2 += p[i] * p[i];
+  let t = 0;
+  for (let i = 0; i < p.length; i++) {
+    const q = 1 - p[i];
+    t += p[i] * p[i] * (q * q + S2 - p[i] * p[i]);
+  }
+  return Math.sqrt(Math.max(0, t));
+}
+function entropyOf(p) {                      // in NATS; ln(n) is the maximum
+  let H = 0;
+  for (let i = 0; i < p.length; i++) if (p[i] > 0) H -= p[i] * Math.log(p[i]);
+  return H;
+}
+function perplexityOf(p) { return Math.exp(entropyOf(p)); }   // "effective #keys attended"
+
+/* Heads split the LAST axis into h blocks of ADJACENT columns. */
+function splitHeads(M, h) {
+  const n = M.length, hd = M[0].length, d = hd / h, out = [];
+  for (let j = 0; j < h; j++) {
+    const H = zeros2(n, d);
+    for (let i = 0; i < n; i++) for (let c = 0; c < d; c++) H[i][c] = M[i][j * d + c];
+    out.push(H);
+  }
+  return out;
+}
+function mergeHeads(T) {
+  const h = T.length, n = T[0].length, d = T[0][0].length, M = zeros2(n, h * d);
+  for (let j = 0; j < h; j++) for (let i = 0; i < n; i++) for (let c = 0; c < d; c++) M[i][j * d + c] = T[j][i][c];
+  return M;
+}
+
+/* ── masks. Every one is ADDITIVE, 0 to keep and −Infinity to forbid. ── */
+function causalMask(nq, nk, off) {           // position i may read j ≤ i + off
+  const K = nk === undefined ? nq : nk, o = off === undefined ? 0 : off;
+  const M = zeros2(nq, K);
+  for (let i = 0; i < nq; i++) for (let j = 0; j < K; j++) if (j > i + o) M[i][j] = -Infinity;
+  return M;
+}
+function padMask(nq, valid) {                // valid: array of booleans over KEYS
+  const M = zeros2(nq, valid.length);
+  for (let i = 0; i < nq; i++) for (let j = 0; j < valid.length; j++) if (!valid[j]) M[i][j] = -Infinity;
+  return M;
+}
+/* Sliding window of width w (w keys ending at i, inclusive), optionally
+   dilated by `dil`, optionally with `sinks` always-visible leading keys.  */
+function windowMask(n, w, o) {
+  const oo = Object.assign({ causal: true, dil: 1, sinks: 0 }, o || {});
+  const M = zeros2(n, n);
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+    let ok = false;
+    if (j <= i || !oo.causal) {
+      const dist = i - j;
+      if (dist >= 0 && dist < w * oo.dil && dist % oo.dil === 0) ok = true;
+      if (!oo.causal && dist < 0 && -dist < w * oo.dil && (-dist) % oo.dil === 0) ok = true;
+    }
+    if (j < oo.sinks && (j <= i || !oo.causal)) ok = true;
+    if (!ok) M[i][j] = -Infinity;
+  }
+  return M;
+}
+function addMasks(A, B) {                    // −∞ + finite = −∞; keeps 0 where both keep
+  return A.map((r, i) => r.map((v, j) => v + B[i][j]));
+}
+/* How far below the row maximum a FINITE mask constant must sit before the
+   masked weight underflows to exactly zero, per precision. Returned as the
+   gap g such that exp(−g) is the smallest positive representable.        */
+const maskConst = {
+  float64: { zeroGap: 745.1, epsGap: 36.04, min: -1.7976931348623157e308 },
+  float32: { zeroGap: 103.97, epsGap: 15.94, min: -3.4028234663852886e38 },
+  float16: { zeroGap: 17.33, epsGap: 6.93, min: -65504 },
+  note: "a finite constant added to EVERY entry of a row is a NO-OP: softmax is shift-invariant."
+};
+
+/* ── scaled dot-product attention, ONE head ─────────────────────────────
+   Q (nq × dk), K (nk × dk), V (nk × dv). o.scale defaults to 1/√dk;
+   pass o.scale = 1 to see what the scaling is for. o.mask is additive.  */
+function sdpa(Q, K, V, o) {
+  const oo = o || {}, dk = Q[0].length;
+  const sc = oo.scale === undefined ? 1 / Math.sqrt(dk) : oo.scale;
+  const nq = Q.length, nk = K.length, S = zeros2(nq, nk);
+  for (let i = 0; i < nq; i++) for (let j = 0; j < nk; j++) {
+    let s = 0; for (let c = 0; c < dk; c++) s += Q[i][c] * K[j][c];
+    S[i][j] = s * sc + (oo.mask ? oo.mask[i][j] : 0);
+  }
+  const A = softmaxRows(S);
+  const dv = V[0].length, Z = zeros2(nq, dv);
+  for (let i = 0; i < nq; i++) for (let j = 0; j < nk; j++) {
+    const a = A[i][j]; if (!a) continue;
+    for (let c = 0; c < dv; c++) Z[i][c] += a * V[j][c];
+  }
+  return { S: S, A: A, Z: Z, scale: sc };
+}
+
+/* ── a multi-head attention BLOCK: init, forward, exact backward ────────
+   No residual, no normalisation, no FFN — those are part 6's, deliberately.
+   g = number of KEY/VALUE heads (g = h is MHA, 1 < g < h is GQA, g = 1 is
+   MQA); query head j reads KV head floor(j·g/h).                         */
+function mhaInit(dm, dk, dv, h, o) {
+  const oo = Object.assign({ seed: 0, g: h, scale: null, bias: false }, o || {});
+  const r = rng(oo.seed), s = oo.scale === null ? 1 / Math.sqrt(dm) : oo.scale;
+  const gen = (a, b) => { const M = zeros2(a, b); for (let i = 0; i < a; i++) for (let j = 0; j < b; j++) M[i][j] = randn(r) * s; return M; };
+  return {
+    Wq: gen(dm, h * dk), Wk: gen(dm, oo.g * dk), Wv: gen(dm, oo.g * dv), Wo: gen(h * dv, dm),
+    h: h, g: oo.g, dk: dk, dv: dv, dm: dm
+  };
+}
+function kvHeadOf(j, h, g) { return Math.floor(j * g / h); }
+function mhaForward(X, P, o) {
+  const oo = o || {}, h = P.h, g = P.g === undefined ? h : P.g;
+  const Q = splitHeads(matmul(X, P.Wq), h);
+  const Kall = splitHeads(matmul(X, P.Wk), g);
+  const Vall = splitHeads(matmul(X, P.Wv), g);
+  const per = [];
+  for (let j = 0; j < h; j++) {
+    const kv = kvHeadOf(j, h, g);
+    per.push(sdpa(Q[j], Kall[kv], Vall[kv], { mask: oo.mask, scale: oo.scale }));
+  }
+  const C = mergeHeads(per.map(p => p.Z));
+  const Y = matmul(C, P.Wo);
+  return { Y: Y, st: { X: X, Q: Q, K: Kall, V: Vall, per: per, C: C, h: h, g: g, mask: oo.mask } };
+}
+function mhaBackward(dY, st, P) {
+  const h = st.h, g = st.g, X = st.X, C = st.C;
+  const gWo = matmul(transpose(C), dY);
+  const dC = matmul(dY, transpose(P.Wo));
+  const dZ = splitHeads(dC, h);
+  const dQ = [], dKa = [], dVa = [];
+  for (let j = 0; j < g; j++) { dKa.push(zeros2(st.K[j].length, st.K[j][0].length)); dVa.push(zeros2(st.V[j].length, st.V[j][0].length)); }
+  for (let j = 0; j < h; j++) {
+    const kv = kvHeadOf(j, h, g), A = st.per[j].A, sc = st.per[j].scale;
+    const V = st.V[kv], K = st.K[kv], Q = st.Q[j];
+    const nq = A.length, nk = A[0].length, dv = V[0].length, dk = Q[0].length;
+    /* dA = dZ Vᵀ ; dV += Aᵀ dZ */
+    const dA = zeros2(nq, nk);
+    for (let i = 0; i < nq; i++) for (let k = 0; k < nk; k++) {
+      let s = 0; for (let c = 0; c < dv; c++) s += dZ[j][i][c] * V[k][c];
+      dA[i][k] = s;
+    }
+    for (let i = 0; i < nq; i++) for (let k = 0; k < nk; k++) {
+      const a = A[i][k]; if (!a) continue;
+      for (let c = 0; c < dv; c++) dVa[kv][k][c] += a * dZ[j][i][c];
+    }
+    /* dS = A ⊙ (dA − rowsum(dA ⊙ A)) , then × scale */
+    const dS = zeros2(nq, nk);
+    for (let i = 0; i < nq; i++) {
+      let dot = 0; for (let k = 0; k < nk; k++) dot += dA[i][k] * A[i][k];
+      for (let k = 0; k < nk; k++) dS[i][k] = A[i][k] * (dA[i][k] - dot) * sc;
+    }
+    const dQj = zeros2(nq, dk);
+    for (let i = 0; i < nq; i++) for (let k = 0; k < nk; k++) {
+      const s = dS[i][k]; if (!s) continue;
+      for (let c = 0; c < dk; c++) { dQj[i][c] += s * K[k][c]; dKa[kv][k][c] += s * Q[i][c]; }
+    }
+    dQ.push(dQj);
+  }
+  const mQ = mergeHeads(dQ), mK = mergeHeads(dKa), mV = mergeHeads(dVa);
+  const gWq = matmul(transpose(X), mQ), gWk = matmul(transpose(X), mK), gWv = matmul(transpose(X), mV);
+  const dX = matmul(mQ, transpose(P.Wq));
+  const b1 = matmul(mK, transpose(P.Wk)), b2 = matmul(mV, transpose(P.Wv));
+  for (let i = 0; i < dX.length; i++) for (let c = 0; c < dX[0].length; c++) dX[i][c] += b1[i][c] + b2[i][c];
+  return { Wq: gWq, Wk: gWk, Wv: gWv, Wo: gWo, X: dX };
+}
+/* Central differences over a set of named matrices, for the audit figures.
+   loss() must close over the SAME objects it is handed.                   */
+function numGradMats(loss, mats, eps) {
+  const e = eps === undefined ? 1e-5 : eps, out = {};
+  Object.keys(mats).forEach(k => {
+    const M = mats[k], G = zeros2(M.length, M[0].length);
+    for (let i = 0; i < M.length; i++) for (let j = 0; j < M[0].length; j++) {
+      const o = M[i][j];
+      M[i][j] = o + e; const lp = loss();
+      M[i][j] = o - e; const lm = loss();
+      M[i][j] = o;
+      G[i][j] = (lp - lm) / (2 * e);
+    }
+    out[k] = G;
+  });
+  return out;
+}
+
+/* ── counting ───────────────────────────────────────────────────────────
+   Parameters of one attention block, exactly. g < h shrinks W_K and W_V
+   and NOTHING else — the query and output projections are untouched.     */
+function mhaParams(dm, dk, dv, h, g, bias) {
+  const G = g === undefined ? h : g;
+  const wq = dm * h * dk, wk = dm * G * dk, wv = dm * G * dv, wo = h * dv * dm;
+  const b = bias ? (h * dk + G * dk + G * dv + dm) : 0;
+  return { Wq: wq, Wk: wk, Wv: wv, Wo: wo, bias: b, total: wq + wk + wv + wo + b };
+}
+/* MACs for ONE layer's forward pass at sequence length n, batch 1.
+   `nmat` is 2 for a GELU MLP and 3 for a SwiGLU one. `causal:true` halves
+   the quadratic term, which is what a kernel that skips fully masked
+   blocks actually achieves.                                              */
+function attnMacs(o) {
+  const c = Object.assign({ n: 1024, d: 768, h: 12, g: null, dh: 64, dff: 3072, nmat: 2, causal: false }, o || {});
+  const g = c.g === null ? c.h : c.g;
+  const proj = c.n * c.d * (c.h * c.dh) + 2 * c.n * c.d * (g * c.dh) + c.n * (c.h * c.dh) * c.d;
+  const f = c.causal ? 0.5 * (1 + 1 / c.n) : 1;
+  const quad = 2 * c.n * c.n * (c.h * c.dh) * f;
+  const ffn = c.nmat * c.n * c.d * c.dff;
+  return { proj: proj, quad: quad, ffn: ffn, attn: proj + quad, total: proj + quad + ffn };
+}
+/* The sequence length at which the quadratic term overtakes `against`.
+   Closed form when h·dh = d and g = h:   quad = 2n²d, proj = 4nd²,
+   ffn = nmat·n·d·dff  ⇒  n* = 2d (proj), nmat·dff/2 (ffn), the sum (rest).
+   Solved numerically here so that GQA (g < h) and h·dh ≠ d are handled.  */
+function macCrossover(o, against) {
+  let lo = 1, hi = 1 << 30;
+  const val = n => {
+    const m = attnMacs(Object.assign({}, o, { n: n }));
+    return { quad: m.quad, other: against === "proj" ? m.proj : against === "ffn" ? m.ffn : m.proj + m.ffn };
+  };
+  while (hi - lo > 1) { const mid = Math.floor((lo + hi) / 2), v = val(mid); if (v.quad < v.other) lo = mid; else hi = mid; }
+  return hi;
+}
+/* KV cache, in ELEMENTS per token, for the whole stack.
+   kind: "mha" | "gqa" | "mqa" use 2·g·dh·L ; "mla" uses (dc + dr)·L.     */
+function kvCacheElems(o) {
+  const c = Object.assign({ h: 32, g: null, dh: 128, L: 32, kind: "gqa", dc: 512, dr: 64 }, o || {});
+  if (c.kind === "mla") return (c.dc + c.dr) * c.L;
+  const g = c.kind === "mha" ? c.h : c.kind === "mqa" ? 1 : (c.g === null ? c.h : c.g);
+  return 2 * g * c.dh * c.L;
+}
+/* Arithmetic intensity of ONE decode step's attention over the cache:
+   MACs 2·n·h·dh, bytes 2·n·g·dh·b  ⇒  I = h/(g·b) MAC/byte = 2h/(g·b)
+   FLOP/byte. The sequence length CANCELS, and batching does not help
+   because each sequence owns its cache.                                  */
+function decodeIntensity(h, g, bytesPerElem) {
+  const b = bytesPerElem === undefined ? 2 : bytesPerElem;
+  return { mac: h / (g * b), flop: 2 * h / (g * b) };
+}
+
   return {
     clamp, lerp, linspace, fmt, sig, fmtE, big, commas,
     rng, randn, shuffle,
@@ -2118,6 +2434,11 @@ function ridge(X, Y, lam) {
     jacFD, eigGeneral, specRad, scaleToRho, matPow, eigSym, pinvSym, ridge,
     CELL, cellList, cellParams, cellFlatten, cellUnflatten, cellGradFlatten, cellClone,
     seqRandn, seqInit, seqForward, seqLoss, seqLossAt, seqHead,
-    seqBPTT, seqBPTTtrunc, seqBPTTchunk, seqNumGrad, stateJac, sliceState, addGrads
+    seqBPTT, seqBPTTtrunc, seqBPTTchunk, seqNumGrad, stateJac, sliceState, addGrads,
+    /* [part 5 — Attention] see THE ATTENTION LAYOUT LAW above */
+    softmaxRows, softmaxJac, softmaxJacFrob, entropyOf, perplexityOf,
+    splitHeads, mergeHeads, causalMask, padMask, windowMask, addMasks, maskConst,
+    sdpa, mhaInit, mhaForward, mhaBackward, kvHeadOf, numGradMats,
+    mhaParams, attnMacs, macCrossover, kvCacheElems, decodeIntensity
   };
 })();
