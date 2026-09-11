@@ -23,9 +23,9 @@ const page = process.argv[2];
 const deps = process.argv[3] || "/tmp/harness-deps";
 if (!page) { console.error("usage: node tools/figure_harness.js <page.html> [depsDir]"); process.exit(2); }
 
-let JSDOM, createCanvas;
+let JSDOM, VirtualConsole, createCanvas;
 try {
-  ({ JSDOM } = require(path.join(deps, "node_modules/jsdom")));
+  ({ JSDOM, VirtualConsole } = require(path.join(deps, "node_modules/jsdom")));
   ({ createCanvas } = require(path.join(deps, "node_modules/canvas")));
 } catch (e) {
   console.error(`missing deps in ${deps}\n  npm i --prefix ${deps} jsdom canvas`);
@@ -33,11 +33,25 @@ try {
 }
 
 const html = fs.readFileSync(path.join(ROOT, page), "utf8");
-const dom = new JSDOM(html, { pretendToBeVisual: true, runScripts: "outside-only" });
+/* jsdom does NOT rethrow an exception thrown inside an event listener: dispatchEvent
+   returns normally and the error goes to the virtual console as a "jsdomError". Without
+   this hook a control handler that throws still reads "all controls exercised cleanly". */
+let handlerErrs = 0;
+const vc = new VirtualConsole();
+vc.forwardTo(console, { jsdomErrors: "none" });   // jsdom ≥ 25 API (was sendTo/omitJSDOMErrors)
+vc.on("jsdomError", e => {
+  handlerErrs++;
+  const err = e && e.detail || e;
+  const frame = ((err && err.stack) || "").split("\n").find(l => /\.viz\.js|viz\.js/.test(l)) || "";
+  console.log(`HANDLER THROW: ${err && err.message || e.message || e} @ ${frame.trim()}`);
+});
+const dom = new JSDOM(html, { pretendToBeVisual: true, runScripts: "outside-only", virtualConsole: vc });
 const w = dom.window;
 global.window = w; global.document = w.document; global.navigator = w.navigator;
 global.self = w; global.HTMLElement = w.HTMLElement;
 global.requestAnimationFrame = cb => setTimeout(cb, 0);
+global.cancelAnimationFrame = id => clearTimeout(id);
+w.requestAnimationFrame = global.requestAnimationFrame; w.cancelAnimationFrame = global.cancelAnimationFrame;
 
 /* jsdom has no 2-D canvas; several pages raster images into one rather than emitting
    one <rect> per pixel, which is unusable above ~2500 cells. */
@@ -61,8 +75,13 @@ const files = ["vendor/d3.min.js", ...wanted.map(s => path.relative(ROOT, path.r
   .filter(f => fs.existsSync(path.join(ROOT, f)));
 console.log("loading:", files.join(" → "));
 
+/* notes.js is skipped, but the older pages read its palette `C` (a plain const on its
+   first lines). Preload just that declaration so those pages are tested, not the skip. */
+const bodies = files.map(f => fs.readFileSync(path.join(ROOT, f), "utf8"));
+const declaresC = bodies.some(b => /^\s*(const|let|var)\s+C\b/m.test(b));   // a page with its own C wins
+const palette = declaresC ? "" : (fs.readFileSync(path.join(ROOT, "notes.js"), "utf8").match(/^const C = \{[^\n]*\};/m) || [""])[0];
 let fatal = null;
-try { (0, eval)(files.map(f => fs.readFileSync(path.join(ROOT, f), "utf8")).join("\n;\n")); }
+try { (0, eval)([palette, ...bodies].join("\n;\n")); }
 catch (e) { fatal = e.stack.split("\n").slice(0, 6).join("\n   "); }
 if (fatal) { console.log("TOP-LEVEL THROW:\n   " + fatal); process.exit(1); }
 
@@ -112,5 +131,6 @@ const nan = [];
 });
 if (nan.length) console.log("BAD VALUES IN READOUTS:\n  " + nan.join("\n  "));
 
+bad += handlerErrs;
 console.log(bad ? `${bad} CONTROL THROWS` : "all controls exercised cleanly");
 process.exit((bad || empty.length || nan.length || blankRo.length) ? 1 : 0);

@@ -111,7 +111,16 @@ rather than emitting a `<rect>` per pixel — then:
 * drives every `<select>` through all its options, every range to min/mid/max (snapped to
   the step, as browsers do), every checkbox both ways, and clicks every button, reporting
   any throw;
-* flags `NaN`, `undefined` or `Infinity` reaching a readout.
+* flags `NaN`, `undefined` or `Infinity` reaching a readout;
+* counts exceptions thrown **inside event listeners**. jsdom does not rethrow those —
+  `dispatchEvent` returns normally and the error goes to its virtual console — so before
+  this hook a control handler that threw still printed "all controls exercised cleanly".
+  They now appear as `HANDLER THROW: … @ <frame in the page's viz.js>` and fail the run.
+
+Two small accommodations for the older pages: the palette `const C` from `notes.js` is
+preloaded (notes.js itself is skipped) unless the page's own scripts declare a `C`, and
+`cancelAnimationFrame` is stubbed alongside `requestAnimationFrame`. A readout that a page
+fills from a `setTimeout` will still read as empty — the harness reads synchronously.
 
 Exits non-zero on any of those. **It earns its keep:** it found four real problems while
 `vision/frequency-domain.html` was being written, including a leakage demo whose weak tone
