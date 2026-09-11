@@ -157,6 +157,26 @@
                    DL.decodeIntensity — counting, in MACs, matching DL.macs and
                    DL.convCount.  READ THE ATTENTION LAYOUT LAW above them.
                                                                      [part 5]
+     · transformer DL.sinusoidalPE, DL.peShiftMatrix (PE(p+k) = PE(p)·M_k),
+                   DL.ropeFreqs, DL.rope (rotate the ROWS of Q and K; never V;
+                   pairing "adjacent" or "half" are DIFFERENT conventions),
+                   DL.alibiSlopes, DL.alibiBias, DL.relBucket, DL.relBucketMatrix;
+                   DL.lnForward/lnBackward, DL.rmsForward/rmsBackward (norms
+                   with a cache and an exact backward, agreeing with
+                   DL.layerNorm / DL.rmsNorm to 0); DL.ffnInit/ffnForward/
+                   ffnBackward (ungated and gated), DL.ffnParams,
+                   DL.ffnWidthGated (the ⅔ correction); DL.attnForward/
+                   attnBackward (DL.mhaForward with optional RoPE and per-head
+                   biases — identical to it when both are off); DL.blockInit/
+                   blockForward/blockBackward (pre-LN and post-LN), DL.blockParams;
+                   DL.tfInit/tfForward/tfLoss/tfBackward/tfParamList/tfGradList,
+                   DL.optMats — a whole tiny decoder-only model for the live
+                   figures; DL.modelParams, DL.modelFlops (the 6·N·D rule with
+                   the quadratic term explicit, MACs and FLOPs named separately),
+                   DL.noamLR, DL.smoothTarget, DL.xentSoft, DL.smoothFloor.
+                   Every backward pass audited against central differences;
+                   the page prints the worst relative error.
+                   READ THE TRANSFORMER header above sinusoidalPE.   [part 6]
      · drawing     DL.frame, DL.axisB, DL.axisL, DL.gridX, DL.gridY, DL.legend,
                    DL.panelBox, DL.kv, DL.matText, DL.arrow, DL.curve, DL.clip,
                    DL.cells, DL.netDiagram(g, sizes, opt)
@@ -2412,6 +2432,565 @@ function decodeIntensity(h, g, bytesPerElem) {
   return { mac: h / (g * b), flop: 2 * h / (g * b) };
 }
 
+/* ══ TRANSFORMER ════════════════════════════════════════════════════════
+   [part 6 — Transformers]  Everything that turns an attention sub-layer
+   into a model, promoted here because the remaining parts of the series
+   (Residual connections, Encoder vs Decoder, Fine-tuning, Distillation,
+   Distributed training) and the model cards (BERT, GPT) are built out of
+   exactly these calls. Nothing above this line was changed.
+
+   THE ATTENTION LAYOUT LAW CONTINUES TO HOLD. A sequence is X (n × d),
+   one TOKEN per ROW; a weight is (d_in × d_out) and sits on the RIGHT;
+   heads split the LAST axis into ADJACENT blocks; masks are ADDITIVE and
+   −Infinity. Two consequences that are easy to get backwards:
+
+     · RoPE rotates each ROW of Q and of K, pair by pair, by an angle that
+       grows with that row's position. It never touches V.
+     · In a position-wise FFN  Y = act(X·W₁ + b₁)·W₂ + b₂  the "keys" of the
+       key–value-memory reading are the COLUMNS of W₁ (each is dotted with
+       the token row x) and the "values" are the ROWS of W₂.
+
+   Positional encodings
+     sinusoidalPE(n, d[, base])       (n × d), sin in even columns, cos in
+                                      odd, wavelength 2π·base^(2i/d)
+     peShiftMatrix(k, d[, base])      the (d × d) block-rotation M_k with
+                                      PE(p + k) = PE(p)·M_k  EXACTLY, for
+                                      every p (the relative-offset property)
+     ropeFreqs(d[, base])             θᵢ = base^(−2i/d), i = 0 … d/2 − 1
+     rope(X, {base, offset, pairing, inverse})
+                                      rotate every ROW of X (n × d) by its
+                                      position (row index + offset).
+                                      pairing "adjacent" pairs columns
+                                      (2i, 2i+1) as the original paper does;
+                                      "half" pairs (i, i + d/2) as the
+                                      rotate-half implementations do. The
+                                      two are DIFFERENT conventions with the
+                                      SAME relative-offset property; a
+                                      checkpoint is tied to one of them.
+                                      inverse:true rotates by −angle, which
+                                      is the exact backward pass because the
+                                      rotation is orthogonal.
+     alibiSlopes(h)                   the geometric slopes 2^(−8/h · j),
+                                      with the original rule for h not a
+                                      power of two
+     alibiBias(n, slope)              (n × n) of −slope·|i − j|; ADD the
+                                      causal mask separately
+     relBucket(rel, {bidir, buckets, maxDist})
+                                      the T5-style log-spaced bucket index
+     relBucketMatrix(n, o)            (n × n) of bucket indices, j − i
+
+   Normalisation with a cache and an exact backward pass (DL.layerNorm and
+   DL.rmsNorm from part 2 return only Y; these return {Y, st} and agree
+   with them to 0)
+     lnForward(X, γ, β[, eps]) / lnBackward(dY, st) → {X, g, b}
+     rmsForward(X, γ[, eps])   / rmsBackward(dY, st) → {X, g}
+
+   The position-wise FFN
+     ffnInit(d, dff, {act, gated, bias, seed, scale})
+     ffnForward(X, P) → {Y, st};  ffnBackward(dY, st, P) → {W1,b1,W2,b2 | Wg,Wu,Wd, X}
+       ungated: Y = act(X·W₁ + b₁)·W₂ + b₂
+       gated:   Y = (act(X·W_g) ⊙ (X·W_u))·W_d          (SwiGLU when act = silu)
+     ffnParams(d, dff, {gated, bias}); ffnWidthGated(d, {ratio, multiple, mult})
+       — the ⅔ correction that keeps a gated FFN at the ungated parameter
+       count, rounded up to a multiple as real configurations do
+
+   Attention with optional RoPE and per-head additive biases
+     attnForward(X, P, {mask, rope, scale}) / attnBackward(dY, st, P)
+       — P from DL.mhaInit. o.mask may be ONE (n × n) matrix or an ARRAY of
+       h matrices (ALiBi needs a different slope per head). With rope null
+       and a single mask these reproduce DL.mhaForward / DL.mhaBackward to
+       0.000e+00 and are audited against central differences below.
+
+   The block
+     blockInit(d, h, dff, {dk, dv, g, norm:"ln"|"rms", pre:true|false, act,
+                            gated, bias, seed})
+     blockForward(X, P, {mask, rope}) → {Y, st};  blockBackward(dY, st, P)
+       pre-LN:   X₁ = X + Attn(N₁(X));   Y = X₁ + FFN(N₂(X₁))
+       post-LN:  X₁ = N₁(X + Attn(X));   Y = N₂(X₁ + FFN(X₁))
+     blockParams(d, h, dff, o) → {attn, ffn, norms, total}
+
+   A whole tiny decoder-only model, for the live figures
+     tfInit({V, d, L, h, dff, nCtx, pos, norm, pre, gated, act, tie,
+             scaleEmb, embStd, seed, ropeBase, ropePairing})
+       scaleEmb multiplies the looked-up row by √d (the 2017 convention,
+       with E ~ N(0, 1/d)); embStd overrides E's initial std (the 0.02
+       convention uses embStd = 0.02 with scaleEmb false)
+       pos: "learned" | "sin" | "rope" | "alibi" | "none"
+     tfForward(m, idx, o) → {logits, st}     idx = array of token ids
+     tfLoss(m, idx, tgt[, o]) → mean cross-entropy over the positions
+     tfBackward(m, idx, tgt[, o]) → {loss, g: {E, Pos, blocks[], nf, Wout}}
+     tfParamList(m) → [{k, M}] every trainable matrix, by reference
+     tfGradList(g, m) → the same order, for the optimiser
+     optMats(mats, grads, states, key, hp) — one step of DL.OPT[key] over a
+       list of matrices, each with its own flat state; decoupled decay uses
+       hp.wd exactly as DL.OPT.adamw does
+
+   Counting a whole model
+     modelParams(cfg) → {embed, pos, attn, ffn, norms, unembed, total,
+                         perBlock, blocks}
+       cfg = {V, d, L, h, g, dk, dff, nCtx, pos, norm, gated, bias, tie}
+     modelFlops(cfg, n) → {weightMacs, attnMacs, macs, flops, train6ND, …}
+       PER TOKEN: forward MACs = N_nonembed + attention n·d term; training
+       FLOPs = 6·N + 12·L·d·n for a causal model (the "6ND" rule with the
+       quadratic term made explicit). States MACs and FLOPs separately.
+     noamLR(step, d, warm)   d^(−½)·min(step^(−½), step·warm^(−3/2)), the
+       original schedule, 1-BASED step; equals DL.lrAt("invsqrt", step,
+       {peak: (d·warm)^(−½), warm}) to round-off (lrAt's linear warmup
+       reaches the peak AT t = warm, which is the same step)
+     smoothTarget(V, k, ε), xentSoft(logits, q), smoothFloor(V, ε) — label
+       smoothing: the target, the loss against it, and the floor the loss
+       cannot go below (the entropy of the smoothed target)
+                                                                     [part 6] */
+
+/* ── positional encodings ─────────────────────────────────────────────── */
+function sinusoidalPE(n, d, base) {
+  const b = base === undefined ? 10000 : base, P = zeros2(n, d);
+  for (let p = 0; p < n; p++) for (let i = 0; 2 * i < d; i++) {
+    const w = Math.pow(b, -2 * i / d);
+    P[p][2 * i] = Math.sin(p * w);
+    if (2 * i + 1 < d) P[p][2 * i + 1] = Math.cos(p * w);
+  }
+  return P;
+}
+/* PE(p + k) = PE(p)·M_k, row convention: for the pair (sin ωp, cos ωp),
+   [s c]·[[cos ωk, −sin ωk],[sin ωk, cos ωk]] = [s cos ωk + c sin ωk,
+   −s sin ωk + c cos ωk] = [sin ω(p+k), cos ω(p+k)].                        */
+function peShiftMatrix(k, d, base) {
+  const b = base === undefined ? 10000 : base, M = zeros2(d, d);
+  for (let i = 0; 2 * i < d; i++) {
+    const w = Math.pow(b, -2 * i / d), c = Math.cos(k * w), s = Math.sin(k * w);
+    const a = 2 * i, q = 2 * i + 1;
+    if (q < d) { M[a][a] = c; M[a][q] = -s; M[q][a] = s; M[q][q] = c; }
+    else M[a][a] = 1;
+  }
+  return M;
+}
+function ropeFreqs(d, base) {
+  const b = base === undefined ? 10000 : base, out = [];
+  for (let i = 0; 2 * i < d; i++) out.push(Math.pow(b, -2 * i / d));
+  return out;
+}
+function rope(X, o) {
+  const oo = Object.assign({ base: 10000, offset: 0, pairing: "adjacent", inverse: false }, o || {});
+  const n = X.length, d = X[0].length, half = Math.floor(d / 2), th = ropeFreqs(d, oo.base);
+  const sgn = oo.inverse ? -1 : 1, Y = X.map(r => r.slice());
+  for (let p = 0; p < n; p++) {
+    const pos = p + oo.offset;
+    for (let i = 0; i < half; i++) {
+      const ia = oo.pairing === "half" ? i : 2 * i, ib = oo.pairing === "half" ? i + half : 2 * i + 1;
+      const ang = sgn * pos * th[i], c = Math.cos(ang), s = Math.sin(ang);
+      const a = X[p][ia], b = X[p][ib];
+      Y[p][ia] = a * c - b * s;
+      Y[p][ib] = a * s + b * c;
+    }
+  }
+  return Y;
+}
+/* ALiBi slopes: for h a power of two, 2^(−8j/h) for j = 1…h; otherwise the
+   closest power of two below, plus every other slope of the 2·that set.  */
+function alibiSlopes(h) {
+  const pow2 = n => { const s = Math.pow(2, -Math.pow(2, -(Math.log2(n) - 3))); const out = []; for (let j = 1; j <= n; j++) out.push(Math.pow(s, j)); return out; };
+  if (Number.isInteger(Math.log2(h))) return pow2(h);
+  const c = Math.pow(2, Math.floor(Math.log2(h)));
+  const base = pow2(c), extra = pow2(2 * c).filter((_, i) => i % 2 === 0).slice(0, h - c);
+  return base.concat(extra);
+}
+function alibiBias(n, slope, nk) {
+  const K = nk === undefined ? n : nk, B = zeros2(n, K);
+  for (let i = 0; i < n; i++) for (let j = 0; j < K; j++) B[i][j] = -slope * Math.abs(i - j);
+  return B;
+}
+/* T5-style relative-position bucket of rel = j − i (key minus query).
+   Half the buckets are exact small offsets, the other half log-spaced up
+   to maxDist; beyond it everything shares the last bucket.               */
+function relBucket(rel, o) {
+  const oo = Object.assign({ bidir: true, buckets: 32, maxDist: 128 }, o || {});
+  let nb = oo.buckets, r = rel, out = 0;
+  if (oo.bidir) { nb = Math.floor(nb / 2); if (r > 0) out += nb; r = Math.abs(r); }
+  else r = Math.max(-r, 0);
+  const exact = Math.floor(nb / 2);
+  if (r < exact) return out + r;
+  const large = exact + Math.floor(Math.log(r / exact) / Math.log(oo.maxDist / exact) * (nb - exact));
+  return out + Math.min(large, nb - 1);
+}
+function relBucketMatrix(n, o) {
+  const M = zeros2(n, n);
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) M[i][j] = relBucket(j - i, o);
+  return M;
+}
+
+/* ── normalisation with cache and backward ───────────────────────────── */
+function lnForward(X, g, b, eps) {
+  const e = eps === undefined ? 1e-5 : eps, d = X[0].length;
+  const xhat = [], inv = [];
+  const Y = X.map(r => {
+    let m = 0; for (let j = 0; j < d; j++) m += r[j]; m /= d;
+    let v = 0; for (let j = 0; j < d; j++) v += (r[j] - m) * (r[j] - m); v /= d;
+    const iv = 1 / Math.sqrt(v + e), xh = r.map(x => (x - m) * iv);
+    xhat.push(xh); inv.push(iv);
+    return xh.map((x, j) => (g ? g[j] : 1) * x + (b ? b[j] : 0));
+  });
+  return { Y: Y, st: { xhat: xhat, inv: inv, g: g, d: d } };
+}
+function lnBackward(dY, st) {
+  const n = dY.length, d = st.d, dg = zeros(d), db = zeros(d), dX = zeros2(n, d);
+  for (let i = 0; i < n; i++) {
+    const xh = st.xhat[i], dxh = new Array(d);
+    let m1 = 0, m2 = 0;
+    for (let j = 0; j < d; j++) {
+      dg[j] += dY[i][j] * xh[j]; db[j] += dY[i][j];
+      dxh[j] = dY[i][j] * (st.g ? st.g[j] : 1);
+      m1 += dxh[j]; m2 += dxh[j] * xh[j];
+    }
+    m1 /= d; m2 /= d;
+    for (let j = 0; j < d; j++) dX[i][j] = st.inv[i] * (dxh[j] - m1 - xh[j] * m2);
+  }
+  return { X: dX, g: dg, b: db };
+}
+function rmsForward(X, g, eps) {
+  const e = eps === undefined ? 1e-5 : eps, d = X[0].length, inv = [];
+  const Y = X.map(r => {
+    let ms = 0; for (let j = 0; j < d; j++) ms += r[j] * r[j]; ms /= d;
+    const iv = 1 / Math.sqrt(ms + e); inv.push(iv);
+    return r.map((x, j) => (g ? g[j] : 1) * x * iv);
+  });
+  return { Y: Y, st: { X: X, inv: inv, g: g, d: d } };
+}
+function rmsBackward(dY, st) {
+  const n = dY.length, d = st.d, dg = zeros(d), dX = zeros2(n, d);
+  for (let i = 0; i < n; i++) {
+    const x = st.X[i], iv = st.inv[i];
+    let dot = 0;
+    for (let j = 0; j < d; j++) { const gj = st.g ? st.g[j] : 1; dg[j] += dY[i][j] * x[j] * iv; dot += dY[i][j] * gj * x[j]; }
+    for (let j = 0; j < d; j++) dX[i][j] = (st.g ? st.g[j] : 1) * dY[i][j] * iv - x[j] * dot * iv * iv * iv / d;
+  }
+  return { X: dX, g: dg };
+}
+
+/* ── the position-wise FFN ────────────────────────────────────────────── */
+function ffnInit(d, dff, o) {
+  const oo = Object.assign({ act: "gelu", gated: false, bias: true, seed: 3, scale: null }, o || {});
+  const r = rng(oo.seed);
+  const gen = (a, b, s) => { const M = zeros2(a, b); for (let i = 0; i < a; i++) for (let j = 0; j < b; j++) M[i][j] = randn(r) * s; return M; };
+  const s1 = oo.scale === null ? 1 / Math.sqrt(d) : oo.scale, s2 = oo.scale === null ? 1 / Math.sqrt(dff) : oo.scale;
+  if (oo.gated) return { gated: true, act: oo.act, d: d, dff: dff, Wg: gen(d, dff, s1), Wu: gen(d, dff, s1), Wd: gen(dff, d, s2) };
+  return { gated: false, act: oo.act, d: d, dff: dff, bias: oo.bias, W1: gen(d, dff, s1), b1: zeros(dff), W2: gen(dff, d, s2), b2: zeros(d) };
+}
+function ffnForward(X, P) {
+  const A = act(P.act);
+  if (P.gated) {
+    const Hg = matmul(X, P.Wg), Hu = matmul(X, P.Wu);
+    const G = Hg.map((r, i) => r.map((v, j) => A.f(v) * Hu[i][j]));
+    return { Y: matmul(G, P.Wd), st: { X: X, Hg: Hg, Hu: Hu, G: G } };
+  }
+  const H = matmul(X, P.W1);
+  if (P.bias) for (let i = 0; i < H.length; i++) for (let j = 0; j < H[0].length; j++) H[i][j] += P.b1[j];
+  const G = H.map(r => r.map(v => A.f(v)));           // never r.map(A.f): the index would land in the shape parameter
+  const Y = matmul(G, P.W2);
+  if (P.bias) for (let i = 0; i < Y.length; i++) for (let j = 0; j < Y[0].length; j++) Y[i][j] += P.b2[j];
+  return { Y: Y, st: { X: X, H: H, G: G } };
+}
+function ffnBackward(dY, st, P) {
+  const A = act(P.act), X = st.X;
+  if (P.gated) {
+    const gWd = matmul(transpose(st.G), dY), dG = matmul(dY, transpose(P.Wd));
+    const dHu = dG.map((r, i) => r.map((v, j) => v * A.f(st.Hg[i][j])));
+    const dHg = dG.map((r, i) => r.map((v, j) => v * st.Hu[i][j] * A.df(st.Hg[i][j])));
+    const gWg = matmul(transpose(X), dHg), gWu = matmul(transpose(X), dHu);
+    const dX = matmul(dHg, transpose(P.Wg)), t = matmul(dHu, transpose(P.Wu));
+    for (let i = 0; i < dX.length; i++) for (let j = 0; j < dX[0].length; j++) dX[i][j] += t[i][j];
+    return { Wg: gWg, Wu: gWu, Wd: gWd, X: dX };
+  }
+  const gW2 = matmul(transpose(st.G), dY), db2 = zeros(dY[0].length);
+  for (let i = 0; i < dY.length; i++) for (let j = 0; j < dY[0].length; j++) db2[j] += dY[i][j];
+  const dG = matmul(dY, transpose(P.W2));
+  const dH = dG.map((r, i) => r.map((v, j) => v * A.df(st.H[i][j])));
+  const gW1 = matmul(transpose(X), dH), db1 = zeros(dH[0].length);
+  for (let i = 0; i < dH.length; i++) for (let j = 0; j < dH[0].length; j++) db1[j] += dH[i][j];
+  return { W1: gW1, b1: db1, W2: gW2, b2: db2, X: matmul(dH, transpose(P.W1)) };
+}
+function ffnParams(d, dff, o) {
+  const oo = Object.assign({ gated: false, bias: true }, o || {});
+  if (oo.gated) return 3 * d * dff;
+  return 2 * d * dff + (oo.bias ? dff + d : 0);
+}
+/* d_ff for a gated FFN at the same parameter count as an ungated ratio·d
+   one: ⅔·ratio·d, optionally ×mult, rounded UP to a multiple.            */
+function ffnWidthGated(d, o) {
+  const oo = Object.assign({ ratio: 4, multiple: 1, mult: 1 }, o || {});
+  const raw = (2 / 3) * oo.ratio * d * oo.mult;
+  return oo.multiple > 1 ? oo.multiple * Math.ceil(raw / oo.multiple) : Math.round(raw);
+}
+
+/* ── attention with optional RoPE and per-head additive bias ─────────── */
+function attnForward(X, P, o) {
+  const oo = o || {}, h = P.h, g = P.g === undefined ? h : P.g;
+  const Q0 = splitHeads(matmul(X, P.Wq), h), K0 = splitHeads(matmul(X, P.Wk), g), V = splitHeads(matmul(X, P.Wv), g);
+  const Q = oo.rope ? Q0.map(q => rope(q, oo.rope)) : Q0;
+  const K = oo.rope ? K0.map(k => rope(k, oo.rope)) : K0;
+  const per = [];
+  for (let j = 0; j < h; j++) {
+    const kv = kvHeadOf(j, h, g);
+    const mask = Array.isArray(oo.mask) && Array.isArray(oo.mask[0]) && Array.isArray(oo.mask[0][0]) ? oo.mask[j] : oo.mask;
+    per.push(sdpa(Q[j], K[kv], V[kv], { mask: mask, scale: oo.scale }));
+  }
+  const C = mergeHeads(per.map(p => p.Z)), Y = matmul(C, P.Wo);
+  return { Y: Y, st: { X: X, Q: Q, K: K, V: V, per: per, C: C, h: h, g: g, rope: oo.rope || null } };
+}
+function attnBackward(dY, st, P) {
+  const h = st.h, g = st.g, X = st.X;
+  const gWo = matmul(transpose(st.C), dY), dC = matmul(dY, transpose(P.Wo)), dZ = splitHeads(dC, h);
+  const dQ = [], dK = [], dV = [];
+  for (let j = 0; j < g; j++) { dK.push(zeros2(st.K[j].length, st.K[j][0].length)); dV.push(zeros2(st.V[j].length, st.V[j][0].length)); }
+  for (let j = 0; j < h; j++) {
+    const kv = kvHeadOf(j, h, g), A = st.per[j].A, sc = st.per[j].scale;
+    const V = st.V[kv], K = st.K[kv], Q = st.Q[j];
+    const nq = A.length, nk = A[0].length, dv = V[0].length, dk = Q[0].length;
+    const dA = zeros2(nq, nk);
+    for (let i = 0; i < nq; i++) for (let k = 0; k < nk; k++) {
+      let s = 0; for (let c = 0; c < dv; c++) s += dZ[j][i][c] * V[k][c];
+      dA[i][k] = s;
+    }
+    for (let i = 0; i < nq; i++) for (let k = 0; k < nk; k++) {
+      const a = A[i][k]; if (!a) continue;
+      for (let c = 0; c < dv; c++) dV[kv][k][c] += a * dZ[j][i][c];
+    }
+    const dS = zeros2(nq, nk);
+    for (let i = 0; i < nq; i++) {
+      let dot = 0; for (let k = 0; k < nk; k++) dot += dA[i][k] * A[i][k];
+      for (let k = 0; k < nk; k++) dS[i][k] = A[i][k] * (dA[i][k] - dot) * sc;
+    }
+    const dQj = zeros2(nq, dk);
+    for (let i = 0; i < nq; i++) for (let k = 0; k < nk; k++) {
+      const s = dS[i][k]; if (!s) continue;
+      for (let c = 0; c < dk; c++) { dQj[i][c] += s * K[k][c]; dK[kv][k][c] += s * Q[i][c]; }
+    }
+    dQ.push(dQj);
+  }
+  /* RoPE is orthogonal per row: the backward pass is the inverse rotation */
+  const inv = st.rope ? Object.assign({}, st.rope, { inverse: true }) : null;
+  const mQ = mergeHeads(inv ? dQ.map(q => rope(q, inv)) : dQ);
+  const mK = mergeHeads(inv ? dK.map(k => rope(k, inv)) : dK);
+  const mV = mergeHeads(dV);
+  const gWq = matmul(transpose(X), mQ), gWk = matmul(transpose(X), mK), gWv = matmul(transpose(X), mV);
+  const dX = matmul(mQ, transpose(P.Wq)), b1 = matmul(mK, transpose(P.Wk)), b2 = matmul(mV, transpose(P.Wv));
+  for (let i = 0; i < dX.length; i++) for (let c = 0; c < dX[0].length; c++) dX[i][c] += b1[i][c] + b2[i][c];
+  return { Wq: gWq, Wk: gWk, Wv: gWv, Wo: gWo, X: dX };
+}
+
+/* ── the block ────────────────────────────────────────────────────────── */
+function blockInit(d, h, dff, o) {
+  const oo = Object.assign({ dk: null, dv: null, g: null, norm: "ln", pre: true, act: "gelu", gated: false, bias: true, seed: 11, scale: null }, o || {});
+  const dk = oo.dk === null ? d / h : oo.dk, dv = oo.dv === null ? dk : oo.dv, g = oo.g === null ? h : oo.g;
+  const attn = mhaInit(d, dk, dv, h, { seed: oo.seed, g: g, scale: oo.scale });
+  const ffn = ffnInit(d, dff, { act: oo.act, gated: oo.gated, bias: oo.bias, seed: oo.seed + 1, scale: oo.scale });
+  const ones = () => { const v = zeros(d); for (let j = 0; j < d; j++) v[j] = 1; return v; };
+  return { attn: attn, ffn: ffn, n1: { g: ones(), b: zeros(d) }, n2: { g: ones(), b: zeros(d) },
+           cfg: { d: d, h: h, dff: dff, norm: oo.norm, pre: oo.pre, dk: dk, dv: dv, g: g } };
+}
+function normFwd(kind, X, p) { return kind === "rms" ? rmsForward(X, p.g) : lnForward(X, p.g, p.b); }
+function normBwd(kind, dY, st) { return kind === "rms" ? rmsBackward(dY, st) : lnBackward(dY, st); }
+function addM(A, B) { return A.map((r, i) => r.map((v, j) => v + B[i][j])); }
+function blockForward(X, P, o) {
+  const oo = o || {}, k = P.cfg.norm, ao = { mask: oo.mask, rope: oo.rope, scale: oo.scale };
+  if (P.cfg.pre) {
+    const n1 = normFwd(k, X, P.n1), a = attnForward(n1.Y, P.attn, ao), X1 = addM(X, a.Y);
+    const n2 = normFwd(k, X1, P.n2), f = ffnForward(n2.Y, P.ffn), Y = addM(X1, f.Y);
+    return { Y: Y, st: { pre: true, n1: n1.st, a: a.st, X1: X1, n2: n2.st, f: f.st, attnOut: a.Y, ffnOut: f.Y } };
+  }
+  const a = attnForward(X, P.attn, ao), n1 = normFwd(k, addM(X, a.Y), P.n1), X1 = n1.Y;
+  const f = ffnForward(X1, P.ffn), n2 = normFwd(k, addM(X1, f.Y), P.n2);
+  return { Y: n2.Y, st: { pre: false, a: a.st, n1: n1.st, X1: X1, f: f.st, n2: n2.st, attnOut: a.Y, ffnOut: f.Y } };
+}
+function blockBackward(dY, st, P) {
+  const k = P.cfg.norm;
+  if (st.pre) {
+    const gf = ffnBackward(dY, st.f, P.ffn), g2 = normBwd(k, gf.X, st.n2);
+    const dX1 = addM(dY, g2.X);
+    const ga = attnBackward(dX1, st.a, P.attn), g1 = normBwd(k, ga.X, st.n1);
+    const dX = addM(dX1, g1.X);
+    return { attn: ga, ffn: gf, n1: g1, n2: g2, X: dX };
+  }
+  const g2 = normBwd(k, dY, st.n2), gf = ffnBackward(g2.X, st.f, P.ffn);
+  const dX1 = addM(g2.X, gf.X);
+  const g1 = normBwd(k, dX1, st.n1), ga = attnBackward(g1.X, st.a, P.attn);
+  const dX = addM(g1.X, ga.X);
+  return { attn: ga, ffn: gf, n1: g1, n2: g2, X: dX };
+}
+function blockParams(d, h, dff, o) {
+  const oo = Object.assign({ dk: null, dv: null, g: null, norm: "ln", gated: false, bias: true, attnBias: false }, o || {});
+  const dk = oo.dk === null ? d / h : oo.dk, dv = oo.dv === null ? dk : oo.dv, g = oo.g === null ? h : oo.g;
+  const attn = mhaParams(d, dk, dv, h, g, oo.attnBias).total;
+  const ffn = ffnParams(d, dff, { gated: oo.gated, bias: oo.bias });
+  const norms = 2 * (oo.norm === "rms" ? d : 2 * d);
+  return { attn: attn, ffn: ffn, norms: norms, total: attn + ffn + norms };
+}
+
+/* ── a whole tiny decoder-only model ─────────────────────────────────── */
+function tfInit(c) {
+  const cfg = Object.assign({ V: 8, d: 16, L: 2, h: 2, dff: 32, nCtx: 16, pos: "learned", norm: "ln", pre: true,
+                              gated: false, act: "gelu", tie: true, scaleEmb: false, seed: 1, ropeBase: 10000,
+                              ropePairing: "adjacent", bias: true, scale: null, g: null }, c || {});
+  const r = rng(cfg.seed * 1009 + 7);
+  const gen = (a, b, s) => { const M = zeros2(a, b); for (let i = 0; i < a; i++) for (let j = 0; j < b; j++) M[i][j] = randn(r) * s; return M; };
+  const sE = cfg.embStd !== undefined ? cfg.embStd : (cfg.scale === null ? (cfg.scaleEmb ? 1 / Math.sqrt(cfg.d) : 1) : cfg.scale);
+  const m = { cfg: cfg, E: gen(cfg.V, cfg.d, sE), blocks: [], nf: { g: zeros(cfg.d), b: zeros(cfg.d) } };
+  for (let j = 0; j < cfg.d; j++) m.nf.g[j] = 1;
+  m.Pos = cfg.pos === "learned" ? gen(cfg.nCtx, cfg.d, 0.5 * sE) : (cfg.pos === "sin" ? sinusoidalPE(cfg.nCtx, cfg.d) : null);
+  for (let l = 0; l < cfg.L; l++) m.blocks.push(blockInit(cfg.d, cfg.h, cfg.dff,
+    { norm: cfg.norm, pre: cfg.pre, act: cfg.act, gated: cfg.gated, bias: cfg.bias, seed: cfg.seed * 31 + l, g: cfg.g, scale: cfg.scale }));
+  if (!cfg.tie) m.Wout = gen(cfg.d, cfg.V, 1 / Math.sqrt(cfg.d));
+  if (cfg.pos === "alibi") m.slopes = alibiSlopes(cfg.h);
+  return m;
+}
+function tfMasks(m, n) {
+  const cm = causalMask(n);
+  if (m.cfg.pos !== "alibi") return cm;
+  return m.slopes.map(s => addMasks(cm, alibiBias(n, s)));
+}
+function tfForward(m, idx, o) {
+  const cfg = m.cfg, n = idx.length, d = cfg.d, oo = o || {};
+  const es = cfg.scaleEmb ? Math.sqrt(d) : 1;
+  let Pos = m.Pos;
+  if (cfg.pos === "sin" && n > Pos.length) Pos = sinusoidalPE(n, d);        // closed form: any length
+  if (cfg.pos === "learned" && n > Pos.length) throw new Error("tfForward: learned positions have no row for n > nCtx = " + Pos.length);
+  const X0 = zeros2(n, d);
+  for (let i = 0; i < n; i++) for (let j = 0; j < d; j++) X0[i][j] = m.E[idx[i]][j] * es + (Pos ? Pos[i][j] : 0);
+  const mask = oo.mask || tfMasks(m, n);
+  const ro = cfg.pos === "rope" ? { base: cfg.ropeBase, pairing: cfg.ropePairing, offset: 0 } : null;
+  const xs = [X0], sts = [];
+  let X = X0;
+  for (let l = 0; l < cfg.L; l++) { const b = blockForward(X, m.blocks[l], { mask: mask, rope: ro }); sts.push(b.st); X = b.Y; xs.push(X); }
+  const nf = normFwd(cfg.norm, X, m.nf);
+  const logits = cfg.tie ? matmul(nf.Y, transpose(m.E)) : matmul(nf.Y, m.Wout);
+  return { logits: logits, st: { idx: idx, X0: X0, xs: xs, blocks: sts, nf: nf.st, nfY: nf.Y, mask: mask, es: es } };
+}
+function tfLoss(m, idx, tgt, o) {
+  const f = tfForward(m, idx, o); let L = 0, c = 0;
+  for (let i = 0; i < idx.length; i++) { if (tgt[i] < 0) continue; L += xent(f.logits[i], tgt[i]); c++; }
+  return c ? L / c : 0;
+}
+function tfBackward(m, idx, tgt, o) {
+  const cfg = m.cfg, f = tfForward(m, idx, o), n = idx.length, d = cfg.d, V = cfg.V;
+  let cnt = 0; for (let i = 0; i < n; i++) if (tgt[i] >= 0) cnt++;
+  const dLog = zeros2(n, V); let loss = 0;
+  for (let i = 0; i < n; i++) {
+    if (tgt[i] < 0) continue;
+    const p = softmax(f.logits[i]); loss += xent(f.logits[i], tgt[i]);
+    for (let k = 0; k < V; k++) dLog[i][k] = (p[k] - (k === tgt[i] ? 1 : 0)) / cnt;
+  }
+  const g = { E: zeros2(V, d), Pos: m.Pos && cfg.pos === "learned" ? zeros2(m.Pos.length, d) : null, blocks: [], nf: null, Wout: null };
+  let dH;
+  if (cfg.tie) { const t = matmul(transpose(dLog), f.st.nfY); for (let i = 0; i < V; i++) for (let j = 0; j < d; j++) g.E[i][j] += t[i][j]; dH = matmul(dLog, m.E); }
+  else { g.Wout = matmul(transpose(f.st.nfY), dLog); dH = matmul(dLog, transpose(m.Wout)); }
+  const gn = normBwd(cfg.norm, dH, f.st.nf); g.nf = gn;
+  let dX = gn.X;
+  for (let l = cfg.L - 1; l >= 0; l--) { const gb = blockBackward(dX, f.st.blocks[l], m.blocks[l]); g.blocks[l] = gb; dX = gb.X; }
+  for (let i = 0; i < n; i++) for (let j = 0; j < d; j++) {
+    g.E[idx[i]][j] += dX[i][j] * f.st.es;
+    if (g.Pos) g.Pos[i][j] += dX[i][j];
+  }
+  return { loss: cnt ? loss / cnt : 0, g: g, dX0: dX, logits: f.logits, st: f.st };
+}
+function tfParamList(m) {
+  const out = [{ k: "E", M: m.E }];
+  if (m.Pos && m.cfg.pos === "learned") out.push({ k: "Pos", M: m.Pos });
+  m.blocks.forEach((B, l) => {
+    ["Wq", "Wk", "Wv", "Wo"].forEach(k => out.push({ k: "b" + l + ".attn." + k, M: B.attn[k] }));
+    (B.ffn.gated ? ["Wg", "Wu", "Wd"] : (B.ffn.bias ? ["W1", "b1", "W2", "b2"] : ["W1", "W2"])).forEach(k => out.push({ k: "b" + l + ".ffn." + k, M: B.ffn[k] }));
+    out.push({ k: "b" + l + ".n1.g", M: B.n1.g });
+    if (B.cfg.norm !== "rms") out.push({ k: "b" + l + ".n1.b", M: B.n1.b });
+    out.push({ k: "b" + l + ".n2.g", M: B.n2.g });
+    if (B.cfg.norm !== "rms") out.push({ k: "b" + l + ".n2.b", M: B.n2.b });
+  });
+  out.push({ k: "nf.g", M: m.nf.g });
+  if (m.cfg.norm !== "rms") out.push({ k: "nf.b", M: m.nf.b });
+  if (!m.cfg.tie) out.push({ k: "Wout", M: m.Wout });
+  return out;
+}
+function tfGradList(g, m) {
+  const out = [{ k: "E", M: g.E }];
+  if (g.Pos) out.push({ k: "Pos", M: g.Pos });
+  m.blocks.forEach((B, l) => {
+    const gb = g.blocks[l];
+    ["Wq", "Wk", "Wv", "Wo"].forEach(k => out.push({ k: "b" + l + ".attn." + k, M: gb.attn[k] }));
+    (B.ffn.gated ? ["Wg", "Wu", "Wd"] : (B.ffn.bias ? ["W1", "b1", "W2", "b2"] : ["W1", "W2"])).forEach(k => out.push({ k: "b" + l + ".ffn." + k, M: gb.ffn[k] }));
+    out.push({ k: "b" + l + ".n1.g", M: gb.n1.g });
+    if (B.cfg.norm !== "rms") out.push({ k: "b" + l + ".n1.b", M: gb.n1.b });
+    out.push({ k: "b" + l + ".n2.g", M: gb.n2.g });
+    if (B.cfg.norm !== "rms") out.push({ k: "b" + l + ".n2.b", M: gb.n2.b });
+  });
+  out.push({ k: "nf.g", M: g.nf.g });
+  if (m.cfg.norm !== "rms") out.push({ k: "nf.b", M: g.nf.b });
+  if (!m.cfg.tie) out.push({ k: "Wout", M: g.Wout });
+  return out;
+}
+/* One optimiser step over a list of matrices (2-D) or vectors (1-D), each
+   with its own flat DL.OPT state; states is filled in on first use.      */
+function optMats(mats, grads, states, key, hp) {
+  const O = OPT[key] || OPT.adamw;
+  let gnorm = 0;
+  mats.forEach((p, i) => {
+    const M = p.M, G = grads[i].M, is2 = Array.isArray(M[0]);
+    const flatG = is2 ? [].concat.apply([], G) : G.slice();
+    const flatT = is2 ? [].concat.apply([], M) : M.slice();
+    for (let q = 0; q < flatG.length; q++) gnorm += flatG[q] * flatG[q];
+    if (!states[i]) states[i] = O.init(flatG.length);
+    const h = Object.assign({}, hp, { theta: flatT, wd: (p.k === "E" || /W[qkvo12gud]|Wout/.test(p.k)) ? (hp.wd || 0) : 0 });
+    const dx = O.step(states[i], flatG, h);
+    if (is2) { const w = M[0].length; for (let q = 0; q < dx.length; q++) M[Math.floor(q / w)][q % w] += dx[q]; }
+    else for (let q = 0; q < dx.length; q++) M[q] += dx[q];
+  });
+  return Math.sqrt(gnorm);
+}
+
+/* ── counting a whole model ──────────────────────────────────────────── */
+function modelParams(c) {
+  const cfg = Object.assign({ V: 50257, d: 768, L: 12, h: 12, g: null, dk: null, dff: 3072, nCtx: 1024, pos: "learned",
+                              norm: "ln", gated: false, bias: true, tie: true, attnBias: true }, c || {});
+  const per = blockParams(cfg.d, cfg.h, cfg.dff, { dk: cfg.dk, g: cfg.g, norm: cfg.norm, gated: cfg.gated, bias: cfg.bias, attnBias: cfg.attnBias });
+  const embed = cfg.V * cfg.d, pos = cfg.pos === "learned" ? cfg.nCtx * cfg.d : 0;
+  const finalNorm = cfg.norm === "rms" ? cfg.d : 2 * cfg.d;
+  const unembed = cfg.tie ? 0 : cfg.V * cfg.d;
+  const attn = per.attn * cfg.L, ffn = per.ffn * cfg.L, norms = per.norms * cfg.L + finalNorm;
+  const total = embed + pos + attn + ffn + norms + unembed;
+  return { embed: embed, pos: pos, attn: attn, ffn: ffn, norms: norms, unembed: unembed, total: total,
+           perBlock: per, blocks: per.total * cfg.L, nonEmbed: attn + ffn + norms, cfg: cfg };
+}
+/* Per-token cost at sequence length n. Forward MACs of the weight path =
+   one MAC per non-embedding parameter (+ the output projection V·d, which
+   is a real matmul whether or not it is tied); the attention path adds
+   2·n·d per layer (Q·Kᵀ and A·V, uncausal) or n·d causal-average. Training
+   = forward + backward = 3× the MACs = 6× in FLOPs: the "6·N·D" rule.    */
+function modelFlops(c, n, o) {
+  const P = modelParams(c), cfg = P.cfg, oo = Object.assign({ causal: true }, o || {});
+  const hd = cfg.h * (cfg.dk === null ? cfg.d / cfg.h : cfg.dk);
+  const weightMacs = P.nonEmbed - P.norms + cfg.V * cfg.d;
+  const f = oo.causal ? 0.5 * (1 + 1 / Math.max(1, n)) : 1;
+  const attnMacsPerTok = 2 * n * hd * f * cfg.L;
+  const macs = weightMacs + attnMacsPerTok;
+  return { weightMacs: weightMacs, attnMacs: attnMacsPerTok, macs: macs, fwdFlops: 2 * macs,
+           trainFlops: 6 * macs, train6N: 6 * P.total, train6Nnon: 6 * (P.nonEmbed + cfg.V * cfg.d),
+           attnShare: attnMacsPerTok / macs, params: P };
+}
+function noamLR(step, d, warm) {
+  const s = Math.max(1, step);
+  return Math.pow(d, -0.5) * Math.min(Math.pow(s, -0.5), s * Math.pow(warm, -1.5));
+}
+function smoothTarget(V, k, eps) {
+  const q = new Array(V).fill(eps / V);
+  q[k] += 1 - eps;
+  return q;
+}
+function xentSoft(logits, q) {
+  const ls = logSoftmax(logits); let L = 0;
+  for (let i = 0; i < q.length; i++) if (q[i] > 0) L -= q[i] * ls[i];
+  return L;
+}
+function smoothFloor(V, eps) {
+  return entropyOf(smoothTarget(V, 0, eps));
+}
+
   return {
     clamp, lerp, linspace, fmt, sig, fmtE, big, commas,
     rng, randn, shuffle,
@@ -2439,6 +3018,13 @@ function decodeIntensity(h, g, bytesPerElem) {
     softmaxRows, softmaxJac, softmaxJacFrob, entropyOf, perplexityOf,
     splitHeads, mergeHeads, causalMask, padMask, windowMask, addMasks, maskConst,
     sdpa, mhaInit, mhaForward, mhaBackward, kvHeadOf, numGradMats,
-    mhaParams, attnMacs, macCrossover, kvCacheElems, decodeIntensity
+    mhaParams, attnMacs, macCrossover, kvCacheElems, decodeIntensity,
+    /* [part 6 — Transformers] see the TRANSFORMER header above sinusoidalPE */
+    sinusoidalPE, peShiftMatrix, ropeFreqs, rope, alibiSlopes, alibiBias, relBucket, relBucketMatrix,
+    lnForward, lnBackward, rmsForward, rmsBackward,
+    ffnInit, ffnForward, ffnBackward, ffnParams, ffnWidthGated,
+    attnForward, attnBackward, blockInit, blockForward, blockBackward, blockParams,
+    tfInit, tfMasks, tfForward, tfLoss, tfBackward, tfParamList, tfGradList, optMats,
+    modelParams, modelFlops, noamLR, smoothTarget, xentSoft, smoothFloor
   };
 })();

@@ -416,6 +416,7 @@ const cross = [
   ["State Space Models","Transformers"],["State Space Models","RNNs & LSTMs"],
   ["RNNs & LSTMs","Machine Translation"],["RNNs & LSTMs","Embeddings"],["RNNs & LSTMs","Encoder vs Decoder Models"],
   ["Attention","Machine Translation"],["Attention","Vision Transformers"],["Attention","Mixture of Experts"],["Attention","State Space Models"],["Attention","Encoder vs Decoder Models"],
+  ["Transformers","Neural Network Training"],["Transformers","Context-Length Extension"],["Transformers","Distributed Training"],["Transformers","Fine-Tuning & Transfer Learning"],["Transformers","Parameter-Efficient Fine-Tuning"],["Transformers","Knowledge Distillation"],["Transformers","World Models & JEPA"],["Transformers","RNNs & LSTMs"],
   ["World Models & JEPA","Reinforcement Learning"],["World Models & JEPA","Feedforward / MLP"],
   ["DL Architectures Compared","Transformers"],["DL Architectures Compared","CNNs"],["DL Architectures Compared","State Space Models"],
   ["Text Preprocessing","Tokenization"],["Text Preprocessing","Embeddings"],["Text Preprocessing","Named Entity Recognition"],["Text Preprocessing","Language Models"],
