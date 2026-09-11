@@ -375,7 +375,7 @@ const TR = (function () {
       `Parameters: attention <b>${DL.commas(P.total)}</b> (${TR.pct(P.total / total)}), FFN <b>${DL.commas(Pf)}</b> (${TR.pct(Pf / total)}), norms ${normP}. ` +
       `MACs per forward pass: projections ${DL.big(Mc.proj)}, the n² term ${DL.big(Mc.quad)} (<b>${TR.pct(Mc.quad / Mc.total)}</b> of the block), FFN ${DL.big(Mc.ffn)} (${TR.pct(Mc.ffn / Mc.total)}). ` +
       `The quadratic term overtakes everything else only at n = ${DL.commas(DL.macCrossover({ d: d, h: h, dh: dk, dff: dff, nmat: gated ? 3 : 2 }, "rest"))} — ` +
-      `<a href="attention.html#crossover">part 5 §19</a> derives that number; this figure only reads it.`;
+      `<a href="attention.html#crossover">The attention page's crossover section</a> derives that number; this figure only reads it.`;
   }
   ["bk-d", "bk-h", "bk-r", "bk-w"].forEach(id => d3.select("#" + id).on("change", draw));
   d3.select("#bk-n").on("input", draw);
@@ -1341,12 +1341,12 @@ const TR = (function () {
     });
     const ey = rows.length * rh + 4;
     TR.note(g, -6, ey + 10, "attnForward vs mhaForward (no RoPE)", DC.ink, 9.5, "end"); TR.note(g, 4, ey + 10, `identical: ${DL.fmtE(A.eqA, 1)}`, DC.good, 9.5);
-    TR.note(g, -6, ey + 24, "lnForward/rmsForward vs part 2's norms", DC.ink, 9.5, "end"); TR.note(g, 4, ey + 24, `identical: ${DL.fmtE(A.eqN, 1)}`, DC.good, 9.5);
+    TR.note(g, -6, ey + 24, "lnForward/rmsForward vs the training page's norms", DC.ink, 9.5, "end"); TR.note(g, 4, ey + 24, `identical: ${DL.fmtE(A.eqN, 1)}`, DC.good, 9.5);
     El("fd-readout").innerHTML =
       `${rows.length} backward passes audited at ε = ${DL.fmtE(eps, 0)}, seed ${seed}. Worst: <b>${DL.fmtE(worst[1], 1)}</b> (${worst[0]}). ` +
       `${rows.filter(r => r[1] > 1e-6).length === 0 ? "Every pass is below the 10⁻⁶ tolerance." : "<b>A pass exceeds the tolerance.</b>"} ` +
       `Passes with the exact GELU on the path sit near 10⁻⁷ to 10⁻⁸ because the error function itself is evaluated to about that accuracy; the erf-free passes sit at 10⁻⁹ to 10⁻¹¹. ` +
-      `The attention block with RoPE off reproduces part 5's DL.mhaForward to ${DL.fmtE(A.eqA, 1)}, and the cached-norm forward passes match DL.layerNorm / DL.rmsNorm to ${DL.fmtE(A.eqN, 1)}.`;
+      `The attention block with RoPE off reproduces the attention page's DL.mhaForward to ${DL.fmtE(A.eqA, 1)}, and the cached-norm forward passes match DL.layerNorm / DL.rmsNorm to ${DL.fmtE(A.eqN, 1)}.`;
   }
   d3.select("#fd-e").on("change", draw);
   d3.select("#fd-seed").on("input", draw);

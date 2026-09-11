@@ -13,7 +13,7 @@
    axis into ADJACENT blocks, masks are ADDITIVE and −Infinity.
    Page-specific numerics live in AT below.
 
-     1  #bd-svg   part 4's curve, and the same measurement with every state kept
+     1  #bd-svg   the RNN page's bottleneck curve, and the same measurement with every state kept
      2  #al-svg   one decode step: score, normalise, blend
      3  #hs-svg   soft against hard: the exact gradient against the sampled one
      4  #sf-svg   four score functions, cost and expressiveness
@@ -174,7 +174,7 @@ const AT = (function () {
     if (both) DL.curve(g, c.fin.map((v, i) => [x(i + 1), y(Math.max(v, 1e-9))]), { stroke: DC.a2, w: 2 });
     DL.curve(g, c.all.map((v, i) => [x(i + 1), y(Math.max(v, 1e-9))]), { stroke: DC.accent, w: 2.4 });
     const items = [{ label: "every state kept — attention's reader", color: DC.accent }];
-    if (both) items.push({ label: "the final state only — part 4's reader", color: DC.a2 });
+    if (both) items.push({ label: "the final state only — the recurrent reader", color: DC.a2 });
     DL.legend(g, items, 2, gh + 34, { vertical: true, gap: 13, font: 9.5 });
     if (dx > dh) AT.note(g, 4, 12, "dₓ > dₕ: even keeping every state loses dₕ/dₓ", DC.bad, 9.5);
 
@@ -1397,7 +1397,7 @@ const AT = (function () {
       `<b>${DL.fmtE(R.m / Math.max(1e-300, R.s), 2)}</b>. ` +
       (R.m < 1e-12
         ? `That is floating-point round-off: attention is <b>exactly</b> permutation-equivariant, and therefore cannot tell ` +
-          `"dog bites man" from "man bites dog" at any depth. Something positional has to be added, and part 6 owns which.`
+          `"dog bites man" from "man bites dog" at any depth. Something positional has to be added, and the Transformer page owns which.`
         : `The symmetry is broken — by ${MODES.find(m => m[0] === kind)[1]}. Note in particular that the <b>causal mask alone</b> ` +
           `breaks it, which is why decoder-only models are less position-blind than the proof suggests.`);
   }
@@ -3619,7 +3619,7 @@ const HW = {
       `is exact. What it costs is rank: the kernel mixing matrix has numerical rank <b>${rankL}</b> against the softmax ` +
       `matrix's <b>${rankS}</b> of ${n}, and the best rank-${dp} approximation to the softmax mixing still leaves a relative ` +
       `residual of <b>${DL.fmt(resid, 4)}</b>. In recurrent form the state holds d′·d_v numbers against an input of n·d_v, ` +
-      `so by §01's counting argument it retains <b>${DL.fmt(dp / n, 4)}</b> of the input — part 4's bottleneck, returned.`;
+      `so by §01's counting argument it retains <b>${DL.fmt(dp / n, 4)}</b> of the input — the RNN page's bottleneck, returned.`;
   }
   ["la-n", "la-d"].forEach(id => d3.select("#" + id).on("input", draw));
   ["la-f", "la-o"].forEach(id => d3.select("#" + id).on("change", draw));

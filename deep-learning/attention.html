@@ -7,7 +7,7 @@
 <script src="../vendor/d3.min.js"></script>
 <link rel="stylesheet" href="../notes.css" />
 <style>
-  /* the small layouts this series uses — identical to parts 1, 2, 3 and 4 */
+  /* the small layouts this series uses — identical to the other pages of the series */
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
   .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
   .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
@@ -48,7 +48,7 @@
     <header class="page">
       <p style="margin:0 0 6px;font-size:13px;color:var(--muted)">Deep Learning · part 5 · mechanism</p>
       <h1>Attention</h1>
-      <p><a href="rnns-lstms.html#bottleneck">Part 4 ended on a counting argument</a>. A recurrent encoder compresses a length-<code>L</code> source into one <code>dₕ</code>-dimensional vector, so the average fraction of the input that any decoder can recover is <code>dₕ/(L·dₓ)</code> — a rank, not a training outcome, and therefore not fixable by a better optimiser, a better initialisation or a bigger corpus. Part 4 measured that fraction to six decimal places and stopped. <b>This page starts by removing the cause.</b> Do not summarise the source at all: keep every encoder state, and give the decoder a learned, differentiable rule for deciding which of them to read at each step. The length dependence disappears in one line, and what replaces it is a mechanism with its own arithmetic, its own failure modes and its own hardware economics — which is what the remaining thirty-five sections are about.</p>
+      <p><b>Attention is a learned, differentiable rule for reading from a set of vectors:</b> score every stored vector against a query, turn the scores into non-negative weights that sum to one, and return the weighted sum. It is the mechanism a decoder uses to read a source sentence one step at a time, and the mechanism a Transformer uses to let every token read every other. It exists because of a counting argument. A recurrent encoder compresses a length-<code>L</code> source into one <code>dₕ</code>-dimensional vector, so the average fraction of the input that any decoder can recover is <code>dₕ/(L·dₓ)</code> — a rank, not a training outcome, and therefore not fixable by a better optimiser, a better initialisation or a bigger corpus (<a href="rnns-lstms.html#bottleneck">the RNN page measures this</a> to six decimal places). <b>Attention removes the cause.</b> Do not summarise the source at all: keep every encoder state, and give the decoder a learned, differentiable rule for deciding which of them to read at each step. The length dependence disappears in one line, and what replaces it is a mechanism with its own arithmetic, its own failure modes and its own hardware economics — which is what the remaining thirty-five sections are about.</p>
       <p>The centre of this page is the mechanism, taken apart: the additive alignment score derived from the problem it solves, the dot-product replacement and why it won, the <code>1/√dₖ</code> scaling <i>derived from the variance of a dot product</i> rather than asserted, the query/key/value abstraction as a differentiable dictionary lookup, and the framing everything else follows from — <b>attention computes its own mixing matrix from the input</b>, where a dense layer's is fixed and a convolution's is fixed and tied. From there: multi-head attention and what a head actually specialises in, masking and the <code>−∞</code>-before-softmax detail that fails quietly, the exact cost in multiply–accumulates and the sequence length at which the quadratic term genuinely starts to matter, what attention cannot do, and the KV cache — the object that decides how much a long-context model costs to run, and the thing MQA, GQA and MLA each attack in a different way.</p>
       <p>Every number printed here was recomputed against an independent implementation before it was printed: the variance of the dot product, the backward pass (audited against central differences, worst relative error <b>1.3e−09</b>), the mask arithmetic in three precisions, the MAC crossovers, the KV-cache sizes, the arithmetic intensities, the rank-collapse curves and the long-context margins. Four widely repeated claims did not survive the recomputation — the standard account of what the missing <code>√dₖ</code> does to the gradient (§06), the standard summary of what stops rank collapse (§22), the headline KV-cache reduction of the low-rank cache design (§28), and “attention dominates the cost” (§19). Each is taught as a discrepancy in place, with the measurement, rather than repeated.</p>
       <div style="margin-top:10px">
@@ -72,13 +72,29 @@
     </header>
 
     <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
-    <section class="topic" id="pickup" data-nav="Where part 4 stopped">
-      <h3><span class="idx">01</span> Where part 4 stopped, and the one-line repair</h3>
-      <p class="lede"><b>Attention is a learned, differentiable rule for reading from a set of vectors: score each stored vector against a query, turn the scores into non-negative weights that sum to one, and return the weighted sum.</b> It exists because a recurrent encoder's single summary vector loses information in proportion to the source length, and the repair is a counting repair: <b>stop throwing the states away</b>, keep all of them, and let the decoder choose what to read. Everything else on this page is a consequence of taking that seriously.</p>
+    <section class="topic" id="what" data-nav="What attention is">
+      <h3><span class="idx">01</span> What attention is, and the conventions this page never departs from</h3>
+      <p class="lede">One sentence first: <b>attention is a learned, differentiable rule for reading from a set of vectors: score each stored vector against a query, turn the scores into non-negative weights that sum to one, and return the weighted sum.</b> The <b>query</b> is the vector doing the reading; the <b>set</b> is what is being read, one vector per member; the <b>weights</b> are a probability distribution over the set; and the output is a <b>convex combination</b> of the set's members — one fixed-size vector, whatever the size of the set.</p>
 
-      <p>Restate the bound exactly as <a href="rnns-lstms.html#bottleneck">part 4</a> left it. A linear recurrent encoder makes the context vector an explicit linear function of the whole input,</p>
+      <div class="formula"><span class="lbl">the mechanism, in the row convention of this page — one vector per ROW</span><span class="eq">query        q                    a (1 × dₖ) ROW — the state doing the reading
+the set      K = [k₁; …; kₙ]      (n × dₖ), one stored vector per row, and
+             V = [v₁; …; vₙ]      (n × d_v), what each row hands back if chosen
 
-      <div class="formula"><span class="lbl">part 4's bound, quoted, not re-derived</span><span class="eq">C = h_L = ∑ₖ xₖ · ( U W⁽ᴸ⁻¹⁻ᵏ⁾ )        so  C  is a linear map from L·dₓ
+score        eⱼ = score(q, kⱼ)                    one number per stored row
+normalise    αⱼ = exp(eⱼ) / ∑ₖ exp(eₖ)            so  αⱼ ≥ 0  and  ∑ⱼ αⱼ = 1
+weighted sum out = ∑ⱼ αⱼ · vⱼ  =  α·V             a (1 × d_v) ROW, for ANY n
+
+many queries at once, Q (n_q × dₖ):    out = softmax( score(Q, K) )·V   (n_q × d_v)
+with the dot-product score of §04:     out = softmax( Q·Kᵀ / √dₖ )·V</span></div>
+
+      <p>Read it as a <b>soft, differentiable lookup</b>. A hash table takes a key, finds the one entry that matches exactly and returns its value; attention takes a query, scores <i>every</i> entry by how well it matches, and returns the value-weighted blend, with the weights summing to one so the answer lies inside the convex hull of the values. Because each step — the score, the softmax, the sum — is smooth, the gradient of a loss flows back into the query, into the stored vectors and into whatever produced them, and the rule for <i>what to read</i> is learned from the same loss as everything else. In its first home the query is a decoder state, the set is the encoder's hidden states and the read happens once per output token (seq2seq decoding, §02–§03); in its second every token of a sequence is a query against every token of the same sequence (self-attention, §09), which is the sub-layer a <a href="transformers.html">Transformer</a> block is built around.</p>
+
+      <h4>Why it exists: the fixed-length bottleneck</h4>
+      <p>Attention exists because a recurrent encoder's single summary vector loses information in proportion to the source length, and the repair is a counting repair: <b>stop throwing the states away</b>, keep all of them, and let the decoder choose what to read. Everything else on this page is a consequence of taking that seriously.</p>
+
+      <p>Restate the bound as <a href="rnns-lstms.html#bottleneck">the RNN page's bottleneck section</a> derives it. A linear recurrent encoder makes the context vector an explicit linear function of the whole input,</p>
+
+      <div class="formula"><span class="lbl">the bottleneck bound (derived on the RNN page)</span><span class="eq">C = h_L = ∑ₖ xₖ · ( U W⁽ᴸ⁻¹⁻ᵏ⁾ )        so  C  is a linear map from L·dₓ
                 └────┬────┘             numbers into dₕ numbers, and
                      Mₖ                 rank(map) ≤ min(L·dₓ, dₕ)
 
@@ -103,7 +119,7 @@ input remains linearly recoverable, at every length.</span></div>
 
       <div class="viz" id="viz-bd">
         <div class="vhead">
-          <span class="vtitle">Part 4's curve, and the same measurement once the states are kept</span>
+          <span class="vtitle">The bottleneck curve from the RNN page, and the same measurement once the states are kept</span>
           <span class="vhint">both curves are exact closed forms, not fits — the flat one is what removing the summary buys, and the slider showing d<sub>x</sub> &gt; d<sub>h</sub> is where even it stops being 1</span>
         </div>
         <div class="controls">
@@ -113,12 +129,12 @@ input remains linearly recoverable, at every length.</span></div>
           <label>ρ(W) <input type="range" id="bd-rho" min="0.5" max="1.2" step="0.05" value="1" /><span id="bd-rhov" style="min-width:34px;display:inline-block">1.00</span></label>
           <label><input type="checkbox" id="bd-both" checked /> show the final-state curve too</label>
         </div>
-        <svg id="bd-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left panel: the fraction of each source position that is linearly recoverable, plotted against source position on a logarithmic vertical axis, for two readers. The lower curve reads only the final encoder state and reproduces part four's result — near one at the last position and collapsing towards zero at the beginning of the sequence. The upper curve reads the whole sequence of encoder states and is exactly flat at one across every position, as long as the hidden width is at least the input width. Raising the input width slider past the hidden width drops the flat curve to the ratio of the two widths, which is where even keeping every state stops being sufficient. Right panel: the mean recoverable fraction against source length on logarithmic axes for both readers, together with the two rank bounds drawn as dashed lines: the hidden width divided by the product of length and input width, a straight line of slope minus one, and the constant one. The final-state points lie exactly on the falling bound whenever the encoder's spectral radius is at least one, and the all-states points lie exactly on the flat one, so the figure is the algebraic cancellation of the length made visible; with a spectral radius below one and a bound that needs many early positions, the final-state point drops beneath its bound because the early positions' contribution has decayed below numerical rank, and the readout says so when it happens. The readout prints both mean fractions, both rank bounds, the ratio between the two readers at the current length, and the recoverable fraction at the first source position under each."></svg>
+        <svg id="bd-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left panel: the fraction of each source position that is linearly recoverable, plotted against source position on a logarithmic vertical axis, for two readers. The lower curve reads only the final encoder state and reproduces the RNN page's result — near one at the last position and collapsing towards zero at the beginning of the sequence. The upper curve reads the whole sequence of encoder states and is exactly flat at one across every position, as long as the hidden width is at least the input width. Raising the input width slider past the hidden width drops the flat curve to the ratio of the two widths, which is where even keeping every state stops being sufficient. Right panel: the mean recoverable fraction against source length on logarithmic axes for both readers, together with the two rank bounds drawn as dashed lines: the hidden width divided by the product of length and input width, a straight line of slope minus one, and the constant one. The final-state points lie exactly on the falling bound whenever the encoder's spectral radius is at least one, and the all-states points lie exactly on the flat one, so the figure is the algebraic cancellation of the length made visible; with a spectral radius below one and a bound that needs many early positions, the final-state point drops beneath its bound because the early positions' contribution has decayed below numerical rank, and the readout says so when it happens. The readout prints both mean fractions, both rank bounds, the ratio between the two readers at the current length, and the recoverable fraction at the first source position under each."></svg>
         <div class="readout" aria-live="polite" id="bd-readout"></div>
       </div>
 
       <h4>The layout law of this page, declared once and never departed from</h4>
-      <p>This is the place a series forks its conventions silently. Part 1 declared the <b>row convention</b>: a batch <code>X</code> is <code>(N × d)</code>, one example per row, and a layer is <code>X·W + b</code> with <code>W</code> of shape <code>(dᵢₙ × dₒᵤₜ)</code>. Part 3 extended it to NCHW; part 4 extended it to time, one time step per row. This page extends it to tokens and heads, in the only way that keeps a row a single vector of features — and <b>the head split is the fork nobody notices</b>, because an interleaved split also runs and never throws — it groups different columns into each head, which is harmless when training from scratch (the two groupings differ only by a fixed permutation of the projection columns) and silently wrong the moment weights trained under the other convention are loaded.</p>
+      <p>This is the place a series forks its conventions silently. <a href="neural-networks.html#neuron">The feedforward page</a> declared the <b>row convention</b>: a batch <code>X</code> is <code>(N × d)</code>, one example per row, and a layer is <code>X·W + b</code> with <code>W</code> of shape <code>(dᵢₙ × dₒᵤₜ)</code>. <a href="convolutional-networks.html#what">The convolution page</a> extended it to NCHW; <a href="rnns-lstms.html#what">the RNN page</a> extended it to time, one time step per row. This page extends it to tokens and heads, in the only way that keeps a row a single vector of features — and <b>the head split is the fork nobody notices</b>, because an interleaved split also runs and never throws — it groups different columns into each head, which is harmless when training from scratch (the two groupings differ only by a fixed permutation of the projection columns) and silently wrong the moment weights trained under the other convention are loaded.</p>
 
       <div class="formula"><span class="lbl">the layout law — one TOKEN per ROW, heads split the LAST axis</span><span class="eq">one sequence     X   is (n × d_model)      xᵢ = X[i], a ROW vector
 a batch          (N, n, d_model)         batch, then position, then features
@@ -127,7 +143,7 @@ a batch          (N, n, d_model)         batch, then position, then features
 projections      W_Q, W_K   (d_model × h·dₖ)      W_V  (d_model × h·d_v)
                  W_O        (h·d_v × d_model)
 
-so a projection is  X·W , the row vector on the LEFT, exactly as in part 1.
+so a projection is  X·W , the row vector on the LEFT, exactly as on the feedforward page.
 
 HEADS SPLIT THE LAST AXIS INTO ADJACENT BLOCKS:
     (n × h·dₖ)  →  h matrices of shape (n × dₖ)
@@ -149,14 +165,14 @@ usually square it does not crash — it runs and computes a different model.</sp
       <ul class="notes" style="margin-top:8px">
         <li><b>A superscript <code>ᵀ</code> always means transpose.</b> Exponents are written with an explicit numeral or a named symbol; <code>Wᵈ</code> is a power and <code>Wᵀ</code> is a transpose, and the two never appear ambiguously.</li>
         <li><b><code>n</code> is the sequence length, <code>d</code> is <code>d_model</code>, <code>h</code> is the number of <i>query</i> heads and <code>g</code> the number of <i>key/value</i> heads.</b> <code>g = h</code> is multi-head attention, <code>1 &lt; g &lt; h</code> is grouped-query, <code>g = 1</code> is multi-query. Carrying <code>g</code> from the start costs nothing and means §27 is a change of one number rather than a new mechanism.</li>
-        <li><b>Cost is counted in MACs</b> — multiply–accumulates — matching <a href="convolutional-networks.html#counting">part 3's convention</a> and <code>DL.macs</code> from part 1. A source quoting "FLOPs" often means MACs (the convolutional-network literature in particular counts this way); one that means literal floating-point operations — one multiply plus one add — quotes <b>twice</b> these numbers. Every count on this page is a MAC count and every figure says so.</li>
+        <li><b>Cost is counted in MACs</b> — multiply–accumulates — matching <a href="convolutional-networks.html#counting">the convolution page's counting convention</a> and <code>DL.macs</code> from <a href="neural-networks.html#counting">the feedforward page</a>. A source quoting "FLOPs" often means MACs (the convolutional-network literature in particular counts this way); one that means literal floating-point operations — one multiply plus one add — quotes <b>twice</b> these numbers. Every count on this page is a MAC count and every figure says so.</li>
       </ul></div>
 
       <div class="callout"><b>What this page does not cover, and where it lives.</b> This page owns <b>the attention mechanism</b> — the operation, its shapes, its gradient, its cost and its variants. It does not own the architecture built out of it.
       <ul class="notes" style="margin-top:8px">
-        <li><b>The Transformer block and the whole model</b> — <a href="transformers.html">Transformers</a> is part 6. It owns the residual-and-norm wiring around an attention sub-layer, the position-wise FFN, <b>positional encoding as an architectural choice</b> (sinusoidal, learned, RoPE, ALiBi), the encoder / decoder / encoder–decoder stacks, and the training recipe. §11 here proves <i>why</i> position has to be injected and then hands the question over; §21 shows what attention alone cannot do and hands the FFN over. <b>§36 states the hand-off line by line.</b></li>
-        <li><b>The general machinery</b> — <a href="neural-networks.html">part 1</a> owns the function class and the role of a feedforward layer; <a href="neural-network-training.html#backprop">part 2's backpropagation</a> owns the algorithm this page specialises, <a href="neural-network-training.html#layernorm">part 2's normalisation</a> owns LayerNorm, <a href="neural-network-training.html#init">initialisation</a> and <a href="neural-network-training.html#optimizers">the optimisers</a> likewise.</li>
-        <li><b>Recurrence</b> — <a href="rnns-lstms.html">part 4</a>. §01 quotes <a href="rnns-lstms.html#bottleneck">its bottleneck result (part 4 §36)</a> and does not re-derive seq2seq; §34 compares against it.</li>
+        <li><b>The Transformer block and the whole model</b> — <a href="transformers.html">Transformers</a> (part 6). It owns the residual-and-norm wiring around an attention sub-layer, the position-wise FFN, <b>positional encoding as an architectural choice</b> (sinusoidal, learned, RoPE, ALiBi), the encoder / decoder / encoder–decoder stacks, and the training recipe. §11 here proves <i>why</i> position has to be injected and then hands the question over; §21 shows what attention alone cannot do and hands the FFN over. <b>§36 states the hand-off line by line.</b></li>
+        <li><b>The general machinery</b> — <a href="neural-networks.html">Feedforward Networks</a> (part 1) owns the function class and the role of a feedforward layer; on <a href="neural-network-training.html">Neural Network Training</a> (part 2), <a href="neural-network-training.html#backprop">backpropagation</a> owns the algorithm this page specialises, <a href="neural-network-training.html#layernorm">normalisation</a> owns LayerNorm, <a href="neural-network-training.html#init">initialisation</a> and <a href="neural-network-training.html#optimizers">the optimisers</a> likewise.</li>
+        <li><b>Recurrence</b> — <a href="rnns-lstms.html">RNNs &amp; LSTMs</a> (part 4). §01 quotes <a href="rnns-lstms.html#bottleneck">its bottleneck result</a> and does not re-derive seq2seq; §34 compares against it.</li>
         <li><b>Vision Transformers</b> — <a href="../vision/vision-transformers.html">Vision Transformers</a> owns patch embedding and the vision-specific story. <b>Machine translation</b>, where alignment was first useful, is <a href="../nlp/machine-translation.html">Machine Translation</a>.</li>
         <li><b>Long context at model scale</b> — <a href="../llm/context-length-extension.html">Context-Length Extension</a> owns position interpolation, NTK-aware scaling, YaRN, needle-in-a-haystack evaluation and the lost-in-the-middle effect. §32 here owns only the <i>mechanism-level</i> question of what the softmax itself does as the number of keys grows, which is a different claim with a closed form, and links out for the rest.</li>
         <li><b>Sparse conditional computation</b> — <a href="mixture-of-experts.html">Mixture of Experts</a>; <b>S4 and Mamba</b> — <a href="state-space-models.html">State Space Models</a>. §34 compares against both; it does not teach them.</li>
@@ -172,7 +188,7 @@ usually square it does not crash — it runs and computes a different model.</sp
 
       <div class="cards">
         <div class="box"><div class="n">requirement 1</div><div class="t">Fixed size, any <code>L</code></div><div class="g"><code>cᵢ</code> must have a shape the decoder can consume, and that shape cannot depend on <code>L</code> — otherwise the decoder's weights depend on the input length and it is not a model.</div></div>
-        <div class="box"><div class="n">requirement 2</div><div class="t">Different at every step</div><div class="g">If <code>cᵢ</code> were the same for all <code>i</code> we would be back at part 4's single summary and the bound would return. The read must depend on <code>sᵢ₋₁</code>.</div></div>
+        <div class="box"><div class="n">requirement 2</div><div class="t">Different at every step</div><div class="g">If <code>cᵢ</code> were the same for all <code>i</code> we would be back at <a href="rnns-lstms.html#bottleneck">the recurrent encoder's single summary</a> and the bound would return. The read must depend on <code>sᵢ₋₁</code>.</div></div>
         <div class="box"><div class="n">requirement 3</div><div class="t">Differentiable end to end</div><div class="g">There is no supervision for <i>which source word</i> to look at. The choice must be learned from the translation loss alone, which means the gradient has to flow through the choosing.</div></div>
       </div>
 
@@ -526,7 +542,7 @@ So ‖J‖_F is not monotone in the sharpness, and therefore not monotone in d�
 
       <div class="wrong"><span class="say">What a single benchmark would have told you.</span> Run the comparison on retrieval and the scale looks useless or harmful. Run it on averaging and it looks essential. <span class="fix">Both results are real and they are the same experiment.</span> The scale's function is to make the layer <b>start undecided</b>. That is worthless when the answer is a decision and decisive when it is not — and a deep model does both in different heads (§12), which is why the scale is worth keeping even though many heads would be fine without it.</div>
 
-      <div class="callout"><b>What is done instead, when the scale is not enough.</b> The <code>√dₖ</code> factor is fixed at initialisation-time statistics and §05 showed why it drifts: training correlates the components of <code>q</code> and <code>k</code>, and the effective dimension of the dot product falls below <code>dₖ</code>. Two responses are common. <b>A learned scalar</b> multiplying the scores, so the model can pick its own sharpness — cheap, and it can be learned into saturation too. <b>Normalising <code>q</code> and <code>k</code> before the dot product.</b> In its strict form — projecting each onto the unit sphere ("cosine attention") — every score is bounded in <code>[−1, +1]</code> and saturation is impossible without an explicit learned temperature; the more common "QK-norm" applies a LayerNorm or RMSNorm with learned gains to <code>q</code> and <code>k</code>, which bounds the <i>growth</i> of the scores rather than the scores themselves. Either is a genuine architectural change and belongs to <a href="transformers.html">part 6</a>'s account of what goes into a block. §23 measures the failure mode both are aimed at.</div>
+      <div class="callout"><b>What is done instead, when the scale is not enough.</b> The <code>√dₖ</code> factor is fixed at initialisation-time statistics and §05 showed why it drifts: training correlates the components of <code>q</code> and <code>k</code>, and the effective dimension of the dot product falls below <code>dₖ</code>. Two responses are common. <b>A learned scalar</b> multiplying the scores, so the model can pick its own sharpness — cheap, and it can be learned into saturation too. <b>Normalising <code>q</code> and <code>k</code> before the dot product.</b> In its strict form — projecting each onto the unit sphere ("cosine attention") — every score is bounded in <code>[−1, +1]</code> and saturation is impossible without an explicit learned temperature; the more common "QK-norm" applies a LayerNorm or RMSNorm with learned gains to <code>q</code> and <code>k</code>, which bounds the <i>growth</i> of the scores rather than the scores themselves. Either is a genuine architectural change and belongs to <a href="transformers.html">the Transformer page's</a> account of what goes into a block. §23 measures the failure mode both are aimed at.</div>
     </section>
 
     <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
@@ -656,7 +672,7 @@ masks key 3 out of this same row; §17 differentiates it.</span></div>
 
  NOTHING here depends on the sequence length. An attention block has a
  FIXED parameter count and a sequence-dependent COST — which is the exact
- opposite of the dense layer of part 1, whose parameter count is fixed by
+ opposite of the dense layer of the feedforward page, whose parameter count is fixed by
  the input size. That is why one trained model runs at any length.</span></div>
 
       <h4>Parameter count, exactly</h4>
@@ -731,7 +747,7 @@ the sequence itself.</span></div>
         <tr class="tot"><td><b>what it is for</b></td><td>building a contextual representation of a sequence out of itself</td><td>conditioning one sequence on another of unrelated length and modality</td></tr>
       </table>
 
-      <p>The fourth row is the one with practical consequences. In an encoder–decoder model, cross-attention's keys and values are computed <b>once</b> from the source and then reused at every decode step, so the cross-attention cache neither grows nor is recomputed. Self-attention's cache grows linearly with the tokens generated. That asymmetry is why the cache discussion in §24–§28 is a discussion about <i>self</i>-attention, and why an encoder–decoder model with a long source and a short output has a very different memory profile from a decoder-only model given the same text as a prompt. <a href="encoder-decoder-models.html">Encoder vs Decoder Models</a> owns that comparison; <a href="transformers.html">part 6</a> owns where each block sits in the stack.</p>
+      <p>The fourth row is the one with practical consequences. In an encoder–decoder model, cross-attention's keys and values are computed <b>once</b> from the source and then reused at every decode step, so the cross-attention cache neither grows nor is recomputed. Self-attention's cache grows linearly with the tokens generated. That asymmetry is why the cache discussion in §24–§28 is a discussion about <i>self</i>-attention, and why an encoder–decoder model with a long source and a short output has a very different memory profile from a decoder-only model given the same text as a prompt. <a href="encoder-decoder-models.html">Encoder vs Decoder Models</a> owns that comparison; <a href="transformers.html">the Transformer page</a> owns where each block sits in the stack.</p>
 
       <div class="viz" id="viz-sc">
         <div class="vhead">
@@ -778,8 +794,8 @@ of input positions — with the two operators the earlier parts built:
   convolution                  Z = A_conv · V      A_conv is BANDED and
                                                    TIED: f free numbers
                                                    repeated down the
-                                                   diagonals (part 3's
-                                                   Toeplitz matrix), fixed
+                                                   diagonals (the convolution
+                                                   page's Toeplitz matrix), fixed
                                                    after training
 
   attention                    Z = A(X) · V        A is COMPUTED. It has
@@ -794,7 +810,7 @@ of input positions — with the two operators the earlier parts built:
       <ul class="notes">
         <li><b>The parameter count stops depending on the sequence length.</b> A dense mixing matrix over <code>n</code> positions needs <code>n²</code> parameters and can only ever handle that <code>n</code>. Attention's mixing has <b>none</b> — it is produced by <code>W_Q</code> and <code>W_K</code>, which are <code>(d × dₖ)</code> and know nothing about <code>n</code>. That is why the same weights run at 512 tokens and at 128 000.</li>
         <li><b>The cost starts depending on the sequence length.</b> The matrix is not stored, so it must be <i>built</i> — <code>n²</code> scores, every forward pass. §18 counts it exactly. This is the price of the previous point, and it is the same trade in both directions.</li>
-        <li><b>The prior is weak, and it is weak on purpose.</b> A convolution asserts that the useful relations are local and position-independent. Attention asserts almost nothing about <i>which</i> positions should be related, only that whatever the relation is, it should be computable as a low-rank bilinear form on the representations. <a href="neural-networks.html#inductive-bias">Part 1 §24's table</a> is organised around exactly this axis, and its transformer row says it in one line: <i>the mixing matrix is computed from the data rather than learned as a fixed parameter</i>. This section is that row, derived.</li>
+        <li><b>The prior is weak, and it is weak on purpose.</b> A convolution asserts that the useful relations are local and position-independent. Attention asserts almost nothing about <i>which</i> positions should be related, only that whatever the relation is, it should be computable as a low-rank bilinear form on the representations. <a href="neural-networks.html#inductive-bias">The inductive-bias table on the feedforward page</a> is organised around exactly this axis, and its transformer row says it in one line: <i>the mixing matrix is computed from the data rather than learned as a fixed parameter</i>. This section is that row, derived.</li>
         <li><b>It is a multiplicative operation.</b> <code>A</code> depends on <code>X</code> and then multiplies <code>V</code>, which also depends on <code>X</code>. The output is therefore <b>not linear</b> in the input even before any activation function: the scores <code>XW_QW_KᵀXᵀ</code> are quadratic in <code>X</code>, and they multiply <code>XW_V</code>, so expanding the softmax around uniform gives a linear term (the plain mean of the values) plus a <i>cubic</i> term <code>∝ (XW_QW_KᵀXᵀ)XW_V</code>, and higher orders after that. A dense layer and a convolution are both linear in their input. That multiplicative interaction is a genuine increase in expressive power per layer, and it is why attention can implement operations like "find the token that matches this one and copy what follows it" (§33) that no fixed linear mixing can.</li>
       </ul>
 
@@ -820,7 +836,7 @@ of input positions — with the two operators the earlier parts built:
     <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
     <section class="topic" id="perm" data-nav="Permutation equivariance">
       <h3><span class="idx">11</span> Attention does not know about order — proved, measured, and handed over</h3>
-      <p class="lede">A convolution knows what "next to" means because its matrix is banded. Attention's matrix is built from content alone, so it has <b>no notion of position whatsoever</b>. That is a two-line proof, it is exactly measurable, and it is the reason <a href="transformers.html">part 6</a> has to do something about it.</p>
+      <p class="lede">A convolution knows what "next to" means because its matrix is banded. Attention's matrix is built from content alone, so it has <b>no notion of position whatsoever</b>. That is a two-line proof, it is exactly measurable, and it is the reason <a href="transformers.html">the Transformer page</a> has to do something about it.</p>
 
       <div class="formula"><span class="lbl">permutation equivariance of self-attention, in the row convention</span><span class="eq">Let P be an (n × n) permutation matrix, so PX is X with its ROWS permuted.
 
@@ -842,7 +858,7 @@ therefore inherits the equivariance. A transformer without positional
 information is a SET function. It cannot distinguish "dog bites man"
 from "man bites dog", at any depth, with any number of heads.</span></div>
 
-      <p>Compare with <a href="neural-networks.html#inductive-bias">part 1 §24</a>, which proved the mirror-image statement for an MLP: permuting the <i>input coordinates</i> leaves an MLP's achievable loss unchanged, because it never knew the coordinates were arranged in a grid. Here the object being permuted is different — <b>positions in a sequence, not features within a vector</b> — but the conclusion has the same shape and the same cause: an operator that treats its inputs as an unordered collection cannot be hurt by reordering them, and being hurt is the evidence that the architecture knew something. A convolution is hurt. Attention is not.</p>
+      <p>Compare with <a href="neural-networks.html#inductive-bias">the feedforward page's inductive-bias section</a>, which proved the mirror-image statement for an MLP: permuting the <i>input coordinates</i> leaves an MLP's achievable loss unchanged, because it never knew the coordinates were arranged in a grid. Here the object being permuted is different — <b>positions in a sequence, not features within a vector</b> — but the conclusion has the same shape and the same cause: an operator that treats its inputs as an unordered collection cannot be hurt by reordering them, and being hurt is the evidence that the architecture knew something. A convolution is hurt. Attention is not.</p>
 
       <div class="viz" id="viz-pe">
         <div class="vhead">
@@ -864,7 +880,7 @@ from "man bites dog", at any depth, with any number of heads.</span></div>
         <div class="readout" aria-live="polite" id="pe-readout"></div>
       </div>
 
-      <div class="callout"><b>Three ways out, and this page owns none of them.</b> Position can be <b>added to the input</b> (sinusoidal or learned embeddings), <b>rotated into the query and key</b> before the dot product (RoPE), or <b>added to the scores</b> as a distance-dependent bias (ALiBi and relative-position schemes). All three are architectural choices about how to break the symmetry this section proves, and all three belong to <a href="transformers.html#positional">part 6</a>. What matters here is that <i>something</i> must be done, that the requirement is a theorem rather than a heuristic, and that a <b>causal mask is itself a positional signal</b> — the causal-mask option in the figure shows that masking alone breaks the equivariance, which is why decoder-only models are not quite as position-blind as the proof above would suggest.</div>
+      <div class="callout"><b>Three ways out, and this page owns none of them.</b> Position can be <b>added to the input</b> (sinusoidal or learned embeddings), <b>rotated into the query and key</b> before the dot product (RoPE), or <b>added to the scores</b> as a distance-dependent bias (ALiBi and relative-position schemes). All three are architectural choices about how to break the symmetry this section proves, and all three belong to <a href="transformers.html#positional">the Transformer page's positional-encoding sections</a>. What matters here is that <i>something</i> must be done, that the requirement is a theorem rather than a heuristic, and that a <b>causal mask is itself a positional signal</b> — the causal-mask option in the figure shows that masking alone breaks the equivariance, which is why decoder-only models are not quite as position-blind as the proof above would suggest.</div>
 
       <div class="wrong"><span class="say">The overstatement to avoid.</span> "A decoder-only transformer still needs explicit positional encoding, because attention is permutation-equivariant." <span class="fix">The premise is right and the conclusion is too strong.</span> A causal mask breaks the permutation symmetry on its own — position <code>i</code> can see <code>i</code> keys and position <code>j</code> can see <code>j</code>, so the positions are already distinguishable — and causal models trained with no positional encoding at all do learn position-dependent behaviour — in most reports somewhat less well than with an explicit scheme, though the gap is task-dependent. The figure measures the symmetry breaking rather than arguing about it. The practical answer is still to add a positional scheme; the reason is quality, not impossibility.</div>
     </section>
@@ -1052,7 +1068,7 @@ and substituting Zⱼ = Aⱼ Vⱼ = Aⱼ X W_Vʲ:
         <div class="readout" aria-live="polite" id="wo-readout"></div>
       </div>
 
-      <div class="callout"><b>Where this is going.</b> The decomposition <code>Y = ∑ⱼ Aⱼ X (W_Vʲ W_Oʲ)</code> is the form in which §22's rank-collapse result is proved, the form in which §33's induction-head circuits are described, and the form in which head pruning and head-level interpretability are defined. It is worth being able to write it from memory. <a href="transformers.html">Part 6</a> adds the residual stream around it, at which point "what a head writes" becomes literally an addition to a running sum that every later layer reads.</div>
+      <div class="callout"><b>Where this is going.</b> The decomposition <code>Y = ∑ⱼ Aⱼ X (W_Vʲ W_Oʲ)</code> is the form in which §22's rank-collapse result is proved, the form in which §33's induction-head circuits are described, and the form in which head pruning and head-level interpretability are defined. It is worth being able to write it from memory. <a href="transformers.html">The Transformer page</a> adds the residual stream around it, at which point "what a head writes" becomes literally an addition to a running sum that every later layer reads.</div>
     </section>
 
     <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
@@ -1235,7 +1251,7 @@ weight exactly zero in the forward one.</span></div>
     <!-- ═══ 17 ═══════════════════════════════════════════════════════════ -->
     <section class="topic" id="backward" data-nav="The backward pass, audited">
       <h3><span class="idx">17</span> The backward pass, derived and audited against central differences</h3>
-      <p class="lede">Attention has one non-obvious gradient in it — the one through the row-wise softmax — and it is the one every hand-written implementation gets subtly wrong. Here it is derived, and then checked the way <a href="convolutional-networks.html#backprop">part 3</a> and <a href="rnns-lstms.html#bptt-audit">part 4</a> checked theirs.</p>
+      <p class="lede">Attention has one non-obvious gradient in it — the one through the row-wise softmax — and it is the one every hand-written implementation gets subtly wrong. Here it is derived, and then checked the way <a href="convolutional-networks.html#backprop">the convolution page</a> and <a href="rnns-lstms.html#bptt-audit">the RNN page</a> checked theirs.</p>
 
       <div class="formula"><span class="lbl">the whole backward pass, one head, given ∂L/∂Z</span><span class="eq">forward   S = QKᵀ·c      A = softmax_rows(S + M)      Z = A·V     with c = 1/√dₖ
 
@@ -1509,7 +1525,7 @@ a factor of 256 at n = 131072.</span></div>
         <div class="readout" aria-live="polite" id="mm-readout"></div>
       </div>
 
-      <div class="callout"><b>A note on what "activation memory" includes.</b> The counts above are the attention sub-layer's own tensors. A real training step also holds the FFN's intermediates (<code>n·d_ff</code> per layer, linear in <code>n</code>), the residual stream, the normalisation statistics, and the optimiser state — none of which is quadratic. <a href="neural-network-training.html">Part 2</a> owns the general activation-memory accounting and gradient checkpointing; this section owns only the term that is quadratic, because it is the only one whose growth is qualitatively different.</div>
+      <div class="callout"><b>A note on what "activation memory" includes.</b> The counts above are the attention sub-layer's own tensors. A real training step also holds the FFN's intermediates (<code>n·d_ff</code> per layer, linear in <code>n</code>), the residual stream, the normalisation statistics, and the optimiser state — none of which is quadratic. <a href="neural-network-training.html">The training page</a> owns the general activation-memory accounting and gradient checkpointing; this section owns only the term that is quadratic, because it is the only one whose growth is qualitatively different.</div>
     </section>
 
     <!-- ═══ 21 ═══════════════════════════════════════════════════════════ -->
@@ -1538,7 +1554,7 @@ is one matrix. No amount of depth creates a per-token non-linearity.</span>
 
       <p>To be precise about what is and is not being claimed: with more than one token, an attention-only stack is <i>not</i> a linear function of <code>X</code>, because the weights <code>Aⱼ</code> depend on <code>X</code> (§10), and §33's induction circuit is built from attention alone. The claim is narrower and exact — the non-linearity enters only through <i>which positions are mixed</i>, never through a per-feature map, so along the feature axis every head is the fixed linear map <code>W_Vʲ W_Oʲ</code> whatever the input.</p>
 
-      <p>This is why the position-wise feedforward sub-layer is not an accessory. <a href="neural-networks.html">Part 1</a>'s whole argument — that depth plus a point-wise non-linearity is what buys the function class — applies to the feature axis, and attention supplies none of it. The standard division of labour is exactly that: <b>attention moves information between positions; the FFN computes with it.</b> Two-thirds to four-fifths of a block's parameters sit in the second job (§08), which is the arithmetic version of the same statement.</p>
+      <p>This is why the position-wise feedforward sub-layer is not an accessory. <a href="neural-networks.html">The feedforward page</a>'s whole argument — that depth plus a point-wise non-linearity is what buys the function class — applies to the feature axis, and attention supplies none of it. The standard division of labour is exactly that: <b>attention moves information between positions; the FFN computes with it.</b> Two-thirds to four-fifths of a block's parameters sit in the second job (§08), which is the arithmetic version of the same statement.</p>
 
       <div class="viz" id="viz-tm">
         <div class="vhead">
@@ -1623,7 +1639,7 @@ resolve the rate, but not slower than the bound: log(−log r) rises by 2.8,
         <div class="readout" aria-live="polite" id="rc-readout"></div>
       </div>
 
-      <div class="callout"><b>What this does and does not license you to say.</b> It <b>does</b> say that attention has an intrinsic pull towards token uniformity, that the pull is extremely strong when nothing opposes it, and that the residual-plus-normalisation wiring of a real block is what opposes it. It <b>does not</b> say that trained deep transformers collapse in this way — they do not, although a milder version (token representations growing more similar in the later layers) is reported in trained models too. The measurement above uses random weights precisely so that the architectural tendency is visible without the training that counteracts it. The right reading is the same one <a href="rnns-lstms.html#spectral">part 4</a> gave for the spectral radius: this is the thing the architecture must be built to survive, and the wiring is how it survives it.</div>
+      <div class="callout"><b>What this does and does not license you to say.</b> It <b>does</b> say that attention has an intrinsic pull towards token uniformity, that the pull is extremely strong when nothing opposes it, and that the residual-plus-normalisation wiring of a real block is what opposes it. It <b>does not</b> say that trained deep transformers collapse in this way — they do not, although a milder version (token representations growing more similar in the later layers) is reported in trained models too. The measurement above uses random weights precisely so that the architectural tendency is visible without the training that counteracts it. The right reading is the same one <a href="rnns-lstms.html#spectral">the RNN page</a> gave for the spectral radius: this is the thing the architecture must be built to survive, and the wiring is how it survives it.</div>
     </section>
 
     <!-- ═══ 23 ═══════════════════════════════════════════════════════════ -->
@@ -1656,7 +1672,7 @@ resolve the rate, but not slower than the bound: log(−log r) rises by 2.8,
         <tr><td><b>the <code>1/√dₖ</code> scale</b></td><td>starts every row near uniform (§05, §06). Does nothing about drift afterwards.</td><td>nothing</td></tr>
         <tr><td><b>normalising <code>q</code> and <code>k</code></b> before the dot product</td><td>unit-normalising both (cosine attention) bounds every score in <code>[−1, 1]</code>, so the logit range is fixed by construction and cannot grow, and a learned temperature is then needed to allow sharpness at all; the more common QK-norm (a LayerNorm or RMSNorm on <code>q</code> and <code>k</code>, with learned gains) bounds the score <i>growth</i> instead of the score</td><td>one extra normalisation per head; in the strict form the model can no longer express an arbitrarily confident lookup without moving the temperature</td></tr>
         <tr><td><b>bounding the weights' spectral norm</b> (a spectral reparameterisation of the linear layers)</td><td>bounds the score magnitude indirectly, by bounding <code>‖W_Q‖·‖W_K‖</code>. Reported to remove the need for learning-rate warmup entirely.</td><td>a power iteration per layer per step</td></tr>
-        <tr class="tot"><td><b>warmup and gradient clipping</b></td><td>keep the early steps small, so the logits do not run away before the representation is worth committing to. This is one reason warmup is near-universal in transformer training.</td><td>a schedule to tune — <a href="neural-network-training.html#schedules">part 2</a> owns it</td></tr>
+        <tr class="tot"><td><b>warmup and gradient clipping</b></td><td>keep the early steps small, so the logits do not run away before the representation is worth committing to. This is one reason warmup is near-universal in transformer training.</td><td>a schedule to tune — <a href="neural-network-training.html#schedules">the training page</a> owns it</td></tr>
       </table>
 
       <div class="viz" id="viz-ec">
@@ -2042,7 +2058,7 @@ That is exactly the argument a 4096-window, 32-layer model makes for
 having a 131k "theoretical attention span" while every individual layer
 looks 4096 tokens back.</span></div>
 
-      <p>The word doing the work is "effective". Information <i>can</i> travel <code>L·w</code> tokens, in the same sense that a stack of 3×3 convolutions has a receptive field that grows with depth — and with the same caveat <a href="convolutional-networks.html#rf">part 3 measured</a>: the <b>effective</b> receptive field is much smaller than the theoretical one, because the influence of a distant token has been averaged through <code>L</code> attention rows on the way. A token 100 000 positions back is <i>reachable</i>; whether any of it survives is an empirical question and the answer is usually "much less than the arithmetic suggests".</p>
+      <p>The word doing the work is "effective". Information <i>can</i> travel <code>L·w</code> tokens, in the same sense that a stack of 3×3 convolutions has a receptive field that grows with depth — and with the same caveat <a href="convolutional-networks.html#rf">the convolution page measured</a>: the <b>effective</b> receptive field is much smaller than the theoretical one, because the influence of a distant token has been averaged through <code>L</code> attention rows on the way. A token 100 000 positions back is <i>reachable</i>; whether any of it survives is an empirical question and the answer is usually "much less than the arithmetic suggests".</p>
 
       <table class="grid2">
         <tr><th style="width:150px">pattern</th><th>who each query reads</th><th>scores per layer</th><th>what it is for</th></tr>
@@ -2110,7 +2126,7 @@ looks 4096 tokens back.</span></div>
    O(1) work and O(d′·d_v) memory per generated token, at ANY length.
    No cache that grows. This is the property that makes linear attention
    attractive for generation, and it is exactly the property of
-   part 4's recurrent cell.</span></div>
+   the recurrent cell on the RNN page.</span></div>
 
       <h4>What it gives back, stated as the same counting argument as §01</h4>
       <div class="formula"><span class="lbl">two ways to say the same thing</span><span class="eq">RANK.  The mixing matrix is  A ∝ φ(Q) φ(K)ᵀ, a product of an (n × d′) and
@@ -2125,7 +2141,8 @@ looks 4096 tokens back.</span></div>
        of rank 128 and softmax attention can express rank 8192.
 
 CAPACITY.  The recurrence stores a fixed (d′ × d_v) state. The input it
-       has to summarise is n·d_v numbers. By exactly part 4's argument,
+       has to summarise is n·d_v numbers. By exactly the RNN page's
+       bottleneck argument,
        the average recoverable fraction is
 
               d′·d_v / (n·d_v)  =  d′ / n
@@ -2246,7 +2263,7 @@ CAPACITY.  The recurrence stores a fixed (d′ × d_v) state. The input it
       <h3><span class="idx">32</span> Long context: what breaks in the mechanism itself</h3>
       <p class="lede">Two distinct things fail as <code>n</code> grows, and they are usually conflated. One is about <b>positions the model has never seen</b>, which is a positional-encoding question and belongs elsewhere. The other is about <b>the softmax itself</b>, is independent of the positional scheme, and has a closed form.</p>
 
-      <div class="callout"><b>Scope, stated before the argument.</b> Position interpolation, NTK-aware scaling, YaRN, needle-in-a-haystack evaluation and the lost-in-the-middle effect are owned by <a href="../llm/context-length-extension.html">Context-Length Extension</a>, and the positional schemes themselves by <a href="transformers.html#positional">part 6</a>. This section owns only the part that would still be true if positions were free: <b>a softmax over more keys is a harder softmax</b>.</div>
+      <div class="callout"><b>Scope, stated before the argument.</b> Position interpolation, NTK-aware scaling, YaRN, needle-in-a-haystack evaluation and the lost-in-the-middle effect are owned by <a href="../llm/context-length-extension.html">Context-Length Extension</a>, and the positional schemes themselves by <a href="transformers.html#positional">the Transformer page</a>. This section owns only the part that would still be true if positions were free: <b>a softmax over more keys is a harder softmax</b>.</div>
 
       <div class="formula"><span class="lbl">the model: one right key with a logit margin m, n−1 distractors with logits ~ N(0, <span class="keep">σ</span>²)</span><span class="eq">   p(right key)  =  exp(m) / ( exp(m) + ∑ⱼ exp(sⱼ) )
 
@@ -2373,7 +2390,7 @@ representation, which is the only way heads can interact at all.</span></div>
       <p class="lede"><b>A convolution moves information a fixed distance per layer through a tied, banded matrix; a recurrence moves it one step at a time through repeated application of one matrix; attention moves it any distance in one layer through a weight computed from the content.</b> The whole series has now built all three. Put them side by side on the questions that actually differ — path length, parallelism, cost, what each assumes, how each fails — and the choice stops being a matter of fashion.</p>
 
       <table class="grid2">
-        <tr><th style="width:190px"></th><th><a href="convolutional-networks.html">convolution</a> (part 3)</th><th><a href="rnns-lstms.html">recurrence</a> (part 4)</th><th>attention (part 5)</th></tr>
+        <tr><th style="width:190px"></th><th><a href="convolutional-networks.html">convolution</a></th><th><a href="rnns-lstms.html">recurrence</a></th><th>attention (this page)</th></tr>
         <tr><td><b>the mixing matrix</b></td><td>banded and tied — <code>f</code> free numbers repeated down the diagonals</td><td>an implicit <code>∑ₖ W⁽ᵗ⁻ᵏ⁾</code> — one matrix, applied repeatedly</td><td><b>computed from the input</b>; zero free numbers of its own</td></tr>
         <tr><td><b>path length between positions <code>i</code> and <code>j</code></b></td><td><code>⌈2|i−j| / (f−1)⌉</code> layers — a centred kernel of width <code>f</code> reaches <code>(f−1)/2</code> each side per layer (a causal kernel reaches <code>f−1</code>, halving this)</td><td><code>|i−j|</code> steps</td><td><b>1</b>, at any distance</td></tr>
         <tr><td><b>sequential depth of one layer</b></td><td><code>O(1)</code> — fully parallel</td><td><code>O(n)</code> — inherently serial</td><td><code>O(1)</code> — fully parallel</td></tr>
@@ -2381,11 +2398,11 @@ representation, which is the only way heads can interact at all.</span></div>
         <tr><td><b>memory per layer</b></td><td class="mono">n·d</td><td class="mono">n·d</td><td class="mono">h·n²</td></tr>
         <tr><td><b>per generated token</b></td><td>a fixed window</td><td>a fixed state of <code>O(d)</code> numbers (the <code>O(d²)</code> per step is the weights, read once whatever <code>n</code> is)</td><td>a cache of <code>2·g·dₖ·n</code> — <b>grows</b></td></tr>
         <tr><td><b>what it assumes</b></td><td>locality and translation invariance</td><td>a fixed rule relating each step to the next</td><td>almost nothing about <i>which</i> positions relate; only that the relation is a low-rank bilinear form</td></tr>
-        <tr><td><b>how the gradient travels a distance <code>Δ</code></b></td><td>through <code>2Δ/(f−1)</code> layers — a product of <i>different</i> matrices</td><td>through a <b>matrix power</b>, which vanishes or explodes (<a href="rnns-lstms.html#power">part 4 §17</a>)</td><td>through <b>one</b> attention weight — no product, no decay</td></tr>
+        <tr><td><b>how the gradient travels a distance <code>Δ</code></b></td><td>through <code>2Δ/(f−1)</code> layers — a product of <i>different</i> matrices</td><td>through a <b>matrix power</b>, which vanishes or explodes (<a href="rnns-lstms.html#power">the RNN page's repeated-Jacobian section</a>)</td><td>through <b>one</b> attention weight — no product, no decay</td></tr>
         <tr class="tot"><td><b>the failure mode it owns</b></td><td>a receptive field that grows too slowly</td><td>vanishing gradients over long ranges</td><td>quadratic memory (§20), a growing cache (§25), and token uniformity with depth (§22)</td></tr>
       </table>
 
-      <p>The row that changed the field is the one on how the gradient travels. A recurrence connects two positions through a <b>power</b> of one matrix, and part 4 spent ten sections on the consequences: the gradient decays like <code>ρ^Δ</code> and the entire LSTM exists to make <code>ρ ≈ 1</code> by construction. Attention connects them through a <b>single weight</b>, so there is no product to decay and the distance does not appear in the gradient path at all. That, and not the parallelism, is the deeper reason attention replaced recurrence — though the parallelism is why it was affordable to find out.</p>
+      <p>The row that changed the field is the one on how the gradient travels. A recurrence connects two positions through a <b>power</b> of one matrix, and <a href="rnns-lstms.html#power">the RNN page spends ten sections on the consequences</a>: the gradient decays like <code>ρ^Δ</code> and the entire LSTM exists to make <code>ρ ≈ 1</code> by construction. Attention connects them through a <b>single weight</b>, so there is no product to decay and the distance does not appear in the gradient path at all. That, and not the parallelism, is the deeper reason attention replaced recurrence — though the parallelism is why it was affordable to find out.</p>
 
       <div class="viz" id="viz-tk">
         <div class="vhead">
@@ -2409,7 +2426,7 @@ representation, which is the only way heads can interact at all.</span></div>
         <div class="readout" aria-live="polite" id="tk-readout"></div>
       </div>
 
-      <div class="callout"><b>The synthesis <a href="neural-networks.html#inductive-bias">part 1 §24</a> was building towards.</b> Every one of these is a <b>constrained dense layer over positions</b>. A convolution constrains the mixing matrix to be banded and tied. A recurrence constrains it to be generated by powers of a single matrix. Attention removes the constraint on <i>which</i> entries may be non-zero and replaces it with a constraint on <i>how the entries are produced</i> — from the data, by a low-rank bilinear form. The prior gets weaker in that order, and — roughly, since the ordering of convolution against recurrence depends on the task — the sample efficiency falls and the ceiling given enough data rises along with it. That is the same trade the whole domain is organised around, applied to one axis.</div>
+      <div class="callout"><b>The synthesis <a href="neural-networks.html#inductive-bias">the feedforward page's inductive-bias section</a> was building towards.</b> Every one of these is a <b>constrained dense layer over positions</b>. A convolution constrains the mixing matrix to be banded and tied. A recurrence constrains it to be generated by powers of a single matrix. Attention removes the constraint on <i>which</i> entries may be non-zero and replaces it with a constraint on <i>how the entries are produced</i> — from the data, by a low-rank bilinear form. The prior gets weaker in that order, and — roughly, since the ordering of convolution against recurrence depends on the task — the sample efficiency falls and the ceiling given enough data rises along with it. That is the same trade the whole domain is organised around, applied to one axis.</div>
     </section>
 
     <!-- ═══ 35 ═══════════════════════════════════════════════════════════ -->
@@ -2437,11 +2454,11 @@ representation, which is the only way heads can interact at all.</span></div>
 
     <!-- ═══ 36 ═══════════════════════════════════════════════════════════ -->
     <section class="topic" id="takeaways" data-nav="What to remember, and the hand-off">
-      <h3><span class="idx">36</span> What to remember, and exactly where part 6 begins</h3>
+      <h3><span class="idx">36</span> What to remember, and exactly where the Transformer page begins</h3>
 
       <h4>The mechanism, in the order it was built</h4>
       <ul class="notes">
-        <li><b>Attention exists because a fixed-size summary has a rank.</b> Part 4's bound was <code>dₕ/(L·dₓ)</code>; keeping every encoder state makes it <code>dₕ/dₓ</code> and the length cancels (§01). Everything else is the cost of that cancellation.</li>
+        <li><b>Attention exists because a fixed-size summary has a rank.</b> <a href="rnns-lstms.html#bottleneck">The recurrent encoder's bound</a> was <code>dₕ/(L·dₓ)</code>; keeping every encoder state makes it <code>dₕ/dₓ</code> and the length cancels (§01). Everything else is the cost of that cancellation.</li>
         <li><b>Score, normalise, blend.</b> Three steps, and the softmax is load-bearing: it puts the weights on the simplex, so the output is a convex combination whose norm cannot grow with <code>n</code> (§02), and it makes a discrete selection differentiable, which is why the gradient has zero variance instead of the sampled estimator's (§03).</li>
         <li><b><code>1/√dₖ</code> is a z-score.</b> <code>Var[q·kᵀ] = dₖ</code> exactly, for independent zero-mean unit-variance <code>q</code> and <code>k</code>, whatever their distribution (§05). Without it an untrained head at <code>dₖ = 64</code> already puts 79% of its weight on one arbitrary key, and on a task whose answer is a spread rather than a pick it never recovers (§06).</li>
         <li><b>Q, K, V is a differentiable dictionary lookup</b> in which equality has become a learned, asymmetric, rank-<code>dₖ</code> similarity and a hit has become a blend (§07). There is no "not found": the weights sum to one whatever the scores are, which is the origin of attention sinks (§29) and of the long-context dilution of §32.</li>
@@ -2456,16 +2473,16 @@ representation, which is the only way heads can interact at all.</span></div>
         <li><b>What attention cannot do:</b> it supplies no per-token non-linearity (§21 — with one token, any depth of attention is one matrix multiply); stacked alone it collapses every token to the same vector within two or three layers (§22); and its rows fail at both ends of the entropy scale (§23).</li>
       </ul>
 
-      <div class="callout"><b>The hand-off to <a href="transformers.html">part 6</a>, line by line.</b> This page owns the mechanism and stops at the block boundary. Part 6 owns everything that turns it into a model, and this page has deliberately left each of these open:
+      <div class="callout"><b>The hand-off to <a href="transformers.html">the Transformer page</a>, line by line.</b> This page owns the mechanism and stops at the block boundary. The Transformer page owns everything that turns it into a model, and this page has deliberately left each of these open:
       <ul class="notes" style="margin-top:8px">
         <li><b>Positional encoding.</b> §11 proves it is necessary and measures the symmetry breaking. It does not teach sinusoidal, learned, RoPE or ALiBi — those are architectural choices about <i>how</i> to break it, and §32 links to <a href="../llm/context-length-extension.html">Context-Length Extension</a> for what happens when they are stretched.</li>
-        <li><b>The residual stream and normalisation.</b> §22 measures that the residual-plus-pre-norm wiring is what stops rank collapse, and §14 says that a head's output is a low-rank write. Part 6 owns the wiring itself — pre-norm against post-norm, where the LayerNorm goes, the residual scaling.</li>
-        <li><b>The position-wise FFN.</b> §21 proves it is necessary by showing attention's feature map is exactly linear, and §08 and §19 count its parameters and its MACs because they are needed to say anything about attention's share. Part 6 owns the FFN as a design object — the width ratio, the activation, gated variants.</li>
+        <li><b>The residual stream and normalisation.</b> §22 measures that the residual-plus-pre-norm wiring is what stops rank collapse, and §14 says that a head's output is a low-rank write. The Transformer page owns the wiring itself — pre-norm against post-norm, where the LayerNorm goes, the residual scaling.</li>
+        <li><b>The position-wise FFN.</b> §21 proves it is necessary by showing attention's feature map is exactly linear, and §08 and §19 count its parameters and its MACs because they are needed to say anything about attention's share. The Transformer page owns the FFN as a design object — the width ratio, the activation, gated variants.</li>
         <li><b>The block, the stack and the training recipe.</b> Encoder, decoder and encoder–decoder; how many layers; warmup and schedules; dropout placement; weight tying; the whole assembly.</li>
-        <li><b>What part 6 may assume without re-deriving:</b> the layout law of §01, the exact shapes and parameter count of §08, the mask semantics of §15–§16, the backward pass of §17 (audited to <code>1.3e−09</code>), the MAC and memory accounting of §18–§20, and the KV-cache arithmetic of §24–§28. All of it is in <code>dl-viz.js</code> under <code>DL.sdpa</code>, <code>DL.mhaForward</code>, <code>DL.mhaBackward</code>, <code>DL.attnMacs</code> and <code>DL.kvCacheElems</code>, with the layout law written above them.</li>
+        <li><b>What the Transformer page may assume without re-deriving:</b> the layout law of §01, the exact shapes and parameter count of §08, the mask semantics of §15–§16, the backward pass of §17 (audited to <code>1.3e−09</code>), the MAC and memory accounting of §18–§20, and the KV-cache arithmetic of §24–§28. All of it is in <code>dl-viz.js</code> under <code>DL.sdpa</code>, <code>DL.mhaForward</code>, <code>DL.mhaBackward</code>, <code>DL.attnMacs</code> and <code>DL.kvCacheElems</code>, with the layout law written above them.</li>
       </ul></div>
 
-      <div class="callout"><b>Where else this page connects.</b> <a href="rnns-lstms.html#bottleneck">Part 4 §36</a> is where §01 begins. <a href="neural-networks.html#inductive-bias">Part 1 §24</a>'s table is what §10 derives. <a href="../vision/vision-transformers.html">Vision Transformers</a> applies the mechanism to patches; <a href="../nlp/machine-translation.html">Machine Translation</a> is where it first mattered; <a href="mixture-of-experts.html">Mixture of Experts</a> is the same input-conditioned-routing idea applied to the FFN instead of to the positions; <a href="state-space-models.html">State Space Models</a> is §30's trade made with a differently designed recurrence; <a href="encoder-decoder-models.html">Encoder vs Decoder Models</a> is §09's two wirings turned into a taxonomy.</div>
+      <div class="callout"><b>Where else this page connects.</b> <a href="rnns-lstms.html#bottleneck">The RNN page's bottleneck section</a> is the bound §01 quotes as its motivation. <a href="neural-networks.html#inductive-bias">The feedforward page's inductive-bias table</a> is what §10 derives. <a href="../vision/vision-transformers.html">Vision Transformers</a> applies the mechanism to patches; <a href="../nlp/machine-translation.html">Machine Translation</a> is where it first mattered; <a href="mixture-of-experts.html">Mixture of Experts</a> is the same input-conditioned-routing idea applied to the FFN instead of to the positions; <a href="state-space-models.html">State Space Models</a> is §30's trade made with a differently designed recurrence; <a href="encoder-decoder-models.html">Encoder vs Decoder Models</a> is §09's two wirings turned into a taxonomy.</div>
     </section>
 
   </main>
