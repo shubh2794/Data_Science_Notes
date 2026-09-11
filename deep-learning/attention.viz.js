@@ -4075,7 +4075,9 @@ const HW = {
         g.append("rect").attr("x", i * cw).attr("y", yy + 6).attr("width", cw - 0.8).attr("height", 12)
           .attr("fill", i === mid ? DC.ink : p[2]).attr("fill-opacity", p[1](i) ? 0.85 : 0.12);
       }
-      const need = k === 0 ? Math.ceil((n - 1) / Math.max(1, fw - 1)) : k === 1 ? n - 1 : 1;
+      /* the convolution drawn above (and measured below) is CENTRED: one layer reaches (f−1)/2 each side,
+         so connecting two positions Δ apart takes ⌈2Δ/(f−1)⌉ layers (a causal kernel would take ⌈Δ/(f−1)⌉) */
+      const need = k === 0 ? Math.ceil(2 * (n - 1) / Math.max(1, fw - 1)) : k === 1 ? n - 1 : 1;
       AT.note(g, 0, yy + 32, "layers/steps to connect the two ends of an n = " + DL.commas(n) + " sequence: " +
         DL.commas(need), DC.muted, 9);
     });
@@ -4087,7 +4089,7 @@ const HW = {
     let lines, ylab, title, xlab = "sequence length n", logx = true, xs, msg = "";
     if (cmp === "path") {
       title = "layers needed to connect two ends"; ylab = "layers";
-      lines = [[q => Math.ceil((q - 1) / Math.max(1, fw - 1)), DC.a2], [q => q - 1, DC.violet], [() => 1, DC.accent]];
+      lines = [[q => Math.ceil(2 * (q - 1) / Math.max(1, fw - 1)), DC.a2], [q => q - 1, DC.violet], [() => 1, DC.accent]];
     } else if (cmp === "cost") {
       title = "MACs per layer"; ylab = "MACs";
       lines = [[q => q * fw * d * d, DC.a2], [q => q * d * d, DC.violet],
@@ -4125,7 +4127,7 @@ const HW = {
     } else {
       AT.title(g, rx, -10, "measured ‖∂ output(n−1) / ∂ input(j)‖ against distance");
       const gc = gradAtDistance((X, sd) => stackConv(X, fw, sd)), gr = gradAtDistance(stackRec), ga = gradAtDistance(stackAttn);
-      const rfConv = LM * (fw - 1);                       /* the stack's receptive field: exactly zero beyond it */
+      const rfConv = LM * (fw - 1) / 2;                   /* the CENTRED stack's one-sided receptive field: exactly zero beyond it */
       const all = [gc, gr, ga].flatMap(a => a.map(p => p.g)).filter(v => v > 0);
       xs = d3.scaleLinear().domain([0, NM - 1]).range([0, rw - 12]);
       const y = d3.scaleLog().domain([Math.max(1e-18, Math.min(...all) / 3), Math.max(...all) * 3]).range([gh, 0]).clamp(true);
