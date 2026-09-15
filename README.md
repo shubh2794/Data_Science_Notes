@@ -99,10 +99,14 @@ The project is data-driven and static (no build step, opens over `file://`):
   **from `data.js` at runtime**, plus the scrollspy and the viz colour palette.
   A page declares nothing about its siblings — add a topic to `data.js` and every
   sidebar updates itself.
-- **`index.html`** — the graph is a **collapsible** radial tree: click a domain to
-  expand/collapse its topics, click the centre to toggle all. Cross-links are drawn
-  only between currently-visible nodes, so the view stays readable as it grows.
-  `index-force.html` keeps the original force-directed layout as a fallback.
+- **`index.html`** — the graph is a **3D force-directed web** of every node in
+  `data.js` (WebGL, via `vendor/force-graph-3d.min.js` — a single vendored bundle
+  of 3d-force-graph + three.js + d3-force-3d, so it still works offline). Drag to
+  orbit, scroll to zoom, hover to spotlight a node's neighbours, click to pin it
+  and open its detail panel, click twice to open its notes. The bottom-left panel
+  tunes the physics, filters by depth, and lights up whole domains; the search box
+  flies the camera to a match. `index.html?focus=<id>` deep-links to a node — every
+  notes page's sidebar uses it. All of that lives in `graph.js`.
 
 A notes page is therefore just: header + `section.topic` content + viz
 containers, loading `../data.js` → `../notes.js` → its own `*.viz.js`.
