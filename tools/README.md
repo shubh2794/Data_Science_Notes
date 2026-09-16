@@ -130,6 +130,28 @@ load from an out-of-scope variable, which had blanked most of that page's figure
 
 Recommended cadence: run it on any page whose `.viz.js` changed, before committing.
 
+## wire_dsa_part.py
+
+The DSA twin of `wire_stats_part.py`. The domain is built as **two** seven-part
+level-3 series, so the script takes the series folder as its first argument:
+
+```
+python3 tools/wire_dsa_part.py algorithms 2 "Recursion, Divide & Conquer" \
+    divide-conquer.html "Recursion, Divide &amp; Conquer" analysis.html
+```
+
+`<series>` is `data-structures` or `algorithms`. It performs the four wiring
+steps a page-building agent is told not to do — set `link:` on the level-3 node,
+turn the hub's pending card into a link, link any hub cheat-sheet `Part N` cells,
+and fill the previous part's empty pager span — and refuses to run if the page
+file does not exist yet. Idempotent. It does **not** add cross edges: run
+`hierarchy_audit.py` afterwards and expect to add some by hand.
+
+Shared figure helpers for both series live in `dsa/dsa-viz.js` (globals `AC`
+palette and `AL` namespace). Its house rule: any cost a figure *displays*
+— comparisons, swaps, probes, node visits — must come from `AL.counter()`
+wrapped around the real routine, never from a constant typed into the caption.
+
 ## How this capability should live
 
 This is a **reusable script**, not an agent that re-derives the rules each run.
