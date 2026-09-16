@@ -5,9 +5,9 @@
 (function(){
   const svg=d3.select("#map-svg"), W=660;
   const tiles=[
-    {id:"bigo",  label:"Big-O Complexity",   x:30,  y:30, role:"The yardstick: how cost grows with n.",        cx:"common classes: O(1), O(log n), O(n), O(n log n), O(n²)"},
+    {id:"bigo",  label:"Algorithm Analysis",  x:30,  y:30, role:"The yardstick: how cost grows with n.",        cx:"O(1), O(log n), O(n), O(n log n), O(n²) · recurrences · amortized"},
     {id:"arr",   label:"Arrays & Strings",   x:240, y:30, role:"Contiguous, index-addressable storage.",       cx:"index access O(1) · middle insert/delete O(n)"},
-    {id:"tree",  label:"Trees & Graphs",     x:450, y:30, role:"Hierarchy and pairwise relationships.",        cx:"BST search O(log n) balanced · BFS/DFS O(V+E)"},
+    {id:"tree",  label:"Trees & BSTs",       x:450, y:30, role:"Hierarchy, and the search-tree invariant.",    cx:"traversals · BST ops O(h) · degenerate when h → n"},
     {id:"sort",  label:"Sorting & Searching",x:135, y:170,role:"Order data, then locate it fast.",             cx:"comparison sort Ω(n log n) · binary search O(log n)"},
     {id:"dp",    label:"Dynamic Programming",x:360, y:170,role:"Cache overlapping subproblems; solve once.",    cx:"e.g. Fibonacci O(2ⁿ) naive → O(n) with DP"}
   ];
@@ -26,6 +26,6 @@
   });
   d3.select("#map-reset").on("click",()=>{
     svg.selectAll("g.tile rect").attr("stroke",C.line).attr("stroke-width",1.5).attr("fill","#1a2030");
-    d3.select("#map-readout").text("Click a tile to explore one of the five pillars");
+    d3.select("#map-readout").text("Click a tile to explore one of the five entry points");
   });
 })();
