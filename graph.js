@@ -41,15 +41,79 @@ const topicDomain = {}; domList.forEach(d => tree[d].forEach(t => topicDomain[t]
 Object.entries(subtree).forEach(([top,kids]) => kids.forEach(k => topicDomain[k] = topicDomain[top]));
 const degree = {}; nodes.forEach(n=> degree[n.id] = ADJ[n.id].size);
 
-/* each domain gets an angular slot on a ring — a *gentle* anchor that fans the
-   clusters apart so the dense cross-links don't collapse into a central hairball,
-   while topology (links + charge) still does the real organic placement. */
-const ANCHOR_R = 300;
-const domAngle = {}; domList.forEach((d,i)=> domAngle[d] = i/domList.length*2*Math.PI - Math.PI/2);
+/* ---- placement: a radial tree of anchors, one per node ----
+   The layout is still a force web — links, charge and collision do the organic
+   work — but every node gets its own gentle anchor on a radial tree instead of
+   the whole domain sharing one point:
+     · domains sit on an inner ring, each owning an ARC proportional to the size
+       of its subtree (Deep Learning's 21 nodes get a wide fan; Speech's 1 a sliver),
+       ordered round the ring so that domains sharing many cross-links are
+       neighbours — most cross-links then hop to the next wedge instead of
+       crossing the middle;
+     · topics sit on a middle ring, spread across their domain's arc;
+     · sub-topics sit on an outer ring, spread across their parent topic's slice.
+   The whole tree is stretched to the viewport's aspect so a landscape window is
+   filled rather than a tall column squeezed to fit. */
+const RING = {1: 330, 2: 440, 3: 540};      // anchor radius by level
+function subtreeSize(dom){ return tree[dom].reduce((a,t)=> a + 1 + (subtree[t]? subtree[t].length : 0), 0); }
+
+/* cross-link weight between domains, for ordering the ring */
+const domIndex = {}; domList.forEach((d,i)=> domIndex[d]=i);
+const domW = domList.map(()=> domList.map(()=>0));
+cross.forEach(([s,t])=>{
+  const a = topicDomain[s] || (domIndex[s]!==undefined ? s : null), b = topicDomain[t] || (domIndex[t]!==undefined ? t : null);
+  if(a===null||b===null||a===b) return;
+  domW[domIndex[a]][domIndex[b]] += 1; domW[domIndex[b]][domIndex[a]] += 1;
+});
+/* circular ordering: greedy chain from the best-connected domain, then 2-opt on
+   adjacent-pair weight (neighbours count fully, next-but-one at half) */
+function ringOrder(){
+  const n = domList.length, W = domW;
+  const tot = W.map(r=> r.reduce((a,b)=>a+b,0));
+  let order = [tot.indexOf(Math.max(...tot))], used = new Set(order);
+  while(order.length<n){
+    const last = order[order.length-1]; let best=-1, bw=-1;
+    for(let j=0;j<n;j++) if(!used.has(j) && (W[last][j]>bw || (W[last][j]===bw && tot[j]>tot[best]))){ best=j; bw=W[last][j]; }
+    order.push(best); used.add(best);
+  }
+  const score = o => { let sc=0; for(let i=0;i<n;i++){ sc += W[o[i]][o[(i+1)%n]] + 0.5*W[o[i]][o[(i+2)%n]]; } return sc; };
+  let improved = true, cur = score(order);
+  while(improved){
+    improved=false;
+    for(let i=0;i<n-1;i++) for(let j=i+1;j<n;j++){
+      const o = order.slice(0,i).concat(order.slice(i,j+1).reverse(), order.slice(j+1));
+      const sc = score(o); if(sc>cur+1e-9){ order=o; cur=sc; improved=true; }
+    }
+  }
+  return order.map(i=> domList[i]);
+}
+const ringDoms = ringOrder();
+
+/* arc allocation: width ∝ sqrt(size) + a floor, so small domains keep a readable slot */
+const arcOf = {}; {
+  const w = ringDoms.map(d=> Math.sqrt(subtreeSize(d)) + 0.7), sum = w.reduce((a,b)=>a+b,0);
+  let a = -Math.PI/2;
+  ringDoms.forEach((d,i)=>{ const span = w[i]/sum*2*Math.PI; arcOf[d] = {start:a, span}; a += span; });
+}
+/* per-node anchor angles: topics fan across the domain arc; sub-topics across the parent's slice */
+const anchorAngle = {};
+domList.forEach(d=>{
+  const {start, span} = arcOf[d]; anchorAngle[d] = start + span/2;
+  const kids = tree[d], m = kids.length;
+  const pad = span*0.12;                                   // keep wedges from touching
+  kids.forEach((t,i)=>{
+    const s0 = start + pad + (span-2*pad)*i/m, s1 = start + pad + (span-2*pad)*(i+1)/m;
+    anchorAngle[t] = (s0+s1)/2;
+    const subs = subtree[t]; if(!subs) return;
+    subs.forEach((k,j)=> anchorAngle[k] = s0 + (s1-s0)*(j+0.5)/subs.length);
+  });
+});
+function aspect(){ return Math.max(1, Math.min(1.6, width/height)); }   // stretch x for landscape windows
 function anchorOf(d){
   if(d.level===0) return [0,0];
-  const dom = d.level===1 ? d.id : topicDomain[d.id];
-  const a = domAngle[dom]; return [Math.cos(a)*ANCHOR_R, Math.sin(a)*ANCHOR_R];
+  const a = anchorAngle[d.id], r = RING[d.level] || RING[3];
+  if(a===undefined) return [0,0];
+  return [Math.cos(a)*r*aspect(), Math.sin(a)*r];
 }
 
 function buildGraphData(){
@@ -58,7 +122,7 @@ function buildGraphData(){
   const N = nodes.filter(n=> n.level <= maxDepth).map(n=> Object.assign({}, n));
   const byId = {}; N.forEach(n=> byId[n.id]=n);
   // seed positions near each node's domain slot so the sim settles into clusters quickly
-  N.forEach(n=>{ const [ax,ay]=anchorOf(n); n.x = ax + (Math.random()-.5)*60; n.y = ay + (Math.random()-.5)*60; });
+  N.forEach(n=>{ const [ax,ay]=anchorOf(n); n.x = ax + (Math.random()-.5)*24; n.y = ay + (Math.random()-.5)*24; });
   const L = [];
   Object.entries(tree).forEach(([dom,kids])=>{
     if(byId[dom]) L.push({source:"Data Science",target:dom,kind:"tree"});
@@ -331,10 +395,11 @@ const cfg = {
   link:    () => +$("c-link").value,
   cluster: () => +$("c-cluster").value/100,   // 0..1
 };
-function chargeStrength(d){ const f=cfg.force(); return d.level===0?-f*1.5 : d.level===1?-f*1.1 : -f*0.42; }
-function linkDistance(l){ const v=cfg.link(); return l.kind==="tree"? v*0.62 : v*1.45; }   // tree short (tight clusters), cross long
+function chargeStrength(d){ const f=cfg.force(); return d.level===0?-f*1.5 : d.level===1?-f*1.1 : d.level===2?-f*0.42 : -f*0.26; }   // sub-topics repel less, so a series stays a compact fan
+function linkDistance(l){ const v=cfg.link(); if(l.kind!=="tree") return v*1.45;            // cross long
+  const lv = l.target.level; return lv===1 ? v*1.7 : lv===2 ? v*0.7 : v*0.5; }             // root→domain long, deeper tree links short (tight clusters)
 function linkStrength(l){ return l.kind==="tree"?0.72 : l.kind==="isa"?0.05 : 0.035; }       // cross/isa weak → no hairball
-function clusterStrength(d){ const c=cfg.cluster(); return d.level===0?0.18 : d.level===1?c*0.16 : c*0.06; }
+function clusterStrength(d){ const c=cfg.cluster(); return d.level===0?0.25 : d.level===1?c*0.6 : d.level===2?c*0.2 : c*0.16; }
 
 function applyForces(reheat){
   if(!sim) return;
@@ -368,7 +433,7 @@ $("c-freeze").addEventListener("change",e=>{
 });
 $("c-refit").addEventListener("click",()=>{ userMovedView = false; fitGraph(); });
 $("c-reset").addEventListener("click",()=>{
-  const d = {"c-force":1400,"c-link":160,"c-cluster":0,"c-label":45,"c-size":100,"c-linkop":100};
+  const d = {"c-force":1400,"c-link":160,"c-cluster":50,"c-label":45,"c-size":100,"c-linkop":100};
   Object.entries(d).forEach(([k,v])=>{ $(k).value = v; });
   $("c-depth").value = 3; $("c-arrows").checked = true; $("c-colorlinks").checked = true;
   $("c-stubs").checked = false; $("c-freeze").checked = false;
@@ -484,7 +549,7 @@ function fitGraph(){
   svg.transition().duration(650).call(zoom.transform, d3.zoomIdentity.translate(width/2-cx*k,height/2-cy*k).scale(k));
 }
 
-window.addEventListener("resize",()=>{ width=window.innerWidth; height=window.innerHeight; svg.attr("viewBox",[0,0,width,height]); });
+window.addEventListener("resize",()=>{ width=window.innerWidth; height=window.innerHeight; svg.attr("viewBox",[0,0,width,height]); applyForces(false); });
 
 labelThreshold = +$("c-label").value/100;
 syncReadouts();
