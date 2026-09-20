@@ -402,7 +402,7 @@ const cross = [
   ["Recursion, Divide & Conquer","Frequency Domain"],
   ["Linked Lists, Stacks & Queues","Message Queues"],
   ["NP-Completeness & Approximation","Optimization"],["NP-Completeness & Approximation","Hyperparameter Tuning"],
-  ["Dynamic Programming","Reinforcement Learning"],
+  ["Dynamic Programming","Reinforcement Learning"],["Dynamic Programming","Hidden Markov Models & CRFs"],["Dynamic Programming","Speech Processing"],
   ["Sorting & Searching","Vector Databases (HNSW)"],["Sorting & Searching","Indexing"],
   ["Arrays & Strings","Pandas & NumPy"],
 

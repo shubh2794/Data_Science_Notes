@@ -1,9 +1,7 @@
 /* dsa-viz.js — shared D3 + algorithm helpers for BOTH DSA series
    (dsa/data-structures/* and dsa/algorithms/*).
 
-   Loaded by every part built for the series. One page carried over from the
-   pre-series layout (algorithms/dynamic-programming) is still self-contained
-   and does not use it — wire it in when that part is rebuilt.
+   Loaded by every part of both series.
 
    Loaded after ../../notes.js and before each part's own "<part>.viz.js":
        <script src="../dsa-viz.js"></script>
