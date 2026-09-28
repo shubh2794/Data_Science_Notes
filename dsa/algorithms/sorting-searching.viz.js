@@ -22,6 +22,7 @@
        01 #es-svg   elementary sorts animated as bars, counters live
        02 #iv-svg   insertion sort cost vs number of inversions, measured
        03 #sh-svg   shellsort comparisons vs n for four gap sequences, fitted exponents
+       19 #cy-svg   cycle sort: its cycles, and writes vs selection/insertion (appended at the end, block SC; sits after #sh-svg on the page)
        04 #dt-svg   the decision tree of insertion sort for n = 3, plus log₂(n!) exact vs Stirling
        05 #mr-svg   one merge stepped, with a stability tie visible
        06 #mc-svg   mergesort comparisons vs n against the exact worst-case formula
@@ -899,7 +900,7 @@ const SX = {
       const ex = SS.log2Factorial(m), st = SS.stirlingLog2(m);
       return [SX.int(m), SX.f3(ex), SX.int(Math.ceil(ex)), SX.f3(st), (ex - st).toExponential(1), SX.f1(m * Math.log2(m)), SX.f3(ex / (m * Math.log2(m))), SX.int(SS.mergeWorstClosed(m))];
     });
-    SX.table("#dt-table", ["n", "log₂(n!) exact (sum of logs)", "⇒ any comparison sort needs ≥", "Stirling: n·log₂n − 1.4427n + ½·log₂(2πn)", "exact − Stirling", "n·log₂n", "log₂(n!) / (n·log₂n)", "mergesort worst (§10)"], rows);
+    SX.table("#dt-table", ["n", "log₂(n!) exact (sum of logs)", "⇒ any comparison sort needs ≥", "Stirling: n·log₂n − 1.4427n + ½·log₂(2πn)", "exact − Stirling", "n·log₂n", "log₂(n!) / (n·log₂n)", "mergesort worst (§12)"], rows);
   }
   ["dt-scheme", "dt-n"].forEach(id => SX.on(id, "change", build));
   build();
@@ -1208,7 +1209,7 @@ const SX = {
   build();
 })();
 
-/* ── §17  #co-table  the small-subarray cutoff sweep (a table, no svg) ──── */
+/* ── §19  #co-table  the small-subarray cutoff sweep (a table, no svg) ──── */
 (function () {
   if (d3.select("#co-table").empty()) return;
   const n = 4096, T = 10, cuts = [0, 4, 8, 12, 16, 24, 32, 64];
@@ -1536,4 +1537,159 @@ const SX = {
   build();
 })();
 
+})();
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SC — two more quadratic sorts, appended with §08–§09: cycle sort (fewest
+   writes) and odd-even transposition sort (n parallel rounds). Same counter
+   conventions as SS: c.add("cmp") per key comparison, c.add("write") per
+   array-slot write, c.add("cycle") per non-trivial cycle rotated,
+   c.add("round") / c.add("swp") for the transposition sort. Node-loadable:
+   the routines are added to module.exports alongside SS.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const SC = (function () {
+  const nop = { add: function () {}, get: function () { return 0; } };
+  /* cycle sort: for each start position cs, the element there belongs at
+     cs + #(smaller elements to its right); write it there, pick up the
+     displaced element, and repeat until the cycle closes back at cs. The
+     "skip equal keys" loop is what makes duplicates terminate.
+     rec({from, to, cycle}) is called once per write. */
+  function cycleSort(a, c, rec) {
+    c = c || nop;
+    const n = a.length;
+    let cyc = 0;
+    for (let cs = 0; cs < n - 1; cs++) {
+      let item = a[cs], pos = cs, from = cs;
+      for (let i = cs + 1; i < n; i++) { c.add("cmp"); if (a[i] < item) pos++; }
+      if (pos === cs) continue;                                 // already in place: no write
+      for (;;) { c.add("cmp"); if (item === a[pos]) pos++; else break; }
+      let t = a[pos]; a[pos] = item; item = t; c.add("write");
+      if (rec) rec({ from: from, to: pos, cycle: cyc });
+      from = pos;
+      while (pos !== cs) {
+        pos = cs;
+        for (let i = cs + 1; i < n; i++) { c.add("cmp"); if (a[i] < item) pos++; }
+        for (;;) { c.add("cmp"); if (item === a[pos]) pos++; else break; }
+        t = a[pos]; a[pos] = item; item = t; c.add("write");
+        if (rec) rec({ from: from, to: pos, cycle: cyc });
+        from = pos;
+      }
+      c.add("cycle"); cyc++;
+    }
+    return a;
+  }
+  /* odd-even transposition: round r compare-exchanges the disjoint pairs
+     (i, i + 1) with i ≡ r (mod 2); n rounds always suffice. */
+  function oddEvenTransposition(a, c, rounds) {
+    c = c || nop;
+    const n = a.length, R = rounds === undefined ? n : rounds;
+    for (let r = 0; r < R; r++) {
+      c.add("round");
+      for (let i = r % 2; i + 1 < n; i += 2) {
+        c.add("cmp");
+        if (a[i] > a[i + 1]) { const t = a[i]; a[i] = a[i + 1]; a[i + 1] = t; c.add("swp"); }
+      }
+    }
+    return a;
+  }
+  /* independent: the cycle structure of the permutation that sorts a
+     (distinct keys) — computed from ranks, with no sorting routine. */
+  function permCycles(a) {
+    const n = a.length, idx = a.map((v, i) => i).sort((p, q) => a[p] - a[q]);
+    const dest = new Array(n); idx.forEach((src, r) => { dest[src] = r; });
+    const seen = new Array(n).fill(false); let cycles = 0, fixed = 0;
+    for (let i = 0; i < n; i++) {
+      if (seen[i]) continue;
+      let j = i, len = 0; while (!seen[j]) { seen[j] = true; j = dest[j]; len++; }
+      cycles++; if (len === 1) fixed++;
+    }
+    return { cycles: cycles, fixed: fixed };
+  }
+  /* an array that counts every write into an index, for any routine */
+  function writeCounted(arr, c) {
+    return new Proxy(arr, { set: function (t, k, v) { if (typeof k === "string" && /^\d+$/.test(k)) c.add("write"); t[k] = v; return true; } });
+  }
+  return { cycleSort, oddEvenTransposition, permCycles, writeCounted };
+})();
+if (typeof module !== "undefined" && module.exports) Object.assign(module.exports, SC);
+
+/* ── 19  #cy-svg  cycle sort: the cycles it rotates, and writes against the other sorts ── */
+if (typeof d3 !== "undefined" && typeof AL !== "undefined") (function () {
+  const svg = d3.select("#cy-svg"); if (svg.empty()) return;
+  const W = 680, H = 330;
+  const PAL = [AC.accent, AC.a2, AC.teal, AC.violet, AC.rose, AC.good, "#e879f9", "#facc15"];
+  const val = (id, d) => { const s = d3.select("#" + id); return s.empty() ? d : s.property("value"); };
+  const flag = ok => ok ? '<span style="color:' + AC.good + '">✓ agree</span>' : '<span style="color:' + AC.bad + '">✗ DISAGREE</span>';
+  function input(kind, n) {
+    const r = AL.rng(23);
+    if (kind === "few") return Array.from({ length: n }, () => AL.randInt(r, 1, 4));
+    if (kind === "reversed") return Array.from({ length: n }, (_, i) => n - i);
+    if (kind === "nearly") { const a = Array.from({ length: n }, (_, i) => i + 1); for (let t = 0; t < 2; t++) { const i = AL.randInt(r, 0, n - 1), j = AL.randInt(r, 0, n - 1); const x = a[i]; a[i] = a[j]; a[j] = x; } return a; }
+    return AL.perm(n, r);
+  }
+  function build() {
+    const kind = val("cy-input", "random"), n = +val("cy-n", 10);
+    d3.select("#cy-n-out").text(n);
+    const A = input(kind, n), sorted = A.slice().sort((p, q) => p - q);
+    /* cycle sort under two independent counts: its own, and a proxy on the array */
+    const c = AL.counter(), cp = AL.counter(), moves = [];
+    const out = A.slice();
+    SC.cycleSort(SC.writeCounted(out, cp), c, m => moves.push(m));
+    const cs = AL.counter(), csp = AL.counter(); SS.selectionSort(SC.writeCounted(A.slice(), csp), cs);
+    const cip = AL.counter(); SS.insertionSort(SC.writeCounted(A.slice(), cip), AL.counter());
+    const misplaced = A.filter((v, i) => v !== sorted[i]).length;
+    const distinct = new Set(A).size === n, pc = distinct ? SC.permCycles(A) : null;
+    const wrote = new Array(n).fill(-1); moves.forEach(m => { wrote[m.to] = m.cycle; });
+    const srcCycle = new Array(n).fill(-1); moves.forEach(m => { srcCycle[m.from] = m.cycle; });
+
+    const F = AL.frame(svg, W, H, { l: 14, r: 14, t: 8, b: 8 }), g = F.g;
+    const cw = Math.min(38, (F.iw - 4 * n) / n), step = cw + 4, x0 = (F.iw - n * step) / 2;
+    const cx = i => x0 + i * step + cw / 2;
+    const colr = k => PAL[k % PAL.length];
+    function cellRow(vals, y, colourOf, label, ly) {
+      g.append("text").attr("x", 0).attr("y", ly === undefined ? y - 8 : ly).attr("font-size", 11).attr("fill", AC.muted).text(label);
+      vals.forEach((v, i) => {
+        const k = colourOf(i), col = k < 0 ? AC.line : colr(k);
+        g.append("rect").attr("x", x0 + i * step).attr("y", y).attr("width", cw).attr("height", 28).attr("rx", 4)
+          .attr("fill", k < 0 ? AC.panel2 : col).attr("fill-opacity", k < 0 ? 1 : 0.28).attr("stroke", col).attr("stroke-width", k < 0 ? 1 : 1.6);
+        g.append("text").attr("x", cx(i)).attr("y", y + 18).attr("text-anchor", "middle").attr("font-size", 12).attr("fill", AC.ink).text(v);
+        g.append("text").attr("x", cx(i)).attr("y", y + 40).attr("text-anchor", "middle").attr("font-size", 9).attr("fill", AC.muted).text(i);
+      });
+    }
+    const yIn = 74, yOut = 158;
+    cellRow(A, yIn, i => srcCycle[i], "input — each colour is one cycle the sort rotates; grey = already in its final slot, never written", 10);
+    /* one arc per write: from the slot the element came from to the slot it is written into */
+    moves.forEach(m => {
+      const a = cx(m.from), b = cx(m.to), h = 8 + Math.min(26, Math.abs(b - a) * 0.2);
+      g.append("path").attr("d", `M${a},${yIn - 2} Q${(a + b) / 2},${yIn - 2 - 2 * h} ${b},${yIn - 2}`)
+        .attr("fill", "none").attr("stroke", colr(m.cycle)).attr("stroke-width", 1.4).attr("opacity", 0.9);
+      g.append("circle").attr("cx", b).attr("cy", yIn - 3).attr("r", 2.6).attr("fill", colr(m.cycle));
+    });
+    cellRow(out, yOut, i => wrote[i], "output — each slot coloured by the cycle that wrote it; every slot written at most once");
+
+    /* writes, four ways */
+    const rows = [
+      { label: "cycle sort — array writes", v: c.get("write"), col: AC.good },
+      { label: "lower bound: misplaced slots", v: misplaced, col: AC.muted },
+      { label: "selection sort — array writes (2 per swap)", v: csp.get("write"), col: AC.a2 },
+      { label: "insertion sort — array writes (shifts + drops)", v: cip.get("write"), col: AC.violet }
+    ];
+    const mx = d3.max(rows, r => r.v) || 1, bx = 300, bw = F.iw - bx - 40, y0 = 222;
+    rows.forEach((r, k) => {
+      const y = y0 + k * 24;
+      g.append("text").attr("x", bx - 8).attr("y", y + 12).attr("text-anchor", "end").attr("font-size", 11).attr("fill", AC.muted).text(r.label);
+      g.append("rect").attr("x", bx).attr("y", y + 2).attr("width", Math.max(1, bw * r.v / mx)).attr("height", 14).attr("rx", 3).attr("fill", r.col).attr("opacity", 0.85);
+      g.append("text").attr("x", bx + bw * r.v / mx + 6).attr("y", y + 13).attr("font-size", 11).attr("fill", AC.ink).text(r.v);
+    });
+
+    const ok = out.every((v, i) => v === sorted[i]);
+    let html = `n = ${n} · cycle sort: <b>${c.get("write")}</b> writes in <b>${c.get("cycle")}</b> cycle${c.get("cycle") === 1 ? "" : "s"}, <b>${c.get("cmp")}</b> comparisons (≥ n(n − 1)/2 = ${n * (n - 1) / 2} ${flag(c.get("cmp") >= n * (n - 1) / 2)}) · output sorted ${flag(ok)}`
+      + ` · writes counted by the routine = writes seen by a proxy on the array (${cp.get("write")}) ${flag(cp.get("write") === c.get("write"))}`
+      + ` · writes = misplaced slots (${misplaced}), the minimum any sort can do ${flag(misplaced === c.get("write"))}`;
+    if (pc) html += ` · distinct keys: the sorting permutation has ${pc.cycles} cycles, ${pc.fixed} of them fixed points, so writes = n − fixed = ${n - pc.fixed} ${flag(n - pc.fixed === c.get("write"))} and the fewest swaps is n − cycles = ${n - pc.cycles}; selection sort made ${cs.get("swp")} ${flag(cs.get("swp") === n - pc.cycles)}`;
+    else html += ` · duplicate keys: a slot that already holds an equal key is skipped, which is why the count is the misplaced slots and not n − fixed points`;
+    d3.select("#cy-readout").html(html);
+  }
+  ["cy-input", "cy-n"].forEach(id => { const s = d3.select("#" + id); if (!s.empty()) s.on("input", build).on("change", build); });
+  build();
 })();

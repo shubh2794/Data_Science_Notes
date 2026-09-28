@@ -26,7 +26,11 @@
      10 #naive-svg   the naive matcher, stepped, on its worst case
      11 #rk-svg      Rabin-Karp: the rolling hash, hits and spurious hits
      12 #pi-svg      the KMP prefix function, built cell by cell
-     13 #race-svg    matcher race: measured comparisons, same text and pattern  */
+     13 #race-svg    matcher race: measured comparisons, same text and pattern
+     14 #strcmp-svg  string sorting: string comparisons vs character comparisons
+     15 #dfa-svg     the string-matching automaton, built and run one step per character
+     16 #regex-svg   regex: backtracking vs NFA set simulation on a pathological input
+     17 #lzw-svg     LZW encoder/decoder, stepped, beside run-length and LZ77  */
 
 /* ── shared little helpers ─────────────────────────────────────────────── */
 const AS = {
@@ -1874,4 +1878,783 @@ const MATCH = {
 
   els.k.on("input change", draw);
   draw();
+})();
+
+/* ── routines for figures 15–17: the automaton, regular expressions, compression ──
+   Pure functions, each taking an AL.counter() so a figure can display what it
+   measured. Kept apart from the drawing code so they can be tested headlessly. */
+const STR2 = {
+  /* Σ as a sorted array of distinct symbols */
+  alphabet: function (...ss) {
+    return Array.from(new Set(ss.join("").split(""))).sort();
+  },
+
+  /* the string-matching automaton, built in O(m·|Σ|): row q copies row X, where
+     X is the state the automaton reaches on P[1 … q−1] (the "restart" state), and
+     then overrides the one forward edge δ(q, P[q]) = q + 1. c counts table
+     entries written — exactly (m + 1)·|Σ|. */
+  dfaBuild: function (P, S, c) {
+    const m = P.length, d = [];
+    d.push(S.map(a => (m > 0 && a === P[0]) ? 1 : 0));
+    if (c) c.add("entry", S.length);
+    let X = 0;
+    const xs = [0];
+    for (let q = 1; q <= m; q++) {
+      d.push(d[X].slice());
+      if (c) c.add("entry", S.length);
+      if (q < m) {
+        d[q][S.indexOf(P[q])] = q + 1;
+        X = d[X][S.indexOf(P[q])];
+      }
+      xs.push(X);
+    }
+    return { delta: d, restart: xs };
+  },
+
+  /* δ(q, a) straight from the definition: the length of the longest prefix of
+     P that is a suffix of P[0 … q)·a. Cubic-ish; a cross-check, not a method. */
+  dfaBrute: function (P, S) {
+    const m = P.length, d = [];
+    for (let q = 0; q <= m; q++) {
+      d.push(S.map(a => {
+        const s = P.slice(0, q) + a;
+        let k = Math.min(m, q + 1);
+        while (k > 0 && s.slice(s.length - k) !== P.slice(0, k)) k--;
+        return k;
+      }));
+    }
+    return d;
+  },
+
+  /* run the automaton: exactly one table lookup per text character */
+  dfaRun: function (T, P, S, delta, c, snap) {
+    const m = P.length, found = [];
+    let q = 0;
+    for (let i = 0; i < T.length; i++) {
+      const j = S.indexOf(T[i]);
+      const from = q;
+      q = j < 0 ? 0 : delta[q][j];
+      if (c) c.add("step");
+      if (q === m) found.push(i - m + 1);
+      if (snap) snap({ i, from, q, ch: T[i], hit: q === m });
+    }
+    return found;
+  },
+
+  /* KMP's view of the same machine: δ(q, a) computed LAZILY by following the
+     prefix function, i.e. the automaton with its table replaced by pi */
+  kmpDelta: function (P, pi, q, a, c) {
+    const m = P.length;
+    if (q === m) q = pi[m - 1];
+    while (q > 0 && P[q] !== a) { if (c) c.add("cmp"); q = pi[q - 1]; }
+    if (c) c.add("cmp");
+    return P[q] === a ? q + 1 : 0;
+  },
+  prefix: function (P) {
+    const m = P.length, pi = new Array(m).fill(0);
+    let k = 0;
+    for (let q = 1; q < m; q++) {
+      while (k > 0 && P[k] !== P[q]) k = pi[k - 1];
+      if (P[k] === P[q]) k++;
+      pi[q] = k;
+    }
+    return pi;
+  },
+
+  /* ── regular expressions ─────────────────────────────────────────────── */
+
+  /* recursive-descent parser for  alt := cat ('|' cat)* ;  cat := rep* ;
+     rep := atom ('*' | '+' | '?')* ;  atom := letter | '(' alt ')'.
+     Returns an AST; throws on malformed input. */
+  parse: function (re) {
+    let i = 0;
+    const peek = () => re[i];
+    function alt() {
+      let a = cat();
+      while (peek() === "|") { i++; a = { t: "alt", a, b: cat() }; }
+      return a;
+    }
+    function cat() {
+      let a = null;
+      while (i < re.length && peek() !== "|" && peek() !== ")") {
+        const r = rep();
+        a = a ? { t: "cat", a, b: r } : r;
+      }
+      return a || { t: "eps" };
+    }
+    function rep() {
+      let a = atom();
+      while (peek() === "*" || peek() === "+" || peek() === "?") {
+        const op = re[i++];
+        a = { t: op === "*" ? "star" : op === "+" ? "plus" : "opt", a };
+      }
+      return a;
+    }
+    function atom() {
+      const ch = re[i];
+      if (ch === "(") {
+        i++;
+        const a = alt();
+        if (re[i] !== ")") throw new Error("missing ) at " + i);
+        i++;
+        return a;
+      }
+      if (ch === undefined || "|)*+?".includes(ch)) throw new Error("unexpected '" + (ch || "end") + "' at " + i);
+      i++;
+      return { t: "chr", c: ch };
+    }
+    const ast = alt();
+    if (i !== re.length) throw new Error("unexpected '" + re[i] + "' at " + i);
+    return ast;
+  },
+
+  /* Thompson's construction. Every state has either one labelled edge or up to
+     two ε-edges; each operator adds at most two states, so an m-symbol regex
+     gives at most 2m states. */
+  thompson: function (ast) {
+    const st = [];
+    const mk = () => { st.push({ ch: null, to: -1, eps: [] }); return st.length - 1; };
+    function frag(n) {
+      if (n.t === "chr") { const s = mk(), e = mk(); st[s].ch = n.c; st[s].to = e; return [s, e]; }
+      if (n.t === "eps") { const s = mk(), e = mk(); st[s].eps.push(e); return [s, e]; }
+      if (n.t === "cat") { const A = frag(n.a), B = frag(n.b); st[A[1]].eps.push(B[0]); return [A[0], B[1]]; }
+      if (n.t === "alt") {
+        const s = mk(), A = frag(n.a), B = frag(n.b), e = mk();
+        st[s].eps.push(A[0], B[0]); st[A[1]].eps.push(e); st[B[1]].eps.push(e);
+        return [s, e];
+      }
+      const s = mk(), A = frag(n.a), e = mk();
+      if (n.t === "star") { st[s].eps.push(A[0], e); st[A[1]].eps.push(A[0], e); }
+      if (n.t === "plus") { st[s].eps.push(A[0]);    st[A[1]].eps.push(A[0], e); }
+      if (n.t === "opt")  { st[s].eps.push(A[0], e); st[A[1]].eps.push(e); }
+      return [s, e];
+    }
+    const [start, accept] = frag(ast);
+    return { states: st, start, accept };
+  },
+
+  /* simulate the NFA by carrying the SET of states it could be in. Each state
+     enters a set at most once per character, so the work per character is
+     O(states) and the whole run is O(m·n). c counts state visits. */
+  nfaMatch: function (nfa, s, c) {
+    const S = nfa.states;
+    let maxActive = 0;
+    function closure(seed) {
+      const on = new Uint8Array(S.length), stack = seed.slice(), out = [];
+      seed.forEach(q => { on[q] = 1; });
+      while (stack.length) {
+        const q = stack.pop();
+        out.push(q);
+        if (c) c.add("visit");
+        S[q].eps.forEach(r => { if (!on[r]) { on[r] = 1; stack.push(r); } });
+      }
+      return out;
+    }
+    let cur = closure([nfa.start]);
+    for (let i = 0; i < s.length; i++) {
+      maxActive = Math.max(maxActive, cur.length);
+      const nx = [];
+      cur.forEach(q => { if (S[q].ch === s[i]) nx.push(S[q].to); });
+      cur = closure(nx);
+      if (!cur.length) break;
+    }
+    maxActive = Math.max(maxActive, cur.length);
+    return { ok: cur.includes(nfa.accept), maxActive };
+  },
+
+  /* a backtracking matcher over the same AST — the strategy of most library
+     regex engines. Anchored full match. Continuation-passing: match(n, i, k)
+     tries to match node n at position i and then the rest, k. c counts calls.
+     `budget` aborts a run that has already proved the point. */
+  backtrack: function (ast, s, c, budget) {
+    let steps = 0;
+    const lim = budget || Infinity;
+    const OUT = {};
+    function m(n, i, k) {
+      if (++steps > lim) throw OUT;
+      if (c) c.add("step");
+      switch (n.t) {
+        case "eps": return k(i);
+        case "chr": return i < s.length && s[i] === n.c && k(i + 1);
+        case "cat": return m(n.a, i, j => m(n.b, j, k));
+        case "alt": return m(n.a, i, k) || m(n.b, i, k);
+        case "opt": return m(n.a, i, k) || k(i);
+        case "star": {
+          const loop = j => m(n.a, j, x => x > j && loop(x)) || k(j);
+          return loop(i);
+        }
+        case "plus": {
+          const loop = j => m(n.a, j, x => x > j && loop(x)) || k(j);
+          return m(n.a, i, x => loop(x));
+        }
+      }
+      return false;
+    }
+    try {
+      const ok = m(ast, 0, j => j === s.length);
+      return { ok, steps, capped: false };
+    } catch (e) {
+      if (e === OUT) return { ok: null, steps: lim, capped: true };
+      throw e;
+    }
+  },
+
+  /* subset construction, for the DFA-size discussion: number of reachable
+     DFA states (sets of NFA states) */
+  subsetCount: function (nfa, S) {
+    const st = nfa.states;
+    const clo = seed => {
+      const on = new Set(seed), stack = seed.slice();
+      while (stack.length) { const q = stack.pop(); st[q].eps.forEach(r => { if (!on.has(r)) { on.add(r); stack.push(r); } }); }
+      return Array.from(on).sort((a, b) => a - b);
+    };
+    const key = a => a.join(",");
+    const start = clo([nfa.start]);
+    const seen = new Map([[key(start), start]]), work = [start];
+    while (work.length) {
+      const D = work.pop();
+      S.forEach(a => {
+        const nx = [];
+        D.forEach(q => { if (st[q].ch === a) nx.push(st[q].to); });
+        const E = clo(nx), kk = key(E);
+        if (!seen.has(kk)) { seen.set(kk, E); work.push(E); }
+      });
+    }
+    return seen.size;
+  },
+
+  /* ── compression ─────────────────────────────────────────────────────── */
+
+  rle: function (s) {
+    const runs = [];
+    for (let i = 0; i < s.length;) {
+      let j = i;
+      while (j < s.length && s[j] === s[i]) j++;
+      runs.push([j - i, s[i]]);
+      i = j;
+    }
+    return runs;
+  },
+  unrle: function (runs) { return runs.map(([k, ch]) => ch.repeat(k)).join(""); },
+
+  /* LZ77 with a window of W characters and matches of at most L: at each
+     position emit (offset, length, next). The match may run past the current
+     position into the lookahead — that overlap is how a run of one symbol
+     becomes a single triple. c counts character comparisons in the search. */
+  lz77: function (s, W, L, c) {
+    const out = [];
+    let i = 0;
+    while (i < s.length) {
+      let bestLen = 0, bestOff = 0;
+      for (let j = Math.max(0, i - W); j < i; j++) {
+        let k = 0;
+        while (k < L && i + k < s.length - 1) {
+          if (c) c.add("cmp");
+          if (s[j + k] !== s[i + k]) break;
+          k++;
+        }
+        if (k > bestLen) { bestLen = k; bestOff = i - j; }
+      }
+      out.push([bestOff, bestLen, s[i + bestLen]]);
+      i += bestLen + 1;
+    }
+    return out;
+  },
+  unlz77: function (triples) {
+    const o = [];
+    triples.forEach(([off, len, ch]) => {
+      const st = o.length - off;
+      for (let k = 0; k < len; k++) o.push(o[st + k]);   // byte by byte: overlap is fine
+      if (ch !== undefined) o.push(ch);
+    });
+    return o.join("");
+  },
+
+  /* LZW over an initial dictionary of the single symbols in S (agreed in
+     advance by both sides). snap receives one record per emitted code. */
+  lzw: function (s, S, c, snap) {
+    const dict = new Map(S.map((a, i) => [a, i]));
+    const out = [];
+    let w = "";
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i], wc = w + ch;
+      if (c) c.add("lookup");
+      if (dict.has(wc)) { w = wc; continue; }
+      out.push(dict.get(w));
+      dict.set(wc, dict.size);
+      if (snap) snap({ i, w, ch, code: dict.get(w), add: wc, addCode: dict.size - 1 });
+      w = ch;
+    }
+    if (w) { out.push(dict.get(w)); if (snap) snap({ i: s.length, w, ch: "", code: dict.get(w), add: null }); }
+    return { codes: out, size: dict.size };
+  },
+  unlzw: function (codes, S, snap) {
+    const dict = S.slice();
+    if (!codes.length) return "";
+    let prev = dict[codes[0]], out = prev;
+    if (snap) snap({ code: codes[0], entry: prev, add: null, special: false });
+    for (let t = 1; t < codes.length; t++) {
+      const k = codes[t];
+      let entry, special = false;
+      if (k < dict.length) entry = dict[k];
+      else if (k === dict.length) { entry = prev + prev[0]; special = true; }   // the KwKwK case
+      else throw new Error("bad code " + k);
+      dict.push(prev + entry[0]);
+      if (snap) snap({ code: k, entry, add: prev + entry[0], addCode: dict.length - 1, special });
+      out += entry;
+      prev = entry;
+    }
+    return out;
+  },
+
+  /* ── suffix array by prefix doubling ─────────────────────────────────── */
+  suffixArray: function (s, c) {
+    const n = s.length;
+    let rank = s.split("").map(ch => ch.charCodeAt(0));
+    let sa = Array.from({ length: n }, (_, i) => i);
+    for (let k = 1; ; k *= 2) {
+      const key = i => [rank[i], i + k < n ? rank[i + k] : -1];
+      sa.sort((a, b) => {
+        if (c) c.add("cmp");
+        const A = key(a), B = key(b);
+        return A[0] - B[0] || A[1] - B[1];
+      });
+      const nr = new Array(n);
+      nr[sa[0]] = 0;
+      for (let t = 1; t < n; t++) {
+        const A = key(sa[t - 1]), B = key(sa[t]);
+        nr[sa[t]] = nr[sa[t - 1]] + (A[0] !== B[0] || A[1] !== B[1] ? 1 : 0);
+      }
+      rank = nr;
+      if (rank[sa[n - 1]] === n - 1 || k >= n) break;
+    }
+    return sa;
+  },
+  lcp: function (s, sa) {
+    return sa.map((p, t) => {
+      if (t === 0) return 0;
+      const q = sa[t - 1];
+      let k = 0;
+      while (s[p + k] !== undefined && s[p + k] === s[q + k]) k++;
+      return k;
+    });
+  }
+};
+
+/* ══ FIGURE 15 ═══════════════════════════════════════════════════════════
+   The string-matching automaton. The table is built by the O(m·|Σ|)
+   construction under a counter (entries written) and run over the text under
+   another (transitions taken). The readout rebuilds every entry from the
+   definition by brute force, re-derives every entry through KMP's lazy
+   recurrence on pi, and checks the occurrences against the naive matcher —
+   three independent cross-checks of one table.                             */
+(function () {
+  const svg = d3.select("#dfa-svg"); if (svg.empty()) return;
+  const W = 690, H = 340;
+  const inp = d3.select("#dfa-pattern"), sel = d3.select("#dfa-text"), out = d3.select("#dfa-readout");
+  let st = null;
+
+  function clean(v) {
+    const p = String(v || "").toLowerCase().replace(/[^a-d]/g, "").slice(0, 8);
+    return p || "ababaca";
+  }
+
+  function build() {
+    const P = clean(inp.property("value")), T = sel.property("value");
+    const m = P.length, n = T.length;
+    const S = STR2.alphabet(P, T);
+    const cB = AL.counter(), cR = AL.counter(), cK = AL.counter(), cN = AL.counter();
+    const dfa = STR2.dfaBuild(P, S, cB);
+    const delta = dfa.delta;
+    const frames = [{ i: -1, from: 0, q: 0 }];
+    const found = STR2.dfaRun(T, P, S, delta, cR, f => frames.push(f));
+    const brute = STR2.dfaBrute(P, S);
+    const sameBrute = JSON.stringify(brute) === JSON.stringify(delta);
+    const pi = STR2.prefix(P);
+    let sameLazy = true;
+    for (let q = 0; q <= m; q++) S.forEach((a, j) => { if (STR2.kmpDelta(P, pi, q, a, null) !== delta[q][j]) sameLazy = false; });
+    const kmpRes = MATCH.kmp(T, P, cK, null, AL.counter());
+    const naive = MATCH.naive(T, P, cN, null);
+    const sameHits = found.join() === naive.join() && found.join() === kmpRes.found.join();
+
+    /* the longest run of fall-backs KMP needed on one character */
+    let worst = 0, q = 0;
+    for (let i = 0; i < n; i++) {
+      let f = 0;
+      if (q === m) q = pi[m - 1];
+      while (q > 0 && P[q] !== T[i]) { q = pi[q - 1]; f++; }
+      if (P[q] === T[i]) q++;
+      worst = Math.max(worst, f);
+    }
+
+    if (st) st.pause();
+    svg.selectAll("*").remove();
+    AS.clearControls(svg.node());
+    st = AL.stepper(svg, { frames, delay: 650, label: "character", render: f => render(f, P, T, S, delta, found) });
+
+    out.html(
+      "P = <code>" + P + "</code> (m = " + m + "), <span class='keep'>Σ</span> = {" + S.join(", ") + "}, n = " + n + ". "
+      + "Construction: <b>" + cB.get("entry") + "</b> table entries written, against (m + 1)·|<span class='keep'>Σ</span>| = "
+      + (m + 1) * S.length + ": " + AS.verdict(cB.get("entry") === (m + 1) * S.length) + ". "
+      + "Matching: <b>" + cR.get("step") + "</b> transitions for " + n + " characters — one each: "
+      + AS.verdict(cR.get("step") === n) + "; occurrences at shift" + (found.length === 1 ? " " : "s ")
+      + (found.length ? found.join(", ") : "(none)") + ". "
+      + "KMP on the same text: <b>" + cK.get("cmp") + "</b> character comparisons, with at most <b>" + worst
+      + "</b> fall-back" + (worst === 1 ? "" : "s") + " on any single character, where the automaton never takes more than one step. "
+      + "Cross-checks — every entry rebuilt from the definition by brute force: " + AS.verdict(sameBrute)
+      + "; every entry re-derived through KMP's lazy recurrence on pi = [" + pi.join(", ") + "]: " + AS.verdict(sameLazy)
+      + "; occurrences against the naive matcher and KMP: " + AS.verdict(sameHits) + "."
+    );
+  }
+
+  function render(f, P, T, S, delta, found) {
+    const fr = AL.frame(svg, W, H, { l: 14, r: 14, t: 10, b: 6 });
+    const g = fr.g;
+    const m = P.length;
+    const sx = Math.min(74, 600 / Math.max(1, m)), x0 = 26, cy = 98, r = 15;
+    const X = q => x0 + q * sx;
+    const cur = f.i < 0 ? 0 : f.q, from = f.from;
+    const j = f.i < 0 ? -1 : S.indexOf(T[f.i]);
+
+    g.append("text").attr("x", 0).attr("y", 12).attr("font-size", 11).attr("fill", AC.muted)
+      .text(f.i < 0 ? "start in state 0 — nothing of P has been matched"
+                    : "arcs: the non-zero backward transitions out of state " + from + "; every transition not drawn goes to 0");
+
+    /* backward (and self) transitions out of the state we just left */
+    if (f.i >= 0) {
+      S.forEach((a, k) => {
+        const to = delta[from][k];
+        if (to === 0 || (from < m && a === P[from])) return;
+        const used = k === j;
+        const col = used ? AC.a2 : AC.violet;
+        if (to === from) {
+          g.append("path").attr("d", `M${X(from) - 7},${cy - r + 2} C${X(from) - 20},${cy - 52} ${X(from) + 20},${cy - 52} ${X(from) + 7},${cy - r + 2}`)
+            .attr("fill", "none").attr("stroke", col).attr("stroke-width", used ? 2.2 : 1.3);
+          g.append("text").attr("x", X(from)).attr("y", cy - 46).attr("text-anchor", "middle")
+            .attr("font-size", 11).attr("fill", col).text(a);
+          return;
+        }
+        const x1 = X(from), x2 = X(to), mid = (x1 + x2) / 2, h = Math.min(56, 18 + Math.abs(from - to) * 7);
+        g.append("path").attr("d", `M${x1},${cy - r} Q${mid},${cy - r - h * 2} ${x2},${cy - r}`)
+          .attr("fill", "none").attr("stroke", col).attr("stroke-width", used ? 2.2 : 1.3);
+        g.append("path").attr("d", `M${x2},${cy - r} l-4,-8 l8,0 Z`).attr("fill", col);
+        g.append("text").attr("x", mid).attr("y", cy - r - h - 3).attr("text-anchor", "middle")
+          .attr("font-size", 11).attr("fill", col).text(a);
+      });
+    }
+
+    /* the forward spine */
+    for (let q = 0; q < m; q++) {
+      const used = f.i >= 0 && from === q && f.q === q + 1;
+      AL.arrow(g, X(q) + r, cy, X(q + 1) - r - 1, cy, { color: used ? AC.a2 : AC.line, w: used ? 2.2 : 1.5 });
+      g.append("text").attr("x", (X(q) + X(q + 1)) / 2).attr("y", cy + 16).attr("text-anchor", "middle")
+        .attr("font-size", 11.5).attr("fill", used ? AC.a2 : AC.muted).text(P[q]);
+    }
+    for (let q = 0; q <= m; q++) {
+      const isCur = q === cur, isFrom = f.i >= 0 && q === from && from !== cur;
+      g.append("circle").attr("cx", X(q)).attr("cy", cy).attr("r", r)
+        .attr("fill", isCur ? (q === m ? AC.good : AC.accent) : AC.panel2)
+        .attr("stroke", isFrom ? AC.a2 : AC.line).attr("stroke-width", isFrom ? 2.2 : 1.2);
+      if (q === m) g.append("circle").attr("cx", X(q)).attr("cy", cy).attr("r", r - 4)
+        .attr("fill", "none").attr("stroke", isCur ? AC.bg : AC.line);
+      g.append("text").attr("x", X(q)).attr("y", cy + 4).attr("text-anchor", "middle")
+        .attr("font-size", 12).attr("fill", isCur ? AC.bg : AC.ink).text(q);
+    }
+
+    /* the transition table */
+    const ty = 134, cw = Math.min(46, 540 / (m + 1)), rh = 21, tx = 70;
+    g.append("text").attr("x", tx - 8).attr("y", ty + 14).attr("text-anchor", "end").attr("font-size", 11)
+      .attr("fill", AC.muted).text("state q");
+    for (let q = 0; q <= m; q++) {
+      g.append("text").attr("x", tx + q * cw + cw / 2).attr("y", ty + 14).attr("text-anchor", "middle")
+        .attr("font-size", 11).attr("fill", q === from && f.i >= 0 ? AC.a2 : AC.muted).text(q);
+    }
+    S.forEach((a, k) => {
+      const y = ty + rh * (k + 1);
+      g.append("text").attr("x", tx - 8).attr("y", y + 14).attr("text-anchor", "end").attr("font-size", 11)
+        .attr("fill", k === j ? AC.a2 : AC.muted).text("δ(q, " + a + ")");
+      for (let q = 0; q <= m; q++) {
+        const hot = f.i >= 0 && q === from && k === j;
+        const fwd = q < m && a === P[q];
+        g.append("rect").attr("x", tx + q * cw + 1).attr("y", y).attr("width", cw - 2).attr("height", rh - 2)
+          .attr("rx", 3).attr("fill", hot ? AC.a2 : (fwd ? "#1f2a3d" : AC.panel2)).attr("stroke", AC.line);
+        g.append("text").attr("x", tx + q * cw + cw / 2).attr("y", y + 14).attr("text-anchor", "middle")
+          .attr("font-size", 11.5).attr("fill", hot ? AC.bg : (delta[q][k] ? AC.ink : AC.muted)).text(delta[q][k]);
+      }
+    });
+
+    /* the text */
+    const yT = ty + rh * (S.length + 1) + 14, n = T.length, tw = Math.min(34, 600 / n);
+    const hitCells = new Set();
+    found.forEach(s => { if (s + m - 1 <= f.i) for (let t = s; t < s + m; t++) hitCells.add(t); });
+    g.append("text").attr("x", 0).attr("y", yT + 17).attr("font-size", 11).attr("fill", AC.muted).text("T");
+    AL.row(g, T.split(""), {
+      x: 26, y: yT, w: tw - 3, h: 26, gap: 3, index: true, fontSize: 12.5,
+      mark: i => i === f.i ? AC.a2 : (hitCells.has(i) ? "#1f3d2b" : (i < f.i ? AC.panel : null))
+    });
+    g.append("text").attr("x", 0).attr("y", yT + 60).attr("font-size", 11.5)
+      .attr("fill", f.hit ? AC.good : AC.ink)
+      .text(f.i < 0 ? "q = 0. Press ▶ or › to read T one character at a time."
+                    : "read T[" + f.i + "] = '" + f.ch + "':  δ(" + f.from + ", " + f.ch + ") = " + f.q
+                      + (f.hit ? "  — state m reached: an occurrence at shift " + (f.i - m + 1)
+                               : (f.q === f.from + 1 ? "  — the match extends" : "  — the longest live prefix now has length " + f.q)));
+  }
+
+  sel.on("change", build);
+  inp.on("change", build).on("input", build);
+  build();
+})();
+
+/* ══ FIGURE 16 ═══════════════════════════════════════════════════════════
+   Backtracking against NFA set simulation, on aⁿ (optionally aⁿb). Both
+   engines run the same parsed regex; each is wrapped in its own counter —
+   calls to the recursive matcher for the backtracker, state visits for the
+   simulation. A backtracking run that exceeds its step budget is stopped,
+   drawn at the budget line, and larger n are not attempted: the count is
+   monotone in n on these inputs, so the next run could only be worse.      */
+(function () {
+  const svg = d3.select("#regex-svg"); if (svg.empty()) return;
+  const W = 690, H = 300, BUDGET = 2000000;
+  const els = {
+    pat: d3.select("#regex-pat"), n: d3.select("#regex-n"), nOut: d3.select("#regex-n-out"),
+    b: d3.select("#regex-b"), out: d3.select("#regex-readout")
+  };
+
+  function draw() {
+    const re = els.pat.property("value"), N = +els.n.property("value"), withB = els.b.property("checked");
+    els.nOut.text(N);
+    const ast = STR2.parse(re), nfa = STR2.thompson(ast);
+    const rows = [];
+    let capped = false, agree = true, maxActive = 0;
+    for (let n = 1; n <= N; n++) {
+      const s = "a".repeat(n) + (withB ? "b" : "");
+      const cN = AL.counter(), cB = AL.counter();
+      const sim = STR2.nfaMatch(nfa, s, cN);
+      maxActive = Math.max(maxActive, sim.maxActive);
+      let bt = null;
+      if (!capped) {
+        bt = STR2.backtrack(ast, s, cB, BUDGET);
+        if (bt.capped) capped = true;
+        else if (bt.ok !== sim.ok) agree = false;
+      }
+      rows.push({ n, nfa: cN.get("visit"), bt: bt ? (bt.capped ? BUDGET : cB.get("step")) : null,
+                  cap: bt ? bt.capped : false, ok: sim.ok });
+    }
+
+    const fr = AL.frame(svg, W, H, { l: 64, r: 150, t: 22, b: 40 });
+    const g = fr.g;
+    const x = d3.scaleLinear().domain([1, N]).range([0, fr.iw]);
+    const ymax = Math.max(10, d3.max(rows, d => Math.max(d.nfa, d.bt || 0)));
+    const y = d3.scaleLog().domain([1, ymax * 1.5]).range([fr.ih, 0]).clamp(true);
+    const pow = d3.range(0, Math.ceil(Math.log10(ymax * 1.5)) + 1).map(k => Math.pow(10, k)).filter(v => v <= ymax * 1.5);
+    g.append("g").selectAll("line").data(pow).join("line")
+      .attr("x1", 0).attr("x2", fr.iw).attr("y1", d => y(d)).attr("y2", d => y(d)).attr("stroke", AC.grid);
+    g.append("g").attr("class", "axis").call(d3.axisLeft(y).tickValues(pow).tickFormat(d3.format(".0s")));
+    AL.axisB(g, x, fr.ih, Math.min(N, 12), "input length n (the input is aⁿ" + (withB ? "b)" : ")"), d3.format("d"));
+    g.append("text").attr("x", 0).attr("y", -8).attr("font-size", 11).attr("fill", AC.muted).text("steps (log scale)");
+
+    if (capped) {
+      g.append("line").attr("x1", 0).attr("x2", fr.iw).attr("y1", y(BUDGET)).attr("y2", y(BUDGET))
+        .attr("stroke", AC.bad).attr("stroke-dasharray", "4 4").attr("opacity", 0.6);
+      g.append("text").attr("x", fr.iw).attr("y", y(BUDGET) - 5).attr("text-anchor", "end")
+        .attr("font-size", 10.5).attr("fill", AC.bad).text("step budget — larger n not attempted");
+    }
+    const line = key => d3.line().x(d => x(d.n)).y(d => y(Math.max(1, d[key])));
+    const btRows = rows.filter(d => d.bt !== null);
+    g.append("path").datum(btRows).attr("d", line("bt")).attr("fill", "none").attr("stroke", AC.rose).attr("stroke-width", 2.2);
+    g.append("path").datum(rows).attr("d", line("nfa")).attr("fill", "none").attr("stroke", AC.accent).attr("stroke-width", 2.2);
+    g.selectAll("circle.bt").data(btRows).join("circle").attr("cx", d => x(d.n)).attr("cy", d => y(Math.max(1, d.bt)))
+      .attr("r", d => d.cap ? 5 : 2.6).attr("fill", d => d.cap ? AC.bad : AC.rose);
+    g.selectAll("circle.nf").data(rows).join("circle").attr("cx", d => x(d.n)).attr("cy", d => y(Math.max(1, d.nfa)))
+      .attr("r", 2.6).attr("fill", AC.accent);
+    AL.legend(g, [{ label: "backtracking (calls)", color: AC.rose },
+                  { label: "NFA sets (visits)", color: AC.accent }], fr.iw + 12, 10);
+
+    const last = rows[rows.length - 1], lastBt = btRows[btRows.length - 1];
+    g.append("text").attr("x", fr.iw + 12).attr("y", 62).attr("font-size", 11).attr("fill", AC.ink)
+      .text("NFA: " + nfa.states.length + " states");
+    g.append("text").attr("x", fr.iw + 12).attr("y", 80).attr("font-size", 11).attr("fill", AC.muted)
+      .text("max active set: " + maxActive);
+
+    /* subset-construction witness family: (a|b)*a(a|b)^k */
+    const fam = [];
+    for (let k = 0; k <= 5; k++) {
+      const r = "(a|b)*a" + "(a|b)".repeat(k);
+      fam.push(k + " → " + STR2.subsetCount(STR2.thompson(STR2.parse(r)), ["a", "b"]));
+    }
+    const dfaHere = STR2.subsetCount(nfa, ["a", "b"]);
+
+    /* growth of the backtracker over the uncapped runs: the ratio for one
+       extra character, and the exponent p fitted between n/2 and n */
+    const clean = btRows.filter(d => !d.cap);
+    let growth = "";
+    if (clean.length >= 4) {
+      const b = clean[clean.length - 1], a = clean[clean.length - 2];
+      const h = clean[Math.floor((clean.length - 1) / 2)];
+      const ratio = b.bt / a.bt, pExp = Math.log(b.bt / h.bt) / Math.log(b.n / h.n);
+      growth = ratio >= 1.5
+        ? "Each extra character multiplied the backtracker's count by <b>" + AS.sig(ratio, 2) + "</b> — exponential growth. "
+        : "From n = " + h.n + " to n = " + b.n + " the backtracker's count grew by " + AS.sig(b.bt / h.bt, 2)
+          + "×, a fitted exponent of <b>" + AS.sig(pExp, 2) + "</b> — "
+          + (pExp < 1.3 ? "linear. " : "polynomial but superlinear. ");
+    }
+
+    els.out.html(
+      "<code>" + re + "</code> against <code>a</code>ⁿ" + (withB ? "<code>b</code>" : "") + ", n = 1 … " + N + ". "
+      + "At n = " + last.n + " the set simulation made <b>" + AS.int(last.nfa) + "</b> state visits over a " + nfa.states.length
+      + "-state Thompson NFA (at most " + maxActive + " states active at once), and "
+      + (lastBt ? (lastBt.cap ? "the backtracker exceeded its budget of <b>" + AS.int(BUDGET) + "</b> calls at n = " + lastBt.n + " and was not run further"
+                              : "the backtracker made <b>" + AS.int(lastBt.bt) + "</b> calls") : "") + ". "
+      + growth
+      + "The two engines agree on accept/reject at every n where both ran: " + AS.verdict(agree)
+      + " (answer: " + (last.ok ? "match" : "no match") + "). "
+      + "Subset construction on this NFA over {a, b} yields " + dfaHere + " DFA states; on the witness family "
+      + "<code>(a|b)*a(a|b)</code>ᵏ it yields, for k = " + fam.join(", ") + " — doubling with each k."
+    );
+  }
+
+  els.pat.on("change", draw);
+  els.n.on("input", draw);
+  els.b.on("change", draw);
+  draw();
+})();
+
+/* ══ FIGURE 17 ═══════════════════════════════════════════════════════════
+   LZW, stepped. The encoder runs under a counter (dictionary lookups); the
+   decoder is run on its output and must rebuild the input and the same
+   dictionary, and any step where it meets a code it has not yet defined —
+   the KwKwK case — is flagged in the table. Run-length and LZ77 encode the
+   same input beside it, and every scheme is round-tripped.                  */
+(function () {
+  const svg = d3.select("#lzw-svg"); if (svg.empty()) return;
+  const W = 690, H = 300;
+  const sel = d3.select("#lzw-input"), out = d3.select("#lzw-readout");
+  let st = null;
+
+  function inputFor(v) {
+    if (v === "rep") return "TOBEORNOT".repeat(8);
+    if (v === "rand") {
+      const r = AL.rng(17); let s = "";
+      for (let i = 0; i < 72; i++) s += "abcd"[Math.floor(r() * 4)];
+      return s;
+    }
+    return v;
+  }
+  const lg = k => Math.max(1, Math.ceil(Math.log2(k)));
+  /* code t (0-based) is written in ceil(log₂(|Σ| + t)) bits: the decoder has |Σ| + t − 1
+     entries when it reads it, and the code may be the one about to be defined */
+  const lzwBits = (codes, s0) => codes.reduce((acc, _, t) => acc + lg(s0 + t), 0);
+
+  function build() {
+    const s = inputFor(sel.property("value")), S = STR2.alphabet(s), n = s.length;
+    const cE = AL.counter(), cZ = AL.counter();
+    const enc = [];
+    const res = STR2.lzw(s, S, cE, f => enc.push(f));
+    const dec = [];
+    const back = STR2.unlzw(res.codes, S, f => dec.push(f));
+    const kw = dec.filter(d => d.special).length;
+
+    const raw = n * lg(S.length);
+    const bits = lzwBits(res.codes, S.length);
+    const runs = STR2.rle(s);
+    const rleBits = runs.length * (lg(Math.max(...runs.map(r => r[0])) + 1) + lg(S.length));
+    const Wn = 32, Ln = 15;
+    const tri = STR2.lz77(s, Wn, Ln, cZ);
+    const lzBits = tri.length * (lg(Wn + 1) + lg(Ln + 1) + lg(S.length));
+    const okL = back === s, okR = STR2.unrle(runs) === s, okZ = STR2.unlz77(tri) === s;
+    const H0 = (() => {
+      const f = new Map(); for (const ch of s) f.set(ch, (f.get(ch) || 0) + 1);
+      let h = 0; f.forEach(v => { const p = v / n; h -= p * Math.log2(p); }); return h;
+    })();
+
+    const frames = enc.map((e, t) => ({ e, t }));
+    if (st) st.pause();
+    svg.selectAll("*").remove();
+    AS.clearControls(svg.node());
+    st = AL.stepper(svg, { frames, delay: 700, label: "code", render: f => render(f, s, S, enc) });
+
+    const pct = x => AS.sig(100 * x / raw, 0) + "%";
+    out.html(
+      "Input: " + n + " characters over " + S.length + " symbols; fixed-width baseline " + n + " × " + lg(S.length)
+      + " = <b>" + raw + "</b> bits; zeroth-order entropy " + AS.sig(H0, 3) + " bits/symbol, so a symbol-by-symbol code needs at least "
+      + AS.int(Math.ceil(H0 * n)) + ". "
+      + "LZW: <b>" + res.codes.length + "</b> codes (" + cE.get("lookup") + " dictionary lookups), dictionary grown to "
+      + res.size + " entries, <b>" + bits + "</b> bits with growing code width = " + pct(bits) + " of the baseline"
+      + (bits < raw ? "" : " — <b>larger</b>") + "; decoder met " + kw + " KwKwK code" + (kw === 1 ? "" : "s") + ". "
+      + "Round-trips — LZW: " + AS.verdict(okL) + ", run-length: " + AS.verdict(okR) + ", LZ77: " + AS.verdict(okZ) + "."
+    );
+
+    const rowsT = [
+      ["run-length", runs.length + " (count, symbol) pairs", AS.int(rleBits), pct(rleBits)],
+      ["LZ77, window " + Wn + ", max length " + Ln, tri.length + " triples (" + AS.int(cZ.get("cmp")) + " comparisons to find them)", AS.int(lzBits), pct(lzBits)],
+      ["LZW", res.codes.length + " codes", AS.int(bits), pct(bits)]
+    ];
+    AS.table("#lzw-table", ["scheme", "output", "bits", "vs " + raw + "-bit baseline"], rowsT);
+    const dt = d3.select("#lzw-table");
+    const t2 = dt.append("table").attr("class", "cmp").style("margin", "10px 0 0");
+    const hr = t2.append("tr");
+    ["decoder step", "code read", "decodes to", "adds to dictionary"].forEach(h => hr.append("th").html(h));
+    dec.slice(0, 24).forEach((d, i) => {
+      const tr = t2.append("tr");
+      [i + 1, d.code, "<code>" + d.entry + "</code>" + (d.special ? " <b style='color:" + AC.a2 + "'>KwKwK: not yet defined, so prev + prev[0]</b>" : ""),
+       d.add ? d.addCode + " = <code>" + d.add + "</code>" : "—"].forEach(c => tr.append("td").html(c));
+    });
+    if (dec.length > 24) t2.append("tr").append("td").attr("colspan", 4).style("color", AC.muted)
+      .text("… " + (dec.length - 24) + " more steps, all checked by the round-trip above");
+  }
+
+  function render(f, s, S, enc) {
+    const fr = AL.frame(svg, W, H, { l: 14, r: 14, t: 12, b: 6 });
+    const g = fr.g;
+    const e = f.e, n = s.length;
+    const start = e.i - e.w.length;
+    /* the input, windowed around the current phrase so long inputs still fit */
+    const vis = 24, lo = Math.max(0, Math.min(start - 6, n - vis)), hi = Math.min(n, lo + vis);
+    const cw = 25;
+    g.append("text").attr("x", 0).attr("y", 12).attr("font-size", 11).attr("fill", AC.muted)
+      .text("input" + (n > vis ? " (positions " + lo + "–" + (hi - 1) + " of " + n + ")" : ""));
+    s.slice(lo, hi).split("").forEach((ch, k) => {
+      const i = lo + k;
+      const inW = i >= start && i < e.i, isC = i === e.i;
+      g.append("rect").attr("x", k * cw).attr("y", 20).attr("width", cw - 3).attr("height", 26).attr("rx", 3)
+        .attr("fill", inW ? AC.accent : isC ? AC.a2 : i < start ? AC.panel : AC.panel2).attr("stroke", AC.line);
+      g.append("text").attr("x", k * cw + (cw - 3) / 2).attr("y", 38).attr("text-anchor", "middle")
+        .attr("font-size", 12.5).attr("fill", inW || isC ? AC.bg : AC.ink).text(ch);
+      g.append("text").attr("x", k * cw + (cw - 3) / 2).attr("y", 58).attr("text-anchor", "middle")
+        .attr("font-size", 9.5).attr("fill", AC.muted).text(i);
+    });
+    g.append("text").attr("x", 0).attr("y", 82).attr("font-size", 11.5).attr("fill", AC.ink)
+      .text(e.add ? "w = '" + e.w + "' is the longest known phrase; w + '" + e.ch + "' is new → emit " + e.code
+                    + ", define " + e.addCode + " = '" + e.add + "'"
+                  : "end of input → emit " + e.code + " for w = '" + e.w + "'");
+
+    /* codes emitted so far */
+    g.append("text").attr("x", 0).attr("y", 108).attr("font-size", 11).attr("fill", AC.muted).text("codes emitted");
+    const codes = enc.slice(0, f.t + 1).map(d => d.code);
+    const shown = codes.slice(-22);
+    shown.forEach((c, k) => {
+      const last = k === shown.length - 1;
+      g.append("rect").attr("x", k * 29).attr("y", 116).attr("width", 26).attr("height", 22).attr("rx", 3)
+        .attr("fill", last ? AC.a2 : AC.panel2).attr("stroke", AC.line);
+      g.append("text").attr("x", k * 29 + 13).attr("y", 131).attr("text-anchor", "middle").attr("font-size", 11)
+        .attr("fill", last ? AC.bg : AC.ink).text(c);
+    });
+
+    /* dictionary: initial symbols, then the entries defined so far (latest ones) */
+    g.append("text").attr("x", 0).attr("y", 162).attr("font-size", 11).attr("fill", AC.muted)
+      .text("dictionary — initial: " + S.map((a, k) => k + "=" + a).join(" ") + "; defined so far:");
+    const defs = enc.slice(0, f.t + 1).filter(d => d.add);
+    const showD = defs.slice(-15);
+    showD.forEach((d, k) => {
+      const col = k % 5, rowi = Math.floor(k / 5), last = d === defs[defs.length - 1];
+      const x = col * 132, y = 172 + rowi * 30;
+      g.append("rect").attr("x", x).attr("y", y).attr("width", 126).attr("height", 24).attr("rx", 3)
+        .attr("fill", last ? AC.good : AC.panel2).attr("stroke", AC.line);
+      g.append("text").attr("x", x + 8).attr("y", y + 16).attr("font-size", 11).attr("fill", last ? AC.bg : AC.ink)
+        .text(d.addCode + " = " + (d.add.length > 12 ? d.add.slice(0, 11) + "…" : d.add));
+    });
+  }
+
+  sel.on("change", build);
+  build();
 })();

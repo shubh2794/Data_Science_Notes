@@ -1,0 +1,832 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Parallel Algorithms</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="index.html">Algorithm Design &amp; Analysis</a> · part 9 of 11</p>
+      <h1>Parallel Algorithms</h1>
+      <p>Every algorithm in this series so far has been priced on one processor: a single sequence of steps, one after the other, whose length is the running time. <b>Parallel algorithms</b> are priced on many processors at once, and the price has two numbers instead of one. The <b>work</b> <code>T₁</code> is the total number of steps, exactly the serial cost; the <b>span</b> <code>T∞</code> is the length of the longest chain of steps that must happen one after another, the time an unlimited number of processors would still need. Their ratio, the <b>parallelism</b>, is the most speedup the algorithm can ever show, and a greedy scheduler achieves close to it: <code>T_p ≤ T₁/p + T∞</code>. This page builds that theory on the fork-join model (spawn, sync, parallel for), draws the computation DAG of real programs and schedules it on <code>p</code> processors, sets Amdahl's and Gustafson's laws beside it, shows why races make results depend on timing, and then works the classic parallel algorithms: reduction, the work-efficient prefix sum and what it unlocks, merge sort with a parallel merge, matrix multiplication by loops, by divide and conquer and on a systolic array, and level-synchronous BFS. The thread that runs through all of it is that <b>span, not work, is what decides the speedup</b>. Every work, span and step count on the page is measured by running the real routine under a tracer.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Data Structures &amp; Algorithms</span>
+        <span class="pill">PRAM · fork-join · spawn / sync</span>
+        <span class="pill">Work T₁ · span T∞ · parallelism</span>
+        <span class="pill">Greedy scheduling · Brent · work stealing</span>
+        <span class="pill">Amdahl · Gustafson</span>
+        <span class="pill">Races · atomics · false sharing</span>
+        <span class="pill">Scan · merge sort · matrix multiply · BFS</span>
+        <span class="pill">Systolic arrays</span>
+        <span class="pill">6 visualizations</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="why-parallelism" data-nav="Why parallelism">
+      <h3><span class="idx">01</span> Why parallelism, and why "divide by p" is not the analysis</h3>
+      <p class="lede"><b>For about thirty years a program got faster every year without anyone touching it, because the clock got faster; that stopped in the mid-2000s, and since then the extra transistors each generation brings have been spent on more cores, wider vector units and more GPU lanes instead. Speed now comes from doing several things at once, and it has to be earned by the algorithm.</b> The reason the clock stopped is power. Dynamic power in a chip scales roughly as capacitance × voltage² × frequency, and for decades each shrink let voltage fall along with feature size, so frequency could rise at constant power density. Once voltage could no longer fall — leakage current grows sharply as the threshold voltage drops — a higher clock meant a hotter chip, and a chip can only shed so many watts per square centimetre. Transistor counts kept doubling, so designers used them the only way that does not raise the clock: replicate the core.</p>
+
+      <p>The naive consequence is "with <code>p</code> cores, divide the running time by <code>p</code>". That is almost never what happens, and the reasons are the content of this page. First, <b>not every step can run alongside every other</b>: a step that needs another step's result must wait for it, so the dependency structure of the computation caps the speedup no matter how many processors there are. Second, <b>someone has to decide which processor runs which step</b>, and a bad schedule wastes processors even when the dependencies allow them to be used. Third, <b>processors share memory</b>, so two steps that each look correct can produce a wrong answer together if they touch the same location without coordination, and the coordination itself costs time. Fourth, <b>some of every real program is serial</b>, and that part does not shrink at all.</p>
+
+      <div class="formula"><span class="lbl">the analysis replaces one number with two</span><span class="eq">serial analysis          T(n)                    one number: steps on one processor               (Algorithm Analysis)
+parallel analysis        T₁(n)   = WORK          total steps, i.e. the serial running time
+                         T∞(n)   = SPAN          longest chain of dependent steps
+                         T₁ / T∞ = PARALLELISM   the most speedup any number of processors can give
+                         T_p                     the time on p processors, which depends on the SCHEDULE too
+
+the headline result (§07):   max(T₁/p, T∞)  ≤  T_p  ≤  T₁/p + T∞      for any greedy scheduler</span></div>
+
+      <p>Work tells you whether the algorithm is efficient at all — a parallel algorithm whose work is asymptotically larger than the best serial one loses on a small machine before it has a chance to win on a large one. Span tells you how far parallelism can take it. The two are computed by the same recurrence machinery as the serial analysis of <a href="analysis.html#recurrences">Algorithm Analysis</a>, with one change: where the serial recurrence <i>adds</i> the costs of two recursive calls, the span recurrence takes their <i>maximum</i> when the calls run in parallel. That single change is why a divide-and-conquer algorithm from <a href="divide-conquer.html#dc-template">Recursion, Divide &amp; Conquer</a> is the natural shape for a parallel algorithm: its subproblems are independent by construction.</p>
+
+      <div class="callout"><b>What "processor" means here.</b> The theory is stated for <code>p</code> identical processors sharing one memory, each executing one unit-cost instruction per time step. Real cores are close enough for the asymptotics; GPU lanes and SIMD units are processors that must execute the <i>same</i> instruction in lockstep (§23); a cluster adds communication costs the model leaves out (§21). Every bound on the page names the model it is proved in.</div>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="pram" data-nav="The PRAM model">
+      <h3><span class="idx">02</span> The PRAM model, briefly</h3>
+      <p class="lede"><b>The parallel random-access machine is the parallel analogue of the RAM model: <code>p</code> processors, a shared memory, and a global clock; at every tick each processor performs one instruction, and the variants differ only in what happens when two processors touch the same memory cell in the same tick.</b> It was the dominant model of parallel algorithms theory for two decades, and it is where the step counts of this page's scan and reduction were first worked out. Its weakness is that the algorithm must say, for every tick, exactly what every processor does — it is a model of a machine, not of a program.</p>
+
+      <div class="formula"><span class="lbl">the three standard variants, weakest to strongest</span><span class="eq">EREW   exclusive read, exclusive write     no two processors touch the same cell in one step
+CREW   concurrent read, exclusive write    many may read one cell; only one may write it
+CRCW   concurrent read, concurrent write   many may write one cell; a rule picks the result:
+          COMMON     all writers must write the same value
+          ARBITRARY  one writer, unspecified which, succeeds
+          PRIORITY   the lowest-numbered writer succeeds
+
+power:   EREW ≤ CREW ≤ CRCW, and a p-processor CRCW step can be simulated on EREW in O(log p) steps</span></div>
+
+      <p>The variants genuinely differ. On a COMMON CRCW machine with <code>n</code> processors, the OR of <code>n</code> bits takes <b>one</b> step: every processor holding a 1 writes 1 into a cell initialised to 0. The maximum of <code>n</code> numbers takes <code>O(1)</code> steps with <code>n²</code> processors: processor <code>(i, j)</code> compares <code>a[i]</code> with <code>a[j]</code> and, if <code>a[i] &lt; a[j]</code>, writes "not the max" into cell <code>i</code>. On CREW or EREW both problems need <code>Ω(log n)</code> steps, because each step can combine information from only a constant number of cells into one. That <code>log n</code> gap is exactly the <code>O(log p)</code> simulation overhead in the formula block.</p>
+
+      <p>The PRAM also introduced the idea that runs through the rest of the page. Summing <code>n</code> numbers on an EREW PRAM with <code>n/2</code> processors takes <code>⌈log₂ n⌉</code> steps: add pairs, then pairs of pairs, up a balanced tree. But <code>n/2</code> processors are wasteful — most sit idle after the first step. With only <code>p = n / log n</code> processors, have each first add up a block of <code>log n</code> elements serially (<code>log n</code> steps), then run the tree on the <code>p</code> partial sums (<code>log p ≤ log n</code> steps). The time is still <code>O(log n)</code>, and now the total operations, <code>p × time = O(n)</code>, match the serial algorithm. An algorithm whose processor-time product matches the best serial work is called <b>work-efficient</b> (or <i>work-optimal</i>), and the principle that one can trade processors for time this way is Brent's, from 1974 — §07 proves it in its modern form.</p>
+
+      <div class="callout"><b>Why the page moves on.</b> A PRAM algorithm is written for a fixed <code>p</code> and a lockstep clock; real machines have neither. The number of available cores changes with the load, cores run at different speeds, and nothing synchronises them every instruction. The next section's model describes the algorithm's <i>logical</i> parallelism once, independently of <code>p</code>, and leaves the mapping onto processors to a scheduler with a provable guarantee. Where this page quotes a PRAM step count it says so; everything else is fork-join.</div>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="fork-join" data-nav="Fork-join: spawn, sync, parallel for">
+      <h3><span class="idx">03</span> Fork-join: spawn, sync and parallel for</h3>
+      <p class="lede"><b>In the fork-join (dynamic multithreading) model a program is an ordinary serial program with three extra keywords — <code>spawn</code> ("this call may run in parallel with what follows"), <code>sync</code> ("wait for everything I spawned"), and <code>parallel for</code> ("these iterations are independent") — and nothing else. The keywords express permission, not obligation: the program says what <i>may</i> run concurrently, and a runtime scheduler decides what actually does.</b> This is the model of Cilk, OpenMP tasks, Intel TBB, Java's fork/join pool, Rust's rayon, .NET's task library and Go's goroutines with wait groups, and it is the model every bound after this section is stated in.</p>
+
+      <div class="formula"><span class="lbl">the three keywords, and the running example</span><span class="eq">P-FIB(n)
+  if n &lt; 2:  return n
+  x = spawn P-FIB(n − 1)      ▸ the child MAY run in parallel with the parent's next line
+  y = P-FIB(n − 2)            ▸ the parent keeps going — it does not wait here
+  sync                        ▸ wait until every child spawned by THIS call has returned
+  return x + y
+
+parallel for i = 1 to n:  body(i)
+  ≡ recursively split [1, n] in half, spawn one half, run the other, sync
+  → spawning n iterations has span Θ(log n), not Θ(1) and not Θ(n)                      (§11)</span></div>
+
+      <p>Three properties make the model the practical one. <b>It is processor-oblivious</b>: the program never mentions <code>p</code>, so the same binary runs on two cores or two hundred. <b>It has a serial projection</b>: delete the keywords and you get a correct serial program computing the same result — provided the program is free of determinacy races (§12). That is what makes it debuggable: every question about <i>what</i> the program computes is a question about a serial program. <b>It composes</b>: a parallel library routine called from inside a parallel loop just adds more spawns to the same pool; nothing oversubscribes the machine, because the scheduler, not the program, maps work to threads.</p>
+
+      <p>The trade is that <code>spawn</code> is cheap but not free — a well-engineered runtime makes it a few times the cost of a function call — so real code stops spawning below a <b>grain size</b> and runs the base case serially. The analysis on this page counts every spawn as a unit strand, which makes the constants honest about the overhead while leaving the asymptotics unchanged; §24 returns to what the grain size does in practice.</p>
+
+      <div class="callout"><b>Fork-join against threads.</b> Creating an OS thread per spawn would work in principle and fail in practice: thread creation costs tens of microseconds, and P-FIB(30) spawns over a million children. The runtime instead keeps one worker thread per core and treats each spawn as a small task pushed onto that worker's deque (§08). "Thread" in this page's prose means a logical strand of the computation, never an OS thread.</div>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="computation-dag" data-nav="The computation DAG">
+      <h3><span class="idx">04</span> The computation DAG</h3>
+      <p class="lede"><b>Running a fork-join program on an input unfolds it into a directed acyclic graph: each vertex is a <i>strand</i> — a maximal run of instructions with no spawn, sync or return inside it — and each edge says "this strand must finish before that one starts". The DAG is a property of the program <i>and the input</i>, not of the machine, and every parallel cost on this page is a measurement of it.</b></p>
+
+      <div class="formula"><span class="lbl">the four kinds of edge</span><span class="eq">CONTINUATION   u → u'   the next strand in the same procedure instance
+SPAWN          u → v    u spawned a child whose first strand is v
+CALL           u → v    an ordinary call: v runs, the caller waits (it is a spawn followed at once by a sync)
+RETURN         v → w    the child's last strand must finish before the parent's strand after sync
+
+two strands are LOGICALLY IN SERIES if a directed path joins them, LOGICALLY IN PARALLEL otherwise.
+a strand is READY when all its predecessors are done.</span></div>
+
+      <p>This page's figures build the DAG by running the program under a <b>tracer</b>. The tracer offers two operations, <code>work(k)</code> (append <code>k</code> unit strands in series) and <code>par(f, g, …)</code> (run each branch starting from the current point, then join their ends), and each algorithm is written against them once. One tracer records every strand as a vertex, so a figure can draw it and schedule it; a second keeps only two numbers — total work and the current path length — and composes them by the rules of §05. The load-time audit in the cheat sheet checks that the two agree on every small program.</p>
+
+      <p>A useful way to read the DAG is as the <b>serial execution with the sequencing relaxed</b>. The serial projection runs the strands in one order, a depth-first walk of the spawn tree. Every other order that respects the edges computes the same result for a race-free program, and a parallel execution is just such an order in which several strands occupy the same time step. The DAG therefore contains exactly two things a scheduler needs: how much there is to do, and what must wait for what.</p>
+
+      <div class="callout"><b>Unit strands, and why it costs nothing to assume them.</b> A real strand is a run of instructions of some length. Split it into that many unit-time vertices joined in series and nothing about the work, span or schedule changes except that every vertex now costs one step — which is the convention this page uses throughout. Where the text says "strand", read "unit-time vertex of the DAG".</div>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="work-span" data-nav="Work, span &amp; parallelism">
+      <h3><span class="idx">05</span> Work, span and parallelism</h3>
+      <p class="lede"><b>The work <code>T₁</code> is the number of vertices in the DAG — the time on one processor. The span <code>T∞</code> is the number of vertices on a longest directed path, the <i>critical path</i> — the time on unboundedly many processors, since even they must execute that chain one step at a time. The parallelism <code>T₁/T∞</code> is the average amount of work available per step along the critical path, and it is the largest speedup the program can ever show.</b></p>
+
+      <div class="formula"><span class="lbl">the composition rules — one rule for work, two for span</span><span class="eq">                       WORK                    SPAN
+A then B (series)      T₁(A) + T₁(B)           T∞(A) + T∞(B)
+A ∥ B   (parallel)     T₁(A) + T₁(B)           max(T∞(A), T∞(B))
+
+work ALWAYS adds.  span adds in series and takes the MAX in parallel.</span>
+<span class="lbl">applied to P-FIB, counting each strand as one step</span><span class="eq">T₁(n) = T₁(n − 1) + T₁(n − 2) + Θ(1)            = Θ(F(n)) = Θ(<span class="keep">φ</span>ⁿ),   <span class="keep">φ</span> = (1 + √5)/2 ≈ 1.618
+T∞(n) = max(T∞(n − 1), T∞(n − 2)) + Θ(1)
+      = T∞(n − 1) + Θ(1)                         = Θ(n)
+parallelism  T₁/T∞ = Θ(<span class="keep">φ</span>ⁿ / n)                        — enormous: far more than any machine has cores</span></div>
+
+      <p>The figure draws the DAG of a small program with time running left to right: each vertex sits at its <i>depth</i>, the length of the longest path reaching it, which is the earliest step it could run with unlimited processors. The critical path is traced back from the deepest vertex. P-FIB's DAG is the call tree of the naive Fibonacci recursion with a spawn strand going in and a combine strand coming out of each internal call, so its width grows like the Fibonacci numbers while its depth grows by two per level. The serial loop is a single chain: work and span are equal and the parallelism is exactly 1. The reduction is a balanced tree going out and a balanced tree coming back, depth logarithmic in <code>n</code>. Merge sort with a serial merge is the instructive one: the recursion fans out beautifully, then the final merge is a chain of length <code>n</code> that nothing can shorten — the critical path runs straight through it.</p>
+
+      <div class="viz" id="viz-dag">
+        <div class="vhead">
+          <span class="vtitle">The computation DAG of a real program, with its critical path</span>
+          <span class="vhint">pick a program and a size; the tracer runs it and records every strand. Work and span in the readout are counted from that recording, and the output is checked against a serial routine. Hover a vertex for its label</span>
+        </div>
+        <div class="controls">
+          <label for="dag-prog">program</label>
+          <select id="dag-prog">
+            <option value="fib" selected>P-FIB(n)</option>
+            <option value="sum">parallel sum (reduction)</option>
+            <option value="loop">parallel for, body = 3 steps</option>
+            <option value="serial">serial loop (no parallelism)</option>
+            <option value="amdahl">serial setup · parallel for · serial wrap-up</option>
+            <option value="msn">merge sort, serial merge</option>
+            <option value="msp">merge sort, parallel merge</option>
+            <option value="mat">matrix multiply, parallel loops</option>
+          </select>
+          <label for="dag-n">n</label>
+          <input type="range" id="dag-n" min="2" max="7" step="1" value="5" />
+          <span id="dag-n-val" class="vhint">5</span>
+          <label for="dag-crit"><input type="checkbox" id="dag-crit" checked /> highlight critical path</label>
+        </div>
+        <svg id="dag-svg" width="700" height="380" viewBox="0 0 700 380" role="img" aria-label="A directed acyclic graph of unit strands laid out left to right by the earliest step each could run, coloured by whether the strand spawns, does leaf work or combines results, with the longest path through the graph highlighted"></svg>
+        <div class="readout" id="dag-readout" aria-live="polite"></div>
+      </div>
+
+      <p>Parallelism is the right summary number because it is scale-free: it says how many processors the program can keep busy <i>on average</i>. A program with parallelism 50 can use 8 cores well and 50 cores poorly; one with parallelism 5 000 can use a GPU's worth. The rule of thumb practitioners use — aim for parallelism at least ten times the processor count, called <b>parallel slackness</b> — comes directly from Brent's bound in §07: when <code>T₁/T∞ ≫ p</code>, the <code>T∞</code> term is negligible and the speedup is nearly <code>p</code>.</p>
+
+      <div class="callout"><b>Span is not the height of the spawn tree.</b> It is the longest path through the <i>DAG</i>, and that path can run down through spawns, along long serial stretches, and back up through returns. The serial merge is the example: the spawn tree has height <code>log n</code>, but the span is <code>Θ(n)</code> because the merge at the root is a chain of <code>n</code> strands. Always compute span from the recurrence, not from the recursion depth.</div>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="laws-speedup" data-nav="Work law, span law, speedup">
+      <h3><span class="idx">06</span> The work law, the span law and speedup</h3>
+      <p class="lede"><b>Two lower bounds hold for every schedule on <code>p</code> processors, whatever the scheduler does. The <i>work law</i>: <code>T_p ≥ T₁/p</code>, because <code>p</code> processors execute at most <code>p</code> strands per step and there are <code>T₁</code> strands. The <i>span law</i>: <code>T_p ≥ T∞</code>, because the critical path's strands must execute one per step in order, and a machine with <code>p</code> processors can do no better than one with unboundedly many.</b></p>
+
+      <div class="formula"><span class="lbl">the two laws and what they imply for speedup</span><span class="eq">WORK LAW    T_p ≥ T₁ / p                  ⟹   speedup  S_p = T₁ / T_p ≤ p
+SPAN LAW    T_p ≥ T∞                      ⟹   speedup  S_p = T₁ / T_p ≤ T₁ / T∞  (the parallelism)
+
+S_p = Θ(p)      LINEAR speedup
+S_p = p         PERFECT linear speedup
+S_p &gt; p         SUPERLINEAR — impossible in this model; in practice a sign that the baseline was
+                slow or that p caches held a working set that one cache could not (§24)
+efficiency      E_p = S_p / p ∈ (0, 1]
+slackness       (T₁/T∞) / p   — how many times more parallelism than processors;  ≫ 1 is what you want</span></div>
+
+      <p>The two laws together say <code>T_p ≥ max(T₁/p, T∞)</code>, and they pull in opposite directions as <code>p</code> grows: the work term falls like <code>1/p</code> while the span term is a floor that does not move. Plot speedup against <code>p</code> and it rises along the diagonal <code>S = p</code> until <code>p</code> approaches the parallelism, then flattens toward it. Nothing a scheduler, a compiler or a faster memory system does can lift the curve above that floor; only reducing the span — changing the algorithm — can.</p>
+
+      <p>The laws also define what a good parallel algorithm is. Keep the work <b>within a constant factor of the best serial algorithm</b> (work-efficiency: otherwise the parallel version is slower than the serial one on small machines, and the extra work is energy spent for nothing), and make the span <b>as small as possible</b>, ideally polylogarithmic. The algorithms of §14–§22 are all judged by that pair.</p>
+
+      <div class="callout"><b>Model assumptions behind both laws.</b> Identical processors, unit-time strands, no cost for communication, scheduling or memory contention. Relax any of them and the laws still hold as lower bounds — real overheads only make <code>T_p</code> larger — but the matching upper bounds of the next section need them.</div>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="greedy-scheduling" data-nav="Greedy scheduling &amp; Brent's bound">
+      <h3><span class="idx">07</span> Greedy scheduling and Brent's bound</h3>
+      <p class="lede"><b>A scheduler is <i>greedy</i> if it never leaves a processor idle while a strand is ready: at each step it runs <code>min(p, number of ready strands)</code> of them. Every greedy scheduler, however it breaks ties, achieves <code>T_p ≤ T₁/p + T∞</code>. Since the laws say <code>T_p ≥ max(T₁/p, T∞)</code> and <code>a + b ≤ 2·max(a, b)</code>, a greedy schedule is always within a factor of 2 of the best possible one.</b></p>
+
+      <div class="formula"><span class="lbl">the theorem</span><span class="eq">for any DAG with work T₁ and span T∞, and any greedy schedule on p processors,
+      T_p ≤ T₁ / p + T∞          (sharper:  T_p ≤ (T₁ − T∞)/p + T∞ )
+hence  T_p ≤ 2 · T_p*   where T_p* is the optimal schedule's length,  and
+      T₁/T∞ ≫ p   ⟹   T_p ≈ T₁/p   (near-perfect linear speedup)</span>
+<span class="lbl">the proof: classify every step as complete or incomplete</span><span class="eq">COMPLETE step    all p processors busy.     Each executes p strands, and there are only T₁,
+                 so   #complete ≤ ⌊T₁ / p⌋.
+INCOMPLETE step  fewer than p ready strands, so the scheduler runs ALL of them.
+                 Let G' be the DAG of strands not yet executed. Every longest path in G' starts
+                 at a strand with no unexecuted predecessor — a READY strand — and all of those run,
+                 so the longest path in G' shrinks by one.   Hence  #incomplete ≤ T∞.
+TOTAL            T_p = #complete + #incomplete ≤ T₁/p + T∞.                                    ∎</span></div>
+
+      <p>The figure schedules a recorded DAG greedily on <code>p = 1 … 16</code> processors and plots the measured <code>T_p</code> against the work-law line, the span-law floor and Brent's upper bound; below it is the schedule for the chosen <code>p</code>, one column per step, with incomplete steps shaded. The readout counts complete and incomplete steps and checks both halves of the proof against the measured numbers. Try the three tie-breaking rules. <i>Longest-remaining-path first</i> is the classic critical-path heuristic; <i>shortest-remaining-path first</i> is a deliberately poor greedy rule that leaves the critical path for last. Both, and FIFO, stay inside the bounds — that is the theorem — but the poor rule visibly wastes steps at small <code>p</code>, which is the factor of 2 the theorem allows. Switch to the merge sort with a serial merge and watch the curve flatten against its <code>T∞</code> floor after a handful of processors; switch to the reduction or P-FIB and watch it track the diagonal.</p>
+
+      <div class="viz" id="viz-sched">
+        <div class="vhead">
+          <span class="vtitle">A greedy scheduler on p processors: measured T_p against the work law, the span law and Brent's bound</span>
+          <span class="vhint">the DAG is recorded from the real program, then scheduled step by step; every T_p on the curve is a counted number of steps, and the complete / incomplete split in the readout is the proof of Brent's bound, checked</span>
+        </div>
+        <div class="controls">
+          <label for="sched-prog">program</label>
+          <select id="sched-prog">
+            <option value="fib" selected>P-FIB(n)</option>
+            <option value="sum">parallel sum (reduction)</option>
+            <option value="loop">parallel for, body = 3 steps</option>
+            <option value="amdahl">serial setup · parallel for · serial wrap-up</option>
+            <option value="msn">merge sort, serial merge</option>
+            <option value="msp">merge sort, parallel merge</option>
+            <option value="mat">matrix multiply, parallel loops</option>
+          </select>
+          <label for="sched-n">n</label>
+          <input type="range" id="sched-n" min="2" max="9" step="1" value="8" />
+          <span id="sched-n-val" class="vhint">8</span>
+          <label for="sched-p">p</label>
+          <input type="range" id="sched-p" min="1" max="16" step="1" value="4" />
+          <span id="sched-p-val" class="vhint">4</span>
+          <label for="sched-prio">tie-break</label>
+          <select id="sched-prio">
+            <option value="long" selected>longest remaining path first</option>
+            <option value="fifo">FIFO (oldest ready first)</option>
+            <option value="short">shortest remaining path first (poor)</option>
+          </select>
+        </div>
+        <svg id="sched-svg" width="700" height="420" viewBox="0 0 700 420" role="img" aria-label="Top: measured greedy schedule length against the number of processors from one to sixteen, with the work-law curve, the span-law floor and Brent's upper bound. Bottom: the schedule for the chosen processor count as a grid of steps by processors, with incomplete steps shaded and critical-path strands highlighted"></svg>
+        <div class="readout" id="sched-readout" aria-live="polite"></div>
+      </div>
+
+      <p>The bound's history is worth one sentence. The original 1974 result was about PRAM computations with a known number of operations at each level: a computation of <code>m</code> operations and <code>t</code> levels runs on <code>p</code> processors in at most <code>t + (m − t)/p</code> steps — the sharper form above. The greedy-scheduler version for arbitrary DAGs is the same argument restated for a dynamic setting, and the reason fork-join programs can be written without mentioning <code>p</code>: the program fixes <code>T₁</code> and <code>T∞</code>, and any greedy runtime converts them into a running time on whatever <code>p</code> turns up.</p>
+
+      <div class="callout"><b>What the bound assumes.</b> Unit-time strands (§04 makes this free), identical processors, and a scheduler that knows instantly which strands are ready and can hand them out at no cost. That last assumption is the unrealistic one — a centralised ready queue is a bottleneck on a many-core machine — and the next section is about the schedulers that give up exact greediness to remove it while keeping the bound in expectation.</div>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="work-stealing" data-nav="Work stealing in practice">
+      <h3><span class="idx">08</span> Work stealing: the scheduler real runtimes use</h3>
+      <p class="lede"><b>In a work-stealing scheduler each worker keeps its own double-ended queue of ready tasks and works on the bottom of it like a serial program's call stack; only when its deque is empty does it become a thief, pick another worker uniformly at random, and steal the task at the <i>top</i> of that worker's deque. Randomised work stealing runs a fork-join computation in expected time <code>T₁/p + O(T∞)</code> — Brent's bound up to the constant on the span term — with no central queue at all.</b></p>
+
+      <div class="formula"><span class="lbl">the protocol</span><span class="eq">on spawn of child C:     push the CONTINUATION of the parent onto the bottom of my deque; run C now
+                         ("work-first": the child runs immediately, exactly as in the serial order)
+on return / sync:        pop the bottom of my deque and resume it, if it is still there
+deque empty:             choose a victim uniformly at random; steal the TOP of its deque; repeat on failure</span>
+<span class="lbl">the guarantees, for fully strict fork-join computations</span><span class="eq">time      E[T_p] = T₁/p + O(T∞)            and the same with high probability, up to a log(1/<span class="keep">ε</span>) term
+steals    E[#steal attempts] = O(p · T∞)   — communication is proportional to the SPAN, not the work
+space     S_p ≤ p · S₁                      — each worker's stack is at most one serial stack deep</span></div>
+
+      <p>Why stealing from the top? The top of a deque holds the <i>oldest</i> continuation, which in a divide-and-conquer program is the one closest to the root of the spawn tree — the one with the most work still under it. A single steal therefore transfers a large piece of the computation, and the thief then runs it locally, pushing and popping its own deque without contention for a long time. Owners touch the bottom and thieves touch the top, so the common case needs no lock; only when the deque is nearly empty do the two ends meet, and that race is resolved with one atomic compare-and-swap. The upshot is that almost all of the <code>T₁</code> work runs at serial speed with no synchronisation, and the coordination cost scales with <code>T∞</code> — the same quantity that already bounds the running time.</p>
+
+      <p>The space bound is the other half of why the model is practical. A breadth-first scheduler that ran every ready task as soon as possible would, for P-FIB, materialise exponentially many live frames; work-first stealing keeps each worker on a depth-first path, so the total memory is at most <code>p</code> times what the serial program uses. <code>p</code> processors cost at most <code>p</code> stacks, and never more.</p>
+
+      <div class="callout"><b>Where the model and the runtime part ways.</b> The bound counts steal attempts as unit-time operations and ignores cache effects. In reality a stolen task's data is in another core's cache, so each steal costs a burst of cache misses — the reason grain size matters (§24) and the reason work stealing is paired with locality-aware tweaks such as stealing from a nearby core first. The asymptotics survive; the constants are where the engineering goes.</div>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="amdahl-gustafson" data-nav="Amdahl's &amp; Gustafson's laws">
+      <h3><span class="idx">09</span> Amdahl's law and Gustafson's law</h3>
+      <p class="lede"><b>Amdahl's law is the span law for the crudest possible DAG: a fraction <code>f</code> of the serial running time cannot be parallelised at all, and the rest parallelises perfectly. Then <code>T_p = f·T₁ + (1 − f)·T₁/p</code>, and the speedup can never exceed <code>1/f</code> however many processors you add. Gustafson's law asks a different question — not "how much faster is this problem?" but "how much bigger a problem can I solve in the same time?" — and gets a speedup that grows linearly in <code>p</code>.</b></p>
+
+      <div class="formula"><span class="lbl">Amdahl — fixed problem size (strong scaling)</span><span class="eq">f = serial fraction of the ONE-processor running time
+S_p = T₁ / T_p = 1 / ( f + (1 − f)/p )         →  1/f  as p → ∞
+
+f = 0.05:   S₁₆ = 1 / (0.05 + 0.95/16) ≈ 9.14         and never more than 20, even at a million cores</span>
+<span class="lbl">Gustafson — problem grows with p (weak scaling)</span><span class="eq">f = serial fraction of the p-PROCESSOR running time; the parallel part grows in proportion to p
+scaled speedup  S_p = f + p·(1 − f) = p − f·(p − 1)          — linear in p, slope 1 − f
+
+f = 0.05:   S₁₆ = 16 − 0.05 · 15 = 15.25</span></div>
+
+      <p>The two laws do not contradict each other; they measure different things, and the difference is entirely in what <code>f</code> is a fraction <i>of</i>. Amdahl fixes the problem, so as <code>p</code> grows the parallel part shrinks and the serial part becomes an ever larger share of the time until it is all that is left. Gustafson fixes the <i>time</i> and lets the problem grow, which is how large machines are actually used: a weather model on a bigger computer runs at finer resolution, not faster; a larger GPU cluster trains a larger model. The serial part — reading the configuration, setting up, a final reduction — stays the same size while the parallel part grows with <code>p</code>, so its share of the work falls.</p>
+
+      <p>The figure measures both. The workload is <code>s</code> serial unit steps followed by <code>N</code> independent unit tasks, run by a greedy scheduler that counts its steps; for Amdahl the total work is fixed, and for Gustafson each processor gets a fixed share of the parallel tasks. The measured points sit on the formula curves except where the ceiling in <code>⌈N/p⌉</code> bites at large <code>p</code>, which is the discreteness the formulas ignore. Push <code>f</code> to 0.01 and look at the Amdahl ceiling: 99 % parallel code still cannot reach 100× speedup.</p>
+
+      <div class="viz" id="viz-amdahl">
+        <div class="vhead">
+          <span class="vtitle">Speedup against processor count: Amdahl's fixed-size law and Gustafson's scaled-size law, each measured</span>
+          <span class="vhint">points are step counts from actually scheduling the workload; curves are the formulas; the dotted horizontal line is Amdahl's ceiling 1/f</span>
+        </div>
+        <div class="controls">
+          <label for="amdahl-f">serial fraction f</label>
+          <input type="range" id="amdahl-f" min="0" max="0.5" step="0.01" value="0.05" />
+          <span id="amdahl-f-val" class="vhint">0.05</span>
+          <label for="amdahl-pmax">up to p =</label>
+          <select id="amdahl-pmax">
+            <option value="16">16</option>
+            <option value="256" selected>256</option>
+            <option value="4096">4096</option>
+          </select>
+          <label for="amdahl-mode">show</label>
+          <select id="amdahl-mode">
+            <option value="both" selected>both laws</option>
+            <option value="strong">Amdahl only (strong scaling)</option>
+            <option value="weak">Gustafson only (weak scaling)</option>
+          </select>
+          <label for="amdahl-y">speedup axis</label>
+          <select id="amdahl-y">
+            <option value="lin" selected>linear</option>
+            <option value="log">log</option>
+          </select>
+        </div>
+        <svg id="amdahl-svg" width="700" height="360" viewBox="0 0 700 360" role="img" aria-label="Speedup against number of processors on a logarithmic axis, showing the ideal diagonal, Amdahl's curve saturating at one over the serial fraction, Gustafson's straight line, and measured points from scheduling a workload with a serial part and a parallel part"></svg>
+        <div class="readout" id="amdahl-readout" aria-live="polite"></div>
+      </div>
+
+      <div class="callout"><b>Amdahl is a special case of the span law, and a pessimistic one.</b> In work/span terms, Amdahl's program has <code>T∞ = f·T₁ + 1</code>: the serial part is on the critical path and the parallel part adds one step. The span law gives <code>S_p ≤ T₁/T∞ ≈ 1/f</code> — the same ceiling. Real algorithms rarely have a fixed serial fraction; their span grows with <code>n</code> more slowly than their work, so their parallelism <i>rises</i> with problem size. That is Gustafson's observation in algorithmic form, and it is why work and span are the more useful pair of numbers.</div>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="strong-weak-scaling" data-nav="Strong vs weak scaling">
+      <h3><span class="idx">10</span> Strong scaling and weak scaling</h3>
+      <p class="lede"><b>A scaling study is a graph of speedup or efficiency against <code>p</code>, and it comes in two kinds that answer the two laws' questions. <i>Strong scaling</i> fixes the total problem and asks how the time falls; <i>weak scaling</i> fixes the problem per processor and asks whether the time stays flat.</b></p>
+
+      <table class="cmp">
+        <tr><th></th><th>Strong scaling</th><th>Weak scaling</th></tr>
+        <tr><td>held fixed</td><td>total problem size <code>n</code></td><td>problem size per processor <code>n/p</code></td></tr>
+        <tr><td>ideal result</td><td><code>T_p = T₁/p</code>: speedup <code>p</code>, efficiency 1</td><td><code>T_p = T₁</code> (of the one-processor share): flat time, efficiency 1</td></tr>
+        <tr><td>governing law</td><td>Amdahl; the span law <code>T_p ≥ T∞(n)</code> with <code>n</code> fixed</td><td>Gustafson; the span law with <code>n</code> growing — fine if <code>T∞(n)</code> grows slowly</td></tr>
+        <tr><td>what kills it</td><td>serial fraction, span, per-task overhead once tasks get small</td><td>communication and synchronisation that grow with <code>p</code> (e.g. a global reduction, <code>Θ(log p)</code> per step)</td></tr>
+        <tr><td>typical use</td><td>"make this job finish sooner"</td><td>"use a bigger machine for a bigger problem" — simulations, large-model training</td></tr>
+      </table>
+
+      <p>The work/span analysis predicts both from one pair of recurrences. For the parallel reduction, <code>T₁ = Θ(n)</code> and <code>T∞ = Θ(log n)</code>. Strong scaling at fixed <code>n</code>: speedup rises until <code>p ≈ n / log n</code> and then flattens. Weak scaling with <code>n = p·m</code>: <code>T_p ≈ m + log(p·m)</code>, so the time creeps up only logarithmically — near-perfect weak scaling. For merge sort with a serial merge, <code>T∞ = Θ(n)</code>, so weak scaling is <i>impossible</i>: the time grows linearly in <code>n = p·m</code> whatever <code>p</code> is. Parallelism that does not grow with the problem is the signature of an algorithm that cannot scale.</p>
+
+      <div class="callout"><b>Reporting a scaling result honestly.</b> The baseline <code>T₁</code> should be the best <i>serial</i> program, not the parallel program run on one core — the parallel version carries spawn overhead and extra work, and using it as the baseline inflates the speedup. Say which kind of scaling was measured, the problem size, and the efficiency, not just the speedup; an 80× speedup on 1 000 cores is 8 % efficiency.</div>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="span-recurrences" data-nav="Span recurrences &amp; parallel loops">
+      <h3><span class="idx">11</span> Analysing parallel recursion: span recurrences and parallel loops</h3>
+      <p class="lede"><b>A parallel algorithm is analysed by writing two recurrences from its code: the work recurrence, which is the ordinary serial recurrence, and the span recurrence, which is the same except that calls spawned in parallel contribute the <i>maximum</i> of their spans rather than the sum. Both are then solved with the methods of <a href="analysis.html#master-theorem">the master theorem</a> and <a href="analysis.html#recursion-tree">the recursion tree</a>.</b></p>
+
+      <div class="formula"><span class="lbl">the recipe, and four worked recurrences</span><span class="eq">code shape                                  work recurrence              span recurrence
+two parallel halves + Θ(1) combine          T₁(n) = 2T₁(n/2) + Θ(1)      T∞(n) = T∞(n/2) + Θ(1)
+   (reduction, parallel-for splitting)          = Θ(n)                        = Θ(log n)
+two parallel halves + SERIAL Θ(n) merge     T₁(n) = 2T₁(n/2) + Θ(n)      T∞(n) = T∞(n/2) + Θ(n)
+   (merge sort, naive)                          = Θ(n log n)                  = Θ(n)
+P-FIB                                       T₁(n) = T₁(n−1)+T₁(n−2)+Θ(1) T∞(n) = T∞(n−1) + Θ(1)
+                                                = Θ(<span class="keep">φ</span>ⁿ)                       = Θ(n)
+parallel for i = 1..n with body span s(i)  T₁ = Θ(n) + Σ work(i)        T∞ = Θ(log n) + max_i s(i)</span>
+<span class="lbl">nested parallel loops</span><span class="eq">parallel for i = 1..n:  parallel for j = 1..n:  body Θ(1)      →  T₁ = Θ(n²),   T∞ = Θ(log n) + Θ(log n) = Θ(log n)
+parallel for i = 1..n:  for j = 1..n (serial):   body Θ(1)      →  T₁ = Θ(n²),   T∞ = Θ(log n) + Θ(n)     = Θ(n)</span></div>
+
+      <p>The parallel loop deserves its line. A <code>parallel for</code> over <code>n</code> iterations cannot spawn all <code>n</code> in one step: a spawn creates one child. The runtime therefore splits the range recursively — spawn one half, recurse on the other — which creates a balanced binary tree of spawns of height <code>⌈log₂ n⌉</code>. That <code>Θ(log n)</code> is invisible in the PRAM, where <code>n</code> processors start together by fiat, and it is the reason several fork-join spans on this page carry one more <code>log</code> factor than their PRAM step counts (§14, §15). It is also why a loop's span is <code>Θ(log n)</code> plus the <i>longest</i> iteration, not the average: one expensive iteration is on the critical path.</p>
+
+      <p>The figure runs every routine on the page at <code>n</code> from 4 to 4 096 (matrices to 64 × 64) with the fast tracer, and plots measured work, span and parallelism on log–log axes. Straight lines of different slopes are the polynomial bounds; logarithmic spans show up as curves that bend over. The readout divides each measurement by the claimed Θ-expression: a ratio that levels off is the bound showing through, and the drift at small <code>n</code> is the lower-order terms. Compare the two merge sorts — same work, spans a whole polynomial apart — and the two matrix multiplications, whose parallelism differs by a factor of nearly <code>n / log² n</code>.</p>
+
+      <div class="viz" id="viz-growth">
+        <div class="vhead">
+          <span class="vtitle">Measured work, span and parallelism against n, for every algorithm on this page</span>
+          <span class="vhint">each point is one run of the real routine under the tracer; the output is compared with a serial routine every time. The slider picks the n reported in the readout</span>
+        </div>
+        <div class="controls">
+          <label for="growth-alg">algorithm</label>
+          <select id="growth-alg">
+            <option value="sum" selected>parallel sum (reduction)</option>
+            <option value="loop">parallel for, body = 1 step</option>
+            <option value="msn">merge sort, serial merge</option>
+            <option value="msp">merge sort, parallel merge</option>
+            <option value="scn">scan, naive rounds</option>
+            <option value="sce">scan, work-efficient</option>
+            <option value="mml">matrix multiply, parallel loops</option>
+            <option value="mmd">matrix multiply, divide &amp; conquer</option>
+          </select>
+          <label for="growth-n">n</label>
+          <input type="range" id="growth-n" min="0" max="10" step="1" value="8" />
+          <span id="growth-n-val" class="vhint">n</span>
+        </div>
+        <svg id="growth-svg" width="700" height="360" viewBox="0 0 700 360" role="img" aria-label="Log-log plot of measured work, span and parallelism against input size for a chosen parallel algorithm, with a marker at the selected size"></svg>
+        <div class="readout" id="growth-readout" aria-live="polite"></div>
+      </div>
+
+      <div class="callout"><b>A span recurrence takes the max only over what is really parallel.</b> If a procedure spawns <code>A</code>, calls <code>B</code>, syncs, and then calls <code>C</code>, the span is <code>max(T∞(A), T∞(B)) + T∞(C)</code>, not <code>max</code> of all three. The two most common errors in span analysis are forgetting that everything after a <code>sync</code> is in series with what came before, and forgetting the <code>Θ(log n)</code> of a parallel loop's own spawning.</div>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="races" data-nav="Race conditions &amp; determinacy">
+      <h3><span class="idx">12</span> Race conditions and determinacy races</h3>
+      <p class="lede"><b>A <i>determinacy race</i> occurs when two logically parallel strands access the same memory location and at least one of them writes it. The result then depends on the order the scheduler happened to pick, so a program that computes the right answer a thousand times can compute the wrong one on the thousand-and-first, and its serial projection — which always runs one fixed order — will never show the bug.</b></p>
+
+      <div class="formula"><span class="lbl">the canonical race</span><span class="eq">RACE-EXAMPLE()
+  x = 0
+  parallel for i = 1 to 2:   x = x + 1          ▸ looks atomic; is not
+  print x
+
+each "x = x + 1" is really three instructions:
+  r ← x          load the shared value into a private register
+  r ← r + 1      increment the private copy
+  x ← r          store it back
+
+if both strands load before either stores, both write 1 — one update is LOST and x ends at 1.</span></div>
+
+      <p>The figure enumerates <i>every</i> interleaving of the strands' instructions — every order a scheduler could produce — runs each one against a simulated shared memory, and histograms the final value of <code>x</code>. With two strands of one increment, only the interleavings where one strand's store lands before the other's load give 2. Add a third strand or a second increment each and the right answer becomes a small minority. Then change the synchronisation: an <b>atomic fetch-and-add</b> makes each increment a single indivisible instruction, and a <b>lock</b> around the three instructions forbids the interleavings that interleave them. Both make every outcome correct — at a price the next section measures.</p>
+
+      <div class="viz" id="viz-race">
+        <div class="vhead">
+          <span class="vtitle">Every interleaving of racing increments, enumerated: how often the answer is right</span>
+          <span class="vhint">the histogram counts final values over all feasible orders of the strands' instructions; the slider replays one of those orders as a timeline, with the shared value after each instruction</span>
+        </div>
+        <div class="controls">
+          <label for="race-mode">increment as</label>
+          <select id="race-mode">
+            <option value="race" selected>load · add · store (unsynchronised)</option>
+            <option value="atomic">atomic fetch-and-add</option>
+            <option value="lock">lock · load · add · store · unlock</option>
+          </select>
+          <label for="race-cfg">strands × increments</label>
+          <select id="race-cfg">
+            <option value="2x1" selected>2 × 1</option>
+            <option value="2x2">2 × 2</option>
+            <option value="3x1">3 × 1</option>
+          </select>
+          <label for="race-i">interleaving</label>
+          <input type="range" id="race-i" min="0" max="19" step="1" value="4" />
+          <span id="race-i-val" class="vhint">#5</span>
+        </div>
+        <svg id="race-svg" width="700" height="330" viewBox="0 0 700 330" role="img" aria-label="Left: a histogram of the final value of a shared counter over every interleaving of several strands' load, add and store instructions, with the correct value in green and lost-update values in red. Right: one chosen interleaving drawn as a timeline with one lane per strand and the shared value after each instruction"></svg>
+        <div class="readout" id="race-readout" aria-live="polite"></div>
+      </div>
+
+      <p>Two properties make determinacy races the right thing to reason about. First, a program with no determinacy races is <b>deterministic</b>: every schedule computes what the serial projection computes, so testing the serial program tests the parallel one. Second, determinacy races can be <b>detected</b> — a race detector runs the program once, serially, and tracks for every memory location which logically-parallel strands have touched it, reporting any conflicting pair. Because the check is about the DAG, not the schedule, one run on one input finds every race that input can exhibit, whatever the timing. The fork-join model's discipline — share only what you read, give each parallel strand its own output location — is what makes the check tractable; the algorithms from §14 on are all written that way. Races that are <i>intended</i>, such as a benign "any writer wins" flag or a lock-free data structure, are a different discipline (<i>data-race-free</i> programming with atomics), and the rest of this page avoids them.</p>
+
+      <div class="callout"><b>The loop that is almost always a race.</b> A <code>parallel for</code> whose body updates something indexed by a value that is not the loop variable — <code>count[key[i]] += 1</code>, <code>y[i] += A[i][j]·x[j]</code> with <code>i</code> parallel over the inner <code>j</code>, <code>total += a[i]</code>. Each is correct serially and wrong in parallel. The fix is almost never a lock; it is a different algorithm — a reduction (§21), a scan (§16), or a per-strand private copy combined at the end.</div>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="synchronisation-costs" data-nav="Atomics, locks, reducers, false sharing">
+      <h3><span class="idx">13</span> What coordination costs: atomics, locks, reducers and false sharing</h3>
+      <p class="lede"><b>Every way of making concurrent updates to shared memory correct also makes them serial. A lock or an atomic operation on one location lets exactly one strand update it at a time, so <code>n</code> updates to one location have span <code>Θ(n)</code> however they are scheduled — the synchronisation has put them back on a single critical path. The cure is to avoid the shared location, not to protect it.</b></p>
+
+      <div class="formula"><span class="lbl">the options for "many strands contribute to one value"</span><span class="eq">                            correctness   span of n updates            cost per update
+unsynchronised              WRONG          —                            one load + one store
+lock around the update      correct        Θ(n)  (serialised)          lock/unlock + contention, waits, convoying
+atomic fetch-and-add / CAS  correct        Θ(n)  on one cache line      tens of cycles uncontended; hundreds when
+                                                                         the line bounces between cores
+REDUCER / private copies    correct        Θ(log p) combine + Θ(n/p)    one private update; one combine per strand
+  + tree combine
+REDUCTION algorithm (§21)   correct        Θ(log n)                     Θ(1)</span></div>
+
+      <p>A <b>reducer</b> (or reduction hyperobject, or a thread-local accumulator) is the fork-join runtime's version of the last two rows: the shared variable is given a private view per strand, each strand updates its own view with no synchronisation, and when strands join their views are combined with the associative operator. Because the combine follows the DAG, a reducer over an associative operation gives the same answer as the serial program — even for non-commutative operations like list append — and has no determinacy race. It is the right tool whenever a loop body naturally "adds to a total".</p>
+
+      <p><b>False sharing</b> is the coordination cost that the program never asked for. Caches move data in lines, typically 64 bytes, and a coherence protocol lets only one core hold a line in the writable state at a time. If two strands write <i>different</i> variables that happen to sit in the same line — adjacent elements of a per-thread counter array is the classic case — the line ping-pongs between their caches on every write, and the two strands run as if they shared a lock, though there is no race and the answer is correct. The fix is layout: pad per-thread data to a cache line, or accumulate in a local variable and write once at the end. False sharing is invisible to the work/span model, which has no caches; it is the most common reason a race-free parallel loop with ample parallelism shows no speedup.</p>
+
+      <div class="callout"><b>Why not just lock?</b> Locks are also a source of bugs the model cannot see: <i>deadlock</i>, when two strands each hold a lock the other needs; <i>priority inversion</i>; and <i>convoying</i>, when a descheduled lock holder stalls every waiter. A lock also makes the program's result depend on who acquires first whenever the protected operation is not commutative — a lock prevents a data race but not a determinacy race. The fork-join style of this page, where each output location has exactly one writer and combination happens at joins, needs no locks at all.</div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="prefix-sums" data-nav="Prefix sums (scan)">
+      <h3><span class="idx">14</span> Prefix sums (scan), and the naive parallel scan</h3>
+      <p class="lede"><b>The prefix sum, or scan, of <code>x₀, x₁, …, x_{n−1}</code> under an associative operator <code>⊕</code> is the sequence of running totals. Serially it is a single loop of <code>n − 1</code> additions, each depending on the one before — a chain with span <code>n − 1</code>, apparently the least parallel computation there is. It turns out to be parallelisable to logarithmic span with linear work, and it is the most useful parallel primitive after reduction: an enormous range of apparently serial computations are scans in disguise (§16).</b></p>
+
+      <div class="formula"><span class="lbl">definitions</span><span class="eq">INCLUSIVE scan   yᵢ = x₀ ⊕ x₁ ⊕ … ⊕ xᵢ            [3, 1, 7, 0, 4]  →  [3, 4, 11, 11, 15]
+EXCLUSIVE scan   yᵢ = x₀ ⊕ … ⊕ x_{i−1},  y₀ = e    [3, 1, 7, 0, 4]  →  [0, 3, 4, 11, 11]     (e = identity of ⊕)
+requirement      ⊕ associative.  Commutativity is NOT needed; an identity only for the exclusive form.</span>
+<span class="lbl">the naive parallel scan: log n rounds of "add the value 2ᵈ to my left"</span><span class="eq">for d = 0, 1, …, ⌈log₂ n⌉ − 1:
+    parallel for i = 0 to n − 1:
+        if i ≥ 2ᵈ:  x'[i] = x[i − 2ᵈ] ⊕ x[i]   else  x'[i] = x[i]
+    x = x'
+invariant after round d:  x[i] = sum of the (up to) 2ᵈ⁺¹ elements ending at i
+
+PRAM steps   ⌈log₂ n⌉ rounds
+additions    Σ_d (n − 2ᵈ) = n·log₂ n − n + 1   for n a power of two      → WORK Θ(n log n)
+fork-join    each round is a parallel for, span Θ(log n)                  → SPAN Θ(log² n)</span></div>
+
+      <p>The naive scan has the right span on a PRAM and the wrong work. It performs <code>Θ(n log n)</code> additions where the serial loop needs <code>n − 1</code>, so on <code>p</code> processors its time is <code>Θ((n log n)/p + log n)</code> against the serial <code>Θ(n)</code>: it only beats the serial loop when <code>p &gt; log n</code>, and on a machine with fewer processors than that it is strictly slower. That is the definition of not work-efficient, and it is exactly the kind of algorithm §06 warned against. Its virtue is that each round is perfectly regular — every element does the same thing — which is why it is still used within a GPU warp, where 32 lanes execute in lockstep anyway and idle lanes cost nothing extra.</p>
+
+      <div class="callout"><b>Double buffering is part of the algorithm.</b> The round must read the <i>old</i> <code>x[i − 2ᵈ]</code>, not a value another strand has already updated in this round. Writing in place is a determinacy race in the sense of §12: whether <code>x[i − 2ᵈ]</code> has been overwritten depends on the schedule. The <code>x'</code> buffer makes each round's reads and writes disjoint.</div>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="work-efficient-scan" data-nav="Work-efficient scan">
+      <h3><span class="idx">15</span> The work-efficient scan: up-sweep and down-sweep</h3>
+      <p class="lede"><b>The work-efficient scan does <code>2(n − 1)</code> additions — twice the serial count, a constant factor — in <code>2·log₂ n</code> parallel rounds. It runs a reduction up a balanced binary tree (the <i>up-sweep</i>), keeping the partial sums at internal nodes, and then pushes prefixes back down the same tree (the <i>down-sweep</i>): each node passes its incoming prefix to its left child unchanged and passes "prefix ⊕ left child's sum" to its right child.</b></p>
+
+      <div class="formula"><span class="lbl">in-place on an array, n a power of two</span><span class="eq">UP-SWEEP     for d = 1, 2, 4, …, n/2:
+                parallel for k = 0, 2d, 4d, … &lt; n:
+                    x[k + 2d − 1] = x[k + d − 1] ⊕ x[k + 2d − 1]           ▸ right child ← left + right
+             now x[n − 1] holds the total, and every x[k + 2d − 1] a subtree sum
+
+CLEAR        x[n − 1] = e                                                   ▸ the root's prefix is empty
+
+DOWN-SWEEP   for d = n/2, …, 2, 1:
+                parallel for k = 0, 2d, 4d, … &lt; n:
+                    t = x[k + d − 1]
+                    x[k + d − 1]  = x[k + 2d − 1]                          ▸ left child gets the parent's prefix
+                    x[k + 2d − 1] = t ⊕ x[k + 2d − 1]                      ▸ right child gets prefix ⊕ left sum
+             now x holds the EXCLUSIVE scan</span>
+<span class="lbl">cost</span><span class="eq">additions     (n − 1) up + (n − 1) down = 2(n − 1)       → WORK Θ(n)   — work-efficient
+PRAM steps    2·log₂ n rounds                                → Θ(log n)
+fork-join     written recursively (up: spawn both halves, add; down: spawn both halves with their prefixes)
+              T₁(n) = 2T₁(n/2) + Θ(1) = Θ(n)      T∞(n) = T∞(n/2) + Θ(1) = Θ(log n)
+              — written as 2 log n parallel-for rounds instead, the span picks up the loop's log: Θ(log² n)</span></div>
+
+      <p>Step through the figure and watch both phases. In the up-sweep each round halves the number of active additions — <code>n/2</code>, <code>n/4</code>, …, 1 — so the total is <code>n − 1</code>, exactly the additions of a reduction tree. The clear step saves the total and zeroes the root. The down-sweep reverses the pattern, and each round's teal arrows copy a parent prefix down to a left child while the amber arrows add the left child's saved subtree sum into the right child. Switch to the naive algorithm to compare: fewer rounds, but every round touches almost every element, and the addition counter runs away from <code>n − 1</code>.</p>
+
+      <div class="viz" id="viz-scan">
+        <div class="vhead">
+          <span class="vtitle">The scan, round by round: work-efficient up-sweep / down-sweep against the naive rounds</span>
+          <span class="vhint">each frame is one parallel round — every arrow in it happens at the same time. Additions and rounds are counted as the real routine runs; the last frame checks the result against a serial scan</span>
+        </div>
+        <div class="controls">
+          <label for="scan-alg">algorithm</label>
+          <select id="scan-alg">
+            <option value="eff" selected>work-efficient (up-sweep / down-sweep), exclusive</option>
+            <option value="naive">naive (log n rounds), inclusive</option>
+          </select>
+          <label for="scan-n">n</label>
+          <select id="scan-n">
+            <option value="8" selected>8</option>
+            <option value="16">16</option>
+          </select>
+        </div>
+        <svg id="scan-svg" width="700" height="300" viewBox="0 0 700 300" role="img" aria-label="An array before and after one parallel round of a prefix-sum algorithm, with arrows from each source element to the element it updates; amber arrows add, teal arrows copy"></svg>
+        <div class="readout" id="scan-readout" aria-live="polite"></div>
+      </div>
+
+      <p>Why is it correct? After the up-sweep, the cell for each tree node holds the sum of that node's leaves. The down-sweep maintains the invariant <i>"the cell for node v holds the sum of all leaves to the left of v's subtree"</i>: true at the root, whose prefix is empty; and preserved going down, because a left child has the same leaves to its left as its parent, and a right child has those plus the whole left sibling. At the leaves the invariant is the definition of the exclusive scan. Getting the inclusive scan costs one more parallel step, <code>yᵢ = scanᵢ ⊕ xᵢ</code>.</p>
+
+      <div class="callout"><b>For more than a handful of processors, block it.</b> With <code>p ≪ n</code> the best practical scan is three phases: each processor scans its own block of <code>n/p</code> elements serially; the <code>p</code> block totals are scanned (by the tree, or serially if <code>p</code> is small); each processor adds its block's offset to its elements. Work <code>≈ 2n</code>, time <code>Θ(n/p + log p)</code>. This is Brent's trade from §02 again, and it is how library scans on CPUs and GPUs are organised, with the in-block step itself a warp-level scan on a GPU.</div>
+    </section>
+
+    <!-- ═══ 16 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="scan-applications" data-nav="What scan unlocks">
+      <h3><span class="idx">16</span> What scan unlocks: compaction, partition, radix sort and more</h3>
+      <p class="lede"><b>A scan turns "each element needs to know where it goes" into a parallel computation: if each element computes a count of how many slots it will occupy, the exclusive scan of those counts is exactly each element's output offset. That one idea parallelises filtering, partitioning, sorting by digits, allocating variable-sized outputs, and building sparse structures — all at <code>Θ(n)</code> work and <code>Θ(log n)</code> span.</b></p>
+
+      <div class="formula"><span class="lbl">stream compaction — keep the elements satisfying a predicate, in order</span><span class="eq">input        x    = [ 5, 8, 2, 9, 4, 7, 6, 1 ]         keep if even
+flags        f    = [ 0, 1, 1, 0, 1, 0, 1, 0 ]         parallel map          Θ(n) work, Θ(log n) span
+offsets      s    = exclusive-scan(f)
+                  = [ 0, 0, 1, 2, 2, 3, 3, 4 ]         scan                  Θ(n) work, Θ(log n) span
+scatter      if fᵢ = 1:  out[sᵢ] = xᵢ                   parallel map          out = [8, 2, 4, 6]
+size         s_{n−1} + f_{n−1} = 4                      no two writes collide, so no race</span>
+<span class="lbl">parallel partition and one pass of radix sort</span><span class="eq">SPLIT by a bit (or by "&lt; pivot"):
+   zeros go first, in order:    position = exclusive-scan(1 − b)ᵢ
+   ones go after them, in order: position = (#zeros) + exclusive-scan(b)ᵢ
+   → a STABLE partition in Θ(n) work, Θ(log n) span
+LSD radix sort on k-bit keys = k stable splits                     → Θ(k·n) work, Θ(k·log n) span
+QUICKSORT with a parallel partition: Θ(n log n) expected work, Θ(log² n) expected span</span></div>
+
+      <p>The radix-sort line is why scan matters for sorting on GPUs: <a href="sorting-searching.html#radix-sort">LSD radix sort</a> needs each pass to be a <i>stable</i> distribution by one digit, and a split by scan is stable by construction, because the offsets preserve the input order within each bucket. With <code>r</code>-bit digits instead of single bits, each pass becomes a histogram and a scan over <code>2ʳ</code> buckets per block, which is the structure of the fastest known GPU sorts. The quicksort line is the same partition step with a pivot comparison as the predicate: the recursion depth is <code>Θ(log n)</code> in expectation and each level's partition has span <code>Θ(log n)</code>, so the expected span is <code>Θ(log² n)</code>.</p>
+
+      <p>The pattern generalises well beyond sorting. <b>Segmented scan</b> — a scan that restarts at flagged segment boundaries, itself a scan under a cleverly defined associative operator on (flag, value) pairs — runs many independent scans in one pass, which is how sparse matrix–vector products and per-row operations are parallelised over irregular data. <b>Allocation</b>: when each of <code>n</code> tasks produces a variable number of outputs, a scan of the output counts gives each task its slice of one shared output buffer, with no locking. <b>Linear recurrences</b> <code>yᵢ = aᵢ·y_{i−1} + bᵢ</code> are a scan under the associative composition of affine maps, which is how state-space sequence models evaluate a length-<code>n</code> recurrence in logarithmic span during training.</p>
+
+      <div class="callout"><b>Recognising a scan.</b> If a serial loop carries one accumulator from iteration to iteration, and the update is "combine the accumulator with something from this iteration" under an operation you can show is associative — addition, max, min, matrix product, composition of affine or linear maps, the carry logic of binary addition — the loop is a scan and has logarithmic span. If the update does something non-associative with the accumulator (a data-dependent branch that changes <i>which</i> operation applies, say), it may not be.</div>
+    </section>
+
+    <!-- ═══ 17 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="parallel-merge-sort" data-nav="Parallel merge sort, naively">
+      <h3><span class="idx">17</span> Parallel merge sort: the naive version and its Θ(n) span</h3>
+      <p class="lede"><b>The obvious parallel merge sort spawns the two recursive sorts and merges serially. Its work is the serial <code>Θ(n log n)</code>, but its span is <code>Θ(n)</code>, because the merge at the top is a serial chain of <code>n</code> steps — so its parallelism is only <code>Θ(log n)</code>, and even on a million elements it cannot keep more than a couple of dozen processors busy.</b></p>
+
+      <div class="formula"><span class="lbl">naive parallel merge sort</span><span class="eq">MERGE-SORT′(A, lo, hi)
+  if hi − lo ≤ 1: return
+  mid = ⌊(lo + hi)/2⌋
+  spawn MERGE-SORT′(A, lo, mid)
+  MERGE-SORT′(A, mid, hi)
+  sync
+  MERGE(A, lo, mid, hi)                         ▸ the serial two-finger merge — Θ(n), on the critical path
+
+T₁(n) = 2·T₁(n/2) + Θ(n) = Θ(n log n)
+T∞(n) =   T∞(n/2) + Θ(n) = Θ(n)                ▸ n + n/2 + n/4 + … ≤ 2n
+parallelism  T₁/T∞ = Θ(log n)                   ▸ for n = 10⁶, about 20</span></div>
+
+      <p>The recurrence shows exactly where the span goes: at every level of the recursion, one merge sits on the critical path, and the merges at the top dominate — the root's merge alone is half the span. Parallelising the recursion without parallelising the combine step is the most common way a divide-and-conquer algorithm fails to scale, because the combine step is where the <a href="divide-conquer.html#mergesort">serial merge sort</a> does all of its work. The schedule figure of §07 shows the consequence: select the serial-merge sort and the measured <code>T_p</code> flattens against the span floor after a few processors, while the processors sit idle through the final merge.</p>
+
+      <div class="callout"><b>This is the general lesson of the page.</b> Speedup is limited by span, and span is limited by the <i>least</i> parallel step on the critical path. A divide-and-conquer algorithm has a parallel span only if its divide and combine steps do. For merge sort, the divide step is trivial and the combine step is the whole problem — so the next section parallelises the merge itself.</div>
+    </section>
+
+    <!-- ═══ 18 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="parallel-merge" data-nav="Parallel merge &amp; Θ(log³ n) sort">
+      <h3><span class="idx">18</span> Parallel merge by binary-search splitting, and a Θ(log³ n)-span sort</h3>
+      <p class="lede"><b>To merge two sorted arrays in parallel, take the median <code>x</code> of the longer one, binary-search for where <code>x</code> would go in the shorter one, and place <code>x</code> at the output position that those two indices determine. Everything smaller than <code>x</code> from both arrays belongs to the left of it and everything larger to the right, so the two remaining merges are independent — spawn them. The merge then has <code>Θ(n)</code> work and <code>Θ(log² n)</code> span, and the sort built on it has <code>Θ(n log n)</code> work and <code>Θ(log³ n)</code> span.</b></p>
+
+      <div class="formula"><span class="lbl">the parallel merge</span><span class="eq">P-MERGE(T[p₁..r₁], T[p₂..r₂], A, p₃)            ▸ merge two sorted runs into A starting at p₃
+  n₁ = r₁ − p₁ + 1,  n₂ = r₂ − p₂ + 1
+  if n₁ &lt; n₂:  swap the runs                     ▸ make the first run the longer one
+  if n₁ = 0:   return                            ▸ both empty
+  q₁ = ⌊(p₁ + r₁)/2⌋                              ▸ median of the longer run
+  q₂ = BINARY-SEARCH(T[q₁], T, p₂, r₂)            ▸ first index in run 2 with T[q₁] ≤ T[q₂]
+  q₃ = p₃ + (q₁ − p₁) + (q₂ − p₂)                 ▸ exactly this many elements precede T[q₁]
+  A[q₃] = T[q₁]
+  spawn P-MERGE(T[p₁..q₁−1], T[p₂..q₂−1], A, p₃)
+  P-MERGE(T[q₁+1..r₁], T[q₂..r₂], A, q₃ + 1)
+  sync</span>
+<span class="lbl">why each recursive merge is at most 3n/4, and the span it gives</span><span class="eq">n = n₁ + n₂ with n₁ ≥ n₂, so n₂ ≤ n/2.  Each recursive call gets at most half the longer run
+plus all of the shorter:    ≤ n₁/2 + n₂ = (n₁ + n₂)/2 + n₂/2 ≤ n/2 + n/4 = 3n/4.
+
+span:   PM∞(n) ≤ PM∞(3n/4) + Θ(log n)                        (the binary search)
+             = Θ(log² n)                                     (log n levels, ≤ log n each)
+work:   PM₁(n) = PM₁(αn) + PM₁((1 − α)n) + O(log n),   1/4 ≤ α ≤ 3/4
+             = Θ(n)                                           (substitution: PM₁(n) ≤ c₁n − c₂ log n)</span>
+<span class="lbl">the sort</span><span class="eq">P-MERGE-SORT(A[p..r], B, s)
+  if n = 1: B[s] = A[p]; return
+  allocate T[1..n]                              ▸ assumed O(1); a parallel zeroing costs Θ(log n) span and changes nothing
+  q = ⌊(p + r)/2⌋
+  spawn P-MERGE-SORT(A[p..q],   T, 1)
+  P-MERGE-SORT(A[q+1..r], T, q − p + 2)
+  sync
+  P-MERGE(T[1..q−p+1], T[q−p+2..n], B, s)
+
+T₁(n) = 2·T₁(n/2) + Θ(n)        = Θ(n log n)                  — work-efficient
+T∞(n) =   T∞(n/2) + Θ(log² n)   = Θ(log³ n)                   ▸ Σ over log n levels of Θ(log² n)
+parallelism  Θ(n log n / log³ n) = Θ(n / log² n)              ▸ for n = 10⁶, in the thousands</span></div>
+
+      <p>Both trees in the figures above can show this. In the DAG explorer (§05), set the parallel-merge sort beside the serial-merge sort at the same <code>n</code>: the DAG is wider and its critical path is much shorter, at the price of more strands — the binary searches are extra work, a constant factor at these sizes. In the growth figure (§11), the two sorts' work curves nearly coincide while their span curves separate: one a straight line of slope 1 on the log–log plot, the other bending over. The measured span divided by <code>log³ n</code> is still drifting at <code>n = 4 096</code> because the lower-order <code>log² n</code> terms are the same size as the leading term there; divided by <code>log² n</code> it is still rising. That is what a <code>Θ(log³ n)</code> function with a small leading constant looks like at modest sizes.</p>
+
+      <div class="callout"><b>Assumptions behind the bound.</b> Fork-join model with unit-cost strands; the temporary <code>T</code> allocated in constant time (or initialised in parallel at <code>Θ(log n)</code> span, which is dominated by the merge); comparisons in constant time. The <code>Θ(log³ n)</code> is not the best possible — Cole's pipelined merge sort reaches <code>Θ(log n)</code> span with <code>Θ(n log n)</code> work on a CREW PRAM, and practical parallel sorts (sample sort, parallel radix sort via §16) use a different structure altogether — but it is the natural fork-join version of merge sort, and the analysis technique carries over to any divide-and-conquer algorithm with a splittable combine step.</div>
+    </section>
+
+    <!-- ═══ 19 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="matrix-multiplication" data-nav="Parallel matrix multiplication">
+      <h3><span class="idx">19</span> Parallel matrix multiplication: loops, divide and conquer, Strassen</h3>
+      <p class="lede"><b>Matrix multiplication has so much parallelism that the question is only how to expose it. Parallelising the two outer loops gives <code>Θ(n³)</code> work and <code>Θ(n)</code> span, because each output entry's inner product is still a serial loop. Recursing on quadrants, with the eight sub-products spawned in parallel and summed by a parallel addition, cuts the span to <code>Θ(log² n)</code> at the same work.</b></p>
+
+      <div class="formula"><span class="lbl">parallel loops</span><span class="eq">P-MATRIX-MULTIPLY(A, B, C)            ▸ n × n
+  parallel for i = 1 to n:
+    parallel for j = 1 to n:
+      for k = 1 to n:                  ▸ serial — every iteration writes C[i][j]
+        C[i][j] += A[i][k] · B[k][j]
+
+T₁ = Θ(n³)       T∞ = Θ(log n) + Θ(log n) + Θ(n) = Θ(n)       parallelism Θ(n²)</span>
+<span class="lbl">divide and conquer with a temporary</span><span class="eq">P-MM-RECURSIVE(C, A, B, n)            ▸ writes C = A·B
+  if n = 1:  C₁₁ = A₁₁ · B₁₁;  return
+  allocate T (n × n)                                              ▸ O(1) assumed
+  spawn C₁₁ = A₁₁B₁₁,   C₁₂ = A₁₁B₁₂,   C₂₁ = A₂₁B₁₁,   C₂₂ = A₂₁B₁₂
+  spawn T₁₁ = A₁₂B₂₁,   T₁₂ = A₁₂B₂₂,   T₂₁ = A₂₂B₂₁
+        T₂₂ = A₂₂B₂₂                                               ▸ the eighth runs in the parent
+  sync
+  parallel for i, j:  C[i][j] += T[i][j]                           ▸ Θ(n²) work, Θ(log n) span
+
+T₁(n) = 8·T₁(n/2) + Θ(n²) = Θ(n³)                                  ▸ master theorem, case 1
+T∞(n) =   T∞(n/2) + Θ(log n) = Θ(log² n)                           ▸ all eight products are in parallel
+parallelism  Θ(n³ / log² n)</span>
+<span class="lbl">the variants</span><span class="eq">no temporary: do the 4 C-products, sync, then accumulate the other 4 into C
+    T∞(n) = 2·T∞(n/2) + Θ(1) = Θ(n)          ▸ saves Θ(n²) memory per level; parallelism back to Θ(n²)
+inner product as a parallel REDUCTION instead of a serial loop
+    T∞ = Θ(log n)                              ▸ same work, but Θ(n³) partial sums to combine
+STRASSEN: 7 products of n/2 × n/2 plus Θ(n²) additions, all parallel
+    T₁(n) = 7·T₁(n/2) + Θ(n²) = Θ(n^(log₂ 7)) ≈ Θ(n^2.81)
+    T∞(n) =   T∞(n/2) + Θ(log n) = Θ(log² n)    ▸ parallelism Θ(n^2.81 / log² n)</span></div>
+
+      <p>The variants are a textbook example of the work/span/space trade-off. The temporary matrix buys a span of <code>Θ(log² n)</code> by letting the two halves of each output quadrant be computed at the same time, at the cost of <code>Θ(n²)</code> extra memory at the top level and a parallel addition pass. Dropping it saves the memory but puts the two halves in series, and the span recurrence gains a factor of 2 in front — enough to change <code>Θ(log² n)</code> into <code>Θ(n)</code>. Since <code>n²</code> is already an enormous parallelism for any real matrix, production libraries usually take the memory-light choice, and spend the saved effort on cache blocking instead: a matrix multiplication's real bottleneck is moving data, not a shortage of parallelism. <a href="divide-conquer.html#strassen">Strassen's algorithm</a> parallelises exactly as the eight-product version does, because its seven products are independent and its additions are parallel loops.</p>
+
+      <p>Select the two matrix multiplications in the growth figure of §11. The measured work of both is <code>Θ(n³)</code> — the divide-and-conquer version's extra additions are a lower-order <code>Θ(n²)</code> per level — while the spans separate: the loop version's grows linearly, the recursive version's by only a few steps each time <code>n</code> doubles. The DAG explorer draws the loop version's DAG for small <code>n</code>: <code>n²</code> independent serial chains of length <code>n</code>, fanned out by two levels of loop-splitting.</p>
+
+      <div class="callout"><b>Why the inner loop stays serial in the loop version.</b> Parallelising <code>for k</code> naively is the race of §12: every iteration writes <code>C[i][j]</code>. Making it parallel correctly means turning it into a reduction (the "inner product as a parallel reduction" variant), which is legal but rarely worth it — the outer loops already supply <code>n²</code>-way parallelism, and the reduction adds combining work and destroys the inner loop's sequential memory access.</div>
+    </section>
+
+    <!-- ═══ 20 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="systolic-arrays" data-nav="Systolic arrays">
+      <h3><span class="idx">20</span> Systolic arrays: algorithms built as machines</h3>
+      <p class="lede"><b>A systolic array is a grid of identical, very simple processors, each connected only to its neighbours, through which data is pumped in a fixed rhythm: every step, each cell reads from its neighbours, does one small operation, and passes values on.</b> There is no shared memory, no scheduler and no long wire — the <i>algorithm</i> is the wiring and the timing. The canonical example is matrix multiplication on an <code>n × n</code> grid, which finishes in <code>3n − 2</code> steps; set against this page's work/span accounting it shows exactly what the model leaves out and what a hardware schedule pays for it.</p>
+
+      <div class="formula"><span class="lbl">matrix multiplication, output-stationary — cell (i, j) owns C[i][j]</span><span class="eq">row i of A enters the grid from the left, delayed i steps;   column j of B enters from the top, delayed j steps
+A values move one cell RIGHT per step, B values one cell DOWN per step
+at step t (t = 0, 1, …) cell (i, j) holds  A[i][k] and B[k][j]  with  k = t − i − j,  and if 0 ≤ k &lt; n:   C[i][j] += A[i][k] · B[k][j]
+cell (i, j) is busy for steps i + j … i + j + n − 1;   the last cell, (n − 1, n − 1), finishes at step 3n − 3   ⇒   3n − 2 steps</span>
+<span class="lbl">measured by stepping the schedule  (every C checked against the triple loop)</span><span class="eq">n = 3:   7 steps,   27 MACs,   at most 7 of 9 cells busy in one step
+n = 8:   22 steps,  512 MACs,  at most 48 of 64 busy;   utilisation  n³ / (n² · (3n − 2))  =  0.364   → ⅓ as n grows
+k products streamed back to back:   k·n + 2(n − 1) steps  ⇒  utilisation 0.90 at k = 16, 0.97 at k = 64  (n = 8)</span>
+<span class="lbl">in the work/span language of §05–§07</span><span class="eq">work     T₁ = n³ multiply-adds
+span     T∞ = n        each C[i][j] is a chain of n dependent additions — the loop version of §19
+p = n² cells:   work law  T_p ≥ n;   Brent  T_p ≤ T₁/p + T∞ = 2n;   the systolic schedule  3n − 2
+the extra 2(n − 1) steps are the SKEW: a value needs i + j steps to walk from the edge to cell (i, j)</span></div>
+
+      <p>The comparison with §07 is the point of the example. A greedy scheduler with <code>n²</code> processors and a shared memory could finish in at most <code>2n</code> steps; the systolic array takes <code>3n − 2</code>, within a factor of 1.5, and in exchange it needs no shared memory at all. Every operand is read from memory exactly once — <code>2n²</code> values enter at the edges — and is then reused <code>n</code> times as it marches through the grid, so the machine performs <code>n²</code> multiply-adds per step while fetching only <code>2n</code> values. That ratio of computation to communication, which the PRAM and work/span models treat as free, is what actually limits a dense linear-algebra kernel (§19's closing remark about cache blocking is the same concern in software). Utilisation for a single product tends to <code>⅓</code> because cells idle while the skewed wavefront fills and drains the grid; streaming many products through back to back overlaps one product's drain with the next one's fill and drives utilisation towards 1 — throughput, not latency, is what the design optimises.</p>
+
+      <h4>Other algorithms as machines</h4>
+      <p>The same recipe — a local recurrence, a regular dependence pattern, and a skewed schedule that makes every dependency a one-step move between neighbours — turns many classical loops into arrays. A linear array of <code>n</code> cells computes a matrix–vector product in <code>2n − 1</code> steps, and the same array computes convolutions and FIR filters. Any grid dynamic program whose cell reads only its up, left and up-left neighbours — edit distance, LCS, the alignment scores of <a href="dynamic-programming.html#edit-distance">Dynamic Programming, §15</a> — can be computed by a linear array sweeping anti-diagonal wavefronts, <code>m + n − 1</code> steps for an <code>m × n</code> table, which is how special-purpose sequence-alignment hardware works. <a href="sorting-searching.html#odd-even-transposition">Odd-even transposition sort</a> is a linear systolic array: <code>n</code> cells, each holding one key and compare-exchanging with a neighbour on alternate steps, sorting in <code>n</code> rounds. The design discipline is the opposite of this page's fork-join model — the schedule is fixed at design time rather than discovered at run time by work stealing — and it pays off exactly when the computation is regular enough to fix.</p>
+      <div class="callout"><b>The modern echo.</b> The matrix units at the heart of machine-learning accelerators are systolic arrays of this kind — hundreds of cells on a side, usually <i>weight-stationary</i> (each cell holds one weight and the activations and partial sums flow past) so that a layer's weights are loaded once and reused for a whole stream of inputs; <a href="../../deep-learning/classical-nn/neural-hardware.html#systolic">Neural Network Hardware</a> steps both dataflows cycle by cycle.</div>
+    </section>
+
+    <!-- ═══ 21 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="reduce-map-mapreduce" data-nav="Reduce, map &amp; MapReduce">
+      <h3><span class="idx">21</span> Map, reduce and the MapReduce view</h3>
+      <p class="lede"><b>Two patterns cover a surprising share of parallel programs. A <i>map</i> applies the same function to every element independently — work <code>Θ(n)</code> times the function's work, span <code>Θ(log n)</code> plus the function's span — and is embarrassingly parallel. A <i>reduce</i> combines all elements with an associative operator by a balanced tree — work <code>Θ(n)</code>, span <code>Θ(log n)</code>. MapReduce is the observation that many large-scale data computations are a map, a regrouping by key, and a reduce per key.</b></p>
+
+      <div class="formula"><span class="lbl">reduction, and the condition it needs</span><span class="eq">REDUCE(x, lo, hi, ⊕)
+  if hi − lo = 1: return x[lo]
+  mid = ⌊(lo + hi)/2⌋
+  a = spawn REDUCE(x, lo, mid, ⊕);   b = REDUCE(x, mid, hi, ⊕);   sync
+  return a ⊕ b
+
+T₁(n) = 2T₁(n/2) + Θ(1) = Θ(n)        T∞(n) = T∞(n/2) + Θ(1) = Θ(log n)
+
+REQUIRES  ⊕ ASSOCIATIVE — the tree regroups the terms.  Commutativity is needed only if the
+          runtime may also REORDER them (unordered combining of per-thread partials does).</span>
+<span class="lbl">MapReduce, as three parallel primitives</span><span class="eq">MAP      each input record → zero or more (key, value) pairs         parallel map
+SHUFFLE  group all values with the same key together                  a parallel sort or hash partition
+                                                                      (in memory: a scan-based split, §16)
+REDUCE   for each key, combine its values with an associative ⊕       one reduction per key, all in parallel
+
+word count:   map: document → (word, 1) per word;   reduce: ⊕ = +
+work Θ(total input + shuffle),  span ≈ span(map) + span(shuffle) + max over keys of span(reduce)</span></div>
+
+      <p>Floating-point addition is the reduction that bites in practice. It is not associative: <code>(1 + 10¹⁶) − 10¹⁶</code> is 0 in double precision while <code>1 + (10¹⁶ − 10¹⁶)</code> is 1. A parallel sum therefore generally gives a slightly <i>different</i> answer from the serial loop, and a runtime that combines partial sums in whatever order threads finish gives a different answer <i>from run to run</i>. The tree order is usually <i>more</i> accurate than the serial loop — its rounding error grows like <code>O(log n)</code> rather than <code>O(n)</code> — but reproducibility needs a fixed reduction tree. The vectorised reductions of <a href="../../programming/numpy.html#axis-reductions">NumPy's axis reductions</a> use pairwise summation for exactly this reason.</p>
+
+      <p>MapReduce and its successors are the same algebra at cluster scale, where the model must be extended with the cost the work/span model leaves out: moving data between machines. The shuffle is an all-to-all exchange and usually dominates; a <i>combiner</i> — running the reducer locally on each mapper's output before the shuffle — is only legal because <code>⊕</code> is associative and commutative, and it can shrink the shuffle by orders of magnitude. Dataflow engines generalise the one-shot map-shuffle-reduce into a DAG of such stages kept in memory, which is precisely a computation DAG in the sense of §04 whose vertices are whole partitions of data rather than single instructions.</p>
+
+      <div class="callout"><b>The same reduction at the heart of distributed training.</b> Data-parallel training computes a gradient on each worker's shard and needs their sum on every worker — an <i>all-reduce</i>. A tree all-reduce has <code>Θ(log p)</code> latency; the ring all-reduce used in practice sends each worker's data in <code>p</code> chunks around a ring, reaching bandwidth-optimal <code>2(p − 1)/p</code> times the gradient size per worker, independent of <code>p</code>. <a href="../../deep-learning/distributed-training.html#comm">Distributed Training</a> works through that trade-off, and its <a href="../../deep-learning/distributed-training.html#data">data-parallel section</a> is this page's reduction running across GPUs.</div>
+    </section>
+
+    <!-- ═══ 22 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="parallel-bfs" data-nav="Level-synchronous BFS">
+      <h3><span class="idx">22</span> Parallel BFS, level by level</h3>
+      <p class="lede"><b>Breadth-first search parallelises naturally by levels: all vertices at distance <code>d</code> form the frontier, and expanding the whole frontier at once produces the frontier at distance <code>d + 1</code>. With a parallel loop over the frontier's edges and a scan to compact the next frontier, the work stays <code>O(V + E)</code> and the span is <code>O(D · log V)</code>, where <code>D</code> is the number of levels — the eccentricity of the source.</b></p>
+
+      <div class="formula"><span class="lbl">level-synchronous BFS</span><span class="eq">dist[s] = 0;  F = [s];  d = 0
+while F is not empty:
+    parallel for each u in F, parallel for each edge (u, v):
+        if dist[v] = ∞ and CAS(dist[v], ∞, d + 1):     ▸ exactly one discoverer wins; no duplicates
+            mark v as "in next frontier"
+    F = compact(marked vertices)                       ▸ scan-based compaction, §16
+    d = d + 1
+
+work   O(V + E)          ▸ every vertex enters F once; every edge is examined from each side once
+span   O(D · log V)      ▸ D rounds, each a parallel loop plus a scan, Θ(log V) span per round</span></div>
+
+      <p>The shape of the input decides whether this is fast. On a road network, <code>D</code> is in the thousands and each frontier is small, so there is little parallelism per round and many rounds — BFS on high-diameter graphs parallelises poorly. On a social or web graph, <code>D</code> is typically under 20 and the middle frontiers contain most of the graph, so each round has enormous parallelism. That second case inspired <b>direction-optimising</b> BFS: when the frontier is large, it is cheaper for each <i>unvisited</i> vertex to check whether any neighbour is in the frontier (stopping at the first) than for each frontier vertex to push along every edge. The serial algorithm, its queue invariant and the distance proof are in <a href="../data-structures/graphs.html#bfs">Graph Representations &amp; Traversal</a>; the parallel version keeps the invariant level by level rather than vertex by vertex.</p>
+
+      <div class="callout"><b>The atomic is a correctness device, not a race.</b> Two frontier vertices can discover the same <code>v</code> in the same round. With a plain write, both would add <code>v</code> to the next frontier, and duplicate entries would inflate the work beyond <code>O(V + E)</code>. The compare-and-swap makes exactly one discoverer win. Distances are still deterministic — every writer writes the same <code>d + 1</code> — but the BFS <i>parent</i> of <code>v</code> is whichever discoverer won, and varies from run to run.</div>
+    </section>
+
+    <!-- ═══ 23 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="where-it-shows-up" data-nav="Where it shows up">
+      <h3><span class="idx">23</span> Where it shows up: SIMD, GPUs, ML training, cluster dataflow</h3>
+      <p class="lede"><b>Every modern performance story is a parallel-algorithms story, and each hardware target is a variation on the models above with one cost made explicit: lockstep execution for SIMD and GPUs, communication for clusters.</b></p>
+
+      <table class="cmp">
+        <tr><th>Target</th><th>Model it resembles</th><th>What the page's ideas become</th><th>The cost the model leaves out</th></tr>
+        <tr><td>SIMD vector units (AVX, NEON)</td><td>a tiny lockstep PRAM: 4–16 lanes, one instruction</td><td>a map over contiguous data is free parallelism; reductions and scans are in-register trees; branches become masks</td><td>divergent control flow executes both paths; unaligned or strided loads</td></tr>
+        <tr><td>GPU</td><td>fork-join over thousands of threads grouped into 32-lane lockstep warps</td><td>parallel for = a kernel launch; scan, reduce, compaction, radix sort are the core library primitives (§14–§16); the naive scan runs inside a warp, the work-efficient scan across the block</td><td>memory bandwidth, warp divergence, kernel-launch overhead as a serial fraction</td></tr>
+        <tr><td>Array libraries</td><td>map and reduce as whole-array operations</td><td><a href="../../programming/numpy.html#broadcasting">broadcasting</a> is a parallel map; <a href="../../programming/numpy.html#axis-reductions">axis reductions</a> are reductions; <code>cumsum</code> is a scan</td><td>temporaries between chained operations — the reason for fused kernels</td></tr>
+        <tr><td>Data-parallel ML training</td><td>map (per-shard gradient) then all-reduce</td><td>speedup is Gustafson-shaped: the batch grows with the worker count; the all-reduce is the serial fraction</td><td>communication; <a href="../../deep-learning/distributed-training.html#comm">overlapping it with compute</a> is how scaling is recovered</td></tr>
+        <tr><td>Cluster dataflow engines</td><td>MapReduce generalised to a DAG of stages</td><td>narrow stages (map, filter) pipeline; wide stages (group-by, join) need a shuffle; lineage in the DAG lets lost partitions be recomputed</td><td>network shuffle and stragglers — a slow machine is on the critical path of its stage</td></tr>
+        <tr><td>Multicore CPU</td><td>fork-join with work stealing (§08)</td><td>everything on this page applies directly; grain size and false sharing decide the constants</td><td>cache misses after a steal; memory bandwidth for streaming loops</td></tr>
+      </table>
+
+      <p>Two of these deserve a sentence each. <b>GPUs</b> are the purest test of the work/span idea: a GPU has tens of thousands of lanes, so an algorithm with parallelism below that simply cannot fill the machine, and an algorithm that is not work-efficient wastes it — the reason the work-efficient scan, not the naive one, is the GPU library primitive at block scale. <b>Data-parallel training</b> is Gustafson's law in action: training with more workers usually means a proportionally larger global batch, so each worker's compute stays constant and the question becomes whether the per-step all-reduce — the serial, communication-bound part — stays small relative to it. The page on <a href="../../deep-learning/distributed-training.html#data">distributed training</a> takes that question from here.</p>
+
+      <div class="callout"><b>The stragglers problem, in this page's terms.</b> At the end of a parallel stage the slowest task is on the critical path, so one machine that is 3× slower than the rest makes the whole stage 3× slower whatever <code>p</code> is. That is the span law applied to a DAG whose vertex costs are not uniform, and the standard fix — launch a backup copy of a slow task and take whichever finishes first — spends extra work to shorten the span.</div>
+    </section>
+
+    <!-- ═══ 24 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="pitfalls" data-nav="Pitfalls">
+      <h3><span class="idx">24</span> Pitfalls</h3>
+      <p class="lede"><b>The mistakes below are the ones that make a correct-looking parallel program slow or wrong, grouped by the part of the analysis each one violates.</b></p>
+
+      <table class="cmp">
+        <tr><th>Pitfall</th><th>What goes wrong</th><th>What to do instead</th></tr>
+        <tr><td>Parallelising the recursion, not the combine</td><td>span stays <code>Θ(n)</code>; speedup stalls at <code>Θ(log n)</code> (§17)</td><td>find a parallel combine step — splitting by binary search, a scan, a reduction</td></tr>
+        <tr><td>Grain size too fine</td><td>spawn overhead dominates: millions of tasks each doing a few instructions</td><td>coarsen the base case — stop spawning below a few thousand instructions of work</td></tr>
+        <tr><td>Grain size too coarse</td><td>parallelism below <code>p</code>; the last few big tasks leave processors idle</td><td>aim for parallelism ≥ 10·<code>p</code> (slackness), so the scheduler can balance</td></tr>
+        <tr><td>A shared accumulator</td><td>a determinacy race (wrong answer) or, with a lock/atomic, a <code>Θ(n)</code> serial chain</td><td>a reduction or a reducer — private partials combined at joins</td></tr>
+        <tr><td>Writing in place in a round-based algorithm</td><td>a race between reads and writes of the same round (§14)</td><td>double-buffer, or prove the round's read and write sets are disjoint</td></tr>
+        <tr><td>False sharing</td><td>per-thread counters in one cache line; correct but no speedup</td><td>pad to 64 bytes or accumulate locally and write once</td></tr>
+        <tr><td>Using a work-inefficient algorithm</td><td>slower than serial on small machines (naive scan with <code>p &lt; log n</code>)</td><td>check <code>T₁</code> against the best serial algorithm first</td></tr>
+        <tr><td>Wrong baseline</td><td>speedup measured against the parallel code on one core, which is slower than the best serial code</td><td>report speedup against the best serial implementation</td></tr>
+        <tr><td>"Superlinear speedup"</td><td>usually a cache effect: <code>p</code> caches hold what one could not; or a poor baseline</td><td>measure efficiency at several sizes and say which effect it is</td></tr>
+        <tr><td>Assuming floating-point reductions are exact</td><td>results differ from serial, and from run to run</td><td>fix the reduction tree for reproducibility; compare with a tolerance</td></tr>
+        <tr><td>Forgetting a parallel loop's own span</td><td>claiming <code>Θ(1)</code> span for a loop; nested loops under-counted</td><td><code>Θ(log n)</code> to spawn <code>n</code> iterations, plus the longest iteration (§11)</td></tr>
+        <tr><td>Memory-bandwidth-bound loops</td><td>a map over a large array stops scaling at 4–8 cores whatever its parallelism</td><td>the model has no memory system: measure bytes per operation, block for cache, fuse passes</td></tr>
+      </table>
+    </section>
+
+    <!-- ═══ 25 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="cheatsheet" data-nav="Cheat sheet">
+      <h3><span class="idx">25</span> One-screen cheat sheet</h3>
+
+      <div class="formula"><span class="lbl">the vocabulary</span><span class="eq">WORK T₁           total strands = serial time                    composes by ADDING, always
+SPAN T∞           longest path in the DAG = time on ∞ processors composes by ADDING in series, MAX in parallel
+PARALLELISM       T₁ / T∞                                         the ceiling on speedup
+SPEEDUP           S_p = T₁ / T_p          EFFICIENCY  S_p / p        SLACKNESS  (T₁/T∞)/p ≫ 1 wanted</span>
+<span class="lbl">the laws and the scheduling theorem</span><span class="eq">WORK LAW          T_p ≥ T₁/p
+SPAN LAW          T_p ≥ T∞
+GREEDY / BRENT    T_p ≤ T₁/p + T∞      (≤ 2 × optimal)                  unit strands, ideal shared memory
+WORK STEALING     E[T_p] = T₁/p + O(T∞),  O(p·T∞) steals,  S_p ≤ p·S₁    randomised, fully strict fork-join
+AMDAHL            S_p = 1 / (f + (1 − f)/p) ≤ 1/f                      fixed size, f of the SERIAL time
+GUSTAFSON         S_p = p − f(p − 1)                                    size ∝ p, f of the PARALLEL time</span></div>
+
+      <table class="cmp">
+        <tr><th>Algorithm</th><th>Work</th><th>Span</th><th>Parallelism</th><th>Model / assumption</th><th>§</th></tr>
+        <tr><td>P-FIB</td><td><code>Θ(φⁿ)</code></td><td><code>Θ(n)</code></td><td><code>Θ(φⁿ/n)</code></td><td>fork-join (a teaching example — the work is exponential)</td><td>05, 11</td></tr>
+        <tr><td>parallel for over <code>n</code></td><td><code>Θ(n)</code> + bodies</td><td><code>Θ(log n)</code> + longest body</td><td>—</td><td>fork-join; recursive halving of the range</td><td>11</td></tr>
+        <tr><td>reduction / map</td><td><code>Θ(n)</code></td><td><code>Θ(log n)</code></td><td><code>Θ(n / log n)</code></td><td>associative <code>⊕</code></td><td>21</td></tr>
+        <tr><td>naive scan</td><td><code>Θ(n log n)</code></td><td><code>log₂ n</code> PRAM steps; <code>Θ(log² n)</code> fork-join</td><td>—</td><td>not work-efficient</td><td>14</td></tr>
+        <tr><td>work-efficient scan</td><td><code>Θ(n)</code> — <code>2(n − 1)</code> additions</td><td><code>2 log₂ n</code> PRAM steps; <code>Θ(log n)</code> recursive fork-join</td><td><code>Θ(n / log n)</code></td><td>associative <code>⊕</code>; exclusive form needs an identity</td><td>15</td></tr>
+        <tr><td>compaction / split / partition</td><td><code>Θ(n)</code></td><td><code>Θ(log n)</code></td><td><code>Θ(n / log n)</code></td><td>one scan plus maps</td><td>16</td></tr>
+        <tr><td>merge sort, serial merge</td><td><code>Θ(n log n)</code></td><td><code>Θ(n)</code></td><td><code>Θ(log n)</code></td><td>fork-join</td><td>17</td></tr>
+        <tr><td>parallel merge (binary-search split)</td><td><code>Θ(n)</code></td><td><code>Θ(log² n)</code></td><td><code>Θ(n / log² n)</code></td><td>each recursive merge ≤ 3n/4</td><td>18</td></tr>
+        <tr><td>merge sort, parallel merge</td><td><code>Θ(n log n)</code></td><td><code>Θ(log³ n)</code></td><td><code>Θ(n / log² n)</code></td><td>fork-join; temporaries allocated in <code>O(1)</code></td><td>18</td></tr>
+        <tr><td>matrix multiply, parallel loops</td><td><code>Θ(n³)</code></td><td><code>Θ(n)</code></td><td><code>Θ(n²)</code></td><td>inner product left serial</td><td>19</td></tr>
+        <tr><td>matrix multiply, D&amp;C with temporary</td><td><code>Θ(n³)</code></td><td><code>Θ(log² n)</code></td><td><code>Θ(n³ / log² n)</code></td><td><code>Θ(n²)</code> extra space; without it the span is <code>Θ(n)</code></td><td>19</td></tr>
+        <tr><td>Strassen, parallel</td><td><code>Θ(n^2.81)</code></td><td><code>Θ(log² n)</code></td><td><code>Θ(n^2.81 / log² n)</code></td><td>seven independent products</td><td>19</td></tr>
+        <tr><td>matrix multiply, systolic array</td><td><code>Θ(n³)</code></td><td><code>3n − 2</code> steps</td><td>on <code>n²</code> cells, utilisation → ⅓ per product, → 1 streamed</td><td>neighbour-only links, fixed skewed schedule; each operand fetched once</td><td>20</td></tr>
+        <tr><td>level-synchronous BFS</td><td><code>O(V + E)</code></td><td><code>O(D · log V)</code></td><td>depends on frontier sizes</td><td>CAS on discovery; scan compaction; <code>D</code> = number of levels</td><td>22</td></tr>
+      </table>
+
+      <h4>What this page measured, and the load-time audit that re-checks it</h4>
+      <table class="cmp">
+        <tr><th>Check</th><th>Result</th><th>§</th></tr>
+        <tr><td>Both tracers (DAG-recording and work/span algebra) run every small program on the page at every size the explorer offers; greedy schedules at several <code>p</code> are checked against <code>max(⌈T₁/p⌉, T∞) ≤ T_p ≤ T₁/p + T∞</code></td><td id="audit-cell">(computed at load — see the readout below)</td><td>05, 07</td></tr>
+      </table>
+      <div class="readout" id="audit-readout" aria-live="polite"></div>
+
+      <div class="callout"><b>What was proved, and what was measured.</b> <i>Proved:</i> the work and span laws, Brent's bound for every greedy schedule, the recurrences and their solutions in §11 and §14–§22, the correctness of the up-sweep / down-sweep invariant, the <code>3n/4</code> split of the parallel merge. <i>Quoted, with the model they hold in:</i> the work-stealing bounds (randomised, fully strict computations), the PRAM separations of §02, Cole's <code>Θ(log n)</code>-span sort. <i>Measured, and true only of the runs measured:</i> every work, span, step, addition and interleaving count in the figures — each produced by running the routine, never typed in.</div>
+
+      <div class="callout"><b>Where this goes, upstream and sideways.</b> Within this series: the recurrences solved here use the tools of <a href="analysis.html#recurrences">Algorithm Analysis</a>; the algorithms parallelised here — merge sort, Strassen, the divide-and-conquer template — are from <a href="divide-conquer.html#dc-template">Recursion, Divide &amp; Conquer</a>; radix sort and the serial merge that §17 puts on the critical path are in <a href="sorting-searching.html#merge">Sorting &amp; Searching</a>; serial BFS and its invariant are in <a href="../data-structures/graphs.html#bfs">Graph Representations &amp; Traversal</a>. Outside it: the all-reduce of data-parallel training is at <a href="../../deep-learning/distributed-training.html#data">Distributed Training</a>, and whole-array maps and reductions are at <a href="../../programming/numpy.html#axis-reductions">NumPy</a>.</div>
+    </section>
+
+    <!-- @@SECTIONS-END@@ -->
+
+    <nav class="pager" aria-label="Algorithm Design &amp; Analysis series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="geometry.html">← Computational Geometry</a>
+      <a href="index.html" style="color:var(--muted)">Algorithm Design &amp; Analysis · overview</a>
+      <a href="online-randomized.html">Online &amp; Randomized Algorithms →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dsa-viz.js"></script>
+<script src="parallel.viz.js"></script>
+</body>
+</html>

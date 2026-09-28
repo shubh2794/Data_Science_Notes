@@ -32,6 +32,7 @@
        10 #lcs-svg        LCS table stepped, traceback lit
        11 #ed-svg         edit distance table with weighted operations and the alignment
        12 #hirsch-svg     Hirschberg's split
+       13·#dtw-svg     dynamic time warping: D table, warping path, band (appended at the end, block DW)
        13 #lis-svg        LIS: the Θ(n²) DP and the O(n log n) tails method, stepped
        14 #mc-svg         matrix chain m/s tables and the parenthesization tree
        15 #obst-svg       optimal BST: e/root tables and the tree, vs all trees
@@ -698,10 +699,10 @@ Object.assign(DI, {
   /* the four items of the Greedy page's §10–§11 (W = 50): density greedy 160, optimum 220 {B, C} */
   knapGreedyItems: [{ id: "A", w: 10, v: 60 }, { id: "B", w: 20, v: 100 }, { id: "C", w: 30, v: 120 }, { id: "D", w: 25, v: 90 }],
   knapGreedyW: 50,
-  /* the small instance worked in §10–§11: W = 10; 0/1 optimum 46 {1, 3}, unbounded optimum 48 {1, 4, 4} */
+  /* the small instance worked in §11–§12: W = 10; 0/1 optimum 46 {1, 3}, unbounded optimum 48 {1, 4, 4} */
   knapSmall: [{ id: "1", w: 6, v: 30 }, { id: "2", w: 3, v: 14 }, { id: "3", w: 4, v: 16 }, { id: "4", w: 2, v: 9 }],
   knapSmallW: 10,
-  /* weighted intervals worked in §12 (id, s, f, v) — unsorted on purpose */
+  /* weighted intervals worked in §13 (id, s, f, v) — unsorted on purpose */
   wisIntervals: [[1, 1, 4, 3], [2, 3, 5, 4], [3, 0, 6, 10], [4, 4, 7, 5], [5, 3, 9, 8], [6, 5, 9, 2], [7, 6, 10, 4], [8, 8, 11, 3]].map(p => ({ id: p[0], s: p[1], f: p[2], v: p[3] })),
   lcsX: "ABCBDAB", lcsY: "BDCABA",
   edA: "kitten", edB: "sitting",
@@ -713,7 +714,7 @@ Object.assign(DR, (function () {
   const nop = { add: function () {}, get: function () { return 0; } };
   const INF = Infinity;
 
-  /* ── §17 matrix chain ───────────────────────────────────────────────── */
+  /* ── §19 matrix chain ───────────────────────────────────────────────── */
   /* dims p[0..n]; matrix i is p[i-1] × p[i]. m/s are 1-indexed [1..n][1..n].
      c.add("iter") per inner (i,j,k) iteration; rec after each m[i][j] is fixed. */
   function mcTable(p, c, rec) {
@@ -753,7 +754,7 @@ Object.assign(DR, (function () {
   /* cost of a given parenthesization tree (used to score brute-force enumerations if needed) */
   function mcCostOfTree(t, p) { return t.leaf ? 0 : mcCostOfTree(t.left, p) + mcCostOfTree(t.right, p) + p[t.i - 1] * p[t.k] * p[t.j]; }
 
-  /* ── §18 optimal BST ────────────────────────────────────────────────── */
+  /* ── §20 optimal BST ────────────────────────────────────────────────── */
   /* keys k1..kn with p[1..n], dummies d0..dn with q[0..n]. e[i][j] for 1 ≤ i ≤ n+1, i-1 ≤ j ≤ n.
      c.add("iter") per candidate root examined; rec after each e[i][j] fixed.
      opt.knuth: restrict r to [root[i][j-1], root[i+1][j]]. */
@@ -801,7 +802,7 @@ Object.assign(DR, (function () {
   /* Knuth's root-monotonicity check on a finished table: root[i][j-1] ≤ root[i][j] ≤ root[i+1][j] for all i<j */
   function obstRootMonotone(root, n) { let ok = true, checked = 0; for (let i = 1; i <= n; i++) for (let j = i + 1; j <= n; j++) { checked++; if (!(root[i][j - 1] <= root[i][j] && root[i][j] <= root[i + 1][j])) ok = false; } return { ok, checked }; }
 
-  /* ── §19 interval DP ────────────────────────────────────────────────── */
+  /* ── §21 interval DP ────────────────────────────────────────────────── */
   /* longest palindromic subsequence: L[i][j] over s[i..j], 0-indexed. c.add("cell") per cell fixed. */
   function lpsTable(s, c, rec) {
     c = c || nop; const n = s.length; const L = []; for (let i = 0; i < n; i++) L.push(new Array(n).fill(0));
@@ -838,7 +839,7 @@ Object.assign(DR, (function () {
   /* the "first burst" recurrence — WRONG on purpose, to show why: burst k first, then solve the two sides independently (they are not independent) */
   function burstFirstWrong(v) { const memo = new Map(); function f(arr) { if (!arr.length) return 0; const key = arr.join(","); if (memo.has(key)) return memo.get(key); let best = 0; for (let k = 0; k < arr.length; k++) { const l = k === 0 ? 1 : arr[k - 1], r = k === arr.length - 1 ? 1 : arr[k + 1]; const val = l * arr[k] * r + f(arr.slice(0, k)) + f(arr.slice(k + 1)); if (val > best) best = val; } memo.set(key, best); return best; } return f(v); }
 
-  /* ── §20 tree DP ────────────────────────────────────────────────────── */
+  /* ── §22 tree DP ────────────────────────────────────────────────────── */
   /* tree: {n, parent[], w[], children[][]} rooted at 0. Maximum-weight independent set by (take, skip). c.add("visit") per node. */
   function treeMwis(T, c, rec) {
     c = c || nop; const n = T.n; const take = new Array(n).fill(0), skip = new Array(n).fill(0); const order = [];
@@ -855,7 +856,7 @@ Object.assign(DR, (function () {
   function treeSumDistBrute(T) { const n = T.n, adj = Array.from({ length: n }, () => []); for (let u = 1; u < n; u++) { adj[u].push(T.parent[u]); adj[T.parent[u]].push(u); } return Array.from({ length: n }, (_, s) => { const d = new Array(n).fill(-1); d[s] = 0; const q = [s]; while (q.length) { const u = q.shift(); adj[u].forEach(v => { if (d[v] < 0) { d[v] = d[u] + 1; q.push(v); } }); } return d.reduce((a, b) => a + b, 0); }); }
   function treeFromParents(parent, w) { const n = parent.length; const children = Array.from({ length: n }, () => []); for (let u = 1; u < n; u++) children[parent[u]].push(u); return { n, parent, w, children }; }
 
-  /* ── §21 DAG DP ─────────────────────────────────────────────────────── */
+  /* ── §23 DAG DP ─────────────────────────────────────────────────────── */
   /* G = {n, edges:[{u,v,w}]}. Kahn topological order; then one pass. mode: "short" | "long" | "count". c.add("relax") per edge. */
   function dagTopo(G) { const n = G.n, indeg = new Array(n).fill(0), adj = Array.from({ length: n }, () => []); G.edges.forEach(e => { adj[e.u].push(e); indeg[e.v]++; }); const q = []; for (let i = 0; i < n; i++) if (!indeg[i]) q.push(i); const order = []; while (q.length) { const u = q.shift(); order.push(u); adj[u].forEach(e => { if (--indeg[e.v] === 0) q.push(e.v); }); } return { order, adj, ok: order.length === n }; }
   function dagDP(G, src, mode, c, rec) {
@@ -872,7 +873,7 @@ Object.assign(DR, (function () {
   /* Floyd-Warshall as DP over intermediate vertices ⊆ {0..k} */
   function floydWarshall(G, c) { c = c || nop; const n = G.n; const d = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => i === j ? 0 : INF)); G.edges.forEach(e => { if (e.w < d[e.u][e.v]) d[e.u][e.v] = e.w; }); for (let k = 0; k < n; k++) for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) { c.add("triple"); if (d[i][k] + d[k][j] < d[i][j]) d[i][j] = d[i][k] + d[k][j]; } return d; }
 
-  /* ── §22 Held–Karp ──────────────────────────────────────────────────── */
+  /* ── §24 Held–Karp ──────────────────────────────────────────────────── */
   /* cities 0..n-1, start at 0. C[S][j] with S a bitmask containing bit 0. c.add("triple") per (S, j, i) examined.
      i ranges over S∖{0, j} when |S| ≥ 3; when S = {0, j} the only predecessor is 0. */
   function heldKarp(D, c, rec) {
@@ -894,7 +895,7 @@ Object.assign(DR, (function () {
   function binom(n, k) { let r = 1; for (let i = 1; i <= k; i++) r = r * (n - k + i) / i; return Math.round(r); }
   function factorial(n) { let r = 1; for (let i = 2; i <= n; i++) r *= i; return r; }
 
-  /* ── §23 digit DP ───────────────────────────────────────────────────── */
+  /* ── §25 digit DP ───────────────────────────────────────────────────── */
   /* count integers in [0, N] whose digit sum equals k. State (pos, tight, sum). c.add("state") per distinct memo entry computed, c.add("call") per call. rec per state resolved. */
   function digitSumDP(N, k, c, rec) {
     c = c || nop; const ds = String(N).split("").map(Number); const L = ds.length; const memo = new Map(); const visited = [];
@@ -950,14 +951,14 @@ Object.assign(DI, {
 });
 
 /* ── chunk D routines ── */
-/* ── chunk D routines: checkpointed LCS (§24), the monotone-deque recurrence (§25),
+/* ── chunk D routines: checkpointed LCS (§26), the monotone-deque recurrence (§27),
    value iteration / policy iteration on a gridworld and Viterbi / forward on a
-   trellis (§26) ──────────────────────────────────────────────────────────── */
+   trellis (§28) ──────────────────────────────────────────────────────────── */
 Object.assign(DR, (function () {
   const nop = { add: function () {}, get: function () { return 0; } };
   const INF = Infinity;
 
-  /* ── §24 reconstruction after rolling: checkpointing ────────────────────
+  /* ── §26 reconstruction after rolling: checkpointing ────────────────────
      LCS of X, Y keeping only every r-th row of the table (plus the current pair of
      rows). Forward pass: fill the table two rows at a time, store row i whenever
      i % r === 0. Traceback: for each block of r rows, rebuild the block from its
@@ -992,7 +993,7 @@ Object.assign(DR, (function () {
     return { len, s: out.reverse().join(""), blocks, live, stored: cp.size };
   }
 
-  /* ── §25 the sliding-window recurrence  dp[i] = cost[i] + min over j ∈ [i−k, i) of dp[j],  dp[0] = cost[0]
+  /* ── §27 the sliding-window recurrence  dp[i] = cost[i] + min over j ∈ [i−k, i) of dp[j],  dp[0] = cost[0]
      ("reach position n−1 from 0 in jumps of at most k, paying cost[i] on landing") ── */
   /* naive: examine every j in the window — c.add("cmp") per candidate examined */
   function mqNaive(cost, k, c) {
@@ -1028,7 +1029,7 @@ Object.assign(DR, (function () {
   /* the path from from[] */
   function mqPath(from, n) { const p = []; for (let i = n - 1; i >= 0; i = from[i]) { p.push(i); if (i === 0) break; } return p.reverse(); }
 
-  /* ── §26 value iteration on a gridworld ─────────────────────────────────
+  /* ── §28 value iteration on a gridworld ─────────────────────────────────
      grid: {rows, cols, goal:[r,c], pit:[r,c], walls:[[r,c]…], step (reward per move), goalR, pitR, slip}
      actions 0..3 = up, right, down, left; the intended move happens with prob 1 − 2·slip and
      each perpendicular move with prob slip; moving into a wall or off the grid stays put.
@@ -1084,7 +1085,7 @@ Object.assign(DR, (function () {
     return { V, policy, rounds };
   }
 
-  /* ── §26 Viterbi and the forward algorithm on a trellis ─────────────────
+  /* ── §28 Viterbi and the forward algorithm on a trellis ─────────────────
      hmm = {pi:[S], A:[S][S], B:[S][K]}, obs = [t0, t1, …] symbol indices.
      c.add("mult") per multiplication; c.add("max") per max over predecessors. */
   function viterbi(hmm, obs, c, rec) {
@@ -1137,14 +1138,14 @@ Object.assign(DR, (function () {
            viterbi, forward, hmmBrute, hmmPathProb, hmmBeam };
 })());
 Object.assign(DI, {
-  /* §25: landing costs for the sliding-window recurrence (n = 12) */
+  /* §27: landing costs for the sliding-window recurrence (n = 12) */
   mqCosts: [3, 7, 2, 9, 4, 8, 1, 6, 5, 7, 2, 3],
-  /* §26: the 4 × 4 gridworld — goal top-right, pit just below it, one wall; rewards on entering */
+  /* §28: the 4 × 4 gridworld — goal top-right, pit just below it, one wall; rewards on entering */
   gridworld: { rows: 4, cols: 4, goal: [0, 3], pit: [1, 3], walls: [[1, 1]], step: -0.04, goalR: 1, pitR: -1, slip: 0.1 },
-  /* §26: a three-state HMM over two symbols, and the six observations of the figure */
+  /* §28: a three-state HMM over two symbols, and the six observations of the figure */
   hmm: { names: ["S₁", "S₂", "S₃"], pi: [0.5, 0.3, 0.2], A: [[0.6, 0.3, 0.1], [0.2, 0.5, 0.3], [0.3, 0.2, 0.5]], B: [[0.7, 0.3], [0.4, 0.6], [0.1, 0.9]], syms: ["a", "b"] },
   hmmObs: [0, 1, 1, 0, 1, 1],
-  /* §26: the hand-worked two-state, three-step example */
+  /* §28: the hand-worked two-state, three-step example */
   hmm2: { names: ["A", "B"], pi: [0.6, 0.4], A: [[0.7, 0.3], [0.4, 0.6]], B: [[0.5, 0.5], [0.1, 0.9]], syms: ["u", "v"] },
   hmm2Obs: [0, 1, 1]
 });
@@ -2431,9 +2432,9 @@ const SX = {
       const tb = DR.edTable(a, b, K, c); if (DR.edDijkstra(a, b, K, c) === tb.dist) okD++; if (DR.edAlignCost(DR.edAlign(a, b, tb), K) === tb.dist) okA++;
       const ch = AL.counter(); const h = DR.hirschberg(a, b, K, ch); c.add("cell", ch.get("cell")); if (h.dist === tb.dist) okH++; let bnd = 0; for (let k = 0; ; k++) { const q = Math.ceil(a.length / Math.pow(2, k)); bnd += q; if (q <= 1) break; } if (ch.get("cell") <= bnd * b.length + a.length * b.length) okBnd++;
       if (a.length + b.length <= 8) { const u = DR.edTable(a, b, null, c).dist; if (u <= 3) { nBfs++; if (DR.edBFS(a, b, u).dist === u) okBfs++; } } }
-    /* Hirschberg on the §13 LCS pair: insert/delete 1, substitution 2 makes the distance m + n − 2·LCS and the split the LCS split; the §24 table quotes these two numbers */
+    /* Hirschberg on the §14 LCS pair: insert/delete 1, substitution 2 makes the distance m + n − 2·LCS and the split the LCS split; the §26 table quotes these two numbers */
     const chL = AL.counter(); const hL = DR.hirschberg("ABCBDAB", "BDCABA", { ins: 1, del: 1, sub: 2 }, chL); const hLc = chL.get("cell"); c.add("cell", hLc); const hLb = 6 * (7 + 4 + 2 + 1);
-    out.push(`edit distance, ${T} random pairs over {a, b, c} (lengths ≤ 7, costs 1–3): table = Dijkstra on the edit graph <b>${okD}/${T}</b> ${SX.flag(okD === T)}; alignment re-sums to the distance <b>${okA}/${T}</b> ${SX.flag(okA === T)}; Hirschberg = full table <b>${okH}/${T}</b> ${SX.flag(okH === T)}, cells within the ceiling bound <b>${okBnd}/${T}</b> ${SX.flag(okBnd === T)}; BFS over unit edits on the ${nBfs} tiny cases <b>${okBfs}/${nBfs}</b> ${SX.flag(okBfs === nBfs)}; Hirschberg on the §13 LCS pair ABCBDAB / BDCABA (insert/delete 1, substitution 2, leftmost-minimum split): distance <b>${hL.dist}</b> = 7 + 6 − 2·4 ${SX.flag(hL.dist === 5)}, <b>${hLc}</b> cells against the bound 6·(7 + 4 + 2 + 1) = ${hLb} ${SX.flag(hLc <= hLb)}`); }
+    out.push(`edit distance, ${T} random pairs over {a, b, c} (lengths ≤ 7, costs 1–3): table = Dijkstra on the edit graph <b>${okD}/${T}</b> ${SX.flag(okD === T)}; alignment re-sums to the distance <b>${okA}/${T}</b> ${SX.flag(okA === T)}; Hirschberg = full table <b>${okH}/${T}</b> ${SX.flag(okH === T)}, cells within the ceiling bound <b>${okBnd}/${T}</b> ${SX.flag(okBnd === T)}; BFS over unit edits on the ${nBfs} tiny cases <b>${okBfs}/${nBfs}</b> ${SX.flag(okBfs === nBfs)}; Hirschberg on the §14 LCS pair ABCBDAB / BDCABA (insert/delete 1, substitution 2, leftmost-minimum split): distance <b>${hL.dist}</b> = 7 + 6 − 2·4 ${SX.flag(hL.dist === 5)}, <b>${hLc}</b> cells against the bound 6·(7 + 4 + 2 + 1) = ${hLb} ${SX.flag(hLc <= hLb)}`); }
   /* 8. LIS: quadratic = tails = brute force; both reconstructions are increasing subsequences of full length */
   { const T = 200; let ok = 0, okRec = 0; const r = AL.rng(108);
     for (let t = 0; t < T; t++) { const n = AL.randInt(r, 1, 10); const a = AL.shuffle(Array.from({ length: 20 }, (_, i) => i + 1), r).slice(0, n); const q = DR.lisQuad(a, c), tl = DR.lisTails(a, c), b = DR.lisBrute(a); if (q.len === b.len && tl.len === b.len) ok++;
@@ -2496,4 +2497,158 @@ const SX = {
 })();
 
 /* @@FIGURES-END@@ */
+})();
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   DW — appended with §09 and §17: the binomial row, and dynamic time warping.
+   Same conventions as DR: c.add("add") per addition, c.add("cell") per table
+   cell filled, c.add("path") per warping path enumerated by brute force.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const DW = (function () {
+  const nop = { add: function () {}, get: function () { return 0; } };
+  /* C(n, k) with one row of k + 1 entries, updated RIGHT TO LEFT so that
+     row[j − 1] is still the previous row's value when row[j] reads it. */
+  function binomRow(n, k, c) {
+    c = c || nop;
+    if (k < 0 || k > n) return 0;
+    const row = new Array(k + 1).fill(0); row[0] = 1;
+    for (let i = 1; i <= n; i++)
+      for (let j = Math.min(i, k); j >= 1; j--) { row[j] += row[j - 1]; c.add("add"); }
+    return row[k];
+  }
+  /* D(i, j) = cost(i, j) + min(D(i−1, j), D(i, j−1), D(i−1, j−1)), D(0,0) = 0,
+     D(i,0) = D(0,j) = ∞. r = Sakoe–Chiba radius around the (rescaled)
+     diagonal; r = null for the unconstrained table. */
+  function dtw(x, y, r, c) {
+    c = c || nop;
+    const n = x.length, m = y.length, D = [];
+    for (let i = 0; i <= n; i++) D.push(new Array(m + 1).fill(Infinity));
+    D[0][0] = 0;
+    const slope = (m - 1) / Math.max(1, n - 1);
+    const inBand = (i, j) => r === null || r === undefined || Math.abs((j - 1) - (i - 1) * slope) <= r;
+    for (let i = 1; i <= n; i++) for (let j = 1; j <= m; j++) {
+      if (!inBand(i, j)) continue;
+      c.add("cell");
+      D[i][j] = Math.abs(x[i - 1] - y[j - 1]) + Math.min(D[i - 1][j], D[i][j - 1], D[i - 1][j - 1]);
+    }
+    const path = [];
+    if (D[n][m] < Infinity) {
+      let i = n, j = m; path.push([i, j]);
+      while (i > 1 || j > 1) {
+        let best = null;
+        [[i - 1, j - 1], [i - 1, j], [i, j - 1]].forEach(p => {
+          if (p[0] >= 1 && p[1] >= 1 && (best === null || D[p[0]][p[1]] < D[best[0]][best[1]])) best = p;
+        });
+        i = best[0]; j = best[1]; path.push([i, j]);
+      }
+      path.reverse();
+    }
+    return { D: D, dist: D[n][m], path: path, inBand: inBand };
+  }
+  /* independent: the same recurrence top-down with a memo keyed by (i, j) */
+  function dtwMemo(x, y) {
+    const memo = new Map();
+    function f(i, j) {
+      if (i === 0 && j === 0) return 0;
+      if (i === 0 || j === 0) return Infinity;
+      const k = i * 4096 + j;
+      if (memo.has(k)) return memo.get(k);
+      const v = Math.abs(x[i - 1] - y[j - 1]) + Math.min(f(i - 1, j), f(i, j - 1), f(i - 1, j - 1));
+      memo.set(k, v); return v;
+    }
+    return f(x.length, y.length);
+  }
+  /* brute force: every monotone, continuous path from (1,1) to (n,m) */
+  function dtwBrute(x, y, c) {
+    c = c || nop;
+    const n = x.length, m = y.length; let best = Infinity;
+    (function go(i, j, s) {
+      s += Math.abs(x[i] - y[j]);
+      if (i === n - 1 && j === m - 1) { c.add("path"); if (s < best) best = s; return; }
+      if (i + 1 < n) go(i + 1, j, s);
+      if (j + 1 < m) go(i, j + 1, s);
+      if (i + 1 < n && j + 1 < m) go(i + 1, j + 1, s);
+    })(0, 0, 0);
+    return best;
+  }
+  return { binomRow, dtw, dtwMemo, dtwBrute };
+})();
+if (typeof module !== "undefined" && module.exports) module.exports.DW = DW;
+
+/* ── 13  #dtw-svg  dynamic time warping: the accumulated-cost table, the
+   warping path, and the Sakoe–Chiba band ──────────────────────────────── */
+(function () {
+  if (typeof d3 === "undefined" || typeof AL === "undefined") return;
+  const svg = d3.select("#dtw-svg"); if (svg.empty()) return;
+  const W = 680, H = 360;
+  const flag = ok => ok ? '<span style="color:' + AC.good + '">✓ agree</span>' : '<span style="color:' + AC.bad + '">✗ DISAGREE</span>';
+  const val = (id, d) => { const s = d3.select("#" + id); return s.empty() ? d : s.property("value"); };
+  const bump = (t, c, w) => Math.exp(-((t - c) * (t - c)) / (2 * w * w));
+  const sample = (n, f) => Array.from({ length: n }, (_, i) => Math.round(9 * f(i / (n - 1))));
+  const PAIRS = {
+    delay:  { name: "the same bump, the second one later", x: sample(12, t => bump(t, 0.3, 0.12)), y: sample(12, t => bump(t, 0.62, 0.12)) },
+    slow:   { name: "the same shape, the second one slow then fast", x: sample(12, t => bump(t, 0.3, 0.1) + 0.6 * bump(t, 0.7, 0.08)), y: sample(12, t => bump(t * t, 0.3, 0.1) + 0.6 * bump(t * t, 0.7, 0.08)) },
+    length: { name: "the same shape at two sampling rates (12 and 18)", x: sample(12, t => bump(t, 0.35, 0.12) + 0.5 * bump(t, 0.75, 0.07)), y: sample(18, t => bump(t, 0.35, 0.12) + 0.5 * bump(t, 0.75, 0.07)) },
+    differ: { name: "different shapes: one bump against two", x: sample(12, t => bump(t, 0.5, 0.14)), y: sample(12, t => bump(t, 0.25, 0.08) + bump(t, 0.75, 0.08)) }
+  };
+  function build() {
+    const P = PAIRS[val("dtw-pair", "delay")] || PAIRS.delay, x = P.x, y = P.y, n = x.length, m = y.length;
+    const rv = +val("dtw-r", 12), rMax = 12, r = rv >= rMax ? null : rv;
+    d3.select("#dtw-r-out").text(r === null ? "none (full table)" : "r = " + r);
+    const cF = AL.counter(), full = DW.dtw(x, y, null, cF);
+    const cB = AL.counter(), band = DW.dtw(x, y, r, cB);
+    const shown = band.dist < Infinity ? band : full;
+    const memo = DW.dtwMemo(x, y);
+    const resum = shown.path.reduce((s, p) => s + Math.abs(x[p[0] - 1] - y[p[1] - 1]), 0);
+
+    svg.selectAll("*").remove();
+    /* left: the two sequences and the matching the path induces */
+    const L = svg.append("g").attr("transform", "translate(20,20)"), LW = 280;
+    const sx = i => LW * i / (n - 1), sy = j => LW * j / (m - 1);
+    const vy = d3.scaleLinear().domain([0, 9]).range([90, 10]);
+    const yOff = 150;
+    L.append("text").attr("x", 0).attr("y", 0).attr("font-size", 11).attr("fill", AC.accent).text("x  (" + n + " samples)");
+    L.append("text").attr("x", 0).attr("y", yOff - 4).attr("font-size", 11).attr("fill", AC.a2).text("y  (" + m + " samples)");
+    shown.path.forEach(p => {
+      L.append("line").attr("x1", sx(p[0] - 1)).attr("y1", vy(x[p[0] - 1])).attr("x2", sy(p[1] - 1)).attr("y2", yOff + vy(y[p[1] - 1]))
+        .attr("stroke", AC.muted).attr("stroke-width", 0.8).attr("opacity", 0.7);
+    });
+    const line = (arr, f, off, col) => {
+      L.append("path").datum(arr).attr("fill", "none").attr("stroke", col).attr("stroke-width", 2)
+        .attr("d", d3.line().x((v, i) => f(i)).y(v => off + vy(v)));
+      L.selectAll(null).data(arr).join("circle").attr("cx", (v, i) => f(i)).attr("cy", v => off + vy(v)).attr("r", 2.6).attr("fill", col);
+    };
+    line(x, sx, 0, AC.accent); line(y, sy, yOff, AC.a2);
+    L.append("text").attr("x", 0).attr("y", 262).attr("font-size", 10).attr("fill", AC.muted).text("grey lines: which samples the optimal warping path matches");
+    if (n === m) {
+      const lock = x.reduce((s, v, i) => s + Math.abs(v - y[i]), 0);
+      L.append("text").attr("x", 0).attr("y", 278).attr("font-size", 10).attr("fill", AC.muted).text("lock-step distance Σ|xᵢ − yᵢ| = " + lock + ",  DTW = " + full.dist);
+    }
+
+    /* right: the accumulated-cost table with the band and the path */
+    const cs = Math.min(18, Math.floor(320 / m), Math.floor(290 / n));
+    const R = svg.append("g").attr("transform", `translate(${W - 20 - m * cs},${24})`);
+    const finite = [];
+    for (let i = 1; i <= n; i++) for (let j = 1; j <= m; j++) if (full.D[i][j] < Infinity) finite.push(full.D[i][j]);
+    const col = d3.scaleSequential(d3.interpolateViridis).domain([d3.max(finite), 0]);
+    for (let i = 1; i <= n; i++) for (let j = 1; j <= m; j++) {
+      const inside = band.inBand(i, j);
+      R.append("rect").attr("x", (j - 1) * cs).attr("y", (i - 1) * cs).attr("width", cs - 1).attr("height", cs - 1)
+        .attr("fill", inside ? col(full.D[i][j]) : AC.panel).attr("opacity", inside ? 0.9 : 1)
+        .attr("stroke", inside && r !== null ? AC.ink : "none").attr("stroke-width", 0.3);
+    }
+    R.append("path").datum(shown.path).attr("fill", "none").attr("stroke", AC.rose).attr("stroke-width", 2.4)
+      .attr("d", d3.line().x(p => (p[1] - 0.5) * cs).y(p => (p[0] - 0.5) * cs));
+    R.append("text").attr("x", 0).attr("y", -8).attr("font-size", 10).attr("fill", AC.muted).text("j → (y)   cell = D(i, j); rose = warping path" + (r !== null ? "; dark = outside the band" : ""));
+    R.append("text").attr("x", -6).attr("y", 8).attr("text-anchor", "end").attr("font-size", 10).attr("fill", AC.muted).text("i ↓");
+    R.append("text").attr("x", -6).attr("y", 20).attr("text-anchor", "end").attr("font-size", 10).attr("fill", AC.muted).text("(x)");
+
+    let html = `${P.name} · full table: DTW = <b>${full.dist}</b>, <b>${cF.get("cell")}</b> cells filled (n·m = ${n * m}) ${flag(cF.get("cell") === n * m)} · top-down memoized recursion: ${memo} ${flag(memo === full.dist)}`
+      + ` · the drawn path has ${shown.path.length} cells (between max(n, m) = ${Math.max(n, m)} and n + m − 1 = ${n + m - 1}) and re-sums to ${resum} ${flag(resum === shown.dist)}`;
+    if (r !== null) html += ` · Sakoe–Chiba band r = ${r}: <b>${cB.get("cell")}</b> cells, DTW = <b>${band.dist}</b> — never below the full table's ${flag(band.dist >= full.dist)}${band.dist === full.dist ? " and here equal: the optimal path already lay inside the band" : ", because the optimal path leaves the band"}`;
+    if (n === m) html += ` · lock-step distance ${x.reduce((s, v, i) => s + Math.abs(v - y[i]), 0)} ≥ DTW (the diagonal is one warping path) ${flag(x.reduce((s, v, i) => s + Math.abs(v - y[i]), 0) >= full.dist)}`;
+    d3.select("#dtw-readout").html(html);
+  }
+  ["dtw-pair", "dtw-r"].forEach(id => { const s = d3.select("#" + id); if (!s.empty()) s.on("input", build).on("change", build); });
+  build();
 })();

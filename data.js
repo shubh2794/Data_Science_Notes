@@ -96,7 +96,7 @@ const nodes = [
   {id:"Data Systems", group:"dsys", level:1, desc:"The infrastructure data lives in: relational and NoSQL stores, indexing and transactions, distributed storage and compute, streaming, lakes and warehouses, and the scaling patterns (caching, queues, load balancing, CAP) that hold it together at volume."},
   // DSA — two level-2 series, each a hub with level-3 parts
   {id:"Data Structures", group:"dsa", level:2, link:"dsa/data-structures/index.html", desc:"How data is arranged in memory, and what that arrangement makes cheap. Seven parts: contiguous arrays and strings, linked nodes, hash tables, heaps, search trees, balanced and multiway trees, and graphs — each an abstract data type with a cost contract attached."},
-  {id:"Algorithm Design & Analysis", group:"dsa", level:2, link:"dsa/algorithms/index.html", desc:"How to build a procedure and prove what it costs. Seven parts: asymptotic analysis and recurrences, recursion and divide-and-conquer, sorting and searching, greedy methods, dynamic programming, graph algorithms, and the boundary where efficient algorithms stop existing."},
+  {id:"Algorithm Design & Analysis", group:"dsa", level:2, link:"dsa/algorithms/index.html", desc:"How to build a procedure and prove what it costs. Eleven parts: asymptotic analysis and recurrences, recursion and divide-and-conquer, sorting and searching, greedy methods, dynamic programming, graph algorithms, the boundary where efficient algorithms stop existing, and four selected topics — computational geometry, parallel algorithms, online and randomized algorithms, and number-theoretic algorithms."},
 
   // Data Structures — parts 1-7
   {id:"Arrays & Strings", group:"dsa", level:3, link:"dsa/data-structures/arrays-strings.html", desc:"Contiguous indexed storage: the memory model, index arithmetic, dynamic-array growth and its amortized O(1) append, row-major layout and locality, the two-pointer and sliding-window patterns, prefix sums, and string matching (naive, Rabin-Karp, KMP, Boyer-Moore)."},
@@ -115,6 +115,11 @@ const nodes = [
   {id:"Dynamic Programming", group:"dsa", level:3, link:"dsa/algorithms/dynamic-programming.html", desc:"Reuse instead of recompute: optimal substructure plus overlapping subproblems, memoization vs tabulation, designing the state and the transition, the classic recurrences (LCS, edit distance, knapsack, matrix chain, LIS, coin change), DP over DAGs and trees, and reconstructing the solution from the table."},
   {id:"Shortest Paths, MST & Flow", group:"dsa", level:3, link:"dsa/algorithms/shortest-paths-mst-flow.html", desc:"The weighted-graph algorithms: relaxation and the shortest-path optimality condition, Dijkstra, Bellman-Ford and negative cycles, DAG relaxation, Floyd-Warshall and A*; Kruskal and Prim with union-find; and max-flow/min-cut with Ford-Fulkerson and Edmonds-Karp."},
   {id:"NP-Completeness & Approximation", group:"dsa", level:3, link:"dsa/algorithms/np-completeness.html", desc:"Where efficient algorithms stop: P, NP, NP-hard and NP-complete, polynomial-time reductions and what Cook-Levin established, the classic complete problems, and what to do next — approximation algorithms with proven ratios, randomization, parameterised tractability, and heuristics with no guarantee at all."},
+  // Algorithm Design & Analysis — parts 8-10 (selected topics)
+  {id:"Computational Geometry", group:"dsa", level:3, link:"dsa/algorithms/geometry.html", desc:"Algorithms on points, segments and polygons: the orientation test and why cross products replace angles and slopes, segment intersection, the sweep-line method, convex hulls (Graham scan, Jarvis march, monotone chain) and their Ω(n log n) bound, divide-and-conquer closest pair, point-in-polygon, and range searching with kd-trees and range trees."},
+  {id:"Parallel Algorithms", group:"dsa", level:3, link:"dsa/algorithms/parallel.html", desc:"Pricing an algorithm on many processors: the fork-join model, work and span, parallelism and Brent's bound, Amdahl's and Gustafson's laws, race conditions and determinacy, parallel loops, prefix sums (scan), parallel merge sort and matrix multiplication, and why span, not work, decides the speedup."},
+  {id:"Online & Randomized Algorithms", group:"dsa", level:3, link:"dsa/algorithms/online-randomized.html", desc:"Deciding without seeing the future, and using coin flips on purpose: competitive analysis, ski rental, paging (LRU, FIFO, Belady's offline optimum, the marker algorithm), list update and move-to-front, the hiring and secretary problems, probabilistic analysis with indicator random variables, Las Vegas vs Monte Carlo, and generating randomness itself (LCGs, Fisher-Yates)."},
+  {id:"Number-Theoretic Algorithms", group:"dsa", level:3, link:"dsa/algorithms/number-theory.html", desc:"Arithmetic on integers too large for a machine word: divisibility and Euclid's gcd with its extended form, modular arithmetic and inverses, fast modular exponentiation by repeated squaring, the Chinese remainder theorem, primality testing (Fermat and Miller–Rabin), RSA and why it is correct, and the cost of big-number arithmetic measured in bits."},
   {id:"Relational & SQL", group:"dsys", level:2, desc:"Tables, keys, joins, and the SQL query language over normalized relational schemas."},
   {id:"NoSQL", group:"dsys", level:2, desc:"Non-relational stores — key-value, document, columnar, graph — for scale and flexibility."},
   {id:"Indexing", group:"dsys", level:2, desc:"Data structures (B-trees, hashes) that make lookups fast at some write/space cost."},
@@ -287,7 +292,7 @@ const subtree = {
   "Linear Algebra":["Vectors & Vector Spaces","Matrices & Rank","Systems, Determinants & Inverses","Projections & Least-Squares","Eigendecomposition & SVD","Quadratic Forms, Covariance & PCA"],
   "Classical Vision":["Image Formation","Image Processing","Frequency Domain","Features & Matching","Segmentation","Alignment & Motion","Stereo & Structure from Motion"],
   "Data Structures":["Arrays & Strings","Linked Lists, Stacks & Queues","Hash Tables","Heaps & Priority Queues","Trees & Binary Search Trees","Balanced & Multiway Trees","Graph Representations & Traversal"],
-  "Algorithm Design & Analysis":["Algorithm Analysis","Recursion, Divide & Conquer","Sorting & Searching","Greedy Algorithms","Dynamic Programming","Shortest Paths, MST & Flow","NP-Completeness & Approximation"],
+  "Algorithm Design & Analysis":["Algorithm Analysis","Recursion, Divide & Conquer","Sorting & Searching","Greedy Algorithms","Dynamic Programming","Shortest Paths, MST & Flow","NP-Completeness & Approximation","Computational Geometry","Parallel Algorithms","Online & Randomized Algorithms","Number-Theoretic Algorithms"],
   "Statistics":["Descriptive Statistics","Producing Data & Sampling","Sampling Distributions & CLT","Estimation & Confidence Intervals","Hypothesis Testing","Regression & Correlation","Resampling (Bootstrap & Permutation)","Categorical Data & Chi-Square","ANOVA & Multiple Comparisons"],
 };
 
@@ -427,6 +432,19 @@ const cross = [
   // aman-coverage ties
   ["Hyperparameter Tuning","Model Evaluation"],["Hyperparameter Tuning","Neural Network Training"],["Hyperparameter Tuning","Bias-Variance Tradeoff"],
   ["Residual / Skip Connections","Neural Network Training"],["Residual / Skip Connections","CNNs"],["Residual / Skip Connections","Transformers"],
+  ["Computational Geometry","Recursion, Divide & Conquer"],["Computational Geometry","Sorting & Searching"],
+  ["Computational Geometry","Balanced & Multiway Trees"],["Computational Geometry","Linear Algebra"],
+  ["Parallel Algorithms","Recursion, Divide & Conquer"],["Parallel Algorithms","Algorithm Analysis"],
+  ["Parallel Algorithms","Distributed Training"],["Parallel Algorithms","Apache Spark"],
+  ["Online & Randomized Algorithms","Algorithm Analysis"],["Online & Randomized Algorithms","Probability"],
+  ["Online & Randomized Algorithms","Hash Tables"],["Online & Randomized Algorithms","Linked Lists, Stacks & Queues"],
+  ["Online & Randomized Algorithms","Sorting & Searching"],
+  ["Number-Theoretic Algorithms","Algorithm Analysis"],["Number-Theoretic Algorithms","Online & Randomized Algorithms"],
+  ["Number-Theoretic Algorithms","NP-Completeness & Approximation"],["Number-Theoretic Algorithms","Recursion, Divide & Conquer"],
+  ["Number-Theoretic Algorithms","Hash Tables"],
+  ["Number-Theoretic Algorithms","Arrays & Strings"],
+  ["Online & Randomized Algorithms","Greedy Algorithms"],["Online & Randomized Algorithms","Reinforcement Learning"],
+  ["Online & Randomized Algorithms","A/B Testing"],
   ["Hidden Markov Models & CRFs","Named Entity Recognition"],["Hidden Markov Models & CRFs","Naive Bayes"],
   ["Computer Control","Agents"],["Computer Control","Vision-Language Models"],
   ["A/B Testing","Model Evaluation"],["A/B Testing","Monitoring & Drift"],

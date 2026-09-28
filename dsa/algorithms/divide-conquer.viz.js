@@ -27,7 +27,8 @@
      11 #co-svg      mergesort with an insertion-sort cutoff: measured total work
      12 #nq-svg      n-queens backtracking: nodes explored vs nodes pruned
      13 #en-svg      subsets / permutations enumeration trees, measured sizes
-     14 #rq-svg      randomized quicksort: measured comparisons vs 2(n+1)Hₙ − 4n */
+     14 #rq-svg      randomized quicksort: measured comparisons vs 2(n+1)Hₙ − 4n
+     15 #ab-svg      alpha-beta on a random game tree: leaves/nodes vs plain minimax */
 
 /* ── shared little helpers ─────────────────────────────────────────────── */
 const DC = {
@@ -2086,5 +2087,202 @@ function hanoiRecursive(n) {
     trials = +this.value; d3.select("#rq-trials-out").text(trials); build();
   });
   d3.select("#rq-trials-out").text(trials);
+  build();
+})();
+
+/* ══ FIGURE 15 ═══════════════════════════════════════════════════════════
+   #ab-svg — alpha-beta on a small random game tree, stepped.
+   A seeded random tree (distinct leaf values) is searched twice: once by plain
+   minimax and once by alpha-beta, each wrapped in its own AL.counter(). The
+   stepper replays alpha-beta event by event with the (α, β) window at the
+   current node; subtrees cut off are greyed. The table re-runs alpha-beta under
+   all three child orderings and checks the perfectly-ordered leaf count against
+   b^⌈d/2⌉ + b^⌊d/2⌋ − 1 and every root value against plain minimax. */
+(function () {
+  const svg = d3.select("#ab-svg"); if (svg.empty()) return;
+  const W = 680, H = 340;
+  let shape = "3x3", ordering = "gen", seed = 7, st = null;
+
+  function generate(b, d, sd) {
+    const r = AL.rng(sd);
+    const vals = AL.shuffle(Array.from({ length: 99 }, (_, i) => i + 1), r);
+    let k = 0;
+    return (function mk(dep) {
+      if (dep === d) return { v: vals[k++], kids: [] };
+      const n = { kids: [] };
+      for (let i = 0; i < b; i++) n.kids.push(mk(dep + 1));
+      return n;
+    })(0);
+  }
+  /* plain minimax — the reference, and the node count alpha-beta is judged against */
+  function minimax(n, isMax, c) {
+    if (c) c.add("nodes");
+    if (!n.kids.length) { if (c) c.add("leaves"); return n.v; }
+    const vs = n.kids.map(k => minimax(k, !isMax, c));
+    return isMax ? Math.max(...vs) : Math.min(...vs);
+  }
+  /* reorder children: "best" is an ORACLE ordering (sorted by true minimax value,
+     best for the side to move first); "worst" is its reverse */
+  function reorder(n, isMax, mode) {
+    if (!n.kids.length) return { v: n.v, kids: [] };
+    const ks = n.kids.map(k => reorder(k, !isMax, mode));
+    if (mode !== "gen") {
+      const val = ks.map(k => minimax(k, !isMax, null));
+      const idx = ks.map((_, i) => i).sort((a, b) => {
+        const good = isMax ? val[b] - val[a] : val[a] - val[b];
+        return mode === "best" ? good : -good;
+      });
+      return { kids: idx.map(i => ks[i]) };
+    }
+    return { kids: ks };
+  }
+  /* alpha-beta, instrumented; optional frame recording for the stepper */
+  function alphabeta(root, c, rec) {
+    const all = [];
+    (function number(n, dep, parent) {
+      n.id = all.length; n.dep = dep; n.parent = parent; all.push(n);
+      n.kids.forEach(k => number(k, dep + 1, n));
+    })(root, 0, null);
+    const val = new Array(all.length).fill(null);
+    const stat = new Array(all.length).fill(0);       // 0 unseen, 1 open, 2 done, 3 pruned
+    const snap = (cur, a, b, kind, note) => {
+      if (rec) rec.push({ cur: cur, a: a, b: b, kind: kind, note: note, val: val.slice(),
+                          stat: stat.slice(), leaves: c.get("leaves"), nodes: c.get("nodes") });
+    };
+    const fmtB = x => x === Infinity ? "+∞" : (x === -Infinity ? "−∞" : String(x));
+    const prune = n => { stat[n.id] = 3; n.kids.forEach(prune); };
+    function go(n, a, b, isMax) {
+      c.add("nodes"); stat[n.id] = 1;
+      if (!n.kids.length) {
+        c.add("leaves"); val[n.id] = n.v; stat[n.id] = 2;
+        snap(n.id, a, b, "leaf", "evaluate leaf → " + n.v);
+        return n.v;
+      }
+      let v = isMax ? -Infinity : Infinity;
+      snap(n.id, a, b, "enter", "enter " + (isMax ? "MAX" : "MIN") + " node with window ("
+           + fmtB(a) + ", " + fmtB(b) + ")");
+      for (let i = 0; i < n.kids.length; i++) {
+        const w = go(n.kids[i], a, b, !isMax);
+        if (isMax) { v = Math.max(v, w); a = Math.max(a, v); }
+        else       { v = Math.min(v, w); b = Math.min(b, v); }
+        val[n.id] = v;
+        if (a >= b && i < n.kids.length - 1) {
+          c.add("cutoffs");
+          for (let j = i + 1; j < n.kids.length; j++) prune(n.kids[j]);
+          snap(n.id, a, b, "cutoff", (isMax ? "β-cutoff" : "α-cutoff") + ": α = " + fmtB(a)
+               + " ≥ β = " + fmtB(b) + " — the remaining " + (n.kids.length - 1 - i)
+               + " child subtree(s) cannot change the root, prune them");
+          break;
+        }
+      }
+      stat[n.id] = 2;
+      snap(n.id, a, b, "return", (isMax ? "MAX" : "MIN") + " node returns " + v
+           + (n.parent ? "" : " — the root's minimax value"));
+      return v;
+    }
+    const v = go(root, -Infinity, Infinity, true);
+    return { v: v, all: all };
+  }
+  const shapes = { "2x3": [2, 3], "3x2": [3, 2], "3x3": [3, 3], "2x5": [2, 5], "4x3": [4, 3], "3x4": [3, 4] };
+
+  function build() {
+    const [b, d] = shapes[shape];
+    const base = generate(b, d, seed);
+    const cm = AL.counter();
+    const trueV = minimax(base, true, cm);
+    const tree = reorder(base, true, ordering);
+    const c = AL.counter(), frames = [];
+    const res = alphabeta(tree, c, frames);
+
+    if (st) st.pause();
+    DC.clearControls(svg.node());
+    st = AL.stepper(svg, { frames: frames, delay: 420, label: "event",
+                           render: (f, i) => draw(f, i, frames.length, res, b, d, cm, c) });
+
+    const km = Math.pow(b, Math.ceil(d / 2)) + Math.pow(b, Math.floor(d / 2)) - 1;
+    const rows = [["plain minimax", "—", "<b>" + DC.int(cm.get("leaves")) + "</b>",
+                   "<b>" + DC.int(cm.get("nodes")) + "</b>", String(trueV),
+                   "bᵈ = " + b + "^" + d + " = " + DC.int(Math.pow(b, d)) + " "
+                   + DC.flag(cm.get("leaves") === Math.pow(b, d))]];
+    [["gen", "as generated"], ["best", "best-first (oracle)"], ["worst", "worst-first"]].forEach(([m, lab]) => {
+      const cc = AL.counter();
+      const r = alphabeta(reorder(base, true, m), cc, null);
+      const L = cc.get("leaves");
+      let chk;
+      if (m === "best") chk = "b^⌈d/2⌉ + b^⌊d/2⌋ − 1 = " + DC.int(km) + " " + DC.flag(L === km);
+      else chk = "between " + DC.int(km) + " and " + DC.int(Math.pow(b, d)) + " "
+                 + DC.flag(L >= km && L <= Math.pow(b, d));
+      rows.push(["alpha-beta, " + lab, DC.int(cc.get("cutoffs")), "<b>" + DC.int(L) + "</b>",
+                 "<b>" + DC.int(cc.get("nodes")) + "</b>",
+                 r.v + " " + DC.flag(r.v === trueV), chk]);
+    });
+    DC.table("#ab-table", ["Search", "Cutoffs", "Leaves evaluated", "Nodes visited",
+                           "Root value", "Closed-form check"], rows.map(r => r.map(String)));
+  }
+
+  function draw(f, idx, nf, res, b, d, cm, c) {
+    const fr = AL.frame(svg, W, H, { l: 44, r: 14, t: 20, b: 40 });
+    const g = fr.g;
+    const h = d3.hierarchy(res.all[0], n => n.kids);
+    d3.tree().size([fr.iw, fr.ih - 20]).separation(() => 1)(h);
+    const nodes = h.descendants(), nLeaves = Math.pow(b, d);
+    const r = nLeaves > 40 ? 4 : (nLeaves > 20 ? 7 : 10);
+    const colOf = n => {
+      const s = f.stat[n.data.id];
+      if (s === 3) return AC.line;
+      if (n.data.id === f.cur) return f.kind === "cutoff" ? AC.bad : AC.a2;
+      if (s === 2) return n.data.dep % 2 === 0 ? AC.accent : AC.violet;
+      if (s === 1) return AC.panel2;
+      return AC.panel;
+    };
+    for (let k = 0; k <= d; k++) {
+      const y = k * (fr.ih - 20) / d;
+      g.append("text").attr("x", -8).attr("y", y + 4).attr("text-anchor", "end").attr("font-size", 10)
+        .attr("fill", AC.muted).text(k === d ? "leaf" : (k % 2 === 0 ? "MAX" : "MIN"));
+    }
+    g.selectAll("line.e").data(h.links()).join("line").attr("class", "e")
+      .attr("x1", l => l.source.x).attr("y1", l => l.source.y)
+      .attr("x2", l => l.target.x).attr("y2", l => l.target.y)
+      .attr("stroke", l => f.stat[l.target.data.id] === 3 ? AC.line : AC.muted)
+      .attr("stroke-dasharray", l => f.stat[l.target.data.id] === 3 ? "3 3" : null)
+      .attr("stroke-width", 1.2);
+    const nd = g.selectAll("g.n").data(nodes).join("g").attr("class", "n")
+      .attr("transform", n => "translate(" + n.x + "," + n.y + ")");
+    nd.each(function (n) {
+      const sel = d3.select(this), isMax = n.data.dep % 2 === 0 && n.data.kids.length;
+      const fill = colOf(n), dim = f.stat[n.data.id] === 3;
+      if (isMax) sel.append("rect").attr("x", -r).attr("y", -r).attr("width", 2 * r).attr("height", 2 * r)
+        .attr("rx", 2).attr("fill", fill).attr("stroke", n.data.id === f.cur ? AC.ink : AC.line);
+      else sel.append("circle").attr("r", r).attr("fill", fill)
+        .attr("stroke", n.data.id === f.cur ? AC.ink : AC.line).attr("opacity", dim ? 0.55 : 1);
+      const v = n.data.kids.length ? f.val[n.data.id] : n.data.v;
+      const show = n.data.kids.length ? (v !== null && !dim) : (nLeaves <= 27 || f.stat[n.data.id] === 2);
+      if (show && nLeaves <= 40) sel.append("text").attr("y", n.data.kids.length ? -r - 4 : r + 12)
+        .attr("text-anchor", "middle").attr("font-size", 10)
+        .attr("fill", dim ? AC.line : (f.stat[n.data.id] === 2 ? AC.ink : AC.muted)).text(v);
+    });
+    const cur = nodes.find(n => n.data.id === f.cur);
+    const fmtB = x => x === Infinity ? "+∞" : (x === -Infinity ? "−∞" : String(x));
+    if (cur && cur.data.kids.length) {
+      const right = cur.x < fr.iw - 90;
+      g.append("text").attr("x", cur.x + (right ? r + 6 : -r - 6)).attr("y", cur.y + 4)
+        .attr("text-anchor", right ? "start" : "end").attr("font-size", 11).attr("fill", AC.a2)
+        .text("(α, β) = (" + fmtB(f.a) + ", " + fmtB(f.b) + ")");
+    }
+    g.append("text").attr("x", 0).attr("y", fr.ih + 14).attr("font-size", 11.5).attr("fill", AC.ink)
+      .text(f.note);
+    g.append("text").attr("x", 0).attr("y", fr.ih + 30).attr("font-size", 11).attr("fill", AC.muted)
+      .text("so far: " + f.leaves + " leaves evaluated, " + f.nodes + " nodes visited · plain minimax: "
+            + cm.get("leaves") + " leaves, " + cm.get("nodes") + " nodes");
+    d3.select("#ab-readout").html(
+      "b = <b>" + b + "</b>, depth <b>" + d + "</b> &nbsp;·&nbsp; event <b>" + (idx + 1) + "</b> / " + nf
+      + " &nbsp;·&nbsp; alpha-beta, whole search: <b>" + c.get("leaves") + "</b> leaves / <b>"
+      + c.get("nodes") + "</b> nodes, against minimax's <b>" + cm.get("leaves") + "</b> / <b>"
+      + cm.get("nodes") + "</b> &nbsp;·&nbsp; root value <b>" + res.v + "</b>");
+  }
+
+  d3.select("#ab-shape").on("change", function () { shape = this.value; build(); });
+  d3.select("#ab-order").on("change", function () { ordering = this.value; build(); });
+  d3.select("#ab-new").on("click", function () { seed += 1; build(); });
   build();
 })();
