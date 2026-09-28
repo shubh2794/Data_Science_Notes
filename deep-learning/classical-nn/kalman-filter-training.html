@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Kalman Filter Training</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .controls output{font-family:"SF Mono",Menlo,monospace;font-size:12px;color:var(--ink);min-width:40px;display:inline-block}
+  .controls .chk{display:flex;align-items:center;gap:5px}
+  table.cmp td b{color:var(--ink)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="index.html">Classical Neural Networks</a> · part 7 of 10</p>
+      <h1>Kalman Filter Training</h1>
+      <p>Backpropagation tells you which way is downhill; it does not tell you how far, and it forgets everything about the curvature it has seen as soon as the step is taken. Kalman filter training fixes both at once by a change of viewpoint: treat the network's <b>weights as the hidden state of a dynamical system</b> that barely moves, treat every training target as a <b>noisy measurement</b> of that state through the network, and run a filter. The extended Kalman filter (EKF) then does, for each sample, what a Bayesian would do — it updates a Gaussian belief about the weights, with a mean (the weights you use) and a covariance matrix <b>P</b> that accumulates second-order information from every gradient it has seen. The result is a recursive Gauss–Newton method with an automatic, per-direction learning rate, which trained small feedforward and recurrent networks in tens of epochs where backpropagation needed thousands. The price is written in P's size: M² numbers for M weights. This page derives the filter, the network form (global and decoupled EKF), its reading as online Gauss–Newton, natural gradient and recursive least squares, the recurrent-network version, the unscented alternative, and the practical knobs — and says plainly where it still belongs.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Classical Neural Networks</span>
+        <span class="pill">Kalman filter</span>
+        <span class="pill">Weights as state</span>
+        <span class="pill">Extended Kalman filter</span>
+        <span class="pill">GEKF · DEKF · NDEKF</span>
+        <span class="pill">Process noise Q</span>
+        <span class="pill">Gauss–Newton · natural gradient · RLS</span>
+        <span class="pill">Recurrent nets + BPTT(h)</span>
+        <span class="pill">Unscented KF</span>
+        <span class="pill">6 visualizations</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="idea" data-nav="The idea">
+      <h3><span class="idx">01</span> The idea: training as state estimation</h3>
+      <p class="lede"><b>Minimizing a sum of squared errors over a stream of samples is the same problem as estimating a constant vector from a stream of noisy nonlinear measurements of it.</b> The second problem has had an optimal recursive solution since 1960 (the Kalman filter) and a practical nonlinear one since the late 1960s (the extended Kalman filter). Singhal &amp; Wu (1989) applied it to multilayer perceptrons.</p>
+
+      <p>Stochastic gradient descent processes one sample, takes a step of fixed size along the gradient, and moves on. Nothing it learns about the <i>shape</i> of the error surface survives the step. A Kalman filter keeps, alongside its estimate, a covariance matrix P that says how uncertain each direction of the estimate still is. A new sample that is informative about a direction the filter is already sure of barely moves it; one that probes a direction still uncertain moves it a lot. For a network, the "directions" are combinations of weights, the "informativeness" of a sample in a direction is the network's output Jacobian, and the resulting update is a second-order step — it rescales and rotates the gradient using everything seen so far — computed without ever forming a Hessian.</p>
+
+      <div class="formula"><span class="lbl">the translation table</span><span class="eq">state xₖ             ↔  weight vector wₖ  (M numbers)</span>
+<span class="eq">state dynamics       ↔  wₖ₊₁ = wₖ + ωₖ</span> <span class="eq">the weights "should" be constant; ω is artificial process noise</span>
+<span class="eq">measurement zₖ       ↔  training target yₖ  = h(wₖ, uₖ) + νₖ</span> <span class="eq">h is the network, uₖ the input</span>
+<span class="eq">estimate x̂ₖ          ↔  the weights you actually use</span>
+<span class="eq">error covariance Pₖ  ↔  M × M matrix of weight uncertainty = accumulated curvature (§06)</span>
+<span class="eq">Kalman gain Kₖ       ↔  a per-sample, per-direction learning rate matrix</span></div>
+
+      <ul class="notes">
+        <li><b>Where it came from.</b> Kalman (1960) for linear-Gaussian systems; the EKF from the Apollo-era navigation work of the 1960s; parameter estimation with the EKF is classical system identification. Singhal &amp; Wu (1989) reported MLPs trained with a global EKF in orders of magnitude fewer epochs than backprop; Puskorius &amp; Feldkamp (1991) introduced the decoupled variants that made it affordable, and through the 1990s applied them to recurrent networks for automotive engine control and diagnosis.</li>
+        <li><b>Why it is in a "classical" series.</b> The M² covariance puts it out of reach for networks with millions of weights, so it did not survive the scale-up of deep learning as a general optimizer. Its ideas did: curvature-preconditioned steps (Gauss–Newton, natural gradient, K-FAC), block-diagonal curvature approximations, and online Bayesian learning all have EKF training as an ancestor or a special case.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="kf-recap" data-nav="Kalman filter recap">
+      <h3><span class="idx">02</span> Kalman filter recap: predict, update, gain</h3>
+      <p class="lede"><b>For a linear system with Gaussian noise, the Kalman filter computes the exact posterior mean and covariance of the state, recursively, in two steps per measurement</b>: predict (push the belief through the dynamics, which adds uncertainty) and update (fold in the measurement, which removes it).</p>
+
+      <div class="formula"><span class="lbl">model</span><span class="eq">xₖ₊₁ = F xₖ + ωₖ,   ωₖ ~ N(0, Q)          zₖ = H xₖ + νₖ,   νₖ ~ N(0, R)</span>
+<span class="lbl">predict</span><span class="eq">x̂⁻ = F x̂          P⁻ = F P Fᵀ + Q</span>
+<span class="lbl">update</span><span class="eq">innovation        ξ = z − H x̂⁻</span>
+<span class="eq">innovation cov.   S = H P⁻ Hᵀ + R</span>
+<span class="eq">gain              K = P⁻ Hᵀ S⁻¹</span>
+<span class="eq">state             x̂ = x̂⁻ + K ξ</span>
+<span class="eq">covariance        P = (I − K H) P⁻</span> <span class="eq">(Joseph form (I−KH)P⁻(I−KH)ᵀ + KRKᵀ is the numerically safer equivalent)</span>
+<span class="lbl">scalar reading: F = H = 1</span><span class="eq">K = P⁻ / (P⁻ + R)   ∈ (0, 1)   — trust in the measurement relative to the prediction</span>
+<span class="eq">x̂ = (1 − K) x̂⁻ + K z</span> <span class="eq">— an exponential moving average whose weight is chosen optimally, step by step</span>
+<span class="lbl">steady state of the scalar random walk</span><span class="eq">solve  P⁻ = P⁻R/(P⁻ + R) + Q :</span>
+<span class="eq">P⁻∞ = (Q + √(Q² + 4QR)) / 2          K∞ = P⁻∞ / (P⁻∞ + R)          depends only on Q/R</span>
+<span class="lbl">worked: Q = 1, R = 4</span><span class="eq">P⁻∞ = (1 + √17)/2 = 2.562      K∞ = 2.562/6.562 = 0.390      posterior P∞ = K∞·R = 1.562</span></div>
+
+      <div class="viz" id="viz-kf1d">
+        <div class="vhead"><span class="vtitle">1-D Kalman tracking of a random walk</span><span class="vhint">the true process and sensor noise generate the data; the filter's Q and R are its assumptions</span></div>
+        <div class="controls">
+          <label>true motion noise (log₁₀ var) <input type="range" id="kf-tq" min="-3" max="0" step="0.1" value="-1.5" /><output id="kf-tq-o">-1.5</output></label>
+          <label>true sensor noise (log₁₀ var) <input type="range" id="kf-tr" min="-2" max="1" step="0.1" value="0" /><output id="kf-tr-o">0</output></label>
+          <label>filter Q (log₁₀) <input type="range" id="kf-q" min="-4" max="1" step="0.1" value="-1.5" /><output id="kf-q-o">-1.5</output></label>
+          <label>filter R (log₁₀) <input type="range" id="kf-r" min="-3" max="2" step="0.1" value="0" /><output id="kf-r-o">0</output></label>
+          <button class="btn ghost" id="kf-new" type="button">new data</button>
+          <button class="btn ghost" id="kf-match" type="button">set Q, R to the truth</button>
+        </div>
+        <svg id="kf-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Top: 200 time steps of a hidden random walk (white), noisy measurements (grey dots), the Kalman estimate (blue) and its plus-or-minus two standard deviation band. Bottom: the Kalman gain at each step, converging to its steady-state value, which is marked with a dashed line."></svg>
+        <div class="readout" id="kf-readout" aria-live="polite"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Q/R is the only thing that matters in steady state.</b> Large Q/R: "the state moves a lot, trust the sensor" — K near 1, the estimate chases the noise. Small Q/R: "the state is nearly constant, average many readings" — K small, the estimate is smooth but lags a moving truth. Setting the filter's Q and R to the true values minimizes the estimation error; try detuning either one and watch the RMSE rise.</li>
+        <li><b>The gain starts large and settles.</b> With an uncertain initial P, the first measurements are trusted almost fully; the gain then decays to K∞. That transient is exactly the automatic learning-rate schedule that EKF training inherits (§06). With Q = 0 there is no floor at all: K → 0 like 1/k and the filter becomes a running mean — which is correct for a truly constant state and fatal for a drifting one (§09).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="weights-as-state" data-nav="Weights as state">
+      <h3><span class="idx">03</span> Weights as state: the linear case is recursive least squares</h3>
+      <p class="lede"><b>Put the weights in the state, make the dynamics the identity, and make the network the measurement function.</b> When the network is linear in its weights, the Kalman filter is exact, and it is precisely recursive least squares (RLS).</p>
+
+      <div class="formula"><span class="lbl">state-space model of training</span><span class="eq">wₖ₊₁ = wₖ + ωₖ,        ωₖ ~ N(0, Qₖ)          (process equation — F = I)</span>
+<span class="eq">yₖ   = h(wₖ, uₖ) + νₖ,  νₖ ~ N(0, Rₖ)          (measurement equation — the network)</span>
+<span class="lbl">linear-in-weights model</span><span class="eq">h = Hₖ w,  Hₖ = the regressor row (e.g. uₖᵀ):</span>
+<span class="eq">Kₖ = Pₖ Hₖᵀ (Hₖ Pₖ Hₖᵀ + Rₖ)⁻¹</span>
+<span class="eq">ŵₖ₊₁ = ŵₖ + Kₖ (yₖ − Hₖ ŵₖ)</span>
+<span class="eq">Pₖ₊₁ = Pₖ − Kₖ Hₖ Pₖ + Qₖ</span>
+<span class="lbl">with no process noise this is exactly RLS</span><span class="eq">Q = 0,  R = r·I,  P₀ = p₀·I  ⇒  after k samples:</span>
+<span class="eq">ŵₖ = argmin_w  ( ‖w − ŵ₀‖² / p₀  +  (1/r) ∑ⱼ₌₀ᵏ⁻¹ ‖yⱼ − Hⱼ w‖² )</span> <span class="eq">— ridge regression, solved recursively</span>
+<span class="eq">Pₖ = ( I/p₀ + (1/r) ∑ⱼ Hⱼᵀ Hⱼ )⁻¹        — the inverse regularized Gram matrix</span></div>
+
+      <ul class="notes">
+        <li><b>The prior is the regularizer.</b> P₀ = p₀·I says "before any data, each weight is within about √p₀ of its initial value". That is a Gaussian prior, and it enters the cost as weight decay with strength 1/p₀. A large P₀ (100–1000 is typical) is a weak prior: the first samples move the weights almost as far as least squares would.</li>
+        <li><b>Only the ratio of R to P matters for the weights.</b> Scale R, P₀ and Q all by the same μ &gt; 0 and the gain K = PHᵀ(HPHᵀ + R)⁻¹ is unchanged, so the weight trajectory is identical. EKF training therefore has only two effective knobs: the ratio of R to P₀ (a learning rate) and Q relative to both (§09).</li>
+        <li><b>The ADALINE contrast.</b> The LMS rule of <a href="perceptrons.html">part 1</a> solves the same linear problem with Δw = η ξ uₖ: a fixed scalar gain in place of the matrix Kₖ. RLS converges in roughly M samples regardless of how correlated the inputs are; LMS converges at a rate set by the input covariance's condition number. EKF training is the attempt to get RLS behaviour for a nonlinear network.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ekf" data-nav="EKF linearization">
+      <h3><span class="idx">04</span> The extended Kalman filter: linearize through the network Jacobian</h3>
+      <p class="lede"><b>A network is not linear in its weights, so the EKF linearizes it around the current estimate</b>: the measurement matrix Hₖ becomes the Jacobian of the network's outputs with respect to all its weights, computed by backpropagation.</p>
+
+      <div class="formula"><span class="lbl">first-order expansion about the current weights</span><span class="eq">h(w, uₖ) ≈ h(ŵₖ, uₖ) + Hₖ (w − ŵₖ),        Hₖ = ∂h/∂w |_(ŵₖ, uₖ)      size Nₒ × M</span>
+<span class="lbl">how Hₖ is computed</span><span class="eq">one backward pass per network OUTPUT, each seeded with a 1 at that output (not with the error)</span>
+<span class="eq">row o of Hₖ = ∂ŷₒ/∂w   — the ordinary backprop gradient of ŷₒ, before multiplying by the error</span>
+<span class="lbl">per-node structure (feedforward net)</span><span class="eq">the block of Hₖ for node i's incoming weights is an outer product:   (cᵢ)(uᵢ)ᵀ</span>
+<span class="eq">uᵢ = the node's input vector,   cᵢ = ∂ŷ/∂(node i's net input)   (an Nₒ-vector)</span>
+<span class="lbl">convention note</span><span class="eq">much of the EKF-training literature writes Hₖ as the M × Nₒ transpose of this;</span> <span class="eq">the equations below use Nₒ × M, the usual Jacobian</span></div>
+
+      <ul class="notes">
+        <li><b>The Jacobian, not the gradient.</b> Backprop for SGD seeds the backward pass with the error and collapses all outputs into one gradient vector. The EKF needs each output's sensitivity separately, because the filter weighs output errors against each other through R and through the covariance of the innovations. For a single-output network the two coincide up to the scalar error: gradient of ½ξ² = −ξ·Hₖᵀ.</li>
+        <li><b>What linearization costs.</b> The EKF's covariance is propagated through the tangent plane only. Where the network is strongly curved over the region of weight space that P still allows, the filter's belief is miscalibrated — typically overconfident. This is the gap the unscented filter of §11 targets.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="gekf" data-nav="Global EKF (GEKF)">
+      <h3><span class="idx">05</span> The global EKF training algorithm</h3>
+      <p class="lede"><b>GEKF keeps one full M × M covariance over all weights</b> and, for each training sample, does one forward pass, Nₒ backward passes, and one Kalman update. The Kalman "predict" step is trivial because F = I: it only adds Q.</p>
+
+      <div class="formula"><span class="lbl">one GEKF step per training sample</span><span class="eq">1. forward:    ŷₖ = h(ŵₖ, uₖ),    ξₖ = yₖ − ŷₖ</span>
+<span class="eq">2. backward:   Hₖ = ∂ŷ/∂w (Nₒ × M), one pass per output</span>
+<span class="eq">3. scaling:    Aₖ = (Rₖ + Hₖ Pₖ Hₖᵀ)⁻¹              Nₒ × Nₒ — a scalar for one output</span>
+<span class="eq">4. gain:       Kₖ = Pₖ Hₖᵀ Aₖ                         M × Nₒ</span>
+<span class="eq">5. weights:    ŵₖ₊₁ = ŵₖ + Kₖ ξₖ</span>
+<span class="eq">6. covariance: Pₖ₊₁ = Pₖ − Kₖ Hₖ Pₖ + Qₖ</span>
+<span class="lbl">cost per sample</span><span class="eq">time O(Nₒ M²) for steps 3–6 (plus Nₒ backward passes)      memory O(M²) for P</span>
+<span class="lbl">worked: one tanh neuron</span><span class="eq">ŷ = tanh(w u),   w = 0.5,  u = 2,  target 0.9,  P = 100,  R = 1</span>
+<span class="eq">ŷ = tanh(1) = 0.7616      ξ = 0.1384      H = u(1 − ŷ²) = 0.8399</span>
+<span class="eq">A = 1/(1 + 0.8399²·100) = 0.01398      K = 100·0.8399·0.01398 = 1.174</span>
+<span class="eq">Δw = K ξ = 0.1625  →  w = 0.6625,  new output tanh(1.325) = 0.868          P: 100 → 1.398</span>
+<span class="eq">compare: Gauss–Newton step ξ/H = 0.1648;</span> <span class="eq">SGD with η = 0.1: η ξ H = 0.0116  — fourteen times smaller</span></div>
+
+      <p>The worked step shows the character of the method. With a vague prior (P = 100) the EKF takes almost the full Gauss–Newton step to fit the new sample — Δw = (ξ/H)·H²P/(R + H²P), i.e. the Newton step shrunk by the factor 0.986 — and in the same update it slashes its uncertainty in that direction from 100 to 1.4, so the <i>next</i> sample that pulls this weight will move it far less. SGD knows none of this: its step is proportional to the gradient's size, which is small exactly where the neuron saturates.</p>
+
+      <div class="viz" id="viz-ekfsgd">
+        <div class="vhead"><span class="vtitle">EKF versus SGD training a 1-hidden-layer tanh network on toy regression</span><span class="vhint">one sample per update, shuffled each epoch · same initial weights for every method</span></div>
+        <div class="controls">
+          <label>hidden units <input type="range" id="es-h" min="2" max="12" step="1" value="6" /><output id="es-h-o">6</output></label>
+          <label>SGD rate <span class="keep">η</span> <input type="range" id="es-lr" min="0.005" max="0.2" step="0.005" value="0.05" /><output id="es-lr-o">0.05</output></label>
+          <label>EKF rate (R = 1/<span class="keep">η</span>) <input type="range" id="es-eta" min="0.05" max="2" step="0.05" value="0.5" /><output id="es-eta-o">0.5</output></label>
+          <label>initial q (log₁₀) <input type="range" id="es-q" min="-6" max="-1" step="0.5" value="-2" /><output id="es-q-o">-2</output></label>
+          <button class="btn" id="es-run" type="button">train 60 epochs</button>
+          <button class="btn ghost" id="es-reset" type="button">reset</button>
+        </div>
+        <div class="controls">
+          <span class="chk"><input type="checkbox" id="es-m-sgd" checked /><label for="es-m-sgd">SGD</label></span>
+          <span class="chk"><input type="checkbox" id="es-m-global" checked /><label for="es-m-global">GEKF</label></span>
+          <span class="chk"><input type="checkbox" id="es-m-node" checked /><label for="es-m-node">NDEKF (node-decoupled)</label></span>
+          <span class="chk"><input type="checkbox" id="es-m-full" checked /><label for="es-m-full">fully decoupled</label></span>
+        </div>
+        <svg id="es-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Left: mean squared error on the training set against epoch on a log scale for SGD, global EKF, node-decoupled EKF and fully decoupled EKF, with the noise floor as a dashed line. Right: the training data and the current fit of each method."></svg>
+        <div class="readout" id="es-readout" aria-live="polite"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>What to look for.</b> GEKF reaches the noise floor (dashed; the targets carry noise of variance 0.0025) within a handful of epochs; SGD, at the same one-sample-per-step budget, is still several times above it after 60 epochs and visibly noisy. The decoupled variants fall in between, ordered by how much of P they keep — which is exactly the trade §08 makes. The measured time per epoch in the readout shows the other side of the ledger.</li>
+        <li><b>Per-sample updates.</b> Everything here is fully online: one sample, one update, which is why the EKF lives naturally in adaptive and streaming settings. The q annealing (×0.9 per epoch down to 10⁻⁶) follows common practice (§09).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="cost" data-nav="The cost it minimizes">
+      <h3><span class="idx">06</span> The quadratic cost in the weights</h3>
+      <p class="lede"><b>The EKF is the exact minimizer of a growing quadratic cost</b> — a prior term plus a sum of squared errors, each error linearized at the weights in use when its sample arrived. P⁻¹ is the Hessian of that cost.</p>
+
+      <div class="formula"><span class="lbl">cost after k samples, no process noise</span><span class="eq">Jₖ(w) = ½ (w − ŵ₀)ᵀ P₀⁻¹ (w − ŵ₀)  +  ½ ∑ⱼ₌₀ᵏ⁻¹ (yⱼ − ŷⱼ − Hⱼ(w − ŵⱼ))ᵀ Rⱼ⁻¹ (…)</span>
+<span class="eq">ŵₖ = argmin Jₖ        Pₖ = (∇² Jₖ)⁻¹</span>
+<span class="lbl">information form — curvature accumulates additively</span><span class="eq">Pₖ₊₁⁻¹ = Pₖ⁻¹ + Hₖᵀ Rₖ⁻¹ Hₖ</span>
+<span class="eq">= P₀⁻¹ + ∑ⱼ Hⱼᵀ Rⱼ⁻¹ Hⱼ        — prior + outer-product (Gauss–Newton) Hessian of the SSE</span>
+<span class="lbl">the weight update rewritten with the NEW covariance</span><span class="eq">ŵₖ₊₁ = ŵₖ + Pₖ₊₁ Hₖᵀ Rₖ⁻¹ ξₖ</span> <span class="eq">— a gradient step preconditioned by the inverse accumulated curvature</span>
+<span class="lbl">with process noise</span><span class="eq">Pₖ₊₁ = (Pₖ⁻¹ + HₖᵀRₖ⁻¹Hₖ)⁻¹ + Q</span> <span class="eq">— adding Q to P "forgets" curvature, i.e. downweights old samples</span></div>
+
+      <div class="viz" id="viz-ellipse">
+        <div class="vhead"><span class="vtitle">The covariance ellipse shrinking over updates</span><span class="vhint">a 2-weight model · contours = total squared error over the dataset · ellipses = 2-standard-deviation contour of P</span></div>
+        <div class="controls">
+          <label>model <select id="el-model"><option value="lin">linear neuron  ŷ = w₁u + w₂</option><option value="tanh">tanh neuron  ŷ = tanh(w₁u + w₂)</option></select></label>
+          <label>P₀ (log₁₀) <input type="range" id="el-p0" min="-0.5" max="2" step="0.1" value="0.5" /><output id="el-p0-o">0.5</output></label>
+          <label>q (log₁₀) <input type="range" id="el-q" min="-6" max="-1" step="0.5" value="-6" /><output id="el-q-o">-6</output></label>
+          <button class="btn" id="el-step" type="button">1 sample</button>
+          <button class="btn ghost" id="el-step10" type="button">10 samples</button>
+          <button class="btn ghost" id="el-reset" type="button">reset</button>
+        </div>
+        <svg id="el-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left: loss contours in the plane of two weights, the true weights as a cross, the EKF weight path, and the two-sigma ellipses of the covariance matrix after each update, fading with age; the newest ellipse is highlighted. Right: the square roots of the two eigenvalues of P against the number of samples on a log scale, with a one over square root of k reference."></svg>
+        <div class="readout" id="el-readout" aria-live="polite"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Each sample shrinks P in one direction only.</b> With one output, HₖᵀRₖ⁻¹Hₖ is rank one: a sample tells you about the weight combination along Hₖ and nothing about the orthogonal ones. Step through a few samples: each ellipse is squeezed along the current sample's Jacobian direction. Inputs u with a non-zero mean make w₁ and w₂ correlated — the ellipses tilt — and the EKF moves along the valley instead of across it, which is exactly what plain SGD fails to do.</li>
+        <li><b>1/√k.</b> With Q = 0 the ellipse axes shrink roughly like 1/√k — the familiar standard-error scaling — so the effective learning rate decays like 1/k: a stochastic-approximation schedule chosen automatically. Raise q and the ellipses stop shrinking at a floor where the information gained per sample balances the uncertainty injected.</li>
+        <li><b>The tanh case.</b> The contours are no longer ellipses and the Jacobian changes with w. The filter's P is only a local (Laplace-like) approximation, and early large steps can overshoot — the motivation both for a moderate P₀ and for the iterated and unscented variants.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="relations" data-nav="Gauss–Newton, NG, RLS">
+      <h3><span class="idx">07</span> What the EKF is: online Gauss–Newton, natural gradient, RLS</h3>
+      <p class="lede"><b>Three different communities arrived at the same recursion.</b> Read through the information form, the EKF is an incremental Gauss–Newton method; for probabilistic outputs it is online natural gradient; for linear models it is recursive least squares.</p>
+
+      <table class="cmp">
+        <tr><th>View</th><th>Correspondence</th><th>Reference point</th></tr>
+        <tr><td><b>Recursive least squares</b></td><td>Linear h, Q = 0: the EKF is RLS exactly. Q = (λ⁻¹ − 1)·(P after the update) reproduces RLS with forgetting factor λ.</td><td>§03; standard adaptive-filtering theory</td></tr>
+        <tr><td><b>Gauss–Newton</b></td><td>P⁻¹ accumulates ∑HᵀR⁻¹H, the Gauss–Newton approximation of the SSE Hessian; the update is a GN step on the accumulated linearized cost. Re-linearizing and iterating the update at a fixed sample (the iterated EKF) is exactly Gauss–Newton on that sample's cost plus the prior.</td><td>Bell &amp; Cathey (1993); Bertsekas (1996), incremental Gauss–Newton</td></tr>
+        <tr><td><b>Levenberg–Marquardt</b></td><td>The prior term P₀⁻¹ plays the damping role λI: early on the step is damped towards a gradient step, later it is dominated by curvature.</td><td>—</td></tr>
+        <tr><td><b>Natural gradient</b></td><td>For static parameters and an output noise model matching the network's predictive distribution, the EKF is exactly online natural-gradient descent with step 1/t, the Fisher matrix accumulated from Jacobian outer products.</td><td>Ollivier (2018)</td></tr>
+        <tr><td><b>Bayesian online learning</b></td><td>The EKF is assumed-density filtering with a Gaussian posterior over weights, using a linearized likelihood; P is a running Laplace-style posterior covariance.</td><td>—</td></tr>
+        <tr><td><b>Modern curvature methods</b></td><td>K-FAC and Shampoo approximate the same Fisher/GN matrix by Kronecker-factored blocks per layer — the same instinct as the decoupled EKF (§08) but with factored rather than full blocks. Adam's diagonal second-moment scaling is a very distant cousin of the fully decoupled EKF.</td><td>Martens &amp; Grosse (2015)</td></tr>
+      </table>
+
+      <ul class="notes">
+        <li><b>Why the EKF is not "just Gauss–Newton".</b> Batch Gauss–Newton and Levenberg–Marquardt recompute curvature over the whole dataset at every iterate; the EKF accumulates curvature evaluated at <i>different</i> weights as training moves, discounting old information through Q. It is cheaper per sample, fully online, and — as its authors emphasised — its sequential, noisy updates help it escape the poor local optima batch second-order methods get stuck in.</li>
+        <li><b>Only squared error, natively.</b> Everything here assumes a Gaussian measurement model, i.e. a sum-of-squares loss. Cross-entropy and other losses can be accommodated (by transforming them into an equivalent squared-error form, or via the exponential-family natural-gradient view), but not as simply as swapping a loss function in an SGD loop.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="decoupled" data-nav="Decoupled EKF">
+      <h3><span class="idx">08</span> Decoupled EKF: DEKF, node-decoupled, fully decoupled</h3>
+      <p class="lede"><b>Throw away the covariance between chosen groups of weights</b>, so P becomes block-diagonal, and run one small filter per group that shares a single global scaling matrix. Node decoupling — one group per neuron's incoming weights — is the classic compromise.</p>
+
+      <div class="formula"><span class="lbl">DEKF with disjoint weight groups</span><span class="eq">g groups;  Hₖⁱ = the columns of Hₖ for group i</span>
+<span class="eq">Aₖ   = ( Rₖ + ∑ⱼ₌₁ᵍ Hₖʲ Pₖʲ (Hₖʲ)ᵀ )⁻¹        ONE global Nₒ × Nₒ matrix, shared by all groups</span>
+<span class="eq">Kₖⁱ  = Pₖⁱ (Hₖⁱ)ᵀ Aₖ</span>
+<span class="eq">ŵₖ₊₁ⁱ = ŵₖⁱ + Kₖⁱ ξₖ</span>
+<span class="eq">Pₖ₊₁ⁱ = Pₖⁱ − Kₖⁱ Hₖⁱ Pₖⁱ + Qₖⁱ</span>
+<span class="lbl">limits</span><span class="eq">g = 1  → GEKF exactly</span> <span class="eq">g = M  → fully decoupled: diagonal P, a per-weight adaptive learning rate</span>
+<span class="lbl">cost</span><span class="eq">Mᵢ = number of weights in group i</span>
+<span class="eq">time O(Nₒ² M + Nₒ ∑ᵢ Mᵢ²)          memory O(∑ᵢ Mᵢ²)</span>
+<span class="lbl">worked: a 10-20-20-1 network with biases</span><span class="eq">M = 20·11 + 20·21 + 1·21 = 661</span>
+<span class="eq">GEKF stores 661² = 436,921 entries</span>
+<span class="eq">NDEKF stores 20·11² + 20·21² + 21² = 11,681 entries  — 37× less</span></div>
+
+      <div class="viz" id="viz-decouple">
+        <div class="vhead"><span class="vtitle">Which parts of P each variant keeps</span><span class="vhint">a 4-H-H-2 network with biases, weights ordered node by node</span></div>
+        <div class="controls">
+          <label>decoupling <select id="dc-mode"><option value="global">global (GEKF)</option><option value="layer">layer-decoupled</option><option value="node" selected>node-decoupled (NDEKF)</option><option value="full">fully decoupled</option></select></label>
+          <label>hidden width H <input type="range" id="dc-h" min="2" max="12" step="1" value="5" /><output id="dc-h-o">5</output></label>
+        </div>
+        <svg id="dc-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Left: the M by M covariance matrix drawn as a square, with the blocks kept by the chosen decoupling scheme shaded and coloured by layer. Right: bars comparing stored entries and per-sample operations for global, layer, node and fully decoupled EKF on a logarithmic scale."></svg>
+        <div class="readout" id="dc-readout" aria-live="polite"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Why nodes are the natural groups.</b> The Jacobian block for a node is the outer product cᵢuᵢᵀ (§04), so NDEKF's per-node quantities reduce to vector operations, and weights feeding the same neuron are the ones most strongly coupled in the curvature (they share the same backpropagated signal). In practice NDEKF typically loses little accuracy against GEKF while costing a fraction of it — what the training comparison above shows.</li>
+        <li><b>Fully decoupled keeps only part of the benefit.</b> A diagonal P is a per-weight step size that decays as that weight gathers evidence — roughly an AdaGrad-like scaling with a Kalman flavour. Useful, but it has discarded the cross-weight curvature that was the point.</li>
+        <li><b>The shared A is what keeps decoupling consistent.</b> Every group's gain is normalized by the same total predicted output variance ∑ HʲPʲHʲᵀ + R, so the groups jointly explain the innovation instead of each trying to fix the whole error alone.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="process-noise" data-nav="Process noise Q">
+      <h3><span class="idx">09</span> Process noise Q: learning-rate floor, annealing and tracking</h3>
+      <p class="lede"><b>Q is artificial — the ideal weights do not really wander — but it is the most important knob.</b> It stops P from collapsing, which keeps the gain (the learning rate) from decaying to zero, lets the filter track targets that change, and injects exploration that helps escape poor local minima.</p>
+
+      <div class="formula"><span class="lbl">typical settings (inputs and outputs scaled to unit variance)</span><span class="eq">P₀ = ε⁻¹ I with ε ≈ 0.01 (sigmoidal nodes) … 0.001 (linear nodes)    → P₀ diagonal 100 … 1000</span>
+<span class="eq">R = η⁻¹ I with η ∈ [0.001, 1]       smaller η for noisier targets</span>
+<span class="eq">Q = q I, q annealed from ≈ 0.01–0.1 down to ≈ 10⁻⁶ during training — never exactly 0</span>
+<span class="lbl">what Q does to the steady-state gain (scalar intuition from §02)</span><span class="eq">Q = 0:  P ∝ 1/k,  K → 0            Q &gt; 0:  P → P∞ &gt; 0,  K → K∞ ≈ √(Q/R) for small Q/R</span>
+<span class="lbl">RLS forgetting factor as process noise</span><span class="eq">Pₖ₊₁ = λ⁻¹ (Pₖ − KₖHₖPₖ)        ⇔        Q = (λ⁻¹ − 1)(Pₖ − KₖHₖPₖ),</span> <span class="eq">effective memory ≈ 1/(1 − λ) samples</span></div>
+
+      <div class="viz" id="viz-qtrack">
+        <div class="vhead"><span class="vtitle">Tracking a target that changes: q = 0 versus q &gt; 0</span><span class="vhint">a 2-weight linear neuron; the true weights jump at sample 200 and then drift</span></div>
+        <div class="controls">
+          <label>q (log₁₀) <input type="range" id="qt-q" min="-6" max="-0.5" step="0.1" value="-2.5" /><output id="qt-q-o">-2.5</output></label>
+          <label>measurement noise std <input type="range" id="qt-n" min="0.05" max="1" step="0.05" value="0.3" /><output id="qt-n-o">0.3</output></label>
+          <button class="btn ghost" id="qt-new" type="button">new data</button>
+        </div>
+        <svg id="qt-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Top: the first true weight over 500 samples (white), its estimate by an EKF with q equal to zero (red) and by an EKF with the chosen q (green). Bottom: the trace of P for both filters on a log scale, showing the q equal to zero filter's covariance collapsing while the other levels off."></svg>
+        <div class="readout" id="qt-readout" aria-live="polite"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>The q = 0 filter learns and then stops.</b> Its covariance falls like 1/k; by the time the target jumps, P is tiny, the gain is tiny, and the filter is confidently wrong — it treats the new data as noise. With q &gt; 0 the covariance levels off and the gain stays large enough to re-converge. Too much q and the estimate becomes noisy in the stationary phase: the same bias/variance dial as the forgetting factor of RLS or the Q/R ratio of §02.</li>
+        <li><b>Annealing q in offline training</b> is a learning-rate schedule: start with enough process noise that early, badly linearized updates do not freeze P prematurely, then shrink it so the final weights settle. Keeping a small non-zero floor also guards against P losing positive definiteness through round-off.</li>
+        <li><b>Q and exploration.</b> Injecting q into P is not the same as adding noise to the weights, but it has a similar effect on the search: directions that had been "settled" become movable again, so the next samples can pull the weights out of a shallow basin.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="recurrent" data-nav="Recurrent networks">
+      <h3><span class="idx">10</span> Training recurrent networks: EKF with truncated BPTT derivatives</h3>
+      <p class="lede"><b>For a recurrent network the measurement function depends on the whole input history through the hidden state</b>, so Hₖ must be a <i>dynamic</i> derivative: computed by truncated backpropagation through time or by real-time recurrent learning. The Kalman equations themselves do not change.</p>
+
+      <div class="formula"><span class="lbl">recurrent measurement model</span><span class="eq">ŷₖ = h(ŵₖ, uₖ, vₖ₋₁),      vₖ = recurrent node activations — which themselves depend on w</span>
+<span class="lbl">dynamic derivative by truncated BPTT: a sum of per-step outer products</span><span class="eq">Hₖⁱ = ∑ⱼ₌₁ʰ cᵢ⁽ʲ⁾ (uᵢ⁽ʲ⁾)ᵀ</span> <span class="eq">node i's input at step k−j+1 times the output sensitivity to its net input there</span>
+<span class="lbl">alternatives</span><span class="eq">RTRL: carry ∂v/∂w forward exactly — O(n⁴) per step for n recurrent units, no truncation</span>
+<span class="eq">BPTT(h): O(h·M) per output per step — the practical choice, truncation depth h ≈ 10–40 steps</span>
+<span class="lbl">multistream EKF — several sequence positions in ONE update</span><span class="eq">stack errors and Jacobians of Nₛ streams:</span> <span class="eq">ξ ∈ ℝ^(Nₒ Nₛ),  H ∈ ℝ^(Nₒ Nₛ × M),  A is (NₒNₛ) × (NₒNₛ)</span></div>
+
+      <ul class="notes">
+        <li><b>Why the EKF was prized for RNNs.</b> In the 1990s, gradient descent on recurrent nets was notoriously slow and unstable (the vanishing/exploding gradient problem of <a href="../rnns-lstms.html">RNNs &amp; LSTMs</a>). Second-order, per-sample EKF updates trained small recurrent controllers and models that plain BPTT struggled with — Puskorius &amp; Feldkamp (1994) used node-decoupled EKF with BPTT(h) derivatives for engine idle-speed control, and Williams (1992) had formulated EKF training for fully recurrent nets.</li>
+        <li><b>The recency effect, and multistreaming.</b> A sequential filter drifts towards whatever region of the data it saw last — for time series that must be presented in order, the net may simply retune an output bias for each new regime. Multistream training runs Nₛ copies of the network on Nₛ different positions in the data (or different sequences) and performs one coordinated update from all of them, which is the Kalman-consistent version of a mini-batch.</li>
+        <li><b>Estimating states and weights together.</b> The same machinery can estimate the network's hidden activations as well: the joint EKF augments the state with the weights; the dual EKF runs two coupled filters, one for states and one for weights. This is the route to learning models of noisy dynamical systems, and to part 8's system identification.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ukf" data-nav="Unscented KF">
+      <h3><span class="idx">11</span> The unscented Kalman filter alternative</h3>
+      <p class="lede"><b>Instead of linearizing the network, push a small deterministic set of weight vectors — sigma points — through it and measure the spread of the outputs.</b> No Jacobians are needed, and the mean and covariance are captured correctly to second order, where the EKF is only first-order.</p>
+
+      <div class="formula"><span class="lbl">unscented transform</span><span class="eq">x ~ N(m, P),  dimension L</span>
+<span class="eq">sigma points:   X₀ = m,     Xᵢ = m ± (√((L + λ) P))ᵢ,</span> <span class="eq">i = 1…L    (2L + 1 points; √ = Cholesky column)</span>
+<span class="eq">weights:        W₀ = λ/(L + λ),     Wᵢ = 1/(2(L + λ))            λ = α²(L + κ) − L</span>
+<span class="eq">propagate:      Yᵢ = f(Xᵢ)      ȳ = ∑ Wᵢ Yᵢ</span> <span class="eq">Pᵧ = ∑ Wᵢ (Yᵢ − ȳ)(Yᵢ − ȳ)ᵀ   (+ (1 − α² + β) on the i = 0 term)</span>
+<span class="lbl">for parameter estimation</span><span class="eq">sigma points are 2M + 1 whole weight vectors</span> <span class="eq">→ 2M + 1 forward passes per sample, no backward pass</span>
+<span class="eq">cross-covariance Pwy replaces PHᵀ;   K = Pwy (Pyy + R)⁻¹</span>
+<span class="lbl">worked: a unit Gaussian centred at 1, through tanh</span><span class="eq">true (quadrature)   mean 0.550   std 0.497</span>
+<span class="eq">linearized (EKF)    mean 0.762   std 0.420</span>
+<span class="eq">unscented, κ = 2    mean 0.569   std 0.540</span></div>
+
+      <div class="viz" id="viz-ut">
+        <div class="vhead"><span class="vtitle">Propagating a Gaussian through a nonlinearity: linearization versus sigma points</span><span class="vhint">the true output density is from numerical quadrature</span></div>
+        <div class="controls">
+          <label>nonlinearity <select id="ut-f"><option value="tanh">tanh</option><option value="sin">sin</option><option value="sq">x² / 2</option></select></label>
+          <label>input mean <input type="range" id="ut-m" min="-2" max="2" step="0.05" value="1" /><output id="ut-m-o">1</output></label>
+          <label>input std <input type="range" id="ut-s" min="0.05" max="2" step="0.05" value="1" /><output id="ut-s-o">1</output></label>
+          <label><span class="keep">κ</span> <input type="range" id="ut-k" min="0" max="5" step="0.5" value="2" /><output id="ut-k-o">2</output></label>
+        </div>
+        <svg id="ut-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="The nonlinear function drawn in the centre panel with the input Gaussian density below its horizontal axis and the three sigma points marked. Its tangent line at the input mean is shown. The right panel shows the true output density along the vertical axis together with the Gaussian implied by linearization and the Gaussian implied by the unscented transform, with their means marked."></svg>
+        <div class="readout" id="ut-readout" aria-live="polite"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Where each method fails.</b> Put the mean on the flat part of tanh with a wide spread: the tangent is almost horizontal, so the linearized variance collapses towards zero while the true output is spread across ±1. Try x²/2 at mean 0: the EKF predicts a point mass at 0 (zero slope, zero variance) and a mean of 0; the true mean is σ²/2, which the unscented transform gets exactly.</li>
+        <li><b>For network training the gain is smaller than the demo suggests.</b> In parameter estimation the dynamics are the identity, so the only nonlinearity is the network itself, and as P shrinks the region the sigma points probe becomes nearly linear. The UKF's lasting advantages there are (1) no derivatives, so non-differentiable architectures or losses are fine; (2) better behaviour early in training when P is large. Its cost per sample, 2M + 1 forward passes plus an O(M³) Cholesky factor (O(M²) in square-root forms with rank-one updates), is comparable to or larger than GEKF's (Julier &amp; Uhlmann 1997; Wan &amp; van der Merwe 2000).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="practical" data-nav="Practical considerations">
+      <h3><span class="idx">12</span> Practical considerations</h3>
+
+      <table class="cmp">
+        <tr><th>Issue</th><th>What goes wrong</th><th>Standard remedy</th></tr>
+        <tr><td><b>Initial P</b></td><td>Too small: the filter is overconfident in random initial weights and barely learns. Too large: first steps overshoot badly in a nonlinear net.</td><td>P₀ = 100·I (sigmoidal) to 1000·I (linear), with inputs/outputs standardized; tune η instead of P₀ thereafter (§03: only ratios matter).</td></tr>
+        <tr><td><b>Scaling</b></td><td>Unscaled inputs make Jacobian columns differ by orders of magnitude; P and A become ill-conditioned.</td><td>Zero-mean, unit-variance inputs and targets; small random initial weights.</td></tr>
+        <tr><td><b>Loss of symmetry / positive-definiteness</b></td><td>Round-off in P − KHP accumulates; P develops negative eigenvalues; the filter diverges.</td><td>Symmetrize P ← (P + Pᵀ)/2; keep q &gt; 0; Joseph-form update; double precision.</td></tr>
+        <tr><td><b>Square-root filtering</b></td><td>Needed when q = 0 and runs are long.</td><td>Propagate a factor S with P = SSᵀ via orthogonal (QR) updates: P stays positive-definite by construction, at extra cost — and adding Q to a factored form is expensive, so it pairs best with q = 0 and GEKF.</td></tr>
+        <tr><td><b>Matrix inversion in A</b></td><td>Nₒ × Nₒ inverse per sample; awkward for multi-output nets and hardware.</td><td>Process outputs one at a time as scalar measurements (sequential update): exact for GEKF, a close approximation for DEKF; shuffle output order.</td></tr>
+        <tr><td><b>Memory</b></td><td>M² floats: 10⁴ weights → 10⁸ entries (400 MB in float32); 10⁶ weights → 4 TB.</td><td>Node or layer decoupling; low-rank-plus-diagonal P; or a different optimizer.</td></tr>
+        <tr><td><b>Recency</b></td><td>Sequential updates overfit the latest region of the data.</td><td>Shuffle (static nets) or multistream training (recurrent nets).</td></tr>
+        <tr><td><b>Non-squared losses</b></td><td>The filter's Gaussian measurement model does not match.</td><td>Reformulate as a squared error (e.g. on transformed targets), or use a natural-gradient/exponential-family form.</td></tr>
+      </table>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="today" data-nav="When to use it today">
+      <h3><span class="idx">13</span> When to use it today</h3>
+      <p class="lede"><b>EKF training is the right tool when the network is small, the data arrive as a stream, and every sample must count</b> — and the wrong one for anything with millions of weights.</p>
+
+      <ul class="notes">
+        <li><b>Good fits.</b> Online adaptation of small models in the loop: adaptive control and system identification (<a href="neural-system-identification.html">part 8</a>), sensor calibration and soft sensors, tracking time-varying relationships, embedded settings where there is no second pass over the data. Also any case where a calibrated uncertainty over the weights is useful — P gives you an approximate posterior for free, so predictions can come with error bars (ŷ variance ≈ HPHᵀ + R).</li>
+        <li><b>Also good: the last layer only.</b> Freeze a large pretrained feature extractor and run an exact Kalman filter/RLS on the final linear layer: O(d²) for d features, fully online, with uncertainty. This "Bayesian last layer" pattern is a common, practical descendant.</li>
+        <li><b>Poor fits.</b> Large networks (the M² wall), heavily non-Gaussian losses, and offline training on big datasets, where mini-batch SGD/Adam on GPUs is simpler, better supported and fast enough.</li>
+        <li><b>The ideas that live on.</b> Curvature preconditioning with Kronecker-factored or low-rank approximations (K-FAC, Shampoo); natural gradient; and online Bayesian deep learning, where diagonal and low-rank-plus-diagonal EKF variants have been revisited for streaming and continual learning — e.g. the low-rank EKF of Chang et al. (2023).</li>
+      </ul>
+
+      <h4>Takeaways</h4>
+      <ul class="notes">
+        <li>Training = estimating a constant state (the weights) from noisy measurements (the targets) through the network; the EKF linearizes the network with its Jacobian.</li>
+        <li>GEKF: A = (R + HPHᵀ)⁻¹, K = PHᵀA, w ← w + Kξ, P ← P − KHP + Q. Cost O(NₒM²) time, O(M²) memory.</li>
+        <li>P⁻¹ accumulates the Gauss–Newton Hessian, so the EKF is an online Gauss–Newton/natural-gradient method with an automatic, per-direction, decaying learning rate; for linear models it is exactly RLS.</li>
+        <li>Decoupling (node-level especially) keeps most of the benefit at a fraction of the cost; fully decoupled keeps much less.</li>
+        <li>Q is the learning-rate floor: anneal it, never set it exactly to zero, and raise it to track drifting targets.</li>
+        <li>For recurrent nets use BPTT(h) or RTRL derivatives and multistreaming; the UKF replaces Jacobians with sigma points.</li>
+        <li>Use it for small, online, uncertainty-aware models; use its descendants for large ones.</li>
+      </ul>
+
+      <div class="callout"><b>Where this goes next.</b> <a href="neural-system-identification.html">Part 8</a> puts EKF-trained recurrent networks to work as models and controllers of dynamical systems. The optimizer landscape the EKF sits in is laid out in <a href="../neural-network-training.html">Neural Network Training</a> and <a href="../../math/optimization.html">Optimization</a>; the recurrent-network derivatives come from <a href="../rnns-lstms.html">RNNs &amp; LSTMs</a>. The recursive least-squares step also closes the loop with <a href="neuro-fuzzy.html">part 6</a>, where it fits ANFIS consequents online.</div>
+    </section>
+
+    <nav class="pager" aria-label="Classical Neural Networks series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="neuro-fuzzy.html">← Neuro-Fuzzy Systems</a>
+      <a href="index.html" style="color:var(--muted)">Classical Neural Networks · overview</a>
+      <a href="neural-system-identification.html">Neural System Identification &amp; Control →</a>
+    </nav>
+
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="kalman-filter-training.viz.js"></script>
+</body>
+</html>

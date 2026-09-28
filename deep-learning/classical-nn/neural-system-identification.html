@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Neural System Identification &amp; Control</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="index.html">Classical Neural Networks</a> · part 8 of 10</p>
+      <h1>Neural System Identification &amp; Control</h1>
+      <p>Most of this series trains networks on examples that do not remember one another: an image, a label, the next image. A dynamical system does remember. What a chemical reactor does in the next minute depends on what it did in the last ten, and on what the operator did to the feed valve. <b>System identification</b> is the job of building a model of such a system from recorded input and output signals, and the neural version rests on one move: <i>turn a dynamical problem into a static one by feeding the network a window of the past</i>. That move is easy to make. The hard parts come after it. Whose past goes into the window, the plant's measured outputs or the model's own predictions? A model trained on one of those and run on the other can look perfect on paper and fall apart in use. How long a window, and how do you know it is long enough? Once you have a model, how do you turn it into a controller, and what can you still say about stability when a network sits inside a feedback loop? This page works through that sequence from model classes to controllers, with a real plant identified in your browser, and ends with where each piece sits in modern sequence modelling and learned control.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Classical Neural Networks</span>
+        <span class="pill">NFIR · NARX · NOE · NARMAX</span>
+        <span class="pill">Tapped delay lines · TDNN</span>
+        <span class="pill">Series-parallel vs parallel</span>
+        <span class="pill">Exposure bias</span>
+        <span class="pill">Lag selection</span>
+        <span class="pill">Free-run validation</span>
+        <span class="pill">Residual whiteness</span>
+        <span class="pill">Multi-step forecasting</span>
+        <span class="pill">Inverse · MRAC · NARMA-L2 · MPC</span>
+        <span class="pill">Soft sensors &amp; bioprocesses</span>
+        <span class="pill">5 visualizations</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="the-problem" data-nav="The identification problem">
+      <h3><span class="idx">01</span> The identification problem</h3>
+      <p class="lede"><b>Identification means building a mathematical model of a dynamical system from observed data: a sampled input sequence u(k) that you applied and the output sequence y(k) that came back.</b> "Dynamical" means the output at time k depends on inputs and outputs before k, not just on u(k). A static regression maps x to y. An identified model maps a <i>history</i> to the next value, and then you use it to simulate, to predict, to estimate what you cannot measure, or to control.</p>
+
+      <div class="formula"><span class="lbl">the object being modelled (discrete time, one input, one output)</span><span class="eq">y(k) = F( y(k−1), …, y(k−n), u(k−1), …, u(k−m), e(k), e(k−1), … )</span>
+<span class="lbl">what the model is</span><span class="eq">ŷ(k | Θ) = f( φ(k), Θ )        φ(k) = the regressor: some chosen collection of past signals</span>
+<span class="lbl">what identification solves</span><span class="eq">Θ* = argmin over Θ of  (1/N) ∑ₖ ( y(k) − ŷ(k | Θ) )²        + choose the regressor φ, the model size, and check the result</span>
+<span class="lbl">the neural move</span><span class="eq">f is a static feedforward network (MLP, RBF net, …); all the dynamics live in how φ(k) is assembled</span></div>
+
+      <h4>Why build a model at all</h4>
+      <ul class="notes">
+        <li><b>Simulation and what-if analysis.</b> A model lets you try a new feed profile, a different temperature ramp, or a controller retune without touching the real plant. That matters when the plant is a 50 000-litre fermenter, a steel converter, or a chemical reactor running near a runaway limit.</li>
+        <li><b>Prediction and forecasting.</b> Next-step and multi-step forecasts of a signal, from load demand to river flow to a patient's glucose level.</li>
+        <li><b>Indirect measurement: soft sensors.</b> Many quality variables (biomass concentration, product composition, melt index) are measured rarely, slowly, or only in a lab. A model driven by the cheap, fast measurements (temperatures, pressures, pH, off-gas CO₂) estimates them continuously. <a href="#process-applications">§20</a> returns to this.</li>
+        <li><b>Fault detection.</b> Run the model beside the plant. A residual that departs from its normal statistics signals that the plant has changed.</li>
+        <li><b>Control.</b> Every model-based controller on this page (§13–§18) starts from an identified model of the plant.</li>
+      </ul>
+
+      <h4>White, grey and black boxes</h4>
+      <p>A <b>white-box</b> (first-principles) model comes from physics: mass and energy balances, reaction kinetics, Newton's laws. The data only fix a few physical constants. A <b>black-box</b> model assumes nothing about the mechanism and learns an input–output map from data, and neural identification is the standard example of that. <b>Grey-box</b> (hybrid) models do both: a mass balance gives the structure and a network learns the one term nobody can write down, typically a reaction rate or a specific growth rate. In industrial practice the grey box usually wins. It extrapolates better than a pure network because the conservation laws still hold outside the training range, and it fits better than a pure physics model because the uncertain kinetics are learned. The ideas below apply to all three kinds, but the black-box case is where they are needed most, because the data are the only thing keeping the model honest.</p>
+
+      <h4>The workflow: every step can fail on its own</h4>
+      <ol class="notes">
+        <li><b>Experiment design.</b> Choose the excitation signal, its amplitude and frequency content, the sampling rate, and the record length. A model cannot learn behaviour the data never showed it (<a href="#excitation">§09</a>).</li>
+        <li><b>Model structure.</b> Choose which past signals enter φ(k) (the model class, <a href="#model-classes">§03</a>) and how many lags of each (<a href="#order-selection">§10</a>).</li>
+        <li><b>Estimation.</b> Train the network. Whether you feed it measured or predicted past outputs changes both the algorithm and the answer (<a href="#series-parallel">§05</a>–<a href="#exposure-bias">§08</a>).</li>
+        <li><b>Validation.</b> Test on fresh data, in the mode the model will actually be used in (usually free-run simulation), and check that the residuals contain no structure the model missed (<a href="#validation">§11</a>).</li>
+      </ol>
+      <div class="callout"><b>The one-sentence summary to carry through the page.</b> A neural dynamic model is a static network fed with a sliding window of past signals. Everything else on this page follows from two choices: which pasts go into the window, and whether the past outputs come from the plant (open loop) or from the model itself (closed loop).</div>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="linear-roots" data-nav="Linear roots: ARX, OE, ARMAX">
+      <h3><span class="idx">02</span> Linear roots: ARX, OE, ARMAX</h3>
+      <p class="lede">The neural model classes are nonlinear versions of the classical linear ones, and the linear case shows the one idea that decides everything later: <b>where the noise enters determines which predictor is optimal</b>. Two models can have identical deterministic parts and still call for different regressors and different training algorithms.</p>
+
+      <div class="formula"><span class="lbl">ARX: noise enters as an equation error (white e)</span><span class="eq">y(k) = a₁y(k−1) + … + aₙy(k−n) + b₁u(k−1) + … + bₘu(k−m) + e(k)</span>
+<span class="eq">best one-step predictor:  ŷ(k) = a₁y(k−1) + … + bₘu(k−m)    — uses MEASURED past outputs; linear in Θ ⇒ least squares</span>
+<span class="lbl">OE (output error): noise is added to the output only</span><span class="eq">y₀(k) = a₁y₀(k−1) + … + bₘu(k−m),      y(k) = y₀(k) + e(k)</span>
+<span class="eq">best predictor:  ŷ(k) = a₁ŷ(k−1) + … + bₘu(k−m)    — uses the MODEL's own past outputs; nonlinear in Θ ⇒ iterative</span>
+<span class="lbl">ARMAX: coloured equation noise, modelled as a moving average</span><span class="eq">y(k) = ∑ aᵢy(k−i) + ∑ bⱼu(k−j) + e(k) + c₁e(k−1) + … + c_L e(k−L)</span>
+<span class="eq">predictor:  ŷ(k) = ∑ aᵢy(k−i) + ∑ bⱼu(k−j) + ∑ cₗ ε(k−l),     ε(k) = y(k) − ŷ(k)   — past prediction errors stand in for the unseen e</span>
+<span class="lbl">Box–Jenkins: separate dynamics for the plant and for the noise</span><span class="eq">y(k) = [B(q)/F(q)] u(k) + [C(q)/D(q)] e(k)        q = shift operator</span></div>
+
+      <p>Why the ARX predictor uses measured outputs: if e(k) is white and enters the recursion, then everything on the right-hand side except e(k) is known at time k−1, so the conditional mean of y(k) is exactly the deterministic part evaluated on measured data. The prediction error is e(k) itself, white and unpredictable, which is the best any predictor can do. Now apply the same predictor to OE data. The measured y(k−1) = y₀(k−1) + e(k−1) carries noise, so the regressor contains noise that is correlated with the target, and least squares becomes an <b>errors-in-variables</b> problem with biased estimates. For OE data the unbiased approach is to simulate: feed the model's own noise-free output back. The same split, and the same bias, carries over unchanged to the nonlinear models in the next section.</p>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="model-classes" data-nav="NFIR, NARX, NOE, NARMAX">
+      <h3><span class="idx">03</span> The nonlinear model classes: NFIR, NARX, NOE, NARMAX</h3>
+      <p class="lede">Swap the linear combination for a network f and each linear model has a nonlinear counterpart. The prefix N marks the nonlinearity, and the rest of the name says what goes into the regressor. The classes differ in <i>which signals</i> the network sees, and that choice fixes both the noise assumption and the training algorithm.</p>
+
+      <div class="formula"><span class="lbl">NFIR: nonlinear finite impulse response (inputs only)</span><span class="eq">ŷ(k) = f( u(k−1), …, u(k−m) )</span>
+<span class="lbl">NARX: nonlinear autoregressive with exogenous input</span><span class="eq">ŷ(k) = f( u(k−1), …, u(k−m),  y(k−1), …, y(k−n) )              y = MEASURED plant output</span>
+<span class="lbl">NOE: nonlinear output error</span><span class="eq">ŷ(k) = f( u(k−1), …, u(k−m),  ŷ(k−1), …, ŷ(k−n) )              ŷ = the model's OWN past output</span>
+<span class="lbl">NARMAX: NARX plus moving-average noise terms</span><span class="eq">ŷ(k) = f( u(k−1…k−m),  y(k−1…k−n),  ε(k−1), …, ε(k−L) )         ε(k) = y(k) − ŷ(k)</span>
+<span class="lbl">NBJ and nonlinear state space: the general cases</span><span class="eq">x(k+1) = g( x(k), u(k) ),   y(k) = h( x(k) ) + e(k)          — a recurrent net with a learned hidden state</span></div>
+
+      <div class="viz" id="viz-mc">
+        <div class="vhead">
+          <span class="vtitle">Four model classes, one static network: what goes into the regressor</span>
+          <span class="vhint">pick a class and the lag counts; dashed orange = a signal the model generates itself</span>
+        </div>
+        <div class="controls">
+          <label for="mc-class">model class</label>
+          <select id="mc-class">
+            <option value="nfir">NFIR</option>
+            <option value="narx" selected>NARX</option>
+            <option value="noe">NOE</option>
+            <option value="narmax">NARMAX</option>
+          </select>
+          <label for="mc-nu">input lags nᵤ = <b id="mc-nu-out"></b></label>
+          <input type="range" id="mc-nu" min="1" max="4" step="1" value="2" />
+          <label for="mc-ny">output / residual lags n_y = <b id="mc-ny-out"></b></label>
+          <input type="range" id="mc-ny" min="1" max="4" step="1" value="2" />
+        </div>
+        <svg id="mc-svg" width="760" height="350" viewBox="0 0 760 350" role="img" aria-label="A schematic of a neural dynamic model. Four rows of tapped delay-line cells on the left hold past inputs u, measured outputs y, the model's own past outputs y-hat, and past residuals epsilon. The rows used by the selected model class are highlighted and wired into a static multilayer perceptron on the right, whose output y-hat of k is fed back through a dashed loop whenever the class uses model-generated signals."></svg>
+        <div class="readout" id="mc-readout" aria-live="polite"></div>
+      </div>
+      <p>Switch between NARX and NOE and only one row changes: the output history comes from the <b>plant</b> in NARX and from the <b>model</b> in NOE, shown by the dashed feedback loop. The network is identical in both. The difference is whether its inputs depend on its own weights. In NARX they do not, so every training example (φ(k), y(k)) is fixed data and ordinary backpropagation applies, just as for any regression. In NOE, changing a weight changes ŷ(k−1), which is an input at step k, so the gradient has to be carried through time. NARMAX has the same problem through its residual terms. NFIR removes feedback entirely. It is always stable, because a bounded input window gives a bounded output, but a slow system then needs a long input window: a process with a 50-sample settling time needs roughly 50 input lags, where NARX needs 2 or 3 output lags. That is the usual trade: output feedback makes the model compact but lets it go unstable.</p>
+
+      <h4>Choosing a class in practice</h4>
+      <table class="cmp">
+        <tr><th>Class</th><th>Regressor</th><th>Training</th><th>Optimal when</th><th>Main risk</th></tr>
+        <tr><td><b>NFIR</b></td><td>past inputs only</td><td>static backprop</td><td>short memory, or stability is essential</td><td>huge input windows for slow dynamics</td></tr>
+        <tr><td><b>NARX</b></td><td>past inputs + measured outputs</td><td>static backprop (series-parallel)</td><td>noise enters as equation error; one-step prediction is the use case</td><td>biased under measurement noise; free-run can drift or diverge</td></tr>
+        <tr><td><b>NOE</b></td><td>past inputs + model outputs</td><td>dynamic backprop / BPTT / EKF</td><td>pure measurement noise; simulation is the use case</td><td>slow, local minima, exploding gradients through the feedback</td></tr>
+        <tr><td><b>NARMAX</b></td><td>NARX + past residuals</td><td>dynamic (residuals depend on Θ)</td><td>coloured noise</td><td>the most parameters and the fiddliest training</td></tr>
+        <tr><td><b>State space / RNN</b></td><td>a learned hidden state</td><td>BPTT</td><td>unknown order; no physical output history</td><td>everything that is hard about <a href="../rnns-lstms.html">RNNs</a></td></tr>
+      </table>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="delay-lines" data-nav="Tapped delay lines &amp; TDNNs">
+      <h3><span class="idx">04</span> Tapped delay lines and time-delay neural networks</h3>
+      <p class="lede">A <b>tapped delay line</b> (TDL) is the hardware picture of a sliding window: a shift register of unit delays z⁻¹ with a tap after each stage, so at every tick the network sees the current value and the last d values of a signal. Every model in §03 is a static network with TDLs on its inputs. Where you put those delay lines, only at the input or inside the network as well, gives the family of <b>time-delay neural networks</b>.</p>
+
+      <div class="formula"><span class="lbl">a TDL of depth d on signal s</span><span class="eq">TDL_d[s](k) = [ s(k), s(k−1), …, s(k−d) ]          one shift per sample:  s(k−i) ← s(k−i+1)</span>
+<span class="lbl">focused TDNN: delays only at the input layer</span><span class="eq">h(k) = σ( W · TDL_d[u](k) + b ),    ŷ(k) = v · h(k) + c        — a static net on a window; trains with plain backprop</span>
+<span class="lbl">distributed TDNN (Waibel et al. 1989): delays on every layer</span><span class="eq">hˡ(k) = σ( ∑ᵢ₌₀..d_l  Wˡᵢ · hˡ⁻¹(k−i) + bˡ )       — weights shared across time shifts</span>
+<span class="lbl">FIR neuron (Wan 1990): every synapse is a small FIR filter</span><span class="eq">a_j(k) = ∑ᵢ ∑ₜ₌₀..T  w_jiₜ · x_i(k−t)                     — temporal backprop through the synaptic filters</span>
+<span class="lbl">the modern reading</span><span class="eq">distributed TDNN  ≡  a stack of 1-D convolutions over time;   with dilation 2ˡ  ≡  a WaveNet / TCN stack</span></div>
+
+      <p>The distributed TDNN, introduced for phoneme recognition, is the direct ancestor of the one-dimensional convolutional network. Each layer applies the same small set of weights at every time shift, which is a 1-D convolution, and stacking layers widens the receptive field so that high layers integrate over longer spans. Its selling point was the one convolutions are still used for: <b>shift invariance</b>. A phoneme is recognised wherever it falls in the window, because the same weights see every position. The FIR-network variant made each synapse a filter and won the time-series track of the 1991 Santa Fe forecasting competition on a chaotic laser record, an early sign that windowed nonlinear models could beat the linear ARMA tradition on hard series. Temporal convolutional networks with dilated causal convolutions are the same idea with exponentially spaced taps, which gives a receptive field of thousands of samples from a few layers. See <a href="../convolutional-networks.html">Convolutional Networks</a> for the convolution itself.</p>
+
+      <h4>What a delay line cannot do</h4>
+      <p>A TDL has a <b>hard memory horizon</b>: anything older than d samples has no effect on the output. For NFIR and focused TDNNs this is the whole memory. NARX gets around it partly, because the fed-back output summarises the older past, and the fed-back output taps act as shortcut connections through time. That makes gradients in NARX networks decay more slowly than in simple recurrent nets (Lin, Horne, Tiňo &amp; Giles 1996), which helps with long-term dependencies. A state-space or LSTM model avoids fixing a horizon at all by learning what to keep, at the cost of all the training difficulties covered in <a href="../rnns-lstms.html#bptt-rec">RNNs &amp; LSTMs</a>.</p>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="series-parallel" data-nav="Series-parallel vs parallel">
+      <h3><span class="idx">05</span> Series-parallel vs parallel: open-loop and closed-loop identification</h3>
+      <p class="lede">The distinction that organises the rest of the page comes from the paper that started neural identification and control (Narendra &amp; Parthasarathy 1990). In the <b>series-parallel</b> configuration the model runs alongside the plant and reads the plant's measured outputs: it is in <i>series</i> with the plant, since the plant's output feeds it, and in <i>parallel</i> for comparison. In the <b>parallel</b> configuration the model runs on its own and reads only the input and its own past predictions. Neural-network toolboxes call these <b>open loop</b> and <b>closed loop</b>: open means the model's feedback loop is broken and measured data are patched in, closed means the model's output is wired back into its input.</p>
+
+      <div class="formula"><span class="lbl">series-parallel (open loop) = NARX predictor = teacher forcing</span><span class="eq">ŷ_sp(k) = f( y(k−1), …, y(k−n), u(k−1), …, u(k−m); Θ )</span>
+<span class="eq">L_sp(Θ) = (1/N) ∑ₖ ( y(k) − ŷ_sp(k) )²           ∂ŷ_sp(k)/∂Θ = ∂f/∂Θ only            (static backprop)</span>
+<span class="lbl">parallel (closed loop) = NOE simulator = free-running</span><span class="eq">ŷ_p(k) = f( ŷ_p(k−1), …, ŷ_p(k−n), u(k−1), …, u(k−m); Θ )</span>
+<span class="eq">L_p(Θ) = (1/N) ∑ₖ ( y(k) − ŷ_p(k) )²    — the "simulation error"</span>
+<span class="lbl">the total derivative the parallel model needs</span><span class="eq">dŷ_p(k)/dΘ = ∂f/∂Θ + ∑ᵢ₌₁..n  ( ∂f/∂ŷ_p(k−i) ) · dŷ_p(k−i)/dΘ        — a recursion through time</span>
+<span class="lbl">what each loss measures</span><span class="eq">L_sp: how well the net predicts ONE step ahead from correct history</span>
+<span class="eq">L_p:  how well the net REPRODUCES the whole trajectory from the input alone — what a simulator or an MPC predictor needs</span></div>
+
+      <p>Series-parallel training is fast and robust. The regressors are fixed data, the problem is a plain regression, and any good optimiser works, including Levenberg–Marquardt, the usual choice for small identification networks. It is also well posed when the plant is unstable: fed with true outputs, the model cannot run away during training. But it optimises the wrong quantity if you plan to simulate. A one-step predictor that leans on y(k−1) (which, for a smooth signal, already nearly equals y(k)) can reach a tiny one-step error while learning the dynamics poorly. Once its own slightly wrong output replaces the true one, the errors compound. The common workflow is therefore <b>train open loop, then close the loop and check</b>, and ideally fine-tune in closed loop from the open-loop weights. The next figure lets you run exactly that.</p>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="noise-decides" data-nav="Which is right: noise decides">
+      <h3><span class="idx">06</span> Which one is right? The noise decides</h3>
+      <p class="lede">"Series-parallel for training, parallel for use" is a workflow, not a theorem. The linear argument of §02 carries over directly: <b>series-parallel is the consistent estimator when noise enters the dynamics, and parallel is the consistent one when noise sits on the measurement</b>. If you pick the configuration that does not match the noise, you get biased weights however much data you collect.</p>
+
+      <div class="formula"><span class="lbl">equation-error (process) noise</span><span class="eq">y(k) = F( y(k−1), y(k−2), u(k−1) ) + e(k)       ⇒  E[ y(k) | past ] = F(measured past)  ⇒  NARX is optimal</span>
+<span class="lbl">output-error (measurement) noise</span><span class="eq">y₀(k) = F( y₀(k−1), y₀(k−2), u(k−1) ),   y(k) = y₀(k) + e(k)</span>
+<span class="eq">NARX sees  y(k−1) = y₀(k−1) + e(k−1):  the noise is inside the regressor ⇒ errors-in-variables ⇒ the fit is biased toward flatter f</span>
+<span class="eq">NOE sees   ŷ(k−1) ≈ y₀(k−1):  noise-free regressors ⇒ the fit targets F itself</span>
+<span class="lbl">the linear special case of the bias (one lag, regression slope)</span><span class="eq">â_LS → a · var(y₀) / ( var(y₀) + σ²ₑ )         — attenuated toward zero, a classic result</span></div>
+
+      <p>The attenuation formula is why a model trained open loop on noisy measurements looks sluggish when simulated. The fitted autoregressive part is shrunk toward zero, so the simulated response settles too quickly and with too little gain in the loop. Real processes have both kinds of noise. That is the argument for NARMAX, which adds residual terms to model the colour of the noise explicitly, and for the practical compromise: train open loop to get close, then fine-tune closed loop to remove the bias that open-loop training leaves in the simulation.</p>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="closed-loop-training" data-nav="Training the parallel model">
+      <h3><span class="idx">07</span> Training the parallel model: dynamic backpropagation</h3>
+      <p class="lede">Once the loop is closed the network is a recurrent net, and its gradient needs the time recursion from §05. There are three standard ways to compute it, the same three used for any recurrent network: unroll and backpropagate through time, propagate sensitivities forward in real time, or treat the weights as a state to be filtered.</p>
+
+      <div class="formula"><span class="lbl">backpropagation through time (unroll the window, run the chain rule backward)</span><span class="eq">g(k) ≡ ∂L/∂ŷ(k) = (2/N)(ŷ(k) − y(k)) + ∑ᵢ₌₁..n  g(k+i) · ∂f(k+i)/∂ŷ(k)        for k = N, N−1, …, 1</span>
+<span class="eq">∂L/∂Θ = ∑ₖ g(k) · ∂f(k)/∂Θ           cost O(N·|Θ|) time,  O(N) memory for the stored activations</span>
+<span class="lbl">dynamic backprop / real-time recurrent learning (Williams &amp; Zipser 1989), forward in time</span><span class="eq">S(k) ≡ dŷ(k)/dΘ = ∂f(k)/∂Θ + ∑ᵢ ∂f(k)/∂ŷ(k−i) · S(k−i)        online, O(n·|Θ|) memory, no unrolling</span>
+<span class="lbl">the stability condition hiding in both</span><span class="eq">if |∑ᵢ ∂f/∂ŷ(k−i)| stays above 1 over long stretches, g and S grow geometrically — exploding gradients</span>
+<span class="lbl">the practical recipe used in the figure</span><span class="eq">start from open-loop weights · unroll windows of 40 steps · initialise each window from measured data · clip ‖∇‖ ≤ 1</span></div>
+
+      <div class="viz" id="viz-narx">
+        <div class="vhead">
+          <span class="vtitle">Identify a nonlinear plant with a NARX network: one-step vs free-run</span>
+          <span class="vhint">train open loop first, then close the loop; change the noise type and amplitude and train again</span>
+        </div>
+        <div class="controls">
+          <button class="btn" id="narx-sp">① Train series-parallel (open loop)</button>
+          <button class="btn ghost" id="narx-par">② Fine-tune parallel (closed loop, BPTT)</button>
+          <button class="btn ghost" id="narx-scratch">Train parallel from scratch</button>
+          <button class="btn ghost" id="narx-reset">Reset</button>
+        </div>
+        <div class="controls">
+          <label for="narx-ntype">noise type</label>
+          <select id="narx-ntype">
+            <option value="output" selected>measurement (output error)</option>
+            <option value="equation">process (equation error)</option>
+          </select>
+          <label for="narx-noise">noise σ = <b id="narx-noise-out"></b></label>
+          <input type="range" id="narx-noise" min="0" max="0.3" step="0.05" value="0.1" />
+          <label for="narx-amp">training input amplitude <b id="narx-amp-out"></b></label>
+          <input type="range" id="narx-amp" min="0.25" max="2" step="0.25" value="1.5" />
+        </div>
+        <svg id="narx-svg" width="760" height="430" viewBox="0 0 760 430" role="img" aria-label="Top: the validation output of a lightly damped nonlinear oscillator driven by a square wave and then a sine, drawn as a thick grey line, with the network's one-step-ahead prediction as a dashed blue line and its free-running simulation as an orange line. Bottom: validation error of both predictions against training updates on a log scale, with a green marker where training switched from open loop to closed loop."></svg>
+        <div class="readout" id="narx-readout" aria-live="polite"></div>
+      </div>
+      <p>The plant is a lightly damped hardening-spring (Duffing) oscillator, x″ + 0.16x′ + x + 0.3x³ = u, sampled every 0.3 s. That gives about 21 samples per period, so consecutive outputs are close together, which is exactly the situation in which a one-step predictor can look good for the wrong reason. The network is a 4-input (y(k−1), y(k−2), u(k−1), u(k−2)), 10-hidden-unit MLP identified from 1 000 samples of an amplitude-modulated random step input. It is validated on a square wave followed by a sine, neither of which appears in training. <b>Start with noise at 0 and press ①.</b> The one-step RMSE falls to 0.006, thirty times better than the naive predictor ŷ(k) = y(k−1) at 0.182, yet the free run is off by 0.147. That is a 25-fold gap between two numbers that both describe "the model's error". Press ② to fine-tune in closed loop and the free-run error falls to about 0.10. <b>Now the default measurement noise σ = 0.1.</b> Open-loop training gives a one-step RMSE of 0.203, barely better than the naive 0.229, and a free-run error of 0.453. Closed-loop fine-tuning brings the free run down to 0.172 while the one-step error <i>rises</i> to 0.227. The two objectives disagree, and the one you use the model for should win. At σ = 0.2 the effect is stronger: free run 0.610 → 0.225, one-step 0.330 → 0.449. <b>Switch to process noise</b> (the noise kicks the state, and the output is measured exactly). Open-loop training is now the right estimator and gives a free run of 0.055, better than every measurement-noise case, and closed-loop fine-tuning makes it <i>worse</i> (0.133), just as §06 predicts. Finally, set the noise back to measurement and drop the training amplitude to ±0.5. The validation signals drive the hardening spring into amplitudes the training record never reached, and the free run misses by 0.678 after open-loop training and 0.528 after fine-tuning. No training algorithm recovers dynamics the data never showed; that is the excitation problem of <a href="#excitation">§09</a>. Training the parallel model from scratch with the same budget reaches 0.246, worse than open-loop-then-closed-loop, which is why the two-stage recipe is standard.</p>
+
+      <h4>Kalman filters as recurrent trainers</h4>
+      <p>A third way to train the parallel model treats the weights as the state of a dynamical system, w(k+1) = w(k) + noise, observed through y(k) = f(φ(k), w(k)) + e(k), and runs an extended Kalman filter over it. The EKF propagates a covariance over the weights, so it acts like an online second-order (Gauss–Newton) method. In practice decoupled EKF training of recurrent networks, with gradients from truncated BPTT or RTRL, was the strongest trainer for neural identification and control models through the 1990s. It is covered on the next page of the series, <a href="kalman-filter-training.html">Kalman Filter Training</a>.</p>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="exposure-bias" data-nav="Exposure bias &amp; its fixes">
+      <h3><span class="idx">08</span> Exposure bias: the same problem under a later name</h3>
+      <p class="lede">Series-parallel training is <b>teacher forcing</b>: during training the model always conditions on the true past, and at run time it has to condition on its own past. The model is never <i>exposed</i> to its own mistakes during training, so it has never learned to recover from them. Sequence-to-sequence modelling rediscovered this two decades later and named it <b>exposure bias</b>. It is one problem, whether the sequence is a reactor temperature or a sentence.</p>
+
+      <div class="formula"><span class="lbl">the distribution shift, stated as a bound</span><span class="eq">one-step error ε per step, Lipschitz constant ρ of the closed-loop map  ⇒  error after h steps ≲ ε · (1 + ρ + ρ² + … + ρʰ⁻¹)</span>
+<span class="eq">ρ &lt; 1: error saturates at ε/(1−ρ)        ρ ≥ 1: error grows linearly or geometrically with the horizon</span>
+<span class="lbl">the same statement for imitation learning (Ross &amp; Bagnell)</span><span class="eq">per-step mistake rate ε under the expert's states  ⇒  up to O(T²·ε) cost over T steps under the learner's own states</span></div>
+
+      <h4>Fixes, old and new</h4>
+      <ul class="notes">
+        <li><b>Train closed loop</b> (§07): minimise the simulation error directly. This is the most principled fix, and also the slowest and the most prone to exploding gradients.</li>
+        <li><b>Multiple shooting / short windows.</b> Unroll the model over many short windows, each initialised from measured data, as the figure does with 40-step windows. This keeps the gradient horizon short while still exposing the model to its own outputs. Multiple shooting from numerical ODE fitting formalises the same idea with continuity constraints between windows.</li>
+        <li><b>Scheduled sampling</b> (Bengio et al. 2015): during training, feed back the model's own prediction with a probability that rises over the course of training. This is a smooth path from open loop to closed loop.</li>
+        <li><b>Noise injection / data as demonstrator</b> (Venkatraman et al. 2015): add noise to the fed-back regressors, or add training pairs that start from the model's own drifted states and point back to the true trajectory. This is DAgger (Ross et al. 2011) applied to dynamics models.</li>
+        <li><b>Sequence-level objectives.</b> In language models, minimise a loss on whole generated sequences (Ranzato et al. 2016). The control counterpart is the multi-step MPC objective of §17.</li>
+      </ul>
+      <p>The same trade-off appears in <a href="../rnns-lstms.html#teacher">RNNs &amp; LSTMs</a>, whose teacher-forcing section is this section seen from the language side, and in learned world models, where a dynamics model rolled out for many imagined steps can drift into states it never saw (<a href="../world-models-jepa.html">World Models &amp; JEPA</a>).</p>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="excitation" data-nav="Experiment design &amp; excitation">
+      <h3><span class="idx">09</span> Experiment design and excitation</h3>
+      <p class="lede">A network can only learn the part of the dynamics that the data exercised. For linear systems the requirement is <b>persistent excitation</b>: the input must contain enough distinct frequencies to identify every parameter. Nonlinear systems ask for more, because the input must also cover every <i>amplitude</i> region of the state space where the model will later be used. A linear model identified at small amplitude extrapolates exactly. A network extrapolates however its activation functions happen to behave.</p>
+
+      <div class="formula"><span class="lbl">persistent excitation of order n (linear case)</span><span class="eq">the n×n matrix  R_u = limit (1/N) ∑ₖ [u(k−1) … u(k−n)]ᵀ[u(k−1) … u(k−n)]  is positive definite</span>
+<span class="eq">white noise: PE of every order;   a single sinusoid: PE of order 2 only — it can identify at most 2 parameters</span>
+<span class="lbl">the nonlinear requirement, informally</span><span class="eq">the regressor sequence φ(k) must densely visit the region of regressor space where the model will be queried</span>
+<span class="lbl">amplitude-modulated PRBS (APRBS), the usual industrial choice</span><span class="eq">u(k) holds a random level for a random dwell time T ∈ [T_min, T_max]:  levels cover the amplitude range,</span>
+<span class="eq">short dwells give the high frequencies, long dwells let the plant settle so the steady-state gain is visible</span>
+<span class="lbl">sampling</span><span class="eq">sample 5–10× faster than the fastest time constant of interest; much faster makes the lags nearly collinear</span></div>
+
+      <p>Three practical problems separate industrial identification from textbook identification. <b>You often cannot excite the plant freely</b>. A running reactor or bioreactor tolerates only small, slow perturbations around its operating point, so historical operating data dominate, and those data are highly correlated and cover a narrow region. <b>Closed-loop data mislead</b>. If the data were recorded while a controller was active, the input is a function of the output, and a naive fit can recover the inverse of the controller instead of the plant. <b>Nonstationarity</b>. Catalysts deactivate, cell cultures move through growth phases, and heat exchangers foul, so a model identified in March can be wrong by June. Re-identification and online adaptation are part of the model's life cycle, not an afterthought. The amplitude slider in <a href="#closed-loop-training">§07</a> shows the second-most-common failure in practice (the first is overfitting). The fit on the training range is excellent, and the free run on a signal that leaves that range is not.</p>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="order-selection" data-nav="Lag / order selection">
+      <h3><span class="idx">10</span> Lag and order selection</h3>
+      <p class="lede">The number of lags n_y and nᵤ sets the input dimension of the network. Too few, and the regressor does not determine the next output: two moments with the same regressor lead to different futures, and no network can fix that. Too many, and the network gets redundant, nearly collinear inputs, more weights, and more room to overfit. There are three families of methods: fit many models and compare (information criteria, cross-validation), analyse the data before fitting any model (Lipschitz quotients, false nearest neighbours), and, for the input delay, correlation analysis.</p>
+
+      <div class="formula"><span class="lbl">information criteria (fit each candidate, then penalise size)</span><span class="eq">AIC = N · ln( σ̂²ₑ ) + 2p          MDL/BIC = N · ln( σ̂²ₑ ) + p · ln N          p = number of weights</span>
+<span class="lbl">Lipschitz quotients (He &amp; Asada 1993): no training needed</span><span class="eq">q_ij = | y(i) − y(j) | / ‖ φ(i) − φ(j) ‖           for all pairs i ≠ j, regressor φ of length n</span>
+<span class="eq">q⁽ⁿ⁾ = ( ∏ₖ₌₁..p  √n · q⁽ⁿ⁾(k) )^(1/p)                 q⁽ⁿ⁾(k) = the k-th largest quotient,  p ≈ 0.01N–0.02N</span>
+<span class="lbl">why it works</span><span class="eq">missing a relevant lag ⇒ some near-identical φ pairs have different y ⇒ huge quotients ⇒ large index</span>
+<span class="eq">order reached ⇒ quotients bounded by the Lipschitz constant of f ⇒ index levels off;  pick the knee</span>
+<span class="lbl">false nearest neighbours (Kennel et al. 1992), the same idea from chaos theory</span><span class="eq">raise the embedding dimension until nearest neighbours in φ-space stay near after one more lag is added</span></div>
+
+      <div class="viz" id="viz-ord">
+        <div class="vhead">
+          <span class="vtitle">Choosing the lags: Lipschitz index, free run, and the residual whiteness test</span>
+          <span class="vhint">pick (n_y, nᵤ) with the sliders or by clicking a cell; the net retrains on release</span>
+        </div>
+        <div class="controls">
+          <label for="ord-ny">output lags n_y = <b id="ord-ny-out"></b></label>
+          <input type="range" id="ord-ny" min="1" max="4" step="1" value="1" />
+          <label for="ord-nu">input lags nᵤ = <b id="ord-nu-out"></b></label>
+          <input type="range" id="ord-nu" min="1" max="3" step="1" value="1" />
+          <label for="ord-noise">process noise σ = <b id="ord-noise-out"></b></label>
+          <input type="range" id="ord-noise" min="0.02" max="0.3" step="0.02" value="0.1" />
+          <button class="btn ghost" id="ord-train">Retrain</button>
+        </div>
+        <svg id="ord-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Left: a 4 by 3 heat map of the Lipschitz order index for output lags 1 to 4 and input lags 1 to 3, computed from data without training; the selected cell is outlined. Right top: the free-run simulation of a NARX network trained at the selected order against the true plant. Right bottom: autocorrelation of the one-step residuals for lags 1 to 20 as bars and input-residual cross-correlation as dots, with a green 95 percent confidence band; values outside the band are red."></svg>
+        <div class="readout" id="ord-readout" aria-live="polite"></div>
+      </div>
+      <p>This figure uses the standard benchmark plant of the 1990 paper, y(k) = y(k−1)·y(k−2)·(y(k−1)+2.5) / (1 + y(k−1)² + y(k−2)²) + u(k−1), whose true order is n_y = 2, nᵤ = 1. The data carry <i>process</i> noise, the case where NARX is the correct model and white residuals are achievable. The residual tests run on a fresh random-input record, because against a sinusoidal validation input every lag of the cross-correlation would light up for reasons that have nothing to do with the model. The page opens at n_y = 1, which is under-ordered. The Lipschitz index is <b>50.3</b>, the one-step RMSE is 0.757 against a noise floor of 0.10, the free run is off by 1.71, and 4 of 20 residual autocorrelations fall outside the band. y(k−2) is missing, and its influence shows up as structure the model could not explain. Move to n_y = 2 and the index falls to <b>3.76</b>, a 13-fold drop. The one-step error reaches the noise floor (0.125), the free run tracks (0.175), and no residual autocorrelation leaves the band. Going further changes almost nothing: n_y = 3 gives 3.73 and n_y = 4 gives 3.91. That flat region is the "knee" the method looks for, where extra lags add weights but no information. The input-lag columns barely differ, because u enters only through u(k−1), and more input lags cannot replace a missing output lag: (n_y, nᵤ) = (1, 3) still scores 8.93. Raise the noise to 0.3 and the index at the true order rises from 3.76 to 8.81. This is the method's known weakness: noise inflates the largest quotients, because nearby regressors can have noisy, different outputs, and the knee flattens.</p>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="validation" data-nav="Validating dynamical models">
+      <h3><span class="idx">11</span> Validating dynamical models: free-run and residual tests</h3>
+      <p class="lede">A test-set RMSE is not enough for a dynamical model. You have to decide <b>which</b> prediction is being scored: one-step-ahead or free-run. And a small error does not prove that the model has captured the structure. The classical toolkit adds two checks: <b>simulate</b> the model on independent data, and <b>test the residuals</b> for any structure a better model could have used.</p>
+
+      <div class="formula"><span class="lbl">the two numbers to always report</span><span class="eq">one-step RMSE = √( (1/N) ∑ ( y(k) − ŷ_sp(k) )² )         free-run RMSE = √( (1/N) ∑ ( y(k) − ŷ_p(k) )² )</span>
+<span class="eq">for a smooth signal the naive predictor ŷ(k) = y(k−1) already scores a small one-step error: always compare against it</span>
+<span class="lbl">normalised correlation, 95% band for white residuals</span><span class="eq">r_ab(τ) = ∑ₖ (a(k−τ) − ā)(b(k) − b̄) / √( ∑(a − ā)² · ∑(b − b̄)² )           band: ±1.96 / √N</span>
+<span class="lbl">the nonlinear correlation tests (Billings &amp; Voon 1986): an adequate model satisfies</span><span class="eq">r_εε(τ) = δ(τ)                      residuals uncorrelated with their own past</span>
+<span class="eq">r_uε(τ) = 0          for all τ       residuals uncorrelated with past inputs</span>
+<span class="eq">r_ε(εu)(τ) = 0       for τ ≥ 0       no unmodelled product terms</span>
+<span class="eq">r_(u²)′ε(τ) = 0 ,  r_(u²)′ε²(τ) = 0     for all τ       (u²)′ = u² − mean(u²):  no unmodelled even nonlinearities</span></div>
+
+      <ul class="notes">
+        <li><b>Free-run is the harder test, and usually the relevant one.</b> Any use that runs the model without fresh measurements, such as simulation, a soft sensor between lab samples, or an MPC predictor over its horizon, is a free run. A model that passes one-step validation and fails free-run is the most common false success in the field. A workflow that trains open loop and reports only open-loop fit statistics hides it.</li>
+        <li><b>Validate on a different input.</b> Use a signal with a different spectrum and amplitude profile from the training input, as §07 does. A random-input training set and a random-input test set drawn from the same distribution flatter the model.</li>
+        <li><b>Correlation tests say what is wrong, not just how much.</b> An RMSE says the model is off; it does not say why. Residual autocorrelation at low lags points to missing output lags or unmodelled noise colour, cross-correlation with u points to missing input lags or a wrong delay, and the higher-order tests point to missing nonlinear terms. On real data, where there is no noise-free truth to compare with, these tests are often the only evidence of under-modelling that you have.</li>
+        <li><b>White residuals are necessary, not sufficient.</b> An overfitted model can have white residuals on the training set. Run the tests on validation data, and use them together with the free-run check.</li>
+        <li><b>Physical plausibility.</b> Check steady-state gains, step-response signs and time constants against engineering knowledge. A network that predicts the reactor cooling when the jacket temperature rises is wrong, however good its RMSE.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="forecasting" data-nav="Multi-step forecasting">
+      <h3><span class="idx">12</span> Time-series prediction and multi-step forecasting</h3>
+      <p class="lede">With no exogenous input the NARX model reduces to a <b>nonlinear autoregression</b>, ŷ(t+1) = f(y(t), …, y(t−d+1)), which is the neural time-series predictor. Its embedding is justified for deterministic dynamics by Takens' theorem: enough delayed copies of one observed variable reconstruct the attractor. Forecasting h steps ahead then needs a <b>strategy</b>, and the two basic ones repeat the open- versus closed-loop choice above.</p>
+
+      <div class="formula"><span class="lbl">recursive (iterated) strategy: one model, applied h times</span><span class="eq">ŷ(t+1) = f(y(t), …, y(t−d+1)),   ŷ(t+2) = f(ŷ(t+1), y(t), …),   …,   ŷ(t+h) = f(ŷ(t+h−1), …)</span>
+<span class="eq">one model · trained one-step (open loop) · errors compound through its own outputs</span>
+<span class="lbl">direct strategy: one model per horizon</span><span class="eq">ŷ(t+h) = f_h( y(t), …, y(t−d+1) )          h = 1, …, H</span>
+<span class="eq">H models · each trained on its own target · no compounding, but each must learn an h-step map (harder as h grows)</span>
+<span class="lbl">hybrids</span><span class="eq">DirRec: f_h also takes ŷ(t+1…t+h−1) as inputs     MIMO: one network outputs the whole vector [ŷ(t+1), …, ŷ(t+H)]</span></div>
+
+      <div class="viz" id="viz-fc">
+        <div class="vhead">
+          <span class="vtitle">Recursive vs direct forecasting on a chaotic series</span>
+          <span class="vhint">move the forecast origin; add observation noise and watch the recursive error compound</span>
+        </div>
+        <div class="controls">
+          <label for="fc-noise">observation noise σ = <b id="fc-noise-out"></b></label>
+          <input type="range" id="fc-noise" min="0" max="0.3" step="0.05" value="0" />
+          <label for="fc-origin">forecast origin</label>
+          <input type="range" id="fc-origin" min="0" max="100" step="1" value="30" />
+        </div>
+        <svg id="fc-svg" width="760" height="330" viewBox="0 0 760 330" role="img" aria-label="Left: a Mackey-Glass chaotic series around a forecast origin, with the observed history as dots, the true future as a grey line, the recursive forecast as an orange line and the direct forecasts as blue dots for horizons 1 to 25. Right: test RMSE against the forecast horizon for the recursive strategy as a solid orange line and the direct strategy as a dashed blue line."></svg>
+        <div class="readout" id="fc-readout" aria-live="polite"></div>
+      </div>
+      <p>The series is the Mackey–Glass delay equation (τ = 17), the standard chaotic benchmark for neural forecasting, sampled every 2 time units and standardised. Both strategies use the same network family: 100 frozen tanh units with a ridge-trained readout on six lags, so every model trains in closed form. The recursive strategy trains 1 model and the direct strategy trains 25. With clean data both match at h = 1 (0.009, necessarily, since they are the same model). By h = 5 the recursive error has compounded to 0.039 against 0.016 for direct, and at h = 25 the two nearly meet again (0.118 against 0.109). On this series the direct strategy never loses. Add observation noise σ = 0.1 and the gap at mid horizons widens sharply: at h = 10, recursive 0.356 against direct 0.112. The recursive model feeds its own noisy-input-trained predictions back through six lags, and every step amplifies its error. The direct models each learn a smoothed h-step map, and the noise partly averages out in the ridge fit. One series does not settle the question, though. The broader lesson from forecasting competitions and reviews (Taieb et al. 2012) is that <b>neither strategy wins everywhere</b>: on clean, low-dimensional dynamics with a very accurate one-step model, recursive forecasting can come out ahead. Recursive forecasting shares one well-trained model and respects the dynamics, but its errors compound. Direct forecasting avoids compounding but pays variance for every separate model, and it can produce forecasts that no single trajectory of the system would produce. Modern deep forecasters mostly take the MIMO route: a sequence model emits the whole horizon at once, which makes it a direct method with shared parameters.</p>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="control-overview" data-nav="From model to controller">
+      <h3><span class="idx">13</span> From model to controller: the neural control architectures</h3>
+      <p class="lede">Neural control nearly always has two stages. First <b>identify</b> a plant model, using everything above. Then <b>design</b> a controller using that model. The architectures differ only in the second stage, that is, in how the model is turned into a control signal and how much computation happens online.</p>
+
+      <table class="cmp">
+        <tr><th>Architecture</th><th>How the model is used</th><th>Online cost</th><th>Needs</th><th>Fails when</th></tr>
+        <tr><td><b>Direct inverse</b> (§14)</td><td>learn u = f⁻¹(desired y, state); apply open loop</td><td>one forward pass</td><td>an invertible plant, stable inverse</td><td>non-invertible or non-minimum-phase plant; disturbances (no error feedback)</td></tr>
+        <tr><td><b>Model-reference</b> (§15)</td><td>train a controller net so plant + controller ≈ reference model; plant model supplies gradients</td><td>one forward pass (+ online updates if adaptive)</td><td>a differentiable plant model; dynamic backprop</td><td>badly scaled learning rate; gradients through a wrong model</td></tr>
+        <tr><td><b>NARMA-L2</b> (§16)</td><td>identify y(k+d) = f + g·u, then solve for u algebraically</td><td>two forward passes + a division</td><td>a plant close to companion (affine-in-u) form</td><td>g near zero; strongly non-affine plants</td></tr>
+        <tr><td><b>Neural MPC</b> (§17)</td><td>simulate the model over a horizon and optimise u at every sample</td><td>an optimisation per sample</td><td>a model that is good in free run</td><td>too slow for fast loops; model drifts over the horizon</td></tr>
+        <tr><td><b>Internal model control</b></td><td>forward model in parallel with the plant; inverse model as controller; the model mismatch is fed back</td><td>two forward passes</td><td>forward and inverse models</td><td>the same invertibility caveats as direct inverse</td></tr>
+      </table>
+      <p>Several early architectures date from 1988–1992: direct inverse control (Psaltis, Sideris &amp; Yamamura 1988), the forward-model "distal teacher" (Jordan &amp; Rumelhart 1992), indirect adaptive and model-reference neural control (Narendra &amp; Parthasarathy 1990), and neural internal model control (Hunt &amp; Sbarbaro 1991). A survey from that period (Hunt, Sbarbaro, Żbikowski &amp; Gawthrop 1992) set the taxonomy the table follows. NARMA-L2 came later (Narendra &amp; Mukhopadhyay 1997). All four live controllers run in one loop in the figure of <a href="#control-loop">§18</a>.</p>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="direct-inverse" data-nav="Direct inverse control">
+      <h3><span class="idx">14</span> Direct inverse control</h3>
+      <p class="lede">If the plant maps (state, u) to the next y, then its inverse maps (state, desired next y) to the u that produces it. Learn that inverse and use it as the controller: request the output you want and apply the answer. This is the simplest neural controller, and it is worth understanding mainly for the ways it fails.</p>
+
+      <div class="formula"><span class="lbl">the plant and its inverse</span><span class="eq">y(k+1) = F( y(k), …, u(k), u(k−1), … )     ⇒     u(k) = F⁻¹( y(k+1), y(k), …, u(k−1), … )</span>
+<span class="lbl">generalised (offline) inverse learning</span><span class="eq">excite with random u, record (y(k+1), y(k), …) → u(k) pairs, and fit a network ĝ ≈ F⁻¹ by plain regression</span>
+<span class="lbl">control law</span><span class="eq">u(k) = ĝ( r(k+1), y(k), …, u(k−1), … )       r = the desired next output (here, the reference model's)</span>
+<span class="lbl">specialised (goal-directed) inverse learning: train through a forward model</span><span class="eq">minimise ( r(k+1) − y(k+1) )²  w.r.t. controller weights, with  ∂y/∂u  from a learned forward model   — the "distal teacher"</span></div>
+      <ul class="notes">
+        <li><b>The inverse may not exist.</b> If two different u give the same y, as in any plant whose static gain curve is non-monotonic, the regression averages two valid answers and returns a u that produces neither. Generalised inverse learning fails silently in this case. Specialised learning through a forward model avoids it, because it picks <i>one</i> branch that achieves the goal.</li>
+        <li><b>The inverse may be unstable.</b> A non-minimum-phase plant (one with zeros outside the unit circle, such as the inverse response of a boiler drum level) has an unstable inverse. Perfect inversion then produces a control signal that grows without bound while the output looks fine.</li>
+        <li><b>No feedback on the error.</b> The inverse controller computes u from where the plant <i>is</i> and where it <i>should go</i>, but nothing corrects for an error that persists. Add a constant disturbance and a steady-state offset appears, as the §18 figure shows. Internal model control fixes this by feeding back the plant-minus-model mismatch.</li>
+        <li><b>Generalised learning samples the wrong region.</b> Random excitation covers the states that random inputs reach, not necessarily those along the trajectories you will want to follow.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="mrac" data-nav="Model-reference adaptive control">
+      <h3><span class="idx">15</span> Model-reference adaptive control</h3>
+      <p class="lede">State the <i>behaviour</i> you want as a simple, stable <b>reference model</b>, for example "respond like a first-order lag with a 5-sample time constant". Then train a controller network so that the plant under that controller behaves like the reference model. The error between the plant and the reference model is the training signal. When that training continues online the controller is <b>adaptive</b>, and it tracks slow changes in the plant.</p>
+
+      <div class="formula"><span class="lbl">the reference model (a design choice, not learned)</span><span class="eq">y_m(k+1) = a_m · y_m(k) + (1 − a_m) · r(k)          a_m = 0.8 in the figure: unit gain, time constant ≈ 4.5 samples</span>
+<span class="lbl">controller and objective</span><span class="eq">u(k) = c( r(k), y(k), …; Θ_c )          J = ½ ∑ₖ e(k)²,     e(k) = y(k) − y_m(k)</span>
+<span class="lbl">the gradient passes through the plant, which is not differentiable, so through its model</span><span class="eq">∂e(k+1)/∂Θ_c = ( ∂y(k+1)/∂u(k) ) · ∂u(k)/∂Θ_c  +  (terms through y(k), u(k−1), … — dynamic backprop)</span>
+<span class="eq">plant Jacobian ∂y/∂u ≈ ∂ŷ/∂u from the identified neural plant model</span>
+<span class="lbl">the online update used in the figure (static approximation: one-step Jacobian, recurrent terms dropped)</span><span class="eq">Θ_c ← Θ_c − η · e(k+1) · ĝ(y(k)) · ∂u(k)/∂Θ_c</span></div>
+      <p>The key trick is the one the distal-teacher idea introduced: the plant is a black box, so errors cannot be backpropagated through it, but they <i>can</i> be backpropagated through a differentiable <b>model</b> of it. The model does not need to be accurate, only to get the sign and rough size of ∂y/∂u right, because it supplies a descent direction and does not compute the control. That makes model-reference control much more tolerant of model error than NARMA-L2 or MPC, which use the model's values directly. The price is training cost: done properly, with the recurrent terms included, it is dynamic backpropagation through the closed loop of controller, plant model and reference model. It is the most expensive offline training of the classical architectures, and the one most at risk of the gradient instabilities of §07. The classical adaptive-control literature adds a warning: a naive gradient MRAC rule (the "MIT rule") can itself go unstable at high adaptation gain, which is why Lyapunov-based update laws were developed. The learning-rate slider in §18 lets you find that edge.</p>
+    </section>
+
+    <!-- ═══ 16 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="narma-l2" data-nav="NARMA-L2 feedback linearisation">
+      <h3><span class="idx">16</span> NARMA-L2: feedback linearisation from an identified model</h3>
+      <p class="lede">Restrict the plant model to a form in which the current control enters <b>affinely</b>. The controller then does not need training at all: it is the model rearranged. This is <b>feedback linearisation</b>, cancelling the plant's nonlinearity so that the closed loop behaves linearly, with the nonlinear terms identified by two networks.</p>
+
+      <div class="formula"><span class="lbl">general NARMA model (d = relative degree / delay)</span><span class="eq">y(k+d) = N( y(k), …, y(k−n+1), u(k), …, u(k−n+1) )</span>
+<span class="lbl">NARMA-L2 approximation: a Taylor expansion to first order in u(k) around u(k) = 0</span><span class="eq">ŷ(k+d) = f( y(k), …, y(k−n+1), u(k−1), …, u(k−m+1) )  +  g( y(k), …, u(k−m+1) ) · u(k)</span>
+<span class="eq">f and g are two sub-networks, trained jointly in series-parallel (the product g·u is part of the architecture)</span>
+<span class="lbl">the controller: set ŷ(k+d) = y_r(k+d) and solve</span><span class="eq">u(k) = ( y_r(k+d) − f(·) ) / g(·)</span>
+<span class="lbl">closed loop, if the model were exact</span><span class="eq">y(k+d) = y_r(k+d)        — the nonlinearity is cancelled; the loop follows the reference exactly</span>
+<span class="lbl">the realisable version (d ≥ 2) avoids needing y(k) and u(k) at the same instant</span><span class="eq">u(k+1) = ( y_r(k+d) − f( y(k), …, u(k), … ) ) / g( y(k), …, u(k), … )</span></div>
+      <p>NARMA-L2 has the cheapest online computation of the model-based controllers, two forward passes and a division, and needs no controller training. Its weaknesses are exactly those of feedback linearisation. <b>Division by g</b>: wherever the identified g approaches zero the control saturates or blows up, and an identification error that flips the sign of g near zero gives positive feedback. <b>Model error goes straight into the output</b>: since u is computed to cancel f exactly, any error in f appears one-for-one as tracking error (§18 shows the offset appear as the model-error slider moves). <b>Affine structure</b>: many plants are not affine in u, and the first-order approximation has to hold over the whole operating range. Many practical designs add a linear feedback term or an integrator around the linearising controller to mop up what the cancellation misses.</p>
+    </section>
+
+    <!-- ═══ 17 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="mpc" data-nav="Neural model predictive control">
+      <h3><span class="idx">17</span> Neural model predictive control</h3>
+      <p class="lede">MPC is the controller of choice in the process industries, and a neural plant model slots into it directly. At every sample, <b>simulate the model forward</b> over a horizon for candidate control sequences, <b>choose the sequence that minimises</b> predicted tracking error plus control effort, <b>apply only the first move</b>, then measure again and repeat. This is the <i>receding horizon</i>. Constraints on inputs and outputs, the thing process engineers care about most, become constraints of the optimisation.</p>
+
+      <div class="formula"><span class="lbl">the receding-horizon objective</span><span class="eq">J(k) = ∑ⱼ₌N₁..N₂ ( y_r(k+j) − ŷ(k+j) )²  +  ρ · ∑ⱼ₌₁..Nᵤ ( Δu(k+j−1) )²</span>
+<span class="eq">N₁, N₂ = prediction horizon;   Nᵤ = control horizon (u held constant after Nᵤ moves);   ρ = move-suppression weight</span>
+<span class="lbl">subject to</span><span class="eq">ŷ(k+j) = neural model run in PARALLEL (free-run) from the current measured state · u_min ≤ u ≤ u_max · y_min ≤ ŷ ≤ y_max</span>
+<span class="lbl">apply, then repeat</span><span class="eq">u(k) = u*(k | k),      discard the rest,      re-solve at k+1 with the new measurement</span>
+<span class="lbl">the solver</span><span class="eq">nonconvex in u because the model is nonlinear: gradient / quasi-Newton with ∂ŷ/∂u by backprop through the unrolled model,</span>
+<span class="eq">or a few Newton steps from the previous solution (warm start),  or sampling (CEM / MPPI) in modern learned-model MPC</span></div>
+      <p>Note which prediction MPC uses: the model runs <b>closed loop</b> over the horizon. An MPC built on a model validated only one step ahead is exposed to every compounding error from §07 and §08. The measurement at each sample re-anchors the prediction, which is why MPC tolerates moderate model error (the receding horizon is a form of feedback), but a steady-state gain error still gives an offset unless the formulation includes a disturbance model, typically a bias term updated from the latest plant-minus-model residual. ρ trades aggressiveness against smoothness: ρ = 0 gives the fastest response the model predicts and often chattering, while larger ρ gives calmer moves and slower tracking. The figure uses N₁ = 1, Nᵤ = 1 (a single move held over the horizon, called <i>move blocking</i>), and a grid-plus-golden-section search for u. That is simple, but it is exactly the structure of the classical neural predictive controller, which was demonstrated on catalytic stirred-tank reactor concentration control, the reference problem of the process-control literature.</p>
+      <p>The same loop, with the plant model replaced by a learned world model and the optimiser replaced by sampling, is how model-based reinforcement learning plans. PETS (Chua et al. 2018) runs CEM over an ensemble of neural dynamics models, and MuZero-style planners search in a learned latent model (<a href="../../machine-learning/reinforcement-learning.html">Reinforcement Learning</a>, <a href="../world-models-jepa.html">World Models</a>).</p>
+    </section>
+
+    <!-- ═══ 18 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="control-loop" data-nav="Four controllers, one loop">
+      <h3><span class="idx">18</span> Four controllers, one loop</h3>
+      <p class="lede">The figure closes a loop around a nonlinear, <b>open-loop-unstable</b> plant, y(k+1) = 0.5y + 0.6 sin y + (1 + 0.4 cos 2y)·u + d, whose slope at the origin is 1.1. The goal is to make the plant follow a first-order reference model through a staircase of set-points. The model-error slider m perturbs the controller's internal model of f and g, standing in for an imperfect identification. A disturbance d switches on halfway through.</p>
+
+      <div class="viz" id="viz-ctl">
+        <div class="vhead">
+          <span class="vtitle">A model-reference control loop with four neural controllers</span>
+          <span class="vhint">pick a controller; for model-reference, press "train one more episode" and watch the error fall</span>
+        </div>
+        <div class="controls">
+          <label for="ctl-mode">controller</label>
+          <select id="ctl-mode">
+            <option value="inverse">direct inverse (offline-trained net)</option>
+            <option value="mrac" selected>model-reference, online-trained net</option>
+            <option value="narma">NARMA-L2 (cancel f, divide by g)</option>
+            <option value="mpc">neural MPC (receding horizon)</option>
+          </select>
+          <button class="btn" id="ctl-more">Train one more episode</button>
+          <button class="btn ghost" id="ctl-reset">Reset controller</button>
+        </div>
+        <div class="controls">
+          <label for="ctl-mis">model error m = <b id="ctl-mis-out"></b></label>
+          <input type="range" id="ctl-mis" min="0" max="1" step="0.1" value="0" />
+          <label for="ctl-dist">disturbance d = <b id="ctl-dist-out"></b></label>
+          <input type="range" id="ctl-dist" min="0" max="0.6" step="0.1" value="0" />
+          <label for="ctl-lr">MRAC rate <span class="keep">η</span> = <b id="ctl-lr-out"></b></label>
+          <input type="range" id="ctl-lr" min="0.005" max="0.2" step="0.005" value="0.02" />
+          <label for="ctl-h">MPC N₂ = <b id="ctl-h-out"></b></label>
+          <input type="range" id="ctl-h" min="1" max="10" step="1" value="3" />
+          <label for="ctl-rho">MPC <span class="keep">ρ</span> = <b id="ctl-rho-out"></b></label>
+          <input type="range" id="ctl-rho" min="0" max="5" step="0.05" value="0.05" />
+          <label for="ctl-bias"><input type="checkbox" id="ctl-bias" /> offset-free bias term (inverse, NARMA-L2, MPC)</label>
+        </div>
+        <svg id="ctl-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Top: a staircase command signal as a dashed grey line, the reference model's smooth response in blue, and the plant output under the selected neural controller in orange over 400 time steps, with the disturbance period shaded red. Bottom: the control signal in green with dashed red saturation limits at plus and minus 3."></svg>
+        <div class="readout" id="ctl-readout" aria-live="polite"></div>
+      </div>
+      <p>What to try, with the numbers the figure produces (RMSE of y against y_m over the 400-step episode):</p>
+      <ul class="notes">
+        <li><b>Model-reference</b> is an adaptive controller: it keeps learning online in every episode, starting from its last committed weights. From an untrained network the first episode scores 0.102, but the last 100 steps are already down to 0.036, and you can watch the early set-points being missed. "Train one more episode" commits the learned weights, and the episode error drops to 0.054 and levels off near 0.058. The history line in the readout shows the curve. Set m = 1 and it barely notices (0.065), because the model enters only through the gradient term ĝ, whose sign is still right. Switch on the disturbance and the controller adapts it away within the episode (last 100 steps 0.032). Push <span class="keep">η</span> to 0.2 after a reset and the episode errors wander between 0.20 and 0.27 without settling, the high-gain adaptation problem of §15.</li>
+        <li><b>NARMA-L2</b> with an exact model is perfect: 0.000, since cancellation is exact. It degrades as soon as the model is wrong (0.121 at m = 0.5, 0.244 at m = 1), and a disturbance of 0.4 leaves an offset (0.283). Tick the offset-free bias term and both are removed (0.013 at m = 0.5, 0.020 with the disturbance). But at m = 1 the bias correction <i>destabilises</i> the loop (0.536, with the input hitting its limits). A deadbeat cancelling controller plus an integrating correction, built on a model that is 25% wrong in gain, has too little margin, and that is the division-by-ĝ fragility in action.</li>
+        <li><b>Direct inverse</b> was trained offline on true plant data, so the model-error slider does not touch it (0.034 throughout). A disturbance does: at d = 0.4 an offset appears after k = 200 (0.291 overall, 0.381 over the last 100 steps), because nothing feeds back the persistent miss. The bias term, which asks the inverse for the target minus the last observed miss (internal model control in its simplest form), removes it (0.028).</li>
+        <li><b>Neural MPC</b> with N₂ = 3 tracks at 0.031 with an exact model. The model error that hurt NARMA-L2 costs it more here (0.460 at m = 1) because it predicts over a horizon with the wrong model, but the bias term rescues it robustly (0.088), and the disturbance case goes from 0.643 to 0.044. The horizon matters because of move blocking (Nᵤ = 1): with N₂ = 1 MPC reduces to one-step inversion and scores 0.003, while N₂ = 10 asks one constant input to fit ten future targets and turns conservative (0.142). ρ has only a mild effect here (ρ = 5 gives 0.041), because the reference model already asks for gentle moves.</li>
+      </ul>
+      <p>No controller wins on every axis, and the figure is built so that each one's weakness is one slider away. That is the honest summary of classical neural control. The architecture decides <i>which</i> kind of model error you are exposed to. Robust designs add integral action or a disturbance observer to whichever architecture they start from.</p>
+    </section>
+
+    <!-- ═══ 19 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="stability" data-nav="Stability caveats">
+      <h3><span class="idx">19</span> Stability caveats</h3>
+      <p class="lede">A network inside a feedback loop is a nonlinear dynamical system, and <b>universal approximation says nothing about its stability</b>. A model that fits every training sample can still have a spurious unstable equilibrium or a limit cycle in a region the data never visited. A neural controller that tracks well in simulation carries no guarantee on the real plant. This is the main reason neural control stayed a niche in safety-critical process industries while linear MPC took over.</p>
+
+      <ul class="notes">
+        <li><b>Model stability versus plant stability.</b> An identified model of a stable plant can itself be unstable in free run, which is the divergence in §07 when the model is badly trained or under-excited. The reverse also happens: an unstable plant identified from closed-loop data can yield a model that is stable where it should not be.</li>
+        <li><b>Sufficient conditions exist, but they are conservative.</b> If the network's closed-loop map is a <i>contraction</i> (Lipschitz constant below 1 in the fed-back arguments), free-run errors stay bounded (§08's bound with <span class="keep">ρ</span> &lt; 1). You can enforce this with spectral-norm constraints on the weights, at some cost in accuracy. Lyapunov-based training adds a learned or fixed Lyapunov function and penalises its increase. Linear-matrix-inequality certificates cover small networks with sector-bounded activations. All of these give up some expressiveness in exchange for a certificate.</li>
+        <li><b>Adaptation can destabilise.</b> Online learning inside the loop, as in adaptive MRAC, couples two dynamics: the plant's and the weights'. Too high a learning rate, poor excitation (a constant set-point stops teaching the model anything, and the weights can drift, the "bursting" phenomenon of adaptive control), or unmodelled dynamics can destabilise a loop that was stable with frozen weights. Classical remedies are dead-zones, σ-modification and projection of the weights onto a bounded set.</li>
+        <li><b>Out-of-distribution queries are the normal case.</b> A controller exploits the model: an optimiser searching for the best u will find the spot where the model is <i>wrong in its favour</i>. Model-based RL calls this "model exploitation" and counters it with ensembles and uncertainty penalties. The classical counter is to keep constraints tight around the identified region.</li>
+        <li><b>Practical safety envelope.</b> Industrial deployments almost always keep a conventional controller underneath or beside the network. The network supplies set-points, feedforward, or soft-sensor estimates to a PID or linear MPC layer, and hard limits and fallback logic sit outside the learned part.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 20 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="process-applications" data-nav="Process &amp; bioprocess applications">
+      <h3><span class="idx">20</span> Process and bioprocess applications</h3>
+      <p class="lede">Chemical and biochemical engineering were early and heavy users of neural identification, because they have exactly the conditions in which it pays: strongly nonlinear dynamics, first-principles models that are expensive or incomplete (especially kinetics), abundant routine measurements, and key quality variables that are hard to measure.</p>
+
+      <ul class="notes">
+        <li><b>Soft sensors (inferential measurement).</b> A network estimates a hard-to-measure variable from easy ones, online. Typical cases: biomass or product concentration in a fermenter from dissolved oxygen, pH, temperature, off-gas O₂/CO₂ and base addition; product composition in a distillation column from tray temperatures; polymer quality (melt index) from reactor conditions. Spectroscopic soft sensors map fluorescence or near-infrared spectra to biomolecule concentrations. The spectrum is high-dimensional and strongly collinear, so input compression (PCA or an autoassociative bottleneck network) usually comes first. Soft sensors are validated in free run between lab samples, and re-calibrated when the process drifts (§09).</li>
+        <li><b>Batch fermentation forecasting.</b> A batch culture passes through distinct growth phases (lag, exponential, stationary, decline) with different dynamics in each. Successful designs chain three stages: a compression network for noisy online signals, a classifier that identifies the current growth phase, and a recurrent or NARX-style predictor that forecasts cell concentration forward in time. That is a modular model and a regime-dependent predictor, built before the phrase "mixture of experts" was common. Forecasting beyond the range of the training batches is where they struggle, the excitation problem again.</li>
+        <li><b>Chemical reactors.</b> The continuous stirred-tank reactor (CSTR) is the standard testbed: exothermic kinetics, multiple steady states, and parametric sensitivity make it a hard nonlinear control problem. Neural MPC of product concentration by manipulating a feed flow, and inverse and forward modelling of a CSTR pH-neutralisation process, whose titration curve has a steep S-shape with process gain varying over orders of magnitude, are both classic demonstrations. The pH case is also a textbook reason for inverse-model difficulty: near neutrality a tiny change in reagent flow moves pH by several units.</li>
+        <li><b>Plant-wide problems.</b> The Tennessee Eastman challenge process (Downs &amp; Vogel 1993) is a realistic simulated plant with a reactor, separator, stripper and recycle. It became the benchmark for neural reactor models, for neural supervisory control that replaces several outer loops, and above all for data-driven fault detection and diagnosis.</li>
+        <li><b>Fault diagnosis.</b> Classifier networks map process symptoms to fault classes, and residual-based schemes (§01) monitor plant-minus-model deviations. Steady-state and transient versions were both developed on reactor examples.</li>
+        <li><b>Industrial scale.</b> Neural models have been deployed in steel converters, arc furnaces, polymer reactors and refinery units, usually as grey-box hybrids (a mass or energy balance plus a learned kinetic term) and usually with the network advising a conventional control layer, not replacing it.</li>
+      </ul>
+      <div class="callout"><b>The recurring lesson from process applications.</b> The network was rarely the hard part. What decided success was data work: getting the excitation and operating-range coverage, handling missing and delayed lab data, aligning time delays between sensors, removing controller-induced correlations, and planning for re-identification when the process drifts. <a href="neuro-fuzzy.html">Neuro-fuzzy</a> hybrids were popular in the same plants because operators could read and edit their rules.</div>
+    </section>
+
+    <!-- ═══ 21 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="modern" data-nav="Where this lives today">
+      <h3><span class="idx">21</span> Where this lives in modern deep learning</h3>
+      <ul class="notes">
+        <li><b>Sequence models are NARX and NOE with more capacity.</b> An autoregressive transformer trained with teacher forcing is a series-parallel NARX model over tokens, and sampling from it is the parallel configuration. The exposure-bias debate (§08) is the series-parallel versus parallel debate. <a href="../rnns-lstms.html">RNNs &amp; LSTMs</a> are the nonlinear state-space class of §03. <a href="../state-space-models.html">State-space models</a> such as S4 and Mamba go back to the linear state-space structure, with learned, carefully parameterised stable dynamics, which is the stability lesson of §19 built into the architecture.</li>
+        <li><b>TDNNs became temporal convolutions.</b> Dilated causal 1-D convolutions (WaveNet, TCNs) are distributed TDNNs (§04) with exponentially spaced taps.</li>
+        <li><b>Neural ODEs and physics-informed models</b> are continuous-time grey boxes: a network defines dx/dt, trained through an ODE solver, often with known physics kept as fixed terms. This is the hybrid modelling practice of §01 and §20 with modern autodiff.</li>
+        <li><b>Koopman and deep system identification.</b> Learning a lifting in which the dynamics become linear, then applying linear control, is a recent answer to NARMA-L2's question of how to make a nonlinear plant look linear.</li>
+        <li><b>Model-based RL and world models</b> are identify-then-control at scale: learn the dynamics, then plan through them with MPC, or train a policy inside them. That is the MRAC idea of backpropagating through a learned model (Dreamer) or neural MPC (PETS, TD-MPC). The failure modes of §19 (model exploitation, compounding error, lack of stability guarantees) are that field's central open problems.</li>
+        <li><b>Deep forecasting</b> (DeepAR, N-BEATS, temporal fusion transformers, foundation forecasters) settled mostly on MIMO or direct multi-horizon outputs with probabilistic heads. That is §12's strategy debate resolved in favour of predicting the whole horizon at once.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 22 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">22</span> Takeaways</h3>
+      <table class="cmp">
+        <tr><th>If…</th><th>then</th><th>because</th></tr>
+        <tr><td>you need a model of a dynamical system from data</td><td>a static net on a regressor of lagged signals (NARX first)</td><td>turns dynamics into regression — <a href="#model-classes">§03</a></td></tr>
+        <tr><td>the model will be used for simulation, soft sensing or MPC</td><td>validate in <b>free run</b>, not one-step</td><td>one-step error hides compounding — <a href="#closed-loop-training">§07</a>, <a href="#validation">§11</a></td></tr>
+        <tr><td>the data carry measurement noise</td><td>fine-tune in closed loop (NOE) after open-loop training</td><td>open-loop fits are errors-in-variables biased — <a href="#noise-decides">§06</a></td></tr>
+        <tr><td>you do not know the lags</td><td>Lipschitz index or FNN before training; information criteria or CV after</td><td>the knee marks where extra lags stop adding information — <a href="#order-selection">§10</a></td></tr>
+        <tr><td>residual ACF sticks out of the band</td><td>add lags or noise terms (NARMAX)</td><td>structure left in ε is information the model missed — <a href="#validation">§11</a></td></tr>
+        <tr><td>you forecast many steps ahead</td><td>compare recursive and direct (or MIMO) on your data</td><td>compounding error versus per-horizon variance — <a href="#forecasting">§12</a></td></tr>
+        <tr><td>you need a cheap controller and the plant is affine in u</td><td>NARMA-L2</td><td>no controller training; but model error passes straight to the output — <a href="#narma-l2">§16</a></td></tr>
+        <tr><td>the model is rough but has the right sign of ∂y/∂u</td><td>model-reference (adaptive)</td><td>the model supplies only a gradient direction — <a href="#mrac">§15</a></td></tr>
+        <tr><td>constraints matter and you can afford online optimisation</td><td>neural MPC with a disturbance/bias term</td><td>receding horizon gives feedback; the bias removes offset — <a href="#mpc">§17</a></td></tr>
+        <tr><td>anything is safety-critical</td><td>keep a conventional loop underneath; constrain the network</td><td>approximation power gives no stability guarantee — <a href="#stability">§19</a></td></tr>
+      </table>
+
+      <h4>Every number the figures print, and where it comes from</h4>
+      <table class="cmp">
+        <tr><th>Claim</th><th>Measured in the browser</th><th>Where</th></tr>
+        <tr><td>Open-loop NARX, no noise</td><td>one-step <b>0.006</b> (naive 0.182) · free-run <b>0.147</b>: a 25× gap</td><td>§07</td></tr>
+        <tr><td>Open-loop NARX, measurement noise σ = 0.1</td><td>one-step <b>0.203</b> (naive 0.229) · free-run <b>0.453</b></td><td>§07</td></tr>
+        <tr><td>After closed-loop fine-tuning, σ = 0.1</td><td>one-step <b>0.227</b> (worse) · free-run <b>0.172</b> (2.6× better)</td><td>§07</td></tr>
+        <tr><td>Process noise instead</td><td>open-loop free-run <b>0.055</b>; closed-loop fine-tuning makes it <b>0.133</b></td><td>§07</td></tr>
+        <tr><td>Under-ordered vs correct order (process noise 0.1)</td><td>Lipschitz index <b>50.3 → 3.76</b>; one-step 0.757 → 0.125; residual ACF outside band 4 → 0 of 20</td><td>§10</td></tr>
+        <tr><td>Recursive vs direct</td><td>clean, h = 5: <b>0.039 / 0.016</b>; σ = 0.1, h = 10: <b>0.356 / 0.112</b></td><td>§12</td></tr>
+        <tr><td>Controllers, exact model, no disturbance</td><td>NARMA-L2 <b>0.000</b> · MPC <b>0.031</b> · inverse <b>0.034</b> · MRAC <b>0.102</b> first episode → <b>0.054</b></td><td>§18</td></tr>
+        <tr><td>Disturbance 0.4, without → with bias term</td><td>inverse 0.291 → 0.028 · NARMA-L2 0.283 → 0.020 · MPC 0.643 → 0.044</td><td>§18</td></tr>
+      </table>
+
+      <div class="callout"><b>Where this goes next in the series.</b> The closed-loop training problem of §07 is solved most effectively by treating the weights as a filtered state, the subject of <a href="kalman-filter-training.html">Kalman Filter Training</a> (the previous part). The architectures here assume you already chose the network; <a href="neuroevolution.html">Neuroevolution &amp; Growing Networks</a> (next) searches over the architecture itself, including the recurrent controllers that evolutionary methods were often used to find. The RBF networks of <a href="rbf-networks.html">part 5</a> were the other workhorse model class for identification, because their linear-in-the-parameters readout gives least-squares training.</div>
+      <div class="callout"><b>Out of the series.</b> <a href="../rnns-lstms.html">RNNs &amp; LSTMs</a> for the recurrent state-space class and its training; <a href="../rnns-lstms.html#teacher">teacher forcing</a> for exposure bias seen from language; <a href="../state-space-models.html">State Space Models</a> for stable learned dynamics; <a href="../world-models-jepa.html">World Models</a> and <a href="../../machine-learning/reinforcement-learning.html">Reinforcement Learning</a> for identify-then-plan at scale; <a href="../neural-network-training.html#early-stop">early stopping</a> and <a href="../../machine-learning/model-evaluation.html">model evaluation</a> for the overfitting side of order selection.</div>
+    </section>
+
+    <nav class="pager" aria-label="Classical Neural Networks series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="kalman-filter-training.html">← Kalman Filter Training</a>
+      <a href="index.html" style="color:var(--muted)">Classical Neural Networks · overview</a>
+      <a href="neuroevolution.html">Neuroevolution &amp; Growing Networks →</a>
+    </nav>
+
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="neural-system-identification.viz.js"></script>
+</body>
+</html>

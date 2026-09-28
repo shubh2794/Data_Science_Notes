@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Neural Network Hardware</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="index.html">Classical Neural Networks</a> · part 10 of 10</p>
+      <h1>Neural Network Hardware</h1>
+      <p>A neural network on paper is a sequence of real-valued multiply–accumulates followed by a nonlinearity. A neural network on silicon is something else: every number has a finite number of bits, every multiply costs area and picojoules, every weight has to be <i>fetched</i> from somewhere, and fetching it usually costs far more than using it. This page follows that gap from the bottom up. It starts by counting — MACs, bytes and joules for one forward pass — and turns the count into the <b>roofline</b>, the one-line model that says whether a layer is limited by arithmetic or by memory. It then goes through the choices that designers of neural hardware have argued about since the late 1980s: floating point or fixed point, how many bits, what happens on overflow, why training needs more precision than inference and how stochastic rounding narrows that gap; how to compute a sigmoid with no exponential unit; how to arrange thousands of multipliers so that each fetched value is used many times (the <b>systolic array</b>); and how an FPGA's lookup tables, DSP slices and block RAM trade precision against parallelism. It ends with the exotic arithmetics — bit-serial, stochastic bitstreams, logarithmic numbers, analog crossbars, spiking chips — and with the honest verdict of history: why general-purpose GPUs and one very large-volume ASIC family won the general case, and where FPGAs and small custom chips still win.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Classical Neural Networks</span>
+        <span class="pill">MACs · bytes · picojoules</span>
+        <span class="pill">Roofline</span>
+        <span class="pill">Fixed point Qm.n</span>
+        <span class="pill">Quantization &amp; saturation</span>
+        <span class="pill">Stochastic rounding</span>
+        <span class="pill">bfloat16 · FP8 · int8 · int4</span>
+        <span class="pill">Sigmoid: LUT · PWL · CORDIC · polynomial</span>
+        <span class="pill">Systolic arrays</span>
+        <span class="pill">FPGA: LUT · DSP · BRAM</span>
+        <span class="pill">Bit-serial · stochastic · log arithmetic</span>
+        <span class="pill">Neuromorphic</span>
+        <span class="pill">6 visualizations</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="why-hardware" data-nav="Why hardware matters">
+      <h3><span class="idx">01</span> Why hardware matters</h3>
+      <p class="lede"><b>Every neural network, classical or modern, spends almost all of its time in one operation: the multiply–accumulate (MAC), <code>acc ← acc + w·x</code>.</b> A perceptron is one inner product; a multilayer perceptron is a stack of matrix–vector products; a convolutional layer is a matrix product in disguise; a transformer is matrix products plus a softmax. Whoever makes MACs cheap — in time, area, energy and memory traffic — makes neural networks cheap. That has been true since the first analog neurochips of the late 1980s, and it is why the hardware story of this field is mostly a story about arithmetic and data movement, not about "neurons".</p>
+
+      <div class="formula"><span class="lbl">the neuron, as the hardware sees it</span><span class="eq">y = <span class="keep">φ</span>( ∑ᵢ₌₁ⁿ wᵢ xᵢ + b )        n MACs, one bias add, one nonlinearity</span>
+<span class="lbl">a layer of m neurons</span><span class="eq">y = <span class="keep">φ</span>(W x + b),   W ∈ ℝᵐˣⁿ        m·n MACs, m·n weights to read, m nonlinearities</span>
+<span class="lbl">the same layer over a batch of B inputs</span><span class="eq">Y = <span class="keep">φ</span>(W X + b),  X ∈ ℝⁿˣᴮ        m·n·B MACs, still only m·n weights</span></div>
+
+      <p>Three resources are consumed, and a design is a choice about which to spend:</p>
+      <ul class="notes">
+        <li><b>Compute</b> — how many MACs per second the silicon can perform. It scales with the number of multipliers and the clock, and the size of a multiplier grows roughly with the <i>square</i> of its operand width, so precision and parallelism are directly traded against each other.</li>
+        <li><b>Memory capacity and bandwidth</b> — where the weights and activations live and how fast they can be moved to the multipliers. The multipliers are useless if they are starved.</li>
+        <li><b>Energy</b> — the joules per inference or per training step. On battery-powered devices and in data centres alike, this is the binding constraint, and as §02 shows it is dominated by moving data, not by arithmetic.</li>
+      </ul>
+      <p>One number sits on top of all three: <b>latency</b>, the wall-clock time from input to output. A network used for control or for a trigger in a physics experiment may need an answer in microseconds for a single input, while a recommendation model is judged by throughput over millions of inputs. These two goals favour different hardware, and that difference is the reason FPGAs and small ASICs still exist beside GPUs (§16).</p>
+      <div class="callout"><b>The classical connection.</b> The networks in this series — <a href="perceptrons.html">perceptrons</a>, <a href="hopfield-associative-memory.html">Hopfield nets</a>, <a href="self-organizing-maps.html">SOMs</a>, <a href="rbf-networks.html">RBF networks</a> — were among the first targets of dedicated neural hardware, because their computation is so regular: an inner product, a comparison or a distance, a simple nonlinearity, all repeated over many units in parallel. The same regularity is what modern accelerators exploit for <a href="../convolutional-networks.html">CNNs</a> and <a href="../transformers.html">transformers</a>.</div>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="counting" data-nav="Counting MACs &amp; joules">
+      <h3><span class="idx">02</span> Counting MACs, bytes and joules</h3>
+      <p class="lede">Before choosing hardware, count. For a dense layer the counts are exact and trivial; the lesson comes from putting energy prices on them.</p>
+
+      <div class="formula"><span class="lbl">a dense MLP with layer widths n₀, n₁, …, n_L</span><span class="eq">MACs per input = ∑ₗ nₗ₋₁ · nₗ          parameters = ∑ₗ (nₗ₋₁ + 1) · nₗ</span>
+<span class="lbl">worked: 784 → 512 → 256 → 10 (an MNIST classifier)</span><span class="eq">MACs = 784·512 + 512·256 + 256·10 = 401 408 + 131 072 + 2 560 = 535 040</span>
+<span class="eq">params = 535 040 + (512 + 256 + 10) = 535 818   →   2.14 MB in FP32,  0.54 MB in int8</span>
+<span class="lbl">FLOPs, the unit most papers quote</span><span class="eq">1 MAC = 2 FLOPs (one multiply, one add)   →   1.07 MFLOP per input</span></div>
+
+      <h4>Energy: arithmetic is cheap, moving data is not</h4>
+      <p>A widely used set of per-operation energies was measured for a 45 nm process (Horowitz, ISSCC 2014). Newer processes shrink every number, but the <i>ratios</i> have stayed roughly the same, and the ratios are the point:</p>
+      <table class="cmp">
+        <tr><th>operation (45 nm)</th><th>energy</th><th>relative to an 8-bit add</th></tr>
+        <tr><td>8-bit integer add</td><td>0.03 pJ</td><td>1×</td></tr>
+        <tr><td>32-bit integer add</td><td>0.1 pJ</td><td>3×</td></tr>
+        <tr><td>8-bit integer multiply</td><td>0.2 pJ</td><td>7×</td></tr>
+        <tr><td>32-bit integer multiply</td><td>3.1 pJ</td><td>103×</td></tr>
+        <tr><td>16-bit float add / multiply</td><td>0.4 / 1.1 pJ</td><td>13× / 37×</td></tr>
+        <tr><td>32-bit float add / multiply</td><td>0.9 / 3.7 pJ</td><td>30× / 123×</td></tr>
+        <tr><td>64-bit read, 8 KB on-chip SRAM</td><td>10 pJ</td><td>333×</td></tr>
+        <tr><td>64-bit read, 1 MB on-chip SRAM</td><td>100 pJ</td><td>3 333×</td></tr>
+        <tr><td>32-bit read, off-chip DRAM</td><td>≈ 640 pJ</td><td>≈ 21 000×</td></tr>
+      </table>
+
+      <div class="formula"><span class="lbl">worked: one inference of the 784-512-256-10 MLP at batch 1</span><span class="eq">FP32 arithmetic   535 040 × (3.7 + 0.9) pJ   ≈  2.5 µJ</span>
+<span class="eq">FP32 weights from DRAM   535 818 × 640 pJ   ≈  343 µJ        ← 140× the arithmetic</span>
+<span class="lbl">the same network in int8, weights held on chip</span><span class="eq">int8 multiply + 32-bit accumulate   535 040 × (0.2 + 0.1) pJ   ≈  0.16 µJ</span>
+<span class="eq">int8 weights from a 1 MB SRAM   535 818 bytes × (100 pJ / 8 bytes)   ≈  6.7 µJ</span>
+<span class="lbl">the verdict</span><span class="eq">≈ 346 µJ  →  ≈ 6.9 µJ:  a 50× saving,</span>
+<span class="eq">    almost all of it from moving fewer, smaller bytes a shorter distance</span></div>
+
+      <ul class="notes">
+        <li><b>Precision pays twice.</b> Going from 32 to 8 bits shrinks the multiplier by roughly (32/8)² in area and ≈ 15× in energy, <i>and</i> it cuts every memory transfer by 4×. Sections 05–08 are about how far you can push this before accuracy breaks.</li>
+        <li><b>Reuse is the other lever.</b> At batch 1 each weight is fetched to be used exactly once. Batch B inputs together and each fetched weight serves B MACs; tile a convolution and each fetched activation serves many filters. Sections 10–11 are about arranging the arithmetic so every fetched value is reused as much as possible.</li>
+        <li><b>Where the bytes live matters as much as how many there are.</b> A register access is nearly free, a neighbour PE's register costs about twice that, an on-chip buffer about 6×, and DRAM about 200× (the normalised figures used in the design of the Eyeriss accelerator, Chen et al. 2016). The whole art of accelerator design is keeping data in the cheap levels.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="roofline" data-nav="Arithmetic intensity &amp; roofline">
+      <h3><span class="idx">03</span> Arithmetic intensity and the roofline</h3>
+      <p class="lede"><b>Arithmetic intensity</b> is the number of operations performed per byte moved to or from main memory. The <b>roofline model</b> (Williams, Waterman &amp; Patterson 2009) says that a kernel with intensity I on a machine with peak compute P and memory bandwidth β can run no faster than min(P, β·I). Everything left of the "ridge" is memory-bound; everything right is compute-bound.</p>
+
+      <div class="formula"><span class="lbl">definitions</span><span class="eq">I = FLOPs / bytes moved from DRAM</span>
+<span class="eq">attainable = min( P,  <span class="keep">β</span> · I )          ridge  I* = P / <span class="keep">β</span></span>
+<span class="lbl">dense layer d × d, batch B, 2-byte values (weights read once, inputs and outputs once)</span><span class="eq">FLOPs = 2·B·d²        bytes = 2·(d² + 2·B·d)        I = B·d / (d + 2B)  ≈  B   for B ≪ d</span>
+<span class="lbl">limits</span><span class="eq">B = 1:  I ≈ 1 FLOP/byte          B → ∞:  I → d/2          square GEMM n³:  I = n/3</span>
+<span class="lbl">worked: an H100-class GPU, P ≈ 989 TFLOP/s dense BF16, <span class="keep">β</span> ≈ 3.35 TB/s</span><span class="eq">I* = 989 / 3.35 ≈ 295 FLOP/byte.  At batch 1 a 4096-wide layer reaches 3.35 TFLOP/s</span>
+<span class="eq">    — 0.34% of peak.</span>
+<span class="eq">Solving B·4096/(4096 + 2B) = 295 gives B ≈ 345: only then is the same layer compute-bound.</span></div>
+
+      <div class="viz" id="viz-roof">
+        <div class="vhead">
+          <span class="vtitle">The roofline: where does your layer sit?</span>
+          <span class="vhint">drag anywhere on the chart to set the intensity, or use the batch slider for a 4096 × 4096 BF16 layer; switch devices to move the ridge</span>
+        </div>
+        <div class="controls">
+          <label for="roof-dev">device</label>
+          <select id="roof-dev">
+            <option value="h100" selected>datacenter GPU (H100 SXM, BF16)</option>
+            <option value="tpu1">TPU v1 (2015, 8-bit)</option>
+            <option value="cpu">server CPU, FP32 (illustrative)</option>
+            <option value="fpga">mid-size FPGA, int8 (illustrative)</option>
+            <option value="npu">edge NPU, int8 (illustrative)</option>
+          </select>
+          <label for="roof-batch">batch B = <b id="roof-batch-out"></b></label>
+          <input type="range" id="roof-batch" min="0" max="12" step="1" value="0" />
+        </div>
+        <svg id="roof-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Log-log roofline chart: attainable throughput against arithmetic intensity for the selected device, a sloped memory-bound segment meeting a flat compute ceiling at the ridge point. Grey dots mark typical workloads (elementwise add, batch-1 dense layer, a 3 by 3 convolution, a large matrix multiply) and an amber draggable point marks the chosen intensity; a side panel prints peak, bandwidth, ridge, attainable throughput and whether the point is memory- or compute-bound."></svg>
+        <div class="readout" id="roof-readout" aria-live="polite"></div>
+      </div>
+      <p>At the default (H100-class device, batch 1) the point sits at I ≈ 1 on the sloped line: the machine delivers a third of one percent of its peak, and buying a faster chip with the same memory would change nothing. Slide the batch up and the point climbs the slope until, near B ≈ 345, it hits the flat roof. Switch to the <b>TPU v1</b>: its 92 TOPS of 8-bit MACs were fed by only 34 GB/s of DDR3, which puts the ridge near 2 700 ops/byte — beyond the d/2 = 2 048 that any 4096-wide dense layer can ever reach. That was exactly the published finding (Jouppi et al. 2017): most of Google's production MLPs and LSTMs were memory-bound on the first TPU, and the second generation switched to high-bandwidth memory. The same geometry explains why single-stream LLM decoding (one token, every weight read once) is memory-bound on any device, why <a href="../../mlops/speculative-decoding.html">speculative decoding</a> helps, and why weight-only quantization (§08) speeds decoding almost in proportion to the bytes saved.</p>
+      <div class="callout"><b>How to read a roofline in practice.</b> If your kernel is left of the ridge, reduce bytes: quantize weights, fuse elementwise ops so intermediates never touch DRAM, batch requests. If it is right of the ridge, reduce FLOPs or use lower-precision math units: tensor cores, int8, sparsity. Optimising the wrong side does nothing.</div>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="parallelism" data-nav="Levels of parallelism">
+      <h3><span class="idx">04</span> Where the parallelism is</h3>
+      <p class="lede">"Neural networks are massively parallel" was the founding slogan of neural hardware. It is true, but the parallelism comes at several levels of very different size, and a design has to decide which ones to spend silicon on.</p>
+      <table class="cmp">
+        <tr><th>level</th><th>what runs concurrently</th><th>typical degree</th><th>how hardware exploits it</th></tr>
+        <tr><td><b>training / session</b></td><td>independent training runs, hyperparameter trials, or data-parallel replicas</td><td>tens to thousands</td><td>separate chips or cores; modern <a href="../distributed-training.html">data parallelism</a></td></tr>
+        <tr><td><b>layer</b></td><td>different layers working on different inputs at once</td><td>tens</td><td>pipelining — layer l works on sample t while layer l+1 works on sample t−1</td></tr>
+        <tr><td><b>neuron (node)</b></td><td>all units in a layer computing their inner products</td><td>hundreds to millions</td><td>one PE per neuron, or a row of a systolic array per neuron</td></tr>
+        <tr><td><b>synapse (weight)</b></td><td>the n products wᵢxᵢ inside one inner product</td><td>n</td><td>n multipliers feeding an adder tree of depth ⌈log₂ n⌉</td></tr>
+        <tr><td><b>bit</b></td><td>the bits of one operand</td><td>word width</td><td>bit-parallel multipliers, or bit-serial units that trade time for area (§14)</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">full parallelism is almost never affordable</span><span class="eq">fully parallel layer: m·n multipliers.</span>
+<span class="eq">    784 × 512 alone = 401 408 multipliers — so real designs time-multiplex:</span>
+<span class="eq">p physical MAC units serve m·n virtual ones,</span>
+<span class="eq">    cycles per layer ≈ ⌈m·n / p⌉ + pipeline latency</span>
+<span class="lbl">Amdahl's law — the serial part sets the ceiling</span><span class="eq">speed-up(p) = 1 / ( s + (1 − s)/p )   ≤   1/s</span>
+<span class="eq">with 2% of the work serial (control, I/O, a softmax, a sort),</span>
+<span class="eq">    no number of PEs gives more than 50×</span></div>
+      <p>Two consequences shaped the history of the field. First, <b>virtual parallelism is unavoidable</b>, so every accelerator is really a scheduler: it decides which slice of which weight matrix is on which multiplier in which cycle — the <i>dataflow</i> of §10. Second, the neural-network part is rarely the whole job. Many dedicated neurocomputers of the late 1980s and 1990s were built with enormous arrays of simple PEs and nothing to handle the serial parts — preprocessing, control flow, I/O — so Amdahl's law quietly capped them. Designs that survived were the ones with a general-purpose processor alongside the array; today every accelerator pairs its matrix engine with scalar and vector units for exactly this reason.</p>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="number-formats" data-nav="Float vs fixed point">
+      <h3><span class="idx">05</span> Number representations: floating point vs fixed point</h3>
+      <p class="lede">A floating-point number stores a sign, an exponent and a mantissa, so its <i>relative</i> precision is constant across a huge range. A fixed-point number is just an integer with an implied binary point, so its <i>absolute</i> precision is constant across a small range. Floating point is what software uses; fixed point is what small, fast, low-power hardware prefers, because a fixed-point adder is an integer adder and a fixed-point multiplier is an integer multiplier.</p>
+
+      <h4>Fixed point: the Qm.n format</h4>
+      <div class="formula"><span class="lbl">signed two's-complement Qm.n: 1 sign bit, m integer bits, n fraction bits,  b = 1 + m + n</span><span class="eq">value = (stored integer q) × 2⁻ⁿ,        q ∈ [ −2ᵇ⁻¹,  2ᵇ⁻¹ − 1 ]</span>
+<span class="eq">range = [ −2ᵐ,  2ᵐ − 2⁻ⁿ ]          resolution (LSB) <span class="keep">Δ</span> = 2⁻ⁿ</span>
+<span class="lbl">worked: Q3.12 (16 bits)</span><span class="eq">range [−8, 7.99976],  LSB = 2⁻¹² ≈ 0.000244.     1.5 is stored as 1.5 × 4096 = 6 144</span>
+<span class="lbl">multiplying two Qm.n numbers</span><span class="eq">Q3.12 × Q3.12  →  product has 24 fraction bits and up to 7 integer bits: a Q7.24 in 32 bits</span>
+<span class="eq">1.5 × 2.25:   6 144 × 9 216 = 56 623 104 = 3.375 × 2²⁴</span>
+<span class="eq">    shift right 12  →  13 824 = 3.375 × 4 096  ✓</span>
+<span class="lbl">accumulating K products needs ⌈log₂ K⌉ guard bits</span><span class="eq">int8 × int8 → 16-bit products;</span>
+<span class="eq">    a sum of 4 096 of them needs 16 + 12 = 28 bits  →  every int8 engine accumulates in int32</span></div>
+      <p>The integer bits m buy <b>range</b>, the fraction bits n buy <b>resolution</b>, and for a fixed word length b every bit moved from one to the other halves one and doubles the other. This is the core fixed-point design decision, and it is made separately for weights, activations, sums and gradients because their ranges differ by orders of magnitude.</p>
+
+      <h4>Floating point: the formats neural hardware actually uses</h4>
+      <table class="cmp">
+        <tr><th>format</th><th>sign / exponent / mantissa</th><th>largest finite value</th><th>relative step (2⁻ᵐᵃⁿᵗ)</th><th>where it is used</th></tr>
+        <tr><td>FP32</td><td>1 / 8 / 23</td><td>3.4 × 10³⁸</td><td>1.2 × 10⁻⁷</td><td>master weights, optimizer state, reductions</td></tr>
+        <tr><td>FP16 (half)</td><td>1 / 5 / 10</td><td>65 504</td><td>9.8 × 10⁻⁴</td><td>early mixed-precision training (needs loss scaling), inference</td></tr>
+        <tr><td>bfloat16</td><td>1 / 8 / 7</td><td>3.4 × 10³⁸</td><td>7.8 × 10⁻³</td><td>the default training format on TPUs and modern GPUs</td></tr>
+        <tr><td>FP8 E4M3</td><td>1 / 4 / 3</td><td>448</td><td>0.125</td><td>forward-pass weights and activations</td></tr>
+        <tr><td>FP8 E5M2</td><td>1 / 5 / 2</td><td>57 344</td><td>0.25</td><td>gradients (need range more than precision)</td></tr>
+        <tr><td>int8 / int4</td><td>integer + a scale factor</td><td>127·s / 7·s</td><td>uniform step s</td><td>inference weights and activations (§08)</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>bfloat16 is FP32 with the mantissa cut off.</b> Same 8-bit exponent, so the same range — no overflow or underflow surprises when converting — and a mantissa multiplier of 8 × 8 bits (with the hidden bit) instead of 24 × 24: about one ninth of the area. Networks turned out to care far more about range than about the seventh decimal digit.</li>
+        <li><b>A floating-point adder is a fixed-point adder plus a great deal of alignment logic</b>: compare exponents, shift the smaller mantissa, add, renormalise, round. That is why, on FPGAs and small ASICs, floating point costs so much more than fixed point of the same width. One careful FPGA study of backpropagation found a 16-bit fixed-point adder about 39× smaller than a 32-bit floating-point one, the multiplier 6.5× smaller, and a table-based fixed-point sigmoid 250× smaller than a floating-point sigmoid unit; the whole fixed-point network was 13× smaller and 12× faster, and it still learned the task.</li>
+        <li><b>Block floating point</b> sits in between: a block of values (a row, a tile of 16 or 32) shares one exponent and each value keeps a short integer mantissa. Arithmetic inside the block is fixed point; the shared exponent supplies range. It is the idea behind the microscaling (MX) formats of §08.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="quantization-error" data-nav="Quantization error &amp; overflow">
+      <h3><span class="idx">06</span> Quantization error, overflow and saturation</h3>
+      <p class="lede">Quantizing a real value to a grid of step <span class="keep">Δ</span> introduces two kinds of error. Values <i>inside</i> the range are moved by at most half a step — small, bounded, noise-like. Values <i>outside</i> the range overflow — and what the hardware does then decides whether the error is merely large or catastrophic.</p>
+
+      <div class="formula"><span class="lbl">rounding error inside the range (the uniform-noise model)</span><span class="eq">e = Q(x) − x  ∈  [−<span class="keep">Δ</span>/2, <span class="keep">Δ</span>/2],        E[e] = 0,        Var[e] = <span class="keep">Δ</span>² / 12,        RMS = <span class="keep">Δ</span>/√12</span>
+<span class="lbl">truncation instead of rounding (just drop the low bits)</span><span class="eq">e ∈ (−<span class="keep">Δ</span>, 0],   E[e] = −<span class="keep">Δ</span>/2  — a systematic bias that accumulates through every layer</span>
+<span class="lbl">each extra bit</span><span class="eq"><span class="keep">Δ</span> halves  →  noise power ÷ 4  →  +6.02 dB of signal-to-quantization-noise ratio</span>
+<span class="eq">SQNR ≈ 6.02·b + 1.76 dB for a full-scale sinusoid;</span>
+<span class="eq">    for Gaussian-like weights it depends on where you clip</span>
+<span class="lbl">overflow: two policies</span><span class="eq">saturate:  q ← clamp(q, −2ᵇ⁻¹, 2ᵇ⁻¹ − 1)        error ≤ |x| − range limit</span>
+<span class="eq">wrap:      q ← q mod 2ᵇ  (what a plain two's-complement adder does)</span>
+<span class="eq">    error ≈ 2ᵐ⁺¹ — a sign flip</span>
+<span class="lbl">worked, Q3.12:  3 × 3 = 9 does not fit in [−8, 8)</span><span class="eq">saturate → 32 767 → 7.99976 (error 1.0)</span>
+<span class="eq">    wrap → 36 864 − 65 536 = −28 672 → −7.0 (error 16)</span></div>
+
+      <div class="viz" id="viz-q">
+        <div class="vhead">
+          <span class="vtitle">Fixed-point word length: weights, a network's output, and the error curve</span>
+          <span class="vhint">the 673 plotted weights are exactly the parameters of a 1-24-24-1 tanh network; set the word length and where the binary point goes</span>
+        </div>
+        <div class="controls">
+          <label for="q-bits">total bits b = <b id="q-bits-out"></b></label>
+          <input type="range" id="q-bits" min="2" max="16" step="1" value="8" />
+          <label for="q-int">integer bits m = <b id="q-int-out"></b></label>
+          <input type="range" id="q-int" min="0" max="4" step="1" value="1" />
+          <label for="q-ovf">overflow</label>
+          <select id="q-ovf"><option value="sat" selected>saturate</option><option value="wrap">wrap around</option></select>
+          <label for="q-rnd">rounding</label>
+          <select id="q-rnd"><option value="near" selected>round to nearest</option><option value="trunc">truncate (toward −∞)</option></select>
+        </div>
+        <svg id="q-svg" width="760" height="470" viewBox="0 0 760 470" role="img" aria-label="Three panels. Top left: a histogram of 673 network weights with amber stems marking the values they take after fixed-point quantization and a shaded band marking the representable range. Top right: the output of a small tanh network across its input range with float weights in blue and quantized weights as a dashed amber line. Bottom: RMS weight error and RMS output error on a log scale against total word length from 2 to 16 bits, with the LSB over root-12 reference dashed and the current word length marked."></svg>
+        <div class="readout" id="q-readout" aria-live="polite"></div>
+      </div>
+      <p>At the default Q1.6 (8 bits, range [−2, 2), LSB 1/64) the weight RMS error is 5.1 × 10⁻³ against the <span class="keep">Δ</span>/√12 = 4.5 × 10⁻³ of pure rounding — the small excess is the two widest weights being clipped — and the network's output moves by about 2.6% of its own spread: the dashed curve sits almost on top of the solid one. Things to try:</p>
+      <ul class="notes">
+        <li><b>Sweep b.</b> Along the bottom panel both errors fall by a factor of two per bit (6 dB) while rounding dominates, then the weight error flattens above ≈ 10 bits: extra fraction bits cannot fix the two clipped weights, so the <i>range</i> error becomes the floor. Going down, 4 bits moves the output by about 60% of its spread and 3 bits by more than 100% — the network has become a different function.</li>
+        <li><b>Set m = 0 (range [−1, 1)).</b> You gain a bit of resolution, but 17 weights now clip, and because they are the largest weights they matter most: even with <i>saturate</i> the output error jumps to about half the output's spread. Switch to <b>wrap around</b> and each clipped weight becomes a large weight of the opposite sign — output error over 100%. This is why every neural accelerator saturates, and why checking the dynamic range of every tensor is the first step of any fixed-point port.</li>
+        <li><b>Switch to truncate.</b> The weight RMS error roughly doubles (toward <span class="keep">Δ</span>/√3 instead of <span class="keep">Δ</span>/√12), but the output error grows more than fivefold, to about 14%: every weight is pushed the same way, and a bias does not average out across 24 inputs the way zero-mean noise does. Rounding costs one adder; it is always worth it.</li>
+        <li><b>Set m = 4.</b> Range [−16, 16) spends three more integer bits than Q1.6 on weights whose largest magnitude is about 2.04: the same word length now buys eight times less resolution. Choosing m is choosing a clipping threshold, and the best threshold is usually <i>inside</i> the data's extreme values, not at them.</li>
+      </ul>
+      <div class="callout"><b>Error propagation, informally.</b> A perturbation <span class="keep">δ</span>W of the weights changes a layer's pre-activation by <span class="keep">δ</span>W·x, whose variance is about n·<span class="keep">Δ</span>²/12·E[x²] for n inputs; a tanh or sigmoid slope ≤ 1 then passes it on at most unchanged. So the output error grows with fan-in and depth but only like √n per layer — the reason networks tolerate low precision far better than, say, a matrix inversion does. Saturating nonlinearities help further: an input deep in the flat part of a sigmoid is insensitive to small errors.</div>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="training-precision" data-nav="Training vs inference precision">
+      <h3><span class="idx">07</span> Precision for training vs inference, and stochastic rounding</h3>
+      <p class="lede">Inference only needs the forward pass to be close enough; training needs something harder — that very small weight updates, summed over thousands of steps, actually arrive. Round-to-nearest destroys any update smaller than half an LSB, so a fixed-point learner can stall even though each forward pass is perfectly accurate.</p>
+
+      <div class="formula"><span class="lbl">the swamping problem</span><span class="eq">w ← Q( w + <span class="keep">η</span>·<span class="keep">δ</span>·x )     with round-to-nearest:    |<span class="keep">η δ</span> x| &lt; <span class="keep">Δ</span>/2   ⇒   w never changes</span>
+<span class="lbl">worked: Q3.12 weights, learning rate 0.1</span><span class="eq"><span class="keep">Δ</span>/2 = 2⁻¹³ ≈ 1.22 × 10⁻⁴.</span>
+<span class="eq">    A late-training gradient <span class="keep">δ</span>·x ≈ 10⁻³ gives <span class="keep">η δ</span> x = 10⁻⁴  →  rounded away, every step</span>
+<span class="lbl">stochastic rounding (SR)</span><span class="eq">SR(x) = ⌊x⌋<sub>Δ</sub> + <span class="keep">Δ</span>  with probability  (x − ⌊x⌋<sub>Δ</sub>) / <span class="keep">Δ</span>,   else ⌊x⌋<sub>Δ</sub></span>
+<span class="eq">E[ SR(x) ] = x  exactly — unbiased, so T tiny updates of size u sum to T·u on average</span>
+<span class="eq">the price is variance: after T updates with fractional part f, std = <span class="keep">Δ</span>·√( T·f(1 − f) )</span></div>
+
+      <div class="viz" id="viz-sr">
+        <div class="vhead">
+          <span class="vtitle">400 weight updates, each smaller than one LSB</span>
+          <span class="vhint">set the update size in LSB units; below 0.5 round-to-nearest never moves, truncation never moves below 1, stochastic rounding tracks the exact sum</span>
+        </div>
+        <div class="controls">
+          <label for="sr-u">update size = <b id="sr-u-out"></b> LSB</label>
+          <input type="range" id="sr-u" min="0.05" max="1.5" step="0.05" value="0.3" />
+          <button class="btn ghost" id="sr-new" type="button">new random draws</button>
+        </div>
+        <svg id="sr-svg" width="760" height="330" viewBox="0 0 760 330" role="img" aria-label="Line chart of a weight's value in LSB units over 400 identical small updates: the exact real-valued sum rises linearly in blue, round-to-nearest in amber and truncation in red stay flat or step unevenly, five stochastic-rounding runs in green scatter tightly around the exact line, and a dashed violet line shows a wide master copy rounded only when read."></svg>
+        <div class="readout" id="sr-readout" aria-live="polite"></div>
+      </div>
+      <p>At the default 0.3 LSB per update the exact sum reaches 120 LSB, round-to-nearest and truncation both stay at <b>0</b> — the learner is frozen — and the stochastic-rounding runs end within a few LSB of 120, their spread matching √(T·f(1−f)) ≈ 9 LSB. Push the update to 0.6 and round-to-nearest now rounds <i>every</i> update up to a full LSB, overshooting to 400: a different, equally wrong, answer. Only unbiased rounding, or keeping a wider copy, gets the sum right for every update size.</p>
+      <ul class="notes">
+        <li><b>The classical answer: more bits for training.</b> Early simulation studies of backpropagation in fixed point (Holt &amp; Baker 1991) found about 16 bits — sign, 3 integer bits, 12 fraction bits, with inputs and targets in [0, 1] — to be the minimum for reliable learning, while forward-only use tolerated 8-bit activations and somewhat more for weights. That "16 bits for learning, 8 for recall" rule of thumb held for decades.</li>
+        <li><b>Stochastic rounding moves the line.</b> Gupta et al. (2015) trained networks with 16-bit fixed-point weights and stochastic rounding to the same accuracy as FP32, where round-to-nearest failed. The random bits are cheap in hardware — a linear-feedback shift register per unit — and SR is now built into several training accelerators.</li>
+        <li><b>The modern answer: mixed precision.</b> Keep an FP32 <i>master copy</i> of the weights (the violet line in the figure) and apply updates to it; run the forward and backward matrix products in 16 or 8 bits (Micikevicius et al. 2018). With FP16, gradients can underflow the 5-bit exponent, so the loss is multiplied by a scale factor before backpropagation and divided out afterwards (<i>loss scaling</i>); bfloat16's 8-bit exponent largely removes that need. FP8 training (2022 onward) uses E4M3 for the forward pass and E5M2 for gradients, each tensor with its own scale.</li>
+        <li><b>Accumulators always stay wide.</b> Whatever the operand precision, sums are kept in FP32 or int32: the sum of thousands of products is where the error would otherwise pile up.</li>
+      </ul>
+      <div class="callout"><b>Inference vs training in one line.</b> Inference needs the <i>function</i> to be preserved; that tolerates 8 bits almost everywhere, and 4 bits or less for weights with care. Training needs <i>small differences</i> to be preserved; that needs either wide accumulators and master weights, or unbiased rounding, or both.</div>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="low-precision-today" data-nav="bf16 · FP8 · int8 · int4">
+      <h3><span class="idx">08</span> Low precision today: bfloat16, FP8, int8, int4</h3>
+      <p class="lede">What was an FPGA designer's hand-tuned trick in the 1990s is now standard practice at every scale. The modern recipe keeps the classical ingredients — a short integer or float code plus a scale factor — and adds one new idea: the scale is chosen <i>per channel</i> or <i>per small block</i> rather than per tensor.</p>
+      <div class="formula"><span class="lbl">affine (asymmetric) integer quantization — the int8 inference standard (Jacob et al. 2018)</span><span class="eq">q = clamp( round(r / S) + Z,  q_min,  q_max )          r̂ = S · (q − Z)</span>
+<span class="eq">symmetric weights: Z = 0,  S = max|r| / 127</span>
+<span class="eq">    per-output-channel S: one scale per row of W</span>
+<span class="lbl">an integer-only layer</span><span class="eq">y = S_w S_x ∑ (q_w)(q_x − Z_x)    — the sum runs in int32;</span>
+<span class="eq">    the float factor S_w S_x / S_y is applied as</span>
+<span class="eq">an integer multiplier and a right shift, so no floating-point unit is needed at all</span>
+<span class="lbl">block scaling (microscaling, MX; OCP specification 2023)</span><span class="eq">a block of 32 values shares one 8-bit power-of-two scale;</span>
+<span class="eq">    each value is FP8, FP6, FP4 or int8</span>
+<span class="eq">MXFP4: 4 bits per value + 8 bits per 32 values  =  4.25 bits per value on average</span></div>
+      <table class="cmp">
+        <tr><th>precision</th><th>typical use</th><th>what makes it work</th></tr>
+        <tr><td>BF16 / FP16</td><td>training and inference baseline</td><td>FP32 accumulation; FP32 master weights for training</td></tr>
+        <tr><td>FP8 (E4M3 / E5M2)</td><td>training and inference of large models on recent GPUs</td><td>per-tensor or per-block scales updated from observed maxima</td></tr>
+        <tr><td>int8</td><td>the default for deployed CNNs, speech and vision on phones and edge NPUs</td><td>per-channel scales, calibration on sample data, int32 accumulators</td></tr>
+        <tr><td>int8 in large language models</td><td>server inference</td><td>a few feature dimensions carry huge outliers; handled by keeping them in 16 bits (LLM.int8(), Dettmers et al. 2022) or by moving the difficulty into the weights (SmoothQuant, 2022)</td></tr>
+        <tr><td>int4 / FP4 weights</td><td>memory-bound LLM decoding, on-device models</td><td>weight-only quantization with small group scales and error-compensating rounding (GPTQ 2022, AWQ 2023); activations stay 8–16 bit</td></tr>
+        <tr><td>1–2 bits</td><td>research, tiny FPGAs and microcontrollers</td><td>binary/ternary weights with XNOR–popcount arithmetic (BinaryConnect 2015, binarized nets 2016); training in higher precision</td></tr>
+      </table>
+      <p>The classical lessons all reappear: pick the range per tensor (§06), keep accumulators wide (§05), train with more precision than you infer with (§07). The deployment side — post-training quantization vs quantization-aware training, calibration, measured speed-ups — is covered in <a href="../../mlops/model-acceleration.html#quant">Model Acceleration · quantization</a>.</p>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="activation-hw" data-nav="Activation functions in hardware">
+      <h3><span class="idx">09</span> Implementing activation functions in hardware</h3>
+      <p class="lede">Multiplication and addition are easy in hardware; e<sup>x</sup> and division are not. The logistic sigmoid σ(x) = 1/(1 + e<sup>−x</sup>) and tanh need both, and a naive implementation can end up bigger than all the MACs it follows. Hardware designers therefore never compute them exactly — they approximate, and the only questions are how, at what error, and at what cost in memory, multipliers and latency.</p>
+
+      <div class="formula"><span class="lbl">free identities that halve every approach</span><span class="eq">σ(−x) = 1 − σ(x)       store only x ≥ 0, one subtractor handles the rest</span>
+<span class="eq">tanh(x) = 2σ(2x) − 1   one unit serves both functions (shifts do the ×2)</span>
+<span class="eq">σ′(x) = σ(x)(1 − σ(x))  the derivative for backprop costs one multiply, no second table</span>
+<span class="lbl">saturation</span><span class="eq">σ(8) = 0.99966,  σ(−8) = 3.4 × 10⁻⁴   →</span>
+<span class="eq">    outside ±R, output the constant 0 or 1; the floor on error is σ(−R)</span></div>
+
+      <h4>The four families</h4>
+      <ul class="notes">
+        <li><b>Lookup table (LUT).</b> Use the top k bits of x as an address into a 2ᵏ-entry ROM. One memory read, no arithmetic, trivially pipelined. The error is roughly slope × half a cell: for σ over [−8, 8) with N entries, about 0.25 × (16/N)/2 = 2/N, so each extra bit of accuracy doubles the table. Fine for 8-bit outputs; hopeless for 16.</li>
+        <li><b>Piecewise-linear (PWL) interpolation.</b> Split the range into N segments (a power of two, so the top bits select the segment), store a slope and an intercept for each, compute c₂·x + c₁. One multiply and one add, 2N words. The error falls like 1/N² instead of 1/N. A further factor of two is free: instead of joining the endpoints of each segment (the chord), shift the line by half its maximum gap so that the error <i>equioscillates</i> — equal and opposite at the ends and at the interior extremum. Applied to relative error this minimax condition exactly halves the maximum error of the endpoint fit, with the same table size and hardware.</li>
+        <li><b>PLAN and other shift-only approximations.</b> Choose segment slopes that are powers of two, and the multiply becomes a wire shift. PLAN (Amin, Curtis &amp; Hayes-Gill 1997) uses four segments per side — slopes ¼, ⅛, 1/32 and 0 — and needs only comparators, shifts and adds; its maximum error is about 0.019, adequate for many classifiers. "Hard" variants (hard-sigmoid, hard-tanh, and ReLU itself) take this to its limit.</li>
+        <li><b>Polynomials and CORDIC.</b> A minimax or least-squares polynomial of degree d evaluated by Horner's rule costs d multiply–adds in sequence; an odd polynomial in x for σ(x) − ½ halves that. High degrees are accurate but either slow or large, so hardware uses low-order polynomials <i>per segment</i>, the coefficients selected by the top bits — the combination of a small table with a low-order polynomial that remains the best general-purpose method. CORDIC (Volder 1959; hyperbolic mode, Walther 1971) computes sinh and cosh with nothing but shifts, adds and a small table of atanh(2⁻ⁱ), one bit of accuracy per iteration; but the sigmoid then still needs an exponential range reduction and a division, so it takes two or three CORDIC passes of b iterations each. Its virtue is that one datapath computes many functions; its vice is latency.</li>
+      </ul>
+
+      <div class="viz" id="viz-sig">
+        <div class="vhead">
+          <span class="vtitle">Five ways to build σ(x) without an exponential unit</span>
+          <span class="vhint">N sets the table entries / segments; the bottom panel shows |error| on a log scale; the table counts memory words and multipliers</span>
+        </div>
+        <div class="controls">
+          <label for="sig-n">entries / segments N = <b id="sig-n-out"></b></label>
+          <input type="range" id="sig-n" min="2" max="8" step="1" value="4" />
+          <label for="sig-deg">polynomial degree = <b id="sig-deg-out"></b></label>
+          <input type="range" id="sig-deg" min="1" max="9" step="2" value="5" />
+          <label for="sig-R">input range ±R</label>
+          <select id="sig-R"><option value="4">4</option><option value="6">6</option><option value="8" selected>8</option></select>
+          <label for="sig-q">coefficient precision</label>
+          <select id="sig-q"><option value="0" selected>full</option><option value="8">8 fraction bits</option><option value="12">12 fraction bits</option><option value="16">16 fraction bits</option></select>
+          <label for="sig-show">highlight</label>
+          <select id="sig-show"><option value="all" selected>all five</option><option value="LUT">LUT</option><option value="PWLc">PWL chord</option><option value="PWLb">PWL balanced</option><option value="PLAN">PLAN</option><option value="poly">polynomial</option></select>
+        </div>
+        <svg id="sig-svg" width="760" height="440" viewBox="0 0 760 440" role="img" aria-label="Top: the logistic sigmoid on x from minus 10 to 10 in thick blue with five hardware approximations overlaid: a lookup table, a chord piecewise-linear fit, a balanced piecewise-linear fit, the PLAN shift-and-add approximation and an odd polynomial. Bottom: the absolute error of each approximation on a logarithmic scale with a dashed line at half an LSB of an 8-bit output."></svg>
+        <div class="readout" id="sig-readout" aria-live="polite"></div>
+      </div>
+      <p>At the default (N = 16, degree 5, R = 8) the table in the readout shows the ranking you should expect: the 16-entry LUT is worst (a staircase, error ≈ 0.1), PLAN is next with no memory at all (≈ 0.019), the chord PWL with 16 segments is ≈ 0.012, and the balanced PWL is exactly half of it, ≈ 0.006. The degree-5 polynomial over the whole ±8 range is poor — a single low-order polynomial cannot bend into both flat tails. Slide N to 256: the LUT reaches ≈ 8 × 10⁻³ (still coarser than 8-bit output resolution in the middle), while both PWL variants drop to the floor set by the input range itself, σ(−8) = 3.4 × 10⁻⁴ — with 256 segments the interpolation error is no longer what limits accuracy. Now drop R to 4 and watch every method hit the new, higher floor σ(−4) ≈ 0.018 — the input range is itself an approximation. Finally, quantize the coefficients to 8 fraction bits: the fancy methods lose their edge, because the answer cannot be more precise than the words that store it.</p>
+      <div class="callout"><b>Rate matching, the hidden cost.</b> A neuron with n inputs does n MACs and then one activation. In a custom chip that is easy to balance; on an FPGA, where arithmetic sits in fixed DSP columns and memory in fixed BRAM columns, routing every neuron's sum to a shared activation unit and keeping that unit busy — but not a bottleneck — is often harder than the approximation itself. Designs typically share one activation unit among many MAC chains and pipeline it.</div>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="dataflow" data-nav="Inner products &amp; dataflow">
+      <h3><span class="idx">10</span> Inner products and dataflow</h3>
+      <p class="lede">With the arithmetic fixed, the remaining freedom is <i>order</i>: which products are computed where and when, and therefore which values have to be fetched how often. For a matrix product this is literally the order of three nested loops, and the choice changes the memory traffic by large factors without changing a single result.</p>
+
+      <h4>Chains and trees for one inner product</h4>
+      <div class="formula"><span class="lbl">n products, two ways to add them</span><span class="eq">chain (cascaded MACs):  latency n cycles;  regular, one output — what cascaded DSP slices do</span>
+<span class="eq">adder tree:             latency ⌈log₂ n⌉ adds;  n − 1 adders of growing width, irregular wiring</span>
+<span class="eq">hybrid: chains of length c feeding a tree:   latency c + ⌈log₂(n/c)⌉  — the usual compromise</span></div>
+
+      <h4>Loop order for a matrix product</h4>
+      <div class="formula"><span class="lbl">U = W · Y,  three loops, six orders; the classic three</span><span class="eq">inner product  (ijk):   for i, for j, for k:  U[i,j] += W[i,k]·Y[k,j]</span>
+<span class="eq">    — one output at a time</span>
+<span class="eq">middle product (jki):   for j, for k, for i:  … — a whole column of U updated per step</span>
+<span class="eq">outer product  (kij):   for k, for i, for j:  …</span>
+<span class="eq">    — every U[i,j] updated each step (rank-1 update)</span>
+<span class="lbl">MACs per value fetched, M : I,  for a 2 × 2 example with nothing cached</span><span class="eq">inner 0.5          middle 0.67          outer 1.0</span>
+<span class="eq">    (the outer product uses every fetched value in a MAC)</span></div>
+      <p>For large matrices the right measure is reuse per level of the memory hierarchy, and the modern accelerator vocabulary names the dataflow by <b>what stays still</b> in each processing element's registers:</p>
+      <table class="cmp">
+        <tr><th>dataflow</th><th>kept in the PE</th><th>moves through the array</th><th>best when</th><th>example</th></tr>
+        <tr><td><b>weight-stationary</b></td><td>one weight</td><td>activations in, partial sums out</td><td>weights reused across many inputs (large batch, convolution)</td><td>TPU matrix unit, NVDLA</td></tr>
+        <tr><td><b>output-stationary</b></td><td>one partial sum</td><td>weights and activations</td><td>long reductions; the sum never leaves until finished</td><td>ShiDianNao, many GPU tensor-core tilings</td></tr>
+        <tr><td><b>input-stationary</b></td><td>one activation</td><td>weights in, partial sums out</td><td>few inputs, many filters</td><td>some sparse accelerators</td></tr>
+        <tr><td><b>row-stationary</b></td><td>a 1-D row of a convolution</td><td>mixed</td><td>convolutions, minimising total energy over all data types</td><td>Eyeriss (Chen, Emer &amp; Sze 2016)</td></tr>
+      </table>
+      <p>If weights are stored at higher precision than inputs — common in classical FPGA designs — the loop order can also be chosen to fetch fewer of the wide values and more of the narrow ones. The same thinking drives GPU kernel tiling today: a tile of W and a tile of Y are loaded into shared memory once and reused across the whole tile of U, which is how a matrix multiply is moved right of the ridge in §03.</p>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="systolic" data-nav="Systolic arrays">
+      <h3><span class="idx">11</span> Systolic arrays</h3>
+      <p class="lede">A <b>systolic array</b> (Kung &amp; Leiserson 1978; Kung 1982) is a grid of identical MAC cells, each connected only to its neighbours, through which data is pumped in lock-step like blood through the heart. Each value is read from memory once, enters at the edge, and is used by every cell it passes. Wires are short, control is trivial, and the array scales to tens of thousands of multipliers — which is why it sits at the heart of the TPU and of many edge NPUs.</p>
+      <div class="formula"><span class="lbl">output-stationary n × n array computing C = A · B</span><span class="eq">row i of A enters from the left, delayed i cycles</span>
+<span class="eq">column j of B enters from the top, delayed j cycles</span>
+<span class="eq">in cycle t, PE(i, j) computes  C[i][j] += A[i][k] · B[k][j]   with  k = t − i − j,  if 0 ≤ k &lt; n</span>
+<span class="lbl">cost</span><span class="eq">n² PEs,   n³ MACs,   3n − 2 cycles until the last C[i][j] is complete</span>
+<span class="eq">every A and B element is fetched once and used n times</span>
+<span class="eq">one product alone: utilisation n / (3n − 2) → ⅓;   products streamed back-to-back: → 100%</span>
+<span class="lbl">weight-stationary variant (the TPU's choice)</span><span class="eq">PE(k, j) holds B[k][j];   A[i][k] enters row k at cycle i + k</span>
+<span class="eq">the partial sum for C[i][j] flows down column j and leaves at cycle i + j + n − 1</span>
+<span class="eq">same 3n − 2 cycles;  the weights are loaded once and reused for every input streamed through</span>
+<span class="lbl">the first TPU</span><span class="eq">256 × 256 = 65 536 8-bit MACs × 700 MHz × 2 ops  ≈  92 TOPS</span></div>
+
+      <div class="viz" id="viz-sys">
+        <div class="vhead">
+          <span class="vtitle">A systolic array multiplying two small matrices</span>
+          <span class="vhint">step or play; green PEs are doing a MAC this cycle; the skewed queues show why row i waits i cycles</span>
+        </div>
+        <div class="controls">
+          <label for="sys-n">matrix size n</label>
+          <select id="sys-n"><option value="2">2 × 2</option><option value="3" selected>3 × 3</option><option value="4">4 × 4</option></select>
+          <label for="sys-mode">dataflow</label>
+          <select id="sys-mode"><option value="os" selected>output-stationary</option><option value="ws">weight-stationary</option></select>
+          <button class="btn" id="sys-step" type="button">step</button>
+          <button class="btn ghost" id="sys-play" type="button">▶ play</button>
+          <button class="btn ghost" id="sys-reset" type="button">reset</button>
+        </div>
+        <svg id="sys-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="A grid of processing elements. In output-stationary mode, skewed queues of A values wait to the left and B values above, each PE shows its running sum and highlights green when it performs a multiply-accumulate. In weight-stationary mode each PE shows its stored weight and the partial sum passing through. On the right the result matrix C fills in as entries complete, with the input matrices A and B printed below."></svg>
+        <div class="readout" id="sys-readout" aria-live="polite"></div>
+      </div>
+      <p>Step through the 3 × 3 case. At cycle 1 only the top-left PE works; the wavefront of green cells then sweeps diagonally across the array, is widest at cycle 4 (7 of the 9 PEs busy), and drains out at the bottom right after 3n − 2 = 7 cycles. The readout counts exactly 27 = n³ MACs, and C matches A·B. Switch to weight-stationary: the weights sit still, the A values march across the rows and the partial sums march down the columns, and the timing is identical — but now the <i>weights</i> are the data loaded once, which is what you want when the same layer is applied to a stream of inputs.</p>
+      <ul class="notes">
+        <li><b>Why it scales.</b> Every wire is between neighbours, so wire length and clock skew do not grow with the array; there is no shared bus and no global memory port per PE. Memory bandwidth grows with the array's perimeter (2n values per cycle) while compute grows with its area (n² MACs per cycle) — the systolic array is an arithmetic-intensity machine.</li>
+        <li><b>Why it is rigid.</b> The array is fast only for dense, regular products whose dimensions are multiples of n. Small or ragged matrices, sparsity and irregular operations waste cells — one reason general-purpose GPUs, which pair smaller tensor-core tiles with flexible scheduling, handle a wider range of models well.</li>
+        <li><b>Backprop fits too.</b> The backward pass multiplies by Wᵀ; a systolic array can compute W·x and Wᵀ·<span class="keep">δ</span> with the same stored weights just by feeding data along the other axis. Fully pipelined backpropagation on systolic arrays in FPGAs reached several GOPS in the early 2000s.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="fpga" data-nav="FPGA design">
+      <h3><span class="idx">12</span> FPGA design: LUTs, DSP slices, block RAM</h3>
+      <p class="lede">A field-programmable gate array is a sea of small configurable resources wired together by programmable routing, configured by a bitstream after manufacture. For a neural network it offers a middle path: close to custom-hardware efficiency for the specific network you load, while remaining re-programmable when the network changes.</p>
+      <table class="cmp">
+        <tr><th>resource</th><th>what it is</th><th>what a neural design uses it for</th></tr>
+        <tr><td><b>LUT</b> (lookup table) + flip-flop</td><td>a tiny ROM computing any Boolean function of 4–6 inputs, followed by a register; with fast carry chains between neighbours</td><td>adders, comparators, control, bit-serial or very-low-precision multipliers (binary nets use LUTs for XNOR–popcount)</td></tr>
+        <tr><td><b>DSP slice</b></td><td>a hardened multiplier (e.g. 18 × 18 or 27 × 18 bits) with a wide (e.g. 48-bit) accumulator and cascade ports to its neighbour</td><td>the MACs. A column of cascaded DSP slices is a ready-made chain inner product; two int8 MACs can be packed into one wide multiplier</td></tr>
+        <tr><td><b>Block RAM</b> (BRAM, and larger UltraRAM)</td><td>dual-ported on-chip SRAM blocks of tens of kilobits, configurable width and depth</td><td>weights, activations, activation-function tables; dual ports let weights and inputs be read in the same cycle</td></tr>
+        <tr><td><b>distributed RAM</b></td><td>LUTs used as tiny memories</td><td>small constant tables, e.g. PWL coefficients</td></tr>
+        <tr><td><b>hard processors, transceivers, AI engines</b></td><td>embedded CPU cores, multi-gigabit I/O, and on recent devices arrays of vector processors or tensor blocks</td><td>the serial part (Amdahl, §04), streaming data in and out, and dense matrix work</td></tr>
+      </table>
+
+      <div class="formula"><span class="lbl">peak MAC rate is a product of three numbers</span><span class="eq">peak = (DSP slices) × (clock) × (MACs per slice per cycle)</span>
+<span class="eq">a mid-2000s device:  512 × 500 MHz × 1  =  256 GMAC/s</span>
+<span class="eq">    a large modern device:  thousands × 0.6–0.9 GHz × 2 (int8 packing)  →  several TMAC/s</span>
+<span class="lbl">soft multipliers in LUTs scale with the square of the width</span><span class="eq">LUTs per multiplier  ∝  b²      →  going 16 → 8 bits frees ≈ 4× the LUTs,</span>
+<span class="eq">    16 → 4 bits ≈ 16×,  16 → 1 bit: an XNOR gate</span>
+<span class="lbl">the triangle every FPGA design lives in</span><span class="eq">resources  =  (parallel MAC units) × (cost per unit at precision b)</span>
+<span class="eq">    throughput ∝ parallel units × clock</span>
+<span class="eq">fix the device, and precision and throughput trade against each other directly</span></div>
+      <ul class="notes">
+        <li><b>Resource vs throughput vs precision.</b> On a fixed device, halving word length roughly quadruples the number of LUT-based multipliers you can place, or doubles DSP throughput through packing. The design question is therefore not "how many bits is best" but "what is the lowest precision that keeps accuracy, so I can spend the rest on parallelism". This is why FPGA neural designs pioneered 16-, 8- and eventually 1-bit networks long before GPUs supported them.</li>
+        <li><b>Reconfigurability.</b> The bitstream can be replaced: the same board can host a different network, a different precision per layer, or — with <i>run-time</i> or <i>partial reconfiguration</i> — swap the forward-pass circuit for the weight-update circuit mid-training. The catch is time: loading a bitstream takes milliseconds, and compiling one (synthesis, place and route) takes hours, so FPGAs track model changes far more slowly than a GPU running new software.</li>
+        <li><b>Routing is the real scarce resource.</b> An FPGA is a 2-D grid with limited wiring; a fully connected layer is a complete bipartite graph. Directly mapping one neuron per PE with all-to-all wires fails beyond small networks, so designs time-multiplex a modest array of PEs, restrict connectivity (local or partially connected layers), or use bit-serial links that need one wire per connection instead of b.</li>
+        <li><b>Design flow.</b> Classical designs were written in VHDL or Verilog by hand. Today high-level synthesis compiles C++ or a trained model into a circuit — frameworks such as FINN (for binarized and quantized networks) and hls4ml (for ultra-low-latency physics triggers) generate a fully pipelined, layer-per-block design from a network description.</li>
+      </ul>
+      <div class="callout"><b>A measured data point.</b> In one careful study of backpropagation on an FPGA, a 16-bit fixed-point (Q3.12, range [−8, 8)) network learned XOR as reliably as a 32-bit floating-point one, while being 13× smaller and 12× faster; it did saturate occasionally, and still converged. The floating-point version followed the software simulation's gradient-descent path exactly; the fixed-point one followed a slightly different path because of its quantization error — and ended in the same place.</div>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="on-chip-learning" data-nav="On-chip learning">
+      <h3><span class="idx">13</span> On-chip learning: backprop in hardware</h3>
+      <p class="lede">Most neural hardware, then and now, only does inference: the network is trained in software and its weights are loaded. <b>On-chip learning</b> puts the training algorithm itself on the device — needed when the device must adapt in the field, or when training speed is the goal — and it is much harder, for reasons that are all visible in the backprop equations.</p>
+      <div class="formula"><span class="lbl">what the hardware must add for backpropagation</span><span class="eq">forward:    Hₖ = ∑ⱼ wₖⱼ oⱼ + <span class="keep">θ</span>ₖ,     oₖ = σ(Hₖ)</span>
+<span class="eq">    — keep every oₖ for the backward pass</span>
+<span class="eq">output:     <span class="keep">δ</span>ₖ = (tₖ − oₖ) · oₖ(1 − oₖ)</span>
+<span class="eq">    — σ′ from the stored output, one multiply</span>
+<span class="eq">hidden:     <span class="keep">δ</span>ⱼ = oⱼ(1 − oⱼ) · ∑ₖ wₖⱼ <span class="keep">δ</span>ₖ</span>
+<span class="eq">    — a second matrix–vector product, with Wᵀ</span>
+<span class="eq">update:     wₖⱼ ← wₖⱼ + <span class="keep">η</span> <span class="keep">δ</span>ₖ oⱼ</span>
+<span class="eq">    — an outer product; every weight is written</span>
+<span class="lbl">cost relative to inference</span><span class="eq">≈ 3× the MACs (forward, backward, update),  storage for all activations,</span>
+<span class="eq">    write bandwidth for every weight, higher precision (§07)</span>
+<span class="lbl">the training metric</span><span class="eq">CUPS = connection updates per second   (vs CPS, connections per second, for inference)</span></div>
+      <ul class="notes">
+        <li><b>Control: a two-state machine.</b> The simplest design alternates a <i>forward</i> state, in which only the forward datapath is enabled, and a <i>backward</i> state, in which the error, delta and update circuitry runs; weights are committed on the transition back to forward. Correct and simple, but half the hardware is idle at any time.</li>
+        <li><b>Pipelining forward and backward passes.</b> To keep all hardware busy, the next pattern's forward pass starts while the previous one's error propagates back. Then the weights a pattern sees in its forward pass are a few updates older than those used when its gradient is applied — <i>delayed</i> or <i>pipelined</i> backpropagation. With a small learning rate it converges nearly as well. The same staleness trade-off reappears in modern pipeline-parallel training across many GPUs; see <a href="../distributed-training.html">Distributed Training</a>.</li>
+        <li><b>Learning algorithms chosen for hardware, not for software.</b> An algorithm that converges in fewer epochs in software may be a poor choice in silicon if it needs divisions, global information or high precision. Local rules — the <a href="perceptrons.html">perceptron and LMS rules</a>, Hebbian updates in <a href="hopfield-associative-memory.html">Hopfield networks</a>, the winner-take-all update of <a href="self-organizing-maps.html">self-organizing maps</a>, weight perturbation, and spike-timing-dependent plasticity in neuromorphic chips — need only information available at the synapse, and so were the favourites of on-chip learning. SOMs in particular were widely mapped onto FPGAs, because their "find the nearest unit" step is a parallel distance computation followed by a comparator tree.</li>
+        <li><b>Benchmark honestly.</b> CPS and CUPS are the neural equivalents of MIPS and MFLOPS: easy to inflate, hard to compare across networks, and not the thing users care about. The meaningful measure is time (or energy) to reach a fixed accuracy on a fixed task — the approach taken by the MLPerf benchmarks since 2018.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="arithmetic-design" data-nav="Bit-serial, stochastic, log">
+      <h3><span class="idx">14</span> Arithmetic-based design: bit-serial, stochastic and logarithmic</h3>
+      <p class="lede">When multipliers are the scarce resource, change the arithmetic. Three alternatives recur throughout the history of neural hardware, each trading something — time, accuracy, or the cost of addition — for tiny operators.</p>
+
+      <h4>Bit-serial arithmetic</h4>
+      <div class="formula"><span class="lbl">process one bit per cycle</span><span class="eq">a b-bit add takes b cycles on a 1-bit full adder;</span>
+<span class="eq">    a bit-serial × bit-parallel multiply takes b cycles on b AND gates + an adder</span>
+<span class="eq">area ∝ 1  (or b),  time ∝ b   →</span>
+<span class="eq">    throughput per unit area roughly constant, but the wiring per connection is 1 wire, not b</span>
+<span class="lbl">the payoff: time proportional to precision</span><span class="eq">a layer quantized to p bits instead of 16 runs 16/p times faster</span>
+<span class="eq">    on the same bit-serial hardware (Stripes, Judd et al. 2016)</span></div>
+      <p>Early FPGA neurocomputers packed thousands of bit-serial processing elements onto chips that could not hold more than a few word-parallel multipliers, and the 1-wire-per-connection property also eases the routing problem of §12. The modern revival is precision-proportional accelerators: the same hardware runs an 8-bit layer twice as fast as a 16-bit one, so per-layer precision tuning pays off directly.</p>
+
+      <h4>Stochastic computing</h4>
+      <div class="formula"><span class="lbl">represent a number p ∈ [0, 1] as a random bitstream with P(bit = 1) = p  (Gaines 1967)</span><span class="eq">multiply:  z = a AND b     P(z = 1) = P(a = 1) · P(b = 1) = p₁ p₂</span>
+<span class="eq">    — if the streams are independent</span>
+<span class="eq">scaled add:  z = MUX(a, b; select with P = ½)     P(z = 1) = (p₁ + p₂)/2</span>
+<span class="eq">bipolar code for x ∈ [−1, 1]:  p = (x + 1)/2,  multiply with XNOR</span>
+<span class="lbl">the cost is time: the estimate after N bits is binomial</span><span class="eq">RMS error = √( p(1 − p) / N )      halving the error costs 4× the cycles;</span>
+<span class="eq">    b-bit accuracy needs N ~ 4ᵇ cycles</span></div>
+
+      <div class="viz" id="viz-sc">
+        <div class="vhead">
+          <span class="vtitle">Multiplication with a single AND gate</span>
+          <span class="vhint">two random bitstreams encode p₁ and p₂; counting the 1s of their AND estimates p₁·p₂; share the random source to see correlation break it</span>
+        </div>
+        <div class="controls">
+          <label for="sc-p1">p₁ = <b id="sc-p1-out"></b></label>
+          <input type="range" id="sc-p1" min="0" max="1" step="0.01" value="0.6" />
+          <label for="sc-p2">p₂ = <b id="sc-p2-out"></b></label>
+          <input type="range" id="sc-p2" min="0" max="1" step="0.01" value="0.5" />
+          <label for="sc-n">stream length N = <b id="sc-n-out"></b></label>
+          <input type="range" id="sc-n" min="3" max="14" step="1" value="8" />
+          <label for="sc-corr">random sources</label>
+          <select id="sc-corr"><option value="indep" selected>independent</option><option value="shared">shared (correlated)</option></select>
+          <button class="btn ghost" id="sc-new" type="button">new streams</button>
+        </div>
+        <svg id="sc-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Top: the first 64 bits of two random bitstreams A and B and of their bitwise AND, drawn as rows of filled and empty cells. Bottom: RMS error of the AND-gate estimate of the product against stream length on log-log axes, with the binomial square-root law dashed and horizontal reference lines for the error of 4-, 6- and 8-bit binary numbers. A side panel prints the exact product, the estimate, the error and min of p1 and p2."></svg>
+        <div class="readout" id="sc-readout" aria-live="polite"></div>
+      </div>
+      <p>With the defaults (p₁ = 0.6, p₂ = 0.5, N = 256) the AND-gate estimate lands within a few hundredths of 0.3, and the green curve follows the dashed √(p(1−p)/N) law down the log-log plot: 4× more cycles for each halving of the error, crossing 8-bit binary accuracy only around N ≈ 1.6 × 10⁵. Now choose <b>shared</b> random sources: both streams are generated from the same random numbers, the 1s line up, and the AND gate computes min(p₁, p₂) = 0.5 instead of the product — and no amount of stream length fixes it. Decorrelation (independent random-number generators per input, or deterministic low-discrepancy sequences) is the central engineering problem of stochastic computing. Its virtues are real — tiny gates, graceful degradation under bit flips, natural fit to pulse-based and spiking signals — and it resurfaces whenever area or fault tolerance matters more than latency, but it has never been competitive for high-precision work.</p>
+
+      <h4>Logarithmic and residue number systems</h4>
+      <div class="formula"><span class="lbl">logarithmic number system (LNS): store L = log₂|x| and a sign</span><span class="eq">x · y  ↔  Lₓ + L_y          — a multiplier becomes an adder</span>
+<span class="eq">x + y  ↔  max(Lₓ, L_y) + log₂(1 + 2^(−|Lₓ − L_y|))</span>
+<span class="eq">    — addition needs a function table: the price moves to the accumulator</span>
+<span class="lbl">power-of-two weights, the degenerate case</span><span class="eq">w = ±2^(−k)   →   w · x is a shift of x;</span>
+<span class="eq">    networks quantized to powers of two lose surprisingly little accuracy</span>
+<span class="eq">    (Miyashita et al. 2016)</span>
+<span class="lbl">residue number system (RNS): represent x by its remainders modulo coprime m₁, m₂, …</span><span class="eq">add and multiply digit-wise, carry-free and in parallel;</span>
+<span class="eq">    converting back, comparing and dividing are expensive</span></div>
+      <p>Both exploit the fact that a neural network's arithmetic is mostly multiply and add, and that exact intermediate values rarely matter: a classifier only needs the final decision to be right, so an exotic representation need only be converted back at the very end — if at all.</p>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="analog-neuromorphic" data-nav="Analog &amp; neuromorphic">
+      <h3><span class="idx">15</span> Analog and neuromorphic hardware</h3>
+      <p class="lede">The most literal answer to "a neuron is a weighted sum" is to let physics do the sum. In an analog crossbar the weights are conductances, the inputs are voltages, and Ohm's and Kirchhoff's laws compute a whole matrix–vector product in one step, in place, with no data movement at all.</p>
+      <div class="formula"><span class="lbl">an analog crossbar (in-memory computing)</span><span class="eq">input voltages Vᵢ on the rows,  conductances Gᵢⱼ at the crossings:</span>
+<span class="eq">    column current  Iⱼ = ∑ᵢ Gᵢⱼ Vᵢ</span>
+<span class="eq">the multiply is Ohm's law, the sum is Kirchhoff's current law, and the weights never move</span>
+<span class="lbl">the catch</span><span class="eq">device variation, noise, drift, and the DACs/ADCs at the edges</span>
+<span class="eq">    →  effective precision of roughly 4–8 bits, and converter energy that can dominate</span></div>
+      <ul class="notes">
+        <li><b>Analog neurochips</b> go back to the late 1980s — Mead's analog VLSI program and chips such as Intel's ETANN (1989), which stored weights as charge on floating gates. Modern versions use flash cells, phase-change memory or resistive memories (memristors) as the conductances. They are extremely efficient for inference on fixed weights, but writing weights precisely, training on chip and keeping calibration are hard.</li>
+        <li><b>Neuromorphic chips</b> implement <i>spiking</i> neurons that communicate by discrete events, so energy is spent only when something happens. IBM's TrueNorth (2014) had a million spiking neurons and 256 million synapses on one chip and ran at tens of milliwatts; Intel's Loihi (2018) added on-chip learning rules; the SpiNNaker machine connects about a million ARM cores to simulate spiking networks in real time. They excel at sparse, event-driven sensory processing (event cameras, always-on audio) at very low power, but spiking networks remain harder to train to state-of-the-art accuracy than conventional ones.</li>
+        <li><b>The bridge to classical networks.</b> <a href="hopfield-associative-memory.html">Hopfield's</a> 1984 continuous model was explicitly an analog circuit of amplifiers and resistors, and his energy-function analysis was partly motivated by building it; associative memories and Boltzmann-style samplers remain natural targets for analog and stochastic hardware.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 16 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="who-won" data-nav="Why GPUs/TPUs won">
+      <h3><span class="idx">16</span> Why GPUs and TPUs won the general case — and where FPGAs and ASICs live</h3>
+      <p class="lede">For three decades, dedicated neurocomputers promised order-of-magnitude speed-ups, and almost none of them outperformed the best conventional computer of their own time. Then a device built for video games became the engine of deep learning. The reasons are economic and architectural in about equal measure.</p>
+      <h4>Why the early neurocomputers lost</h4>
+      <ul class="notes">
+        <li><b>Volume beats specialisation.</b> Mass-market processors improved much faster, generation over generation, than low-volume special-purpose chips; by the time a neurochip shipped, commodity hardware had closed the gap. Comparisons claiming big wins were often against an old PC running interpreted code.</li>
+        <li><b>Software lagged.</b> A chip with a small user base never got the compilers, libraries and debuggers that make hardware usable.</li>
+        <li><b>Flexibility ended up re-inventing the FPGA.</b> The variety of network types forced neurochips to be programmable, and a programmable array of configurable units is essentially an FPGA — without the FPGA's volume.</li>
+        <li><b>Amdahl and the serial parts</b> (§04), and <b>poor benchmarking</b> (§13) did the rest.</li>
+      </ul>
+      <h4>Why GPUs and TPUs won</h4>
+      <ul class="notes">
+        <li><b>The workload converged on dense matrix products</b> — exactly what a GPU's thousands of SIMD lanes do well. Deep learning's rise (the 2012 ImageNet result ran on two consumer GPUs) was partly a consequence of this fit.</li>
+        <li><b>Volume and a software ecosystem.</b> Gaming paid for the silicon; CUDA (2007), cuDNN and then the major frameworks made the silicon usable by anyone writing Python.</li>
+        <li><b>Specialisation arrived inside the general-purpose chip.</b> Tensor cores (2017 onward) are small matrix-multiply units, a systolic idea inside a GPU; FP16, BF16, FP8 and FP4 support brought the precision lessons of §05–§08 to the mainstream; high-bandwidth memory and fast interconnects moved the ridge of §03.</li>
+        <li><b>The TPU is the exception that proves the rule.</b> It is an ASIC — a systolic array (§11) with a large on-chip buffer — and it succeeded because a single company's internal volume was large enough to amortise the design cost, and its workloads were stable matrix products. That is the condition under which custom silicon wins: a big, stable market.</li>
+      </ul>
+      <h4>Where FPGAs and small ASICs keep winning</h4>
+      <table class="cmp">
+        <tr><th>niche</th><th>why the GPU is the wrong tool</th><th>why FPGA / ASIC fits</th></tr>
+        <tr><td><b>ultra-low latency at batch 1</b></td><td>kernel launch and batching overheads; latency measured in milliseconds</td><td>a fully pipelined circuit gives deterministic latency of micro- or nanoseconds — particle-physics triggers, trading, network packet processing, real-time control</td></tr>
+        <tr><td><b>edge and battery power</b></td><td>tens to hundreds of watts</td><td>phone NPUs, keyword spotters and camera ASICs run int8 or lower at milliwatts to a few watts</td></tr>
+        <tr><td><b>custom precision</b></td><td>fixed menu of formats</td><td>any width per layer, binary and ternary networks, bespoke activation units</td></tr>
+        <tr><td><b>streaming sensor and signal data</b></td><td>data must be copied into GPU memory</td><td>the network sits directly on the data path (radio, radar, instrumentation, SmartNICs)</td></tr>
+        <tr><td><b>low volume, long life, harsh environments</b></td><td>product lines change every 1–2 years</td><td>reconfigurable in the field; available for a decade; radiation-tolerant parts for space</td></tr>
+        <tr><td><b>prototyping an ASIC</b></td><td>—</td><td>test the accelerator's RTL at speed before committing to silicon</td></tr>
+      </table>
+      <div class="callout"><b>The durable lesson.</b> The hardware that wins is not the one that best mirrors the brain or the network diagram; it is the one that makes the dominant operation cheap per joule and per dollar, keeps data close to the arithmetic, and comes with software people can use. Everything on this page — fixed point, table-based sigmoids, systolic arrays, bit-serial PEs — survives in that form: as ideas inside mainstream accelerators, or as the right answer for a niche where latency, power or precision dominate. For how these ideas are applied when deploying models today, see <a href="../../mlops/model-acceleration.html">Model Acceleration</a>; for scaling training across many accelerators, see <a href="../distributed-training.html">Distributed Training</a>.</div>
+    </section>
+
+    <!-- ═══ 17 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">17</span> Takeaways and cheat sheet</h3>
+      <ul class="notes">
+        <li><b>Count first.</b> MACs = ∑ nₗ₋₁nₗ for dense layers; energy is dominated by data movement (a DRAM read costs ~1000× an 8-bit MAC), so bytes and their location matter more than FLOPs.</li>
+        <li><b>Roofline:</b> attainable = min(P, <span class="keep">β</span>·I). Batch-1 dense layers have I ≈ 1 FLOP/byte and are memory-bound everywhere; batching, tiling and quantizing weights move them right.</li>
+        <li><b>Fixed point Qm.n:</b> m integer bits buy range, n fraction bits buy resolution; rounding error RMS = <span class="keep">Δ</span>/√12; each bit = 6 dB; always saturate, never wrap; always round, don't truncate; accumulate wide.</li>
+        <li><b>Training needs more than inference</b> because updates below half an LSB vanish; fixes are wide master weights, stochastic rounding, loss scaling, and wide accumulators.</li>
+        <li><b>Activations:</b> use symmetry; LUT error ∝ 1/N, PWL ∝ 1/N², balanced (minimax) PWL halves the chord error for free; low-order polynomial per segment is the general-purpose best; CORDIC is flexible but slow.</li>
+        <li><b>Dataflow:</b> name the stationary operand; systolic arrays give n-fold reuse with neighbour-only wiring, 3n − 2 cycles for an n × n product.</li>
+        <li><b>FPGAs:</b> DSPs × clock × packing sets the peak; LUT multipliers scale with b², so precision is parallelism; reconfigurable but slow to recompile; routing is the scarce resource.</li>
+        <li><b>Exotic arithmetic</b> (bit-serial, stochastic, LNS, analog, spiking) trades time, precision or programmability for tiny, low-power operators; each lives on in a niche or inside mainstream designs.</li>
+        <li><b>History:</b> volume, software and a convergent workload let GPUs and TPUs win the general case; FPGAs and small ASICs win on latency, power, custom precision and streaming data.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>quantity</th><th>formula / rule</th><th>worked value on this page</th></tr>
+        <tr><td>MLP MACs</td><td>∑ nₗ₋₁ nₗ</td><td>784-512-256-10: 535 040</td></tr>
+        <tr><td>arithmetic intensity, dense layer</td><td>B·d / (d + 2B), 2-byte values</td><td>batch 1: ≈ 1 FLOP/byte</td></tr>
+        <tr><td>ridge point</td><td>P / <span class="keep">β</span></td><td>H100-class: ≈ 295; TPU v1: ≈ 2 700</td></tr>
+        <tr><td>Qm.n range / LSB</td><td>[−2ᵐ, 2ᵐ − 2⁻ⁿ] / 2⁻ⁿ</td><td>Q3.12: [−8, 8), 2.44 × 10⁻⁴</td></tr>
+        <tr><td>rounding noise</td><td><span class="keep">Δ</span>²/12, +6.02 dB per bit</td><td>§06 figure: measured RMS ≈ <span class="keep">Δ</span>/√12</td></tr>
+        <tr><td>stochastic rounding</td><td>E[SR(x)] = x; std √(T f(1 − f)) LSB</td><td>400 × 0.3 LSB → ≈ 120 ± 9</td></tr>
+        <tr><td>LUT / PWL error</td><td>≈ slope·cell/2 ; ∝ cell²; minimax halves chord</td><td>PLAN: ≈ 0.019 with no memory</td></tr>
+        <tr><td>systolic latency</td><td>3n − 2 cycles, n² PEs, n³ MACs</td><td>3 × 3: 7 cycles, 27 MACs</td></tr>
+        <tr><td>stochastic computing error</td><td>√(p(1 − p)/N)</td><td>8-bit accuracy needs N ~ 10⁵</td></tr>
+        <tr><td>FPGA peak</td><td>DSPs × f × MACs/DSP</td><td>512 × 500 MHz = 256 GMAC/s</td></tr>
+      </table>
+    </section>
+
+    <nav class="pager" aria-label="Classical Neural Networks series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="neuroevolution.html">← Neuroevolution &amp; Growing Networks</a>
+      <a href="index.html" style="color:var(--muted)">Classical Neural Networks · overview</a>
+      <span></span>
+    </nav>
+
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="neural-hardware.viz.js"></script>
+</body>
+</html>

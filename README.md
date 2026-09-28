@@ -47,7 +47,9 @@ ml-notes/
 │   ├── mixture-of-experts.html             # ✅
 │   ├── generative-adversarial-networks.html# ✅
 │   ├── diffusion-models.html               # ✅
-│   └── graph-neural-networks.html          # ✅
+│   ├── graph-neural-networks.html          # ✅
+│   ├── dl-in-practice.html                 # ✅ frameworks & workflow
+│   └── classical-nn/                       # ✅ 10-part series + index.html hub
 │
 └── nlp/                                    # 11/11 pages built
     ├── tokenization.html                   # ✅ STRONG
@@ -73,7 +75,7 @@ data-eng/MLOps/viz stubs).
 | Domain | Folder | Status |
 |--------|--------|--------|
 | Machine Learning | `machine-learning/` | ✅ Regression, kNN, k-Means, SVM, Naive Bayes, Trees, Regularization, PCA, Model Eval, RL, Bias-Variance, Learning Paradigms, ML Compared, Hyperparameter Tuning, ML Strategy (15/15) |
-| Deep Learning | `deep-learning/` | ✅ 18/19 (Neural Nets, CNNs, Attention, Transformers, MoE, GANs, Diffusion, GNNs, NN Training, Fine-Tuning, Distillation, Distributed, Encoder/Decoder, SSM, World Models/JEPA, Arch Compared, Residual, End-to-End) — RNNs stub |
+| Deep Learning | `deep-learning/` | ✅ 23 topics (Neural Nets, CNNs, RNNs/LSTMs, Attention, Transformers, MoE, GANs, Diffusion, GNNs, NN Training, Fine-Tuning, Distillation, Distributed, Encoder/Decoder, SSM, World Models/JEPA, Arch Compared, Residual, End-to-End, Contrastive, Autoencoders/VAEs, **DL in Practice**) + **Classical Neural Networks** series in `deep-learning/classical-nn/` (hub + 10 parts: Perceptrons, Hopfield, Boltzmann/RBMs, SOMs, RBF, Neuro-Fuzzy, Kalman Training, System ID & Control, Neuroevolution, Hardware) |
 | NLP | `nlp/` | ✅ 11/11 (Tokenization, Embeddings, LMs, RAG, Preprocessing, NER, MT, Entailment, Doc Intelligence, KGs, HMMs/CRFs) |
 | LLMs & Generative AI | `llm/` | ✅ 10/10 (LLMs, Context Eng, PEFT, Preference Opt, Reasoning, Hallucination, LLM-as-Judge, VLM, Diffusion LLMs, Context-Length Ext) |
 | Agentic AI | `agentic/` | ✅ 5/5 (Agents, Agentic RL, Agent Skills, Design Patterns, Computer Control) |
