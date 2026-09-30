@@ -515,6 +515,7 @@ const cross = [
   ["Differential Privacy","Data Quality & Governance"],
   ["Speech Processing","Transformers"],["Speech Processing","Embeddings"],["Speech Processing","Vision-Language Models"],
   ["BERT","Encoder vs Decoder Models"],["BERT","Transformers"],["BERT","Fine-Tuning & Transfer Learning"],["BERT","Language Models"],["BERT","Named Entity Recognition"],["BERT","Textual Entailment"],
+  ["BERT","Tokenization"],["BERT","Attention"],["BERT","Knowledge Distillation"],["BERT","Contrastive Learning"],["BERT","Parameter-Efficient Fine-Tuning"],["BERT","Vector Databases (HNSW)"],["BERT","NLP Evaluation Metrics"],["BERT","Model Interpretability"],["BERT","RNNs & LSTMs"],["BERT","Context-Length Extension"],["BERT","Large Language Models"],
   ["EfficientNet","CNNs"],["EfficientNet","Residual / Skip Connections"],["EfficientNet","Fine-Tuning & Transfer Learning"],["EfficientNet","Image Classification"],
   ["EfficientNet","Object Detection"],["EfficientNet","Vision Transformers"],["EfficientNet","Model Acceleration"],["EfficientNet","Hyperparameter Tuning"],
   ["EfficientNet","Neural Network Training"],["EfficientNet","Knowledge Distillation"],["EfficientNet","DL Architectures Compared"],
