@@ -6,134 +6,974 @@
 <title>Interactive Notes · LayoutLM</title>
 <script src="../vendor/d3.min.js"></script>
 <link rel="stylesheet" href="../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+</style>
 </head>
 <body>
 <div class="layout">
   <nav class="sidebar" id="sidebar"></nav>
   <main>
     <header class="page">
-      <h1>LayoutLM (v1 · v2 · v3)</h1>
-      <p>The model family that brought <b>pretrain-then-fine-tune</b> to <i>visually-rich documents</i> — forms, receipts, invoices, scanned pages. A document isn't just a string of words; <i>where</i> each word sits on the page carries meaning. LayoutLM fuses three modalities — <b>text</b>, <b>2D layout</b>, and <b>image</b> — in one Transformer.</p>
+      <h1>LayoutLM (v1 · v2 · v3 · LayoutXLM)</h1>
+      <p>LayoutLM is a family of Transformer encoders from Microsoft Research that read a document page as OCR words plus the bounding box of every word, and — from v2 on — the page image too. Each coordinate is scaled to a 0–1000 grid and looked up in a learned embedding table, so a word's position on the page is part of its input vector. This note follows the family in detail: the benchmark landscape and the OCR front end it depends on, v1's four coordinate lookups and masked visual-language modelling, v2's 7 × 7 visual tokens, spatial-aware attention and text–image alignment tasks, the multilingual LayoutXLM and its XFUND benchmark, v3's linear patches with unified text and image masking, recomputed parameter counts, fine-tuning recipes, sequence budgets, licences, limitations and pitfalls.</p>
       <div style="margin-top:14px;">
+        <span class="pill">Model Architectures</span>
         <span class="pill">Document AI</span>
-        <span class="pill">Multimodal</span>
-        <span class="pill">Transformer</span>
-        <span class="pill">Microsoft</span>
+        <span class="pill">OCR-based</span>
+        <span class="pill">Layout-aware</span>
+        <span class="pill">Multimodal encoder</span>
       </div>
     </header>
 
-    <section class="topic" id="overview">
-      <h3><span class="idx">01</span> The problem: documents are 2D</h3>
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="overview" data-nav="What LayoutLM is">
+      <h3><span class="idx">01</span> What LayoutLM is</h3>
+      <p class="lede">LayoutLM is a BERT-style bidirectional Transformer encoder whose input is a sequence of OCR tokens, each carrying the bounding box of the word it came from, scaled to integers between 0 and 1000. The box coordinates index learned embedding tables and are summed into the token's input vector, so self-attention can use where a word sits on the page as well as what it says. Later versions add the page image as extra tokens and a relative-position bias in attention.</p>
+      <div class="formula"><span class="lbl">a word's box, normalised to the page (W × H pixels)</span><span class="eq">x̂ = floor(1000 · x / W)        ŷ = floor(1000 · y / H)        box = (x̂₀, ŷ₀, x̂₁, ŷ₁)</span>
+<span class="lbl">LayoutLM v1 input embedding of token i (two shared tables, X and Y)</span><span class="eq">eᵢ = Tok(wᵢ) + Pos1D(i) + Seg(sᵢ) + X(x̂₀) + Y(ŷ₀) + X(x̂₁) + Y(ŷ₁)</span>
+<span class="lbl">then an ordinary Transformer encoder, and a task head on top</span><span class="eq">h = Encoder(e₁ … eₙ)        labels / spans / class = Head(h)</span></div>
+
+      <h4>What goes in and what comes out</h4>
       <ul class="notes">
-        <li>Plain <a href="bert.html">BERT</a> reads a 1D token stream and throws away the page geometry. But in a form, the label "Total:" and the value "$42.00" mean what they do <b>because of their positions</b>.</li>
-        <li><b>Visually-rich Document Understanding (VDU)</b> tasks: form/receipt key-value extraction, document classification, document VQA, layout analysis.</li>
-        <li>LayoutLM's idea: feed each token its <b>2D bounding box</b> (from OCR) alongside the word, so attention can reason over spatial relationships — see <a href="../nlp/document-intelligence.html">Document Intelligence</a>.</li>
+        <li><b>Inputs:</b> the words an OCR engine (or a PDF's text layer) found on one page, in some reading order, with one box per word; from v2 on, the page image resized to 224 × 224. LayoutLM does not read pixels to find words — an external engine does.</li>
+        <li><b>Outputs:</b> one contextual vector per token (and per visual token in v2/v3). A linear or MLP head turns them into a label per token (form and receipt fields), start/end positions of an answer span (document question answering), or one class per page (document classification).</li>
+        <li><b>Training:</b> self-supervised pretraining on the roughly 11 million scanned pages of the IIT-CDIP collection, then supervised fine-tuning on a small labelled dataset such as FUNSD's 149 training forms.</li>
       </ul>
-      <div class="callout"><b>One line:</b> LayoutLM = a Transformer encoder that adds <b>2D positional embeddings</b> (and, increasingly, image features) to text, pretrained on millions of scanned documents, then fine-tuned for extraction, classification, and QA.</div>
+
+      <h4>The four members this page covers</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>arXiv</th><th>What it adds</th></tr>
+        <tr><td>LayoutLM (v1)</td><td>1912.13318</td><td>2-D position embeddings on a BERT encoder; masked visual-language modelling; image features only at fine-tuning time</td></tr>
+        <tr><td>LayoutLMv2</td><td>2012.14740</td><td>49 visual tokens from a ResNeXt-101-FPN inside the Transformer; spatial-aware self-attention; text–image alignment and matching pretraining</td></tr>
+        <tr><td>LayoutXLM</td><td>2104.08836</td><td>The v2 architecture pretrained in 53 languages from an InfoXLM initialisation; the seven-language XFUND benchmark</td></tr>
+        <tr><td>LayoutLMv3</td><td>2204.08387</td><td>No CNN: 16 × 16 linear patches; masked language and masked image modelling plus word–patch alignment; segment-level boxes</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> LayoutLM is "BERT whose tokens know their coordinates". Everything else in the family — image tokens, relative spatial bias, patch embeddings, alignment objectives — is a way of giving that encoder more of the page while keeping the OCR-token interface.</div>
+      <div class="callout"><b>What this page does NOT cover, and where it lives.</b> The document-AI category as a whole — the OCR-based versus OCR-free split, the other families side by side, how to choose — <a href="document-ai-models.html">Document AI Models</a>. The OCR-free encoder–decoder that reads pixels directly — <a href="donut.html">Donut</a>. Document processing as a system (OCR engines, layout analysis, tables and forms pipelines) — <a href="../nlp/document-intelligence.html">Document Intelligence</a>. Masked language modelling, WordPiece inputs and BERT's fine-tuning heads in general — <a href="bert.html">BERT</a>. The Transformer block itself — <a href="../deep-learning/transformers.html">Transformers</a>; attention mathematics — <a href="../deep-learning/attention.html">Attention</a>. How a ViT turns an image into patch tokens — <a href="../vision/vision-transformers.html#patchify">Vision Transformers</a>. BIO tagging and entity evaluation — <a href="../nlp/named-entity-recognition.html#bio">Named Entity Recognition</a>; extractive span question answering — <a href="../nlp/question-answering.html#extractive">Question Answering</a>. General vision-language models that now read documents — <a href="../llm/vision-language-models.html">Vision-Language Models</a>. This page owns the LayoutLM family: its inputs, objectives, configurations, results, and how it is fine-tuned and used.</div>
     </section>
 
-    <section class="topic" id="layout">
-      <h3><span class="idx">02</span> Layout = 2D position embeddings</h3>
-      <p class="lede">Each OCR word comes with a bounding box <code>(x₀, y₀, x₁, y₁)</code>, normalized to a 0–1000 grid. LayoutLM embeds those coordinates and <b>adds</b> them to the token embedding. Click a field to see its box.</p>
-
-      <div class="viz" id="viz-bbox">
-        <div class="vhead">
-          <span class="vtitle">Bounding boxes → 2D embeddings</span>
-          <span class="vhint">click a word on the mock invoice</span>
-        </div>
-        <svg id="bbox-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Interactive diagram: Bounding boxes → 2D embeddings"></svg>
-        <div class="readout" aria-live="polite" id="bbox-read"></div>
-      </div>
-
-      <div class="formula"><span class="eq">embedding(word) = token + X(x₀) + Y(y₀) + X(x₁) + Y(y₁) + 1D-position      (v1: two shared tables X, Y)</span></div>
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="motivation" data-nav="Why layout needs its own signal">
+      <h3><span class="idx">02</span> Why layout needs its own signal</h3>
+      <p class="lede">In a form or an invoice, the meaning of a string often comes from where it is: the number to the right of "Total:" is the total, the text under "Ship to:" is an address. A text-only encoder sees only the order the OCR engine emitted words in, and that order can separate a key from its value or interleave two columns.</p>
+      <h4>What a 1-D token stream loses</h4>
       <ul class="notes">
-        <li>Four position embedding layers share <b>two tables</b>: an X table looks up x₀ and x₁, a Y table looks up y₀ and y₁. Together the two corners encode <b>position and size</b>. v2 adds explicit width and height embeddings (as does the common open-source v1 implementation).</li>
-        <li>So two words far apart on the page can attend to each other, and a label can bind to the value <i>beside</i> it — not just the next token in reading order.</li>
+        <li><b>Key–value adjacency is two-dimensional.</b> The v1 paper's example: for a key such as "Passport ID:", the value is much more likely to the right of it or below it than to the left or above. In a serialised stream, "below" can be dozens of tokens away.</li>
+        <li><b>Visual cues carry priority.</b> Headings are larger or bold; totals are often boxed; table rules group cells. The v1 paper lists bold, underline and italic as useful hints for sequence labelling, and the whole-page appearance as a strong cue for classifying the document type.</li>
+        <li><b>Reading order is itself an OCR output.</b> The text encoder's 1-D positions are only as good as the engine's line ordering, which tends to be weakest on the multi-column and tabular pages where layout matters most (see <a href="#ocr">the OCR front end</a>).</li>
       </ul>
+      <h4>What existed before, and what LayoutLM changed</h4>
+      <p>Before 2019, document AI was split between computer-vision pipelines (table or region detection with Faster R-CNN or Mask R-CNN), grid-based models such as Chargrid that painted characters onto a 2-D map, and graph-convolution models over OCR segments. The v1 paper names two gaps: these methods relied on small human-labelled datasets without using large unlabelled collections, and none jointly pretrained text and layout. LayoutLM's move was to take BERT's recipe — pretrain on a large unlabelled corpus, fine-tune on small labelled sets — and change only the input embedding, so the whole BERT toolkit (initialisation, masked-token objective, heads) carried over.</p>
+      <p>The payoff showed up where labels are scarcest. On FUNSD, whose training split has only 149 forms, the v1 paper reports BERT-base at 60.26 F1 and LayoutLM-base (text + layout) at 78.66 — the same encoder size, pretrained with coordinates.</p>
+      <div class="callout"><b>Takeaway:</b> layout is a second positional signal that a document's text order does not reliably carry. LayoutLM supplies it as extra embeddings rather than as a new architecture, which is why it could start from BERT's weights.</div>
     </section>
 
-    <section class="topic" id="architecture">
-      <h3><span class="idx">03</span> Architecture</h3>
-      <p class="lede">All three versions are a single Transformer encoder fed multiple modalities — what changes is <b>how the image enters</b> and which pretraining objectives bind the modalities. Switch versions to see the wiring.</p>
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="tasks" data-nav="The VDU task landscape">
+      <h3><span class="idx">03</span> The visually-rich document understanding tasks</h3>
+      <p class="lede">The LayoutLM papers evaluate on a fixed set of public datasets, each standing for a task type: entity labelling on forms (FUNSD) and receipts (SROIE, CORD), long-document field extraction (Kleister-NDA), page classification (RVL-CDIP), question answering on page images (DocVQA), layout analysis (PubLayNet) and multilingual forms (XFUND). Sizes and metrics below are as the papers state them.</p>
+      <table class="cmp">
+        <tr><th>Dataset</th><th>Task</th><th>Size and split</th><th>Labels</th><th>Metric</th><th>Used by</th></tr>
+        <tr><td>FUNSD</td><td>form entity labelling</td><td>199 scanned forms, 9,707 entities, 31,485 words; 149 train / 50 test</td><td>question, answer, header, other</td><td>F1 (v1: word-level; v2: entity-level; v3 does not say)</td><td>v1, v2, v3, LayoutXLM</td></tr>
+        <tr><td>SROIE (Task 3)</td><td>receipt key-information extraction</td><td>626 train / 347 test receipts</td><td>company, date, address, total</td><td>entity F1 (exact match)</td><td>v1, v2</td></tr>
+        <tr><td>CORD</td><td>receipt field labelling</td><td>1,000 receipts; 800 / 100 / 100</td><td>30 fields under 4 categories</td><td>entity-level F1</td><td>v2, v3</td></tr>
+        <tr><td>Kleister-NDA</td><td>long-document extraction</td><td>254 / 83 / 203 non-disclosure agreements from EDGAR</td><td>4 keys</td><td>F1 (validation set in v2)</td><td>v2</td></tr>
+        <tr><td>RVL-CDIP</td><td>page classification</td><td>400,000 grayscale images, 25,000 per class; 320k / 40k / 40k</td><td>16 classes (letter, form, email, invoice, resume, …)</td><td>accuracy</td><td>v1, v2, v3</td></tr>
+        <tr><td>DocVQA</td><td>question answering on page images</td><td>50,000 questions on 12,000+ pages; 10,194 / 1,286 / 1,287 images, 39,463 / 5,349 / 5,188 questions</td><td>free-text answers</td><td>ANLS</td><td>v2, v3</td></tr>
+        <tr><td>PubLayNet</td><td>layout detection</td><td>335,703 / 11,245 / 11,405 research-paper page images</td><td>text, title, list, table, figure</td><td>mAP @ IoU 0.50:0.95</td><td>v3</td></tr>
+        <tr><td>XFUND</td><td>multilingual form labelling and linking</td><td>7 languages × 199 forms = 1,393; 149 / 50 per language</td><td>FUNSD's four entity types + key–value links</td><td>F1 (entity recognition, relation extraction)</td><td>LayoutXLM</td></tr>
+      </table>
+      <h4>Text-centric and image-centric</h4>
+      <p>The v3 paper divides these into <b>text-centric</b> tasks — FUNSD, CORD, DocVQA, where the answer is a set of OCR words — and <b>image-centric</b> tasks — RVL-CDIP and PubLayNet, where appearance dominates. The distinction explains the family's arc: v1 was built for the first group and needed image features bolted on for RVL-CDIP; v3 was the first member evaluated as a backbone for pure layout detection.</p>
+      <h4>What the metrics measure</h4>
+      <ul class="notes">
+        <li><b>Entity-level F1</b> counts an entity correct only if its whole span and label match; word-level F1 (v1's FUNSD metric) scores each word, which is more forgiving. Numbers from the two protocols are not strictly comparable.</li>
+        <li><b>ANLS</b> gives partial credit to near-miss answer strings (normalised Levenshtein similarity, zeroed below 0.5). Its formula and pitfalls are on the hub's <a href="document-ai-models.html#benchmarks">benchmark section</a>.</li>
+        <li><b>Test sets are small.</b> FUNSD has 50 test forms and CORD 100 test receipts, so a gap of under a point may be within run-to-run variation; none of the four papers' result tables reports variance across seeds.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> read every LayoutLM score together with its dataset's size, its metric's granularity, and whether the task is text-centric or image-centric. The same model can look state-of-the-art or ordinary depending on which column is read.</div>
+    </section>
 
-      <div class="viz" id="viz-arch">
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="ocr" data-nav="OCR front end and reading order">
+      <h3><span class="idx">04</span> The OCR front end and reading order</h3>
+      <p class="lede">Every LayoutLM input begins with an OCR pass (or a born-digital PDF's text layer) that returns words, boxes, and an order. The model inherits all three: misread characters become wrong token ids, loose boxes become wrong coordinates, and the engine's line order becomes the 1-D position of every token.</p>
+      <h4>Which OCR the papers used</h4>
+      <ul class="notes">
+        <li><b>v1 pretraining:</b> the IIT-CDIP collection ships OCR text without word boxes, so the authors re-ran OCR with Tesseract and stored results in hOCR, a hierarchical page → line → word format.</li>
+        <li><b>v2:</b> word-level boxes from the Microsoft Read API for IIT-CDIP and DocVQA ("Microsoft OCR" for RVL-CDIP); the official annotations for FUNSD, CORD and SROIE.</li>
+        <li><b>v3:</b> the Microsoft Read API for RVL-CDIP and DocVQA; the official OCR annotations for FUNSD and CORD; for IIT-CDIP pretraining the paper says only "an off-the-shelf OCR toolkit".</li>
+        <li><b>SROIE in v1:</b> the authors used ground-truth OCR "to eliminate the effect of incorrect OCR results", so the 95.24 F1 is an extraction score, not an end-to-end one.</li>
+        <li><b>LayoutXLM pretraining:</b> 22M born-digital PDFs parsed with PyMuPDF, so text and boxes come from the file rather than from recognition.</li>
+      </ul>
+      <h4>Reading order</h4>
+      <p>An OCR engine typically emits text line by line, top to bottom, left to right within a detected block. On a two-column region, a naive "sort by y, then x" order interleaves the columns — "Bill to: Ship to: Jane Doe Same as billing" — while a block-aware order keeps each column together. The 2-D embeddings mean LayoutLM is not blind to the true geometry, but the 1-D position embedding (and, from v2, the 1-D relative attention bias) is computed from this order, so it pulls the model toward treating stream-adjacent tokens as related.</p>
+      <div class="viz" id="viz-order">
         <div class="vhead">
-          <span class="vtitle">LayoutLM architecture by version</span>
-          <span class="vhint">select v1 / v2 / v3</span>
+          <span class="vtitle">One page, two serialisations</span>
+          <span class="vhint">pick an ordering · click a word to see its 1-D index and its stream distance to its partner</span>
         </div>
         <div class="controls">
-          <label><input type="radio" name="arch" value="v1"> v1</label>
-          <label><input type="radio" name="arch" value="v2"> v2</label>
-          <label><input type="radio" name="arch" value="v3" checked> v3</label>
+          <label>ordering <select id="order-mode"><option value="raster">line raster (sort by y, then x)</option><option value="block">block-aware (column blocks first)</option></select></label>
         </div>
-        <svg id="arch-svg" width="640" height="330" viewBox="0 0 640 330" role="img" aria-label="Interactive diagram: LayoutLM architecture by version"></svg>
-        <div class="readout" aria-live="polite" id="arch-read"></div>
+        <svg id="order-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="Mock invoice with numbered words showing the reading order and arrows through the token stream"></svg>
+        <div class="readout" aria-live="polite" id="order-read"></div>
+        <p class="vcap">The page and its word boxes are the mock invoice used throughout this page (A4 at 300 dpi, boxes in pixels, listed in the script). The raster order sorts lines by their top edge (words whose tops differ by under 40 px count as one line) and then by x. The block-aware order is a simple XY-cut: lines less than 100 px apart vertically form a band, a band is split into columns at its widest vertical whitespace gap if that gap exceeds 150 px, and bands are read top to bottom, columns left to right. The readout counts how many stream positions separate each key from its value; note what the XY-cut does to the table rows.</p>
       </div>
+      <div class="callout"><b>Takeaway:</b> LayoutLM's accuracy is bounded by its OCR. Check the engine's word accuracy, box tightness and reading order on your own documents before comparing to published scores, which were mostly measured with official or high-quality OCR.</div>
     </section>
 
-    <section class="topic" id="v1">
-      <h3><span class="idx">04</span> LayoutLM v1 — text + layout</h3>
-      <ul class="notes">
-        <li><b>Backbone:</b> BERT encoder + the 2D position embeddings above. Image features (Faster R-CNN ROI vectors) are added only at <b>fine-tuning</b>, not during pretraining.</li>
-        <li><b>Pretraining:</b> <b>Masked Visual-Language Modeling (MVLM)</b> — mask tokens but keep their 2D positions, and predict the word from text + layout context. Plus optional Multi-label Document Classification.</li>
-        <li><b>Data:</b> IIT-CDIP — ~11M scanned document images.</li>
-        <li><b>Results (2019):</b> FUNSD 70.7→79.3, receipt (SROIE) 94.0→95.2, RVL-CDIP classification 93.1→94.4.</li>
-      </ul>
-    </section>
-
-    <section class="topic" id="v2">
-      <h3><span class="idx">05</span> LayoutLM v2 — image in the Transformer</h3>
-      <ul class="notes">
-        <li><b>Image joins pretraining.</b> A CNN backbone (ResNeXt-FPN) turns the page into a grid of <b>visual tokens</b> that are concatenated with the text+layout tokens into one sequence.</li>
-        <li><b>Spatial-aware self-attention:</b> a learned <i>relative 2D position bias</i> is added to the attention scores, so "how far apart, and in which direction" directly shapes attention.</li>
-        <li><b>New objectives</b> alongside MVLM: <b>Text-Image Alignment</b> (predict whether a token's image region was covered) and <b>Text-Image Matching</b> (are this image and text from the same document?).</li>
-        <li><b>Results:</b> big jumps — FUNSD 0.79→0.84, CORD 0.95→0.96, SROIE 0.95→0.98, RVL-CDIP 0.944→0.956, and DocVQA 0.73→0.87.</li>
-      </ul>
-    </section>
-
-    <section class="topic" id="v3">
-      <h3><span class="idx">06</span> LayoutLM v3 — unified text &amp; image masking</h3>
-      <p class="lede">v3's big simplification: drop the CNN. Treat the image as <b>linear patches</b> (ViT-style) and pretrain text and image with <b>symmetric</b> masking objectives.</p>
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="boxes" data-nav="From pixels to the 0–1000 grid">
+      <h3><span class="idx">05</span> From pixel boxes to the 0–1000 grid</h3>
+      <p class="lede">Pages arrive at different sizes and scan resolutions, so v1 scales every box coordinate to a "virtual" page 1000 units on a side. The integers that result are indices into embedding tables with 1,024 rows (the released configurations' <code>max_2d_position_embeddings</code>), exactly as a token id indexes the vocabulary.</p>
+      <div class="formula"><span class="lbl">normalise a pixel box (x₀, y₀, x₁, y₁) on a W × H page</span><span class="eq">x̂₀ = floor(1000·x₀/W)   ŷ₀ = floor(1000·y₀/H)   x̂₁ = floor(1000·x₁/W)   ŷ₁ = floor(1000·y₁/H)</span>
+<span class="lbl">derived features used by v2, v3 and the open-source v1 code</span><span class="eq">ŵ = x̂₁ − x̂₀        ĥ = ŷ₁ − ŷ₀</span></div>
+      <h4>Worked example: the word "Total:"</h4>
+      <p>On an A4 page scanned at 300 dpi the image is 2480 × 3508 pixels. Suppose OCR returns "Total:" with pixel box (1650, 2900, 1850, 2960).</p>
       <table class="cmp">
-        <tr><th>Objective</th><th>What it does</th></tr>
-        <tr><td>MLM (text)</td><td>Mask words, predict them from text + layout + image context</td></tr>
-        <tr><td>MIM (image)</td><td>Mask image patches, predict their discrete visual tokens (BEiT-style tokenizer)</td></tr>
-        <tr><td>WPA (alignment)</td><td><b>Word-Patch Alignment</b> — predict whether a word's corresponding image patch is masked, tying the two modalities together</td></tr>
+        <tr><th>Coordinate</th><th>Computation</th><th>Id</th></tr>
+        <tr><td>x̂₀</td><td>floor(1000 · 1650 / 2480) = floor(665.32)</td><td>665</td></tr>
+        <tr><td>ŷ₀</td><td>floor(1000 · 2900 / 3508) = floor(826.68)</td><td>826</td></tr>
+        <tr><td>x̂₁</td><td>floor(1000 · 1850 / 2480) = floor(745.97)</td><td>745</td></tr>
+        <tr><td>ŷ₁</td><td>floor(1000 · 2960 / 3508) = floor(843.79)</td><td>843</td></tr>
+        <tr><td>ŵ, ĥ</td><td>745 − 665, 843 − 826</td><td>80, 17</td></tr>
       </table>
+      <p>In v1 as the paper describes it, the token's layout contribution is X[665] + Y[826] + X[745] + Y[843]: four rows from two tables of shape 1024 × 768 (base). Rescanning the same page at 150 dpi halves every pixel coordinate and the page size together, so the ids stay the same up to one unit of floor rounding.</p>
+      <div class="viz" id="viz-boxes">
+        <div class="vhead">
+          <span class="vtitle">Box → normalised ids → embedding lookups</span>
+          <span class="vhint">click a word · change the scan · toggle the width/height tables</span>
+        </div>
+        <div class="controls">
+          <label>scan <select id="box-dpi"><option value="300">A4 at 300 dpi (2480 × 3508)</option><option value="200">A4 at 200 dpi</option><option value="150">A4 at 150 dpi</option></select></label>
+          <label><input type="checkbox" id="box-wh" /> add width/height tables (v2, v3, open-source v1 code)</label>
+        </div>
+        <svg id="box-svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="Mock invoice with a selected word, its pixel and normalised coordinates, and the embedding tables each coordinate indexes"></svg>
+        <div class="readout" aria-live="polite" id="box-read"></div>
+        <p class="vcap">Pixel boxes are the page geometry (defined once at 300 dpi) scaled to the chosen resolution and rounded; ids use the floor formula above. With the checkbox off the lookups are the v1 paper's four (two shared tables X, Y). With it on, the figure adds the two extra lookups W[ŵ] and H[ĥ] that the open-source v1 implementation adds (four full-width 1024-row tables summed) and that v2/v3 concatenate as narrower slices instead — see <a href="#v2-layout">v2's layout embedding</a>.</p>
+      </div>
+      <h4>Why 1000, and what it costs</h4>
       <ul class="notes">
-        <li>No object-detection backbone → <b>simpler and more parameter-efficient</b>, and reported state of the art on <i>both</i> text-centric (FUNSD, CORD, DocVQA) <b>and</b> image-centric (RVL-CDIP classification, PubLayNet layout analysis) tasks.</li>
-        <li>Unifying the objectives — same masking philosophy for words and patches — is the conceptual core, echoing <a href="../deep-learning/transformers.html">Transformer</a> + ViT patch tokenization.</li>
+        <li>1000 buckets across an A4 width of 210 mm is one bucket per 0.21 mm — finer than typical OCR box accuracy, so quantisation is rarely the bottleneck.</li>
+        <li>The tables have 1,024 rows, so ids up to 1023 are legal; an id of 1024 or more raises an index error in the reference implementation, which is the usual symptom of passing un-normalised pixel boxes.</li>
+        <li>Normalisation removes page size and resolution, not rotation, skew or perspective. A photographed receipt needs deskewing first, or its "rows" will not share a ŷ.</li>
       </ul>
+      <div class="callout"><b>Takeaway:</b> the layout input is four (or six) small integers per token. Getting them right — dividing by the original page size, not the resized image, and clamping into 0…1000 — is the most common place a LayoutLM pipeline silently goes wrong.</div>
     </section>
 
-    <section class="topic" id="evolution">
-      <h3><span class="idx">07</span> How the three versions differ</h3>
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="v1-embed" data-nav="v1: the 2-D position embedding">
+      <h3><span class="idx">06</span> v1: the 2-D position embedding</h3>
+      <p class="lede">LayoutLM v1 keeps BERT's architecture and adds, for each token, four position-embedding lookups from two tables: an X table indexed by x̂₀ and x̂₁ and a Y table indexed by ŷ₀ and ŷ₁. The embedding layers "representing the same dimension share the same embedding table", in the paper's words. The result is summed with BERT's word, 1-D position and segment embeddings.</p>
+      <div class="formula"><span class="lbl">v1 as the paper specifies it</span><span class="eq">eᵢ = Tok(wᵢ) + Pos1D(i) + Seg(sᵢ) + X(x̂₀ᵢ) + Y(ŷ₀ᵢ) + X(x̂₁ᵢ) + Y(ŷ₁ᵢ)</span>
+<span class="lbl">the widely used open-source v1 implementation adds two more tables</span><span class="eq">eᵢ = … + X(x̂₀ᵢ) + Y(ŷ₀ᵢ) + X(x̂₁ᵢ) + Y(ŷ₁ᵢ) + H(ŷ₁ᵢ − ŷ₀ᵢ) + W(x̂₁ᵢ − x̂₀ᵢ)</span>
+<span class="lbl">then LayerNorm and dropout, as in BERT</span><span class="eq">xᵢ⁽⁰⁾ = Dropout(LayerNorm(eᵢ))</span></div>
+      <h4>What two corners encode</h4>
+      <p>The top-left and bottom-right corners determine a box's position and size, so width and height are implicitly available: a network can compute X(x̂₁) − X(x̂₀)-like features in its first layer. Sharing one table between x̂₀ and x̂₁ means "x = 665" has one meaning whether it is a left or a right edge, halving the layout parameters. The explicit width and height tables in the open-source code add those features directly; the paper does not describe them, and its reported 113M base parameter count happens to sit closer to the implementation's total (see <a href="#params">parameter counts</a>).</p>
+      <h4>Special tokens</h4>
+      <ul class="notes">
+        <li>The v1 paper's architecture figure gives [CLS] the whole page, (0, 0, maxW, maxH), and every word its own box.</li>
+        <li>In common fine-tuning code [CLS] and [PAD] get (0, 0, 0, 0) and [SEP] gets (1000, 1000, 1000, 1000); the Transformers documentation's question-answering example uses this convention, and it is the LayoutLMv2 tokenizer's default. The conventions are not uniform across the family: the v2 paper assigns every special token the empty box (0, 0, 0, 0, 0, 0), and the v3 paper and the LayoutLMv3 tokenizer's default give [SEP] zeros as well. What matters is using at fine-tuning time whatever convention the checkpoint was pretrained with, and the v1 paper does not specify [SEP].</li>
+      </ul>
+      <h4>Initialisation and what is new</h4>
+      <p>All modules except the 2-D tables are initialised from BERT-base (or BERT-large); the 2-D tables start random. That is why the text side works from step one and the layout signal is learned during pretraining. Table 3 of the v1 paper shows the initialisation matters: with 1M pretraining pages, FUNSD F1 is 0.6130 from scratch, 0.7299 from BERT-base and 0.7514 from RoBERTa-base — though the released v1 checkpoints use BERT's uncased 30,522-token vocabulary, consistent with BERT initialisation.</p>
+      <div class="callout"><b>Takeaway:</b> v1 is literally BERT plus four extra table lookups per token. Everything that makes it work — masked-token pretraining, BERT initialisation, fine-tuning heads — is inherited unchanged.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="subwords" data-nav="Sub-words and their boxes">
+      <h3><span class="idx">07</span> Sub-words, and which box each one gets</h3>
+      <p class="lede">OCR produces words; the model consumes sub-word tokens. v1 and v2 give every sub-word of a word the word's box (v3, its segment's box). LayoutXLM instead computes character-level boxes and merges the characters in each SentencePiece token, because "word" is not a well-defined unit in every language.</p>
+      <h4>Worked example: "$1,240.00" in an uncased BERT tokenizer</h4>
+      <p>BERT's basic tokenizer splits on punctuation before WordPiece runs, so the single OCR word "$1,240.00" with box (766, 826, 887, 843) becomes six tokens — "$", "1", ",", "240", ".", "00", each of which is in the released 30,522-entry uncased vocabulary — and all six carry (766, 826, 887, 843). Their 1-D positions differ by one each; their 2-D embeddings are identical. For token classification, the common convention (the Transformers LayoutLMv2 tokenizer's default) labels only the first sub-word with the word's tag and gives the other five the ignore index −100, so the loss counts each word once.</p>
       <table class="cmp">
-        <tr><th></th><th>v1 (2019)</th><th>v2 (2020)</th><th>v3 (2022)</th></tr>
-        <tr><td>Image features</td><td>Fine-tuning only (Faster R-CNN)</td><td>In pretraining (CNN grid)</td><td>Linear patches (no CNN)</td></tr>
-        <tr><td>Attention</td><td>Vanilla</td><td>Spatial-aware (2D bias)</td><td>Spatial-aware</td></tr>
-        <tr><td>Objectives</td><td>MVLM (+MDC)</td><td>MVLM + TIA + TIM</td><td>MLM + MIM + WPA</td></tr>
-        <tr><td>Strength</td><td>First to fuse text+layout</td><td>Strong cross-modal</td><td>Unified, text- &amp; image-centric SOTA</td></tr>
+        <tr><th>Token</th><th>1-D position (example)</th><th>Box</th><th>Label (first-sub-word convention)</th></tr>
+        <tr><td>$</td><td>41</td><td>(766, 826, 887, 843)</td><td>B-ANSWER</td></tr>
+        <tr><td>1</td><td>42</td><td>(766, 826, 887, 843)</td><td>−100</td></tr>
+        <tr><td>,</td><td>43</td><td>(766, 826, 887, 843)</td><td>−100</td></tr>
+        <tr><td>240</td><td>44</td><td>(766, 826, 887, 843)</td><td>−100</td></tr>
+        <tr><td>.</td><td>45</td><td>(766, 826, 887, 843)</td><td>−100</td></tr>
+        <tr><td>00</td><td>46</td><td>(766, 826, 887, 843)</td><td>−100</td></tr>
       </table>
-    </section>
-
-    <section class="topic" id="takeaways">
-      <h3><span class="idx">08</span> Takeaways</h3>
+      <h4>Three levels of box granularity</h4>
       <ul class="notes">
-        <li><b>Layout is a modality.</b> Adding 2D bounding-box embeddings to text lets a Transformer reason over page geometry.</li>
-        <li><b>The arc:</b> v1 fuses text+layout (image late) → v2 pulls image into pretraining with spatial-aware attention → v3 unifies text &amp; image under symmetric masking and drops the CNN.</li>
-        <li>Needs an <b>OCR</b> step to get words + boxes — contrast with the OCR-free <a href="donut.html">Donut</a>.</li>
-        <li>Builds on <a href="bert.html">BERT</a>; the document-domain hub is <a href="../nlp/document-intelligence.html">Document Intelligence</a>.</li>
+        <li><b>Word-level (v1, v2):</b> each OCR word's own box, copied to its sub-words.</li>
+        <li><b>Character-merged (LayoutXLM):</b> SentencePiece (unigram) tokens get the union of their characters' boxes, which works for Chinese and Japanese where OCR "words" may be whole lines.</li>
+        <li><b>Segment-level (v3):</b> every word in an OCR segment (a line or text block) shares the segment's box, on the argument that words in one segment usually express one meaning. The v3 paper notes this may help FUNSD and makes its FUNSD scores not directly comparable with word-level models.</li>
       </ul>
+      <div class="callout"><b>Takeaway:</b> the box a sub-word receives is a design decision, not a detail. Match the granularity the checkpoint was pretrained with — word boxes for v1/v2, segment boxes for v3 if you want its published FUNSD behaviour — or expect a distribution shift.</div>
     </section>
 
-    <section class="topic" id="papers">
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="mvlm" data-nav="v1 pretraining: MVLM and MDC">
+      <h3><span class="idx">08</span> v1 pretraining: masked visual-language modelling</h3>
+      <p class="lede">Masked visual-language modelling (MVLM) is BERT's masked language modelling with one change: when a token is masked, its 2-D position embeddings are kept. The model must recover "Total" from the surrounding words and from the fact that a token sits at (665, 826, 745, 843), just left of a dollar amount.</p>
+      <div class="formula"><span class="lbl">selection, as in BERT</span><span class="eq">choose 15% of token positions M;  of these, 80% → [MASK], 10% → random token, 10% unchanged</span>
+<span class="lbl">MVLM loss: predict the original token from text and layout context (boxes never masked)</span><span class="eq">ℒ_MVLM = − ∑_(i ∈ M) log p( wᵢ | w_(∖M), b₁ … bₙ )</span>
+<span class="lbl">optional multi-label document classification over IIT-CDIP tags</span><span class="eq">ℒ = ℒ_MVLM + ℒ_MDC        ℒ_MDC = − ∑_c [ y_c log σ(z_c) + (1 − y_c) log(1 − σ(z_c)) ]</span></div>
+      <h4>Worked example: one 512-token window</h4>
+      <p>With 512 positions, 15% selection chooses 76.8 tokens on average — say 77. Of those, about 61.6 become [MASK], 7.7 become a random vocabulary token and 7.7 stay unchanged but must still be predicted. All 77 keep their boxes. The random and unchanged cases are kept from BERT, whose stated reason is to reduce the mismatch between pretraining (which sees [MASK]) and fine-tuning (which never does).</p>
+      <div class="viz" id="viz-mvlm">
+        <div class="vhead">
+          <span class="vtitle">MVLM on the mock invoice</span>
+          <span class="vhint">resample the mask · change the rate · masked words keep their boxes</span>
+        </div>
+        <div class="controls">
+          <label>selection rate <input type="range" id="mvlm-rate" min="5" max="40" step="1" value="15" /><span id="mvlm-rv" style="min-width:40px;display:inline-block"></span></label>
+          <label><input type="checkbox" id="mvlm-v2" /> v2: also blank the masked words' image regions</label>
+          <button class="btn ghost" id="mvlm-new">Resample</button>
+        </div>
+        <svg id="mvlm-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="Mock invoice where selected words are replaced by MASK, a random token or kept, with their boxes still drawn"></svg>
+        <div class="readout" aria-live="polite" id="mvlm-read"></div>
+        <p class="vcap">Selection is drawn per word with a seeded generator; each selected word is then assigned [MASK], random or unchanged with probabilities 0.8, 0.1, 0.1. Boxes are always drawn because the model always sees them. With the v2 box ticked the selected words' page regions are also greyed, following the v2 paper, which blanks the regions of masked tokens "to avoid visual clue leakage" once the image is an input; greying all three cases (not only [MASK]) is this figure's assumption, since the paper does not say.</p>
+      </div>
+      <h4>The multi-label document classification task</h4>
+      <p>IIT-CDIP pages carry metadata tags, so v1 optionally adds a multi-label classification loss (MDC) on [CLS]. The paper's Table 1 reports it helping FUNSD at 1M pages (0.7299 → 0.7372 F1), but it also flags MDC as optional "and may not be used for pretraining larger models in the future", since most corpora lack such tags; the best v1 FUNSD figure used MVLM alone. v2 and v3 drop it.</p>
+      <div class="callout"><b>Takeaway:</b> MVLM teaches the encoder to fill in words from both neighbours and geometry. Keeping the masked token's box is what forces the layout embeddings to become informative.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="v1-image" data-nav="v1: image features at fine-tuning">
+      <h3><span class="idx">09</span> v1: image features, added only at fine-tuning</h3>
+      <p class="lede">v1 is pretrained on text and layout alone. For fine-tuning, the paper optionally adds an image embedding per token: the page is cut into pieces along each word's OCR box, and a Faster R-CNN with a ResNet-101 backbone pretrained on Visual Genome turns each piece into a region-of-interest feature that is combined with that token's LayoutLM output.</p>
+      <div class="formula"><span class="lbl">image embedding for word i: ROI features from the word's own box</span><span class="eq">vᵢ = FasterRCNN_ROI( image, box_i )        [CLS]: ROI = the whole page</span>
+<span class="lbl">combined with the pretrained LayoutLM output before the task head</span><span class="eq">zᵢ = combine(hᵢ, vᵢ)   (the paper's figure shows the image embeddings joining after the pretrained encoder, before task-specific layers)</span></div>
+      <h4>What it bought</h4>
+      <ul class="notes">
+        <li><b>RVL-CDIP:</b> text + layout alone reaches 91.78% (base, 11M pages); adding the image embedding reaches 94.42%. For classification the paper concatenates the LayoutLM output with the whole-image embedding before the softmax.</li>
+        <li><b>FUNSD:</b> 78.66 → 79.27 F1 (base, 11M pages, 2 epochs).</li>
+        <li><b>SROIE:</b> 94.38 → 94.67 F1 (base), while LayoutLM-large without images reaches 95.24.</li>
+        <li><b>Cost:</b> the paper's parameter column rises from 113M to 160M, the Faster R-CNN's share.</li>
+      </ul>
+      <h4>Why this design was replaced</h4>
+      <p>The image branch never interacts with the text during pretraining, so the model cannot learn cross-modal relations from IIT-CDIP's 11M pages — only from the labelled fine-tuning set (149 forms for FUNSD, though 320,000 pages for RVL-CDIP). It also needs an object detector at inference. The paper's own future-work section proposes "involving image embeddings in the pre-training step", which is exactly v2.</p>
+      <div class="callout"><b>Takeaway:</b> v1's image features are a late-fusion add-on: helpful for page classification, marginal for extraction, and absent from the pretraining that gives the family its strength.</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="v1-results" data-nav="v1: configurations and results">
+      <h3><span class="idx">10</span> v1: configurations, training and results</h3>
+      <p class="lede">Two sizes, both initialised from BERT: base (12 layers, width 768, 12 heads) and large (24 layers, width 1024, 16 heads), with a 30,522-token uncased WordPiece vocabulary and 512 positions. The paper reports about 113M and 343M parameters.</p>
+      <h4>Pretraining recipe</h4>
+      <ul class="notes">
+        <li><b>Data:</b> IIT-CDIP Test Collection 1.0 — more than 6 million documents, more than 11 million scanned page images, re-OCR'd with Tesseract.</li>
+        <li><b>Hardware and optimiser:</b> 8 NVIDIA V100 32 GB GPUs, total batch 80, Adam at 5 × 10⁻⁵ with linear decay.</li>
+        <li><b>Time:</b> about 80 hours per epoch over 11M documents for base (roughly 38 pages per second) and nearly 170 hours for large. The best base model ran 2 epochs; the large model 1.</li>
+        <li><b>Fine-tuning:</b> FUNSD 100 epochs, batch 16, learning rate 5 × 10⁻⁵; RVL-CDIP 30 epochs, batch 40, 2 × 10⁻⁵. Form and receipt labelling use {B, I, E, S, O} tags.</li>
+      </ul>
+      <h4>Results (v1 paper, Tables 1, 4 and 5)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Pretraining</th><th>Params (paper)</th><th>FUNSD F1</th><th>SROIE F1</th><th>RVL-CDIP acc.</th></tr>
+        <tr><td>BERT-base</td><td>—</td><td>110M</td><td>0.6026</td><td>0.9099</td><td>89.81%</td></tr>
+        <tr><td>RoBERTa-base</td><td>—</td><td>125M</td><td>0.6648</td><td>0.9107</td><td>90.06%</td></tr>
+        <tr><td>LayoutLM-base, MVLM</td><td>500K pages, 6 epochs</td><td>113M</td><td>0.6985</td><td>0.9388</td><td>91.25%</td></tr>
+        <tr><td>LayoutLM-base, MVLM</td><td>11M, 2 epochs</td><td>113M</td><td>0.7866</td><td>0.9438</td><td>91.78%</td></tr>
+        <tr><td>LayoutLM-base, MVLM + MDC</td><td>11M, 1 epoch</td><td>113M</td><td>0.7475</td><td>0.9460</td><td>91.78%</td></tr>
+        <tr><td>LayoutLM-large, MVLM</td><td>11M, 1 epoch</td><td>343M</td><td>0.7789</td><td>0.9524</td><td>91.90%</td></tr>
+        <tr><td>LayoutLM-base + image</td><td>11M, 2 epochs</td><td>160M</td><td>0.7927</td><td>0.9467</td><td>94.42%</td></tr>
+      </table>
+      <h4>What the table shows</h4>
+      <ul class="notes">
+        <li><b>More pretraining data helps monotonically on FUNSD</b> (Table 2): 0.6985 at 500K pages, 0.7299 at 1M, 0.7592 at 2M (all 6 epochs), 0.7866 at 11M (2 epochs).</li>
+        <li><b>Large is not uniformly better.</b> LayoutLM-large at one epoch scores below base at two epochs on FUNSD (0.7789 vs 0.7866); the paper trained large for fewer epochs.</li>
+        <li><b>The abstract's headline numbers</b> — FUNSD 70.72 → 79.27, SROIE 94.02 → 95.24, RVL-CDIP 93.07 → 94.42 — compare the best LayoutLM variant for each task against the best prior result (RoBERTa-large, the SROIE leaderboard's top entry and a multimodal ensemble, respectively), not one model against one baseline.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> v1's text-plus-layout pretraining lifts FUNSD by about 18 F1 over same-size BERT, with the gain growing with pretraining pages. Image features matter mostly for classification.</div>
+    </section>
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="v2-arch" data-nav="v2: one sequence, three modalities">
+      <h3><span class="idx">11</span> v2: one sequence, three modalities</h3>
+      <p class="lede">LayoutLMv2 moves the image inside the Transformer. A CNN turns the page into 49 visual tokens that are concatenated with the text tokens into one sequence, every token — text or visual — gets a layout embedding, and all of them are pretrained together. The abstract calls it a two-stream multi-modal Transformer encoder; in the architecture section the two token streams are concatenated into one sequence, so text and visual tokens attend to one another in every layer.</p>
+      <div class="formula"><span class="lbl">text token i (0 ≤ i &lt; L): WordPiece id, 1-D index, segment [A] or [B]</span><span class="eq">tᵢ = TokEmb(wᵢ) + PosEmb1D(i) + SegEmb(sᵢ)</span>
+<span class="lbl">visual token i (0 ≤ i &lt; W·H): projected CNN feature, shared 1-D table, segment [C]</span><span class="eq">vᵢ = Proj( VisTokEmb(I)ᵢ ) + PosEmb1D(i) + SegEmb([C])</span>
+<span class="lbl">first-layer input: concatenate, then add each token's layout embedding</span><span class="eq">X = { v₀ … v_(WH−1), t₀ … t_(L−1) }        xᵢ⁽⁰⁾ = Xᵢ + lᵢ</span></div>
+      <h4>What changed from v1</h4>
+      <ul class="notes">
+        <li><b>Initialisation:</b> the encoder and text embeddings come from UniLMv2 rather than BERT (same WordPiece vocabulary size, 30,522); the visual backbone from a Mask R-CNN trained on PubLayNet; everything else is random.</li>
+        <li><b>Segments:</b> [A] and [B] separate text segments (question and context in DocVQA); [C] marks visual tokens. In pretraining all text is [A].</li>
+        <li><b>Layout for everyone:</b> visual tokens get boxes too — the grid cell each one pools — and special tokens get the empty box (0, 0, 0, 0, 0, 0).</li>
+        <li><b>Attention gains relative biases</b> for 1-D and 2-D offsets (<a href="#v2-attn">spatial-aware self-attention</a>).</li>
+        <li><b>Two new objectives</b> tie the modalities together (<a href="#v2-pretrain">TIA and TIM</a>).</li>
+      </ul>
+      <h4>Where released code differs from the paper's description</h4>
+      <ul class="notes">
+        <li>The paper's Figure 1 puts the visual tokens first; the Transformers implementation appends them after the text tokens. Because attention is order-agnostic apart from position terms, this changes indexing, not capacity.</li>
+        <li>The released v2 configurations set <code>has_visual_segment_embedding</code> to false (the large configuration explicitly, the base by the library default), so the checkpoints carry no trained [C] segment vector. One exception in the Transformers code: <code>LayoutLMv2ForQuestionAnswering</code> switches the flag on by default (<code>has_visual_segment_embedding=True</code>), so for question answering that vector is created freshly initialised rather than loaded. The released LayoutXLM-base configuration sets the flag to true.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> v2 feeds text tokens and image tokens through one encoder as a single concatenated sequence, with layout added to both. Pretraining sees all three modalities at once — the change v1's authors named as their next step.</div>
+    </section>
+
+    <!-- 12 ───────────────────────────────────────────── -->
+    <section class="topic" id="v2-visual" data-nav="v2: the 7 × 7 visual tokens">
+      <h3><span class="idx">12</span> v2: the visual backbone and the 7 × 7 visual tokens</h3>
+      <p class="lede">The page is resized to 224 × 224 and passed through a ResNeXt-101-FPN (32 groups × 8 channels, the "MaskRCNN ResNeXt101 32x8d FPN 3X" Detectron2 setting). The output feature map is average-pooled to W × H = 7 × 7, flattened into 49 vectors, and linearly projected to the model width. The backbone's weights are updated during pretraining and fine-tuning.</p>
+      <div class="formula"><span class="lbl">shape arithmetic in the Transformers implementation (FPN level P2, stride 4, 256 channels)</span><span class="eq">224 × 224 × 3  →  P2: 56 × 56 × 256  →  AdaptiveAvgPool(7, 7): 7 × 7 × 256  →  49 × 256  →  Proj: 49 × 768</span>
+<span class="lbl">each visual token averages an 8 × 8 block of P2 cells = a 32 × 32 pixel block of the 224 image</span><span class="eq">56 / 7 = 8        8 × 4 = 32 pixels</span>
+<span class="lbl">visual token (r, c) is given the grid cell as its box, on the 0–1000 grid</span><span class="eq">x̂₀ = floor(1000·c/7)   x̂₁ = floor(1000·(c+1)/7)   ŷ₀ = floor(1000·r/7)   ŷ₁ = floor(1000·(r+1)/7)</span></div>
+      <h4>Worked example</h4>
+      <p>Grid boundaries on the 0–1000 grid are floor(1000·k/7) for k = 0…7: 0, 142, 285, 428, 571, 714, 857, 1000. The word "Total:" at (665, 826, 745, 843) straddles columns 4 (571–714) and 5 (714–857) in row 5 (714–857), so two visual tokens, (5, 4) and (5, 5), cover it. Each visual token summarises about 1/49 of the page — on an A4 scan at 300 dpi that is a block roughly 354 × 501 original pixels, far too coarse to read 10-point text, which is fine because the text arrives from OCR. The visual tokens carry what OCR drops: rules, boxes, logos, stamps, density, the page's overall genre.</p>
+      <div class="viz" id="viz-grid">
+        <div class="vhead">
+          <span class="vtitle">Pooling the page into visual tokens</span>
+          <span class="vhint">drag the pool size · click a cell to see its box and the words under it</span>
+        </div>
+        <div class="controls">
+          <label>pool W = H <input type="range" id="grid-k" min="1" max="14" step="1" value="7" /><span id="grid-kv" style="min-width:40px;display:inline-block"></span></label>
+        </div>
+        <svg id="grid-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="Mock invoice with a grid of visual-token cells overlaid and a selected cell's normalised box"></svg>
+        <div class="readout" aria-live="polite" id="grid-read"></div>
+        <p class="vcap">The released configurations use 7 × 7 (<code>image_feature_pool_shape</code> = [7, 7, 256]); other sizes are shown for intuition only. Cell boxes use the implementation's floor(1000·k/n) boundaries; "pixels per token" is 224 / n on the resized image and the original A4-at-300-dpi page divided by n per axis.</p>
+      </div>
+      <h4>Practical details that bite</h4>
+      <ul class="notes">
+        <li>The Detectron2 backbone expects BGR channel order and normalises internally; LayoutLMv3 by contrast expects normalised RGB (the Transformers documentation states both).</li>
+        <li>The backbone brings about 90M parameters — nearly half of v2-base — and a Detectron2 dependency, one reason v3 removed it.</li>
+        <li>Batch-norm layers in the backbone need synchronising across GPUs in distributed training; the Transformers class exposes a helper for it.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> v2's image branch is deliberately low-resolution — 49 tokens from a 224 × 224 image. It supplies layout and appearance context; reading is still OCR's job.</div>
+    </section>
+
+    <!-- 13 ───────────────────────────────────────────── -->
+    <section class="topic" id="v2-layout" data-nav="v2: the six-part layout embedding">
+      <h3><span class="idx">13</span> v2: the six-part layout embedding</h3>
+      <p class="lede">v2 keeps the 0–1000 normalisation but changes how coordinates enter: each token's box is described by six features — x_min, x_max, width, y_min, y_max, height — and the paper builds the layout embedding by concatenating an x-part and a y-part rather than summing full-width vectors.</p>
+      <div class="formula"><span class="lbl">the paper's layout embedding for token i</span><span class="eq">lᵢ = Concat( PosEmb2Dₓ(x_min, x_max, width),  PosEmb2D_y(y_min, y_max, height) )</span>
+<span class="lbl">the released implementation: six slices concatenated to the model width</span><span class="eq">lᵢ = [ X(x̂₀) | Y(ŷ₀) | X(x̂₁) | Y(ŷ₁) | H(ĥ) | W(ŵ) ]</span>
+<span class="lbl">slice widths from the released configurations (coordinate_size c, shape_size s)</span><span class="eq">base:  4·128 + 2·128 = 768        large:  4·171 + 2·170 = 1024</span></div>
+      <h4>Worked example: the parameter saving</h4>
+      <p>In the open-source v1 code, four tables of 1,024 rows × 768 columns hold 4 · 1024 · 768 = 3,145,728 parameters. v2-base's four tables are 1,024 rows × 128 columns: 4 · 1024 · 128 = 524,288 — one sixth. The x table is still shared by x̂₀ and x̂₁ and the y table by ŷ₀ and ŷ₁; each lookup now fills its own 128-wide slice of the vector instead of being summed with the others, so a left edge and a right edge with the same value occupy different slices.</p>
+      <p>For "Total:" (665, 826, 745, 843): the vector is X[665] in dimensions 0–127, Y[826] in 128–255, X[745] in 256–383, Y[843] in 384–511, H[17] in 512–639 and W[80] in 640–767. It is then added to the token's text embedding.</p>
+      <h4>Width and height are now explicit</h4>
+      <p>This is where width and height embeddings enter the family in the papers: v1's paper uses corners only, v2's paper names width and height among the box features, and v3 embeds "x-axis, y-axis, width and height features separately". (The widely used v1 implementation already added width and height tables, which is why many descriptions of v1 include them.)</p>
+      <div class="callout"><b>Takeaway:</b> v2's layout embedding is the same coordinate lookup, made cheaper by concatenating narrow slices and made richer by explicit width and height.</div>
+    </section>
+
+    <!-- 14 ───────────────────────────────────────────── -->
+    <section class="topic" id="v2-attn" data-nav="v2: spatial-aware self-attention">
+      <h3><span class="idx">14</span> v2: spatial-aware self-attention</h3>
+      <p class="lede">Absolute embeddings tell a token where it is; a relative bias tells a pair of tokens how far apart they are. v2 adds three learned scalars to every attention logit — one for the 1-D offset in the token stream, one for the horizontal offset and one for the vertical offset between the two boxes — before the softmax. The biases differ across heads and are shared across layers.</p>
+      <div class="formula"><span class="lbl">ordinary scaled dot-product score for query i and key j (one head)</span><span class="eq">αᵢⱼ = (xᵢ W_Q)(xⱼ W_K)ᵀ / √d_head</span>
+<span class="lbl">spatial-aware score: add learned biases indexed by relative offsets</span><span class="eq">α′ᵢⱼ = αᵢⱼ + b¹ᴰ[ j − i ] + b²ᴰˣ[ xⱼ − xᵢ ] + b²ᴰʸ[ yⱼ − yᵢ ]</span>
+<span class="lbl">output: softmax over j, then the usual weighted sum of values</span><span class="eq">hᵢ = ∑ⱼ softmaxⱼ(α′ᵢ·) · xⱼ W_V</span></div>
+      <h4>Buckets, not raw offsets</h4>
+      <p>Offsets range over hundreds of tokens and up to ±1000 grid units, so the implementation maps each offset to a bucket with the T5 scheme: half the buckets are for the sign, and within each sign half the small distances get one bucket each while larger distances share logarithmically wider buckets up to a maximum distance, beyond which everything shares the last bucket. The released configurations use 32 buckets up to 128 tokens for 1-D and 64 buckets up to 256 grid units for each 2-D axis.</p>
+      <div class="formula"><span class="lbl">bucket(r; n buckets, max distance D) — bidirectional</span><span class="eq">h = n / 2        base = (r &gt; 0) ? h : 0        m = |r|        e = h / 2
+bucket = base + m                                          if m &lt; e
+bucket = base + min( h − 1,  e + floor( ln(m/e) / ln(D/e) · (h − e) ) )   otherwise</span></div>
+      <div class="viz" id="viz-bucket">
+        <div class="vhead">
+          <span class="vtitle">The bucketing curve</span>
+          <span class="vhint">drag the offset · both schemes use the released configurations</span>
+        </div>
+        <div class="controls">
+          <label>offset r <input type="range" id="bk-r" min="-600" max="600" step="1" value="101" /><span id="bk-rv" style="min-width:48px;display:inline-block"></span></label>
+        </div>
+        <svg id="bk-svg" width="640" height="280" viewBox="0 0 640 280" role="img" aria-label="Step plot of bucket index against relative offset for the 1-D and 2-D bias schemes"></svg>
+        <div class="readout" aria-live="polite" id="bk-read"></div>
+        <p class="vcap">Both curves are computed with the bucket function above: 1-D with n = 32, D = 128; 2-D with n = 64, D = 256 (<code>rel_pos_bins</code>, <code>max_rel_pos</code>, <code>rel_2d_pos_bins</code>, <code>max_rel_2d_pos</code> in the released configurations). Exact buckets cover |r| &lt; 8 (1-D) and |r| &lt; 16 (2-D). Because of the floor, the last bucket of each sign is reached before D: from |r| = 91 in 1-D and |r| = 216 in 2-D, so every offset from there on, including everything beyond D, shares it.</p>
+      </div>
+      <h4>Worked example: "Total:" attending to "$1,240.00"</h4>
+      <p>Take the two tokens as adjacent in the stream (j − i = +1). The implementation measures 2-D offsets on the left edge x̂₀ and the bottom edge ŷ₁: the value's left edge is x̂₀ = 766, so Δx = 766 − 665 = +101; both share ŷ₁ = 843, so Δy = 0.</p>
+      <ul class="notes">
+        <li>1-D: r = 1 &lt; 8, positive → bucket 16 + 1 = <b>17</b>.</li>
+        <li>x: r = 101 ≥ 16 → 16 + floor(ln(101/16) / ln(256/16) · 16) = 16 + floor(1.8425 / 2.7726 · 16) = 16 + floor(10.63) = 26, positive → 32 + 26 = <b>58</b>.</li>
+        <li>y: r = 0 → bucket <b>0</b>.</li>
+        <li>With illustrative learned values b¹ᴰ[17] = 0.40, b²ᴰˣ[58] = 0.25 and b²ᴰʸ[0] = 0.90 for one head, an unbiased logit of 1.20 becomes 1.20 + 0.40 + 0.25 + 0.90 = 2.75: the head can learn to favour "same line, a little to the right" as a pattern, independent of what the words say.</li>
+        <li>A token 600 units above ("Date:" in the page header) has Δy = −600, and |Δy| &gt; D, so it lands in bucket 31, the same bucket as every offset of −216 or below.</li>
+      </ul>
+      <div class="viz" id="viz-attn">
+        <div class="vhead">
+          <span class="vtitle">Relative-bias buckets for every pair on the page</span>
+          <span class="vhint">pick a component and a query · click any cell to read that pair</span>
+        </div>
+        <div class="controls">
+          <label>component <select id="attn-comp"><option value="x">2-D x bucket</option><option value="y">2-D y bucket</option><option value="d1">1-D bucket</option><option value="sum">illustrative total bias</option></select></label>
+          <label>query <select id="attn-key"></select></label>
+        </div>
+        <svg id="attn-svg" width="640" height="380" viewBox="0 0 640 380" role="img" aria-label="Heatmap of relative-position bucket indices between all word pairs on the mock invoice"></svg>
+        <div class="readout" aria-live="polite" id="attn-read"></div>
+        <p class="vcap">Rows are queries, columns keys, both in raster reading order over the mock invoice's words (one token per word here, for legibility). Buckets are exact, from the released configurations and the implementation's choice of x̂₀ and ŷ₁. The "illustrative total bias" uses made-up bias tables that decay with bucket distance from zero — real learned values differ per head and are not published — to show how a head could come to prefer same-line neighbours.</p>
+      </div>
+      <h4>A detail where code and paper disagree</h4>
+      <p>The paper anchors each box by its top-left corner (x_min, y_min). The released implementation — in both v2 and v3 — uses the left edge x̂₀ and the <em>bottom</em> edge ŷ₁. For words on one text line the two choices give nearly the same Δy; they differ when boxes of different heights are compared. Models loaded from the released checkpoints were trained with the implementation's choice.</p>
+      <p>The v2 ablation (DocVQA validation ANLS, base size, one epoch) credits the mechanism with 0.7124 → 0.7217 when added on top of all three pretraining tasks.</p>
+      <div class="callout"><b>Takeaway:</b> spatial-aware attention adds three table lookups per head per token pair — 32 + 64 + 64 scalars per head in total — and lets attention prefer pairs by stream distance and by 2-D offset, which matches the "value is to the right of or below its key" regularity common in forms.</div>
+    </section>
+
+    <!-- 15 ───────────────────────────────────────────── -->
+    <section class="topic" id="v2-pretrain" data-nav="v2 pretraining: MVLM, TIA, TIM">
+      <h3><span class="idx">15</span> v2 pretraining: MVLM, text–image alignment and matching</h3>
+      <p class="lede">With the image inside the model, masked-token prediction alone gives the network no loss that directly requires the pixels — though the v2 ablation shows an MVLM-only model with visual tokens still gains a little (0.6841 → 0.6915 ANLS), so it does use them. v2 therefore adds a fine-grained task, text–image alignment (TIA), which asks each token whether its own image region was covered, and a coarse task, text–image matching (TIM), which asks whether the image and the text come from the same page.</p>
+      <div class="formula"><span class="lbl">MVLM, as in v1 — plus the masked words' image regions are blanked to prevent leakage</span><span class="eq">15% of text tokens selected;  80% [MASK] / 10% random / 10% unchanged</span>
+<span class="lbl">TIA: cover 15% of OCR lines on the image; binary label per token, masked tokens excluded</span><span class="eq">ℒ_TIA = − ∑_(i ∉ M) [ cᵢ log p(Covered | hᵢ) + (1 − cᵢ) log p(Not covered | hᵢ) ]</span>
+<span class="lbl">TIM: on [CLS]; negatives replace the image (15%) or drop it (5%)</span><span class="eq">ℒ_TIM = − [ m log p(Matched | h_CLS) + (1 − m) log p(Not matched | h_CLS) ]        ℒ = ℒ_MVLM + ℒ_TIA + ℒ_TIM</span></div>
+      <h4>Design choices inside TIA</h4>
+      <ul class="notes">
+        <li><b>Line-level covering.</b> At 224 × 224, a covered word-sized patch can be confused with signatures or bars in a figure, so the paper covers whole OCR lines and calls the operation "covering" to keep it distinct from MVLM's masking.</li>
+        <li><b>Masked tokens are excluded</b> from the TIA loss, so the model cannot learn the shortcut "[MASK] implies Covered" (MVLM already blanks those tokens' regions).</li>
+        <li><b>In TIM negatives,</b> the same masking and covering are applied to the substituted image so the model cannot simply spot negatives by their lack of covering, and every TIA label is set to Covered.</li>
+      </ul>
+      <div class="viz" id="viz-tia">
+        <div class="vhead">
+          <span class="vtitle">TIA covering and labels</span>
+          <span class="vhint">resample · change the covered-line rate · switch to a TIM negative</span>
+        </div>
+        <div class="controls">
+          <label>lines covered <input type="range" id="tia-rate" min="0" max="50" step="5" value="15" /><span id="tia-rv" style="min-width:40px;display:inline-block"></span></label>
+          <label>sample <select id="tia-tim"><option value="pos">matched page (TIM positive)</option><option value="neg">replaced image (TIM negative)</option></select></label>
+          <button class="btn ghost" id="tia-new">Resample</button>
+        </div>
+        <svg id="tia-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="Mock invoice with some text lines covered on the image and each word labelled Covered, Not covered, or excluded"></svg>
+        <div class="readout" aria-live="polite" id="tia-read"></div>
+        <p class="vcap">Lines are the raster lines of the mock invoice; covering is drawn per line with a seeded generator, and 15% of words are independently MVLM-masked (shown hatched and excluded from TIA). In the negative case the label set follows the paper: every non-masked token is labelled Covered.</p>
+      </div>
+      <h4>Recipe</h4>
+      <ul class="notes">
+        <li>IIT-CDIP (11M pages, Microsoft Read API OCR); random sliding window over text longer than L = 512; all text in segment [A]; 7 × 7 visual tokens.</li>
+        <li>Adam, learning rate 2 × 10⁻⁵, weight decay 0.01, (β₁, β₂) = (0.9, 0.999), linear warm-up over the first 10% of steps then linear decay. Base: batch 64 for 5 epochs. Large: batch 2,048 for 20 epochs.</li>
+      </ul>
+      <h4>What each task is worth (v2 paper, Table 5)</h4>
+      <table class="cmp">
+        <tr><th>#</th><th>Configuration (base, 1 epoch)</th><th>DocVQA val ANLS</th></tr>
+        <tr><td>1</td><td>LayoutLM architecture, BERT init, MVLM</td><td>0.6841</td></tr>
+        <tr><td>2a</td><td>+ X101-FPN visual tokens, MVLM only</td><td>0.6915</td></tr>
+        <tr><td>2b</td><td>+ TIA</td><td>0.7061</td></tr>
+        <tr><td>2c</td><td>+ TIM (without TIA)</td><td>0.6955</td></tr>
+        <tr><td>2d</td><td>+ TIA + TIM</td><td>0.7124</td></tr>
+        <tr><td>3</td><td>+ spatial-aware self-attention</td><td>0.7217</td></tr>
+        <tr><td>4</td><td>UniLMv2 initialisation instead of BERT</td><td>0.7421</td></tr>
+      </table>
+      <p>TIA contributes more than TIM (+1.46 versus +0.40 ANLS over 2a), together they add +2.09, and the text-side initialisation is worth another +2.04 — the largest change from a single component (only the two alignment tasks together, +2.09, add more).</p>
+      <div class="callout"><b>Takeaway:</b> an image input is most useful when some loss cannot be minimised without it (MVLM alone extracted only +0.74 ANLS from the visual tokens in the ablation). TIA supplies that at the token level, TIM at the page level; in the ablation, the token-level task is the more valuable of the two.</div>
+    </section>
+
+    <!-- 16 ───────────────────────────────────────────── -->
+    <section class="topic" id="v2-results" data-nav="v2: configurations and results">
+      <h3><span class="idx">16</span> v2: configurations, fine-tuning heads and results</h3>
+      <p class="lede">Two sizes: base (12 layers, width 768, 12 heads) and large (24 layers, width 1024, 16 heads), both with the same ResNeXt-101-FPN; the paper reports about 200M and 426M parameters. Fine-tuning heads sit on the text part of the output, except for page classification, which uses the visual tokens as well.</p>
+      <h4>Fine-tuning heads (v2 paper, appendix)</h4>
+      <ul class="notes">
+        <li><b>Sequence labelling</b> (FUNSD, CORD, SROIE, Kleister-NDA): a token-classification layer over text outputs predicting BIO tags.</li>
+        <li><b>DocVQA:</b> extractive QA — start and end classifiers over text tokens; question in segment [A], context in [B], visual tokens in [C]; maximum sequence length L = 384. An extra setting first fine-tunes on a question-generation dataset of almost one million synthetic question–answer pairs.</li>
+        <li><b>RVL-CDIP:</b> concatenate the [CLS] output, a pooled pre-encoder visual feature and a pooled post-encoder visual feature, then classify.</li>
+      </ul>
+      <h4>Results (v2 paper, Tables 2–4 and appendix)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>FUNSD F1</th><th>CORD F1</th><th>SROIE F1</th><th>Kleister-NDA F1</th><th>RVL-CDIP acc.</th><th>DocVQA ANLS (train only)</th></tr>
+        <tr><td>BERT-base</td><td>0.6026</td><td>0.8968</td><td>0.9099</td><td>0.779</td><td>89.81%</td><td>0.6354</td></tr>
+        <tr><td>UniLMv2-base</td><td>0.6890</td><td>0.9092</td><td>0.9459</td><td>0.795</td><td>90.06%</td><td>0.7134</td></tr>
+        <tr><td>LayoutLM-base</td><td>0.7866</td><td>0.9472</td><td>0.9438</td><td>0.827</td><td>94.42% (w/ image)</td><td>0.6979</td></tr>
+        <tr><td>LayoutLM-large</td><td>0.7895</td><td>0.9493</td><td>0.9524</td><td>0.834</td><td>94.43% (w/ image)</td><td>0.7259</td></tr>
+        <tr><td>LayoutLMv2-base</td><td>0.8276</td><td>0.9495</td><td>0.9625</td><td>0.833</td><td>95.25%</td><td>0.7808</td></tr>
+        <tr><td>LayoutLMv2-large</td><td>0.8420</td><td>0.9601</td><td>0.9781*</td><td>0.852</td><td>95.64%</td><td>0.8348</td></tr>
+      </table>
+      <p>* SROIE large is 0.9661 on the raw test set and 0.9781 "excluding OCR mismatch" — the version the abstract quotes. Kleister-NDA figures are on the validation set, since test labels were not available.</p>
+      <h4>DocVQA settings, stated explicitly</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Fine-tuning data</th><th>ANLS</th></tr>
+        <tr><td>LayoutLM-large</td><td>train</td><td>0.7259</td></tr>
+        <tr><td>LayoutLMv2-large</td><td>train</td><td>0.8348</td></tr>
+        <tr><td>LayoutLMv2-large</td><td>train + dev</td><td>0.8529</td></tr>
+        <tr><td>LayoutLMv2-large</td><td>train + dev, after question-generation pre-fine-tuning</td><td>0.8672</td></tr>
+        <tr><td>Leaderboard top-1 before v2 (30-model ensemble)</td><td>—</td><td>0.8506</td></tr>
+      </table>
+      <p>So the like-for-like v1 → v2 comparison at large size is 0.7259 → 0.8348 (train only). The abstract's "0.7295 → 0.8672" pairs a starting value that appears in none of the paper's tables with v2's best setting, which used more data. Every other "from" value in that abstract (0.7895, 0.9493, 0.9524, 0.8340, 0.9443) is LayoutLM-large's figure from the paper's own tables, so 0.7295 is most plausibly a digit transposition of LayoutLM-large's 0.7259 — an inference, since the paper does not say; the "to" end, 0.8672, is not a train-only number.</p>
+      <div class="callout"><b>Takeaway:</b> At large size, v2's gains over v1 are largest on DocVQA (+10.9 ANLS at equal fine-tuning data) and FUNSD (+5.3 F1), and smallest on CORD (+1.1) and RVL-CDIP (+1.2, where v1 already used image features) — plausibly because text and layout already carry most of the receipt signal.</div>
+    </section>
+
+    <!-- 17 ───────────────────────────────────────────── -->
+    <section class="topic" id="layoutxlm" data-nav="LayoutXLM and XFUND">
+      <h3><span class="idx">17</span> LayoutXLM: the v2 recipe in 53 languages, and XFUND</h3>
+      <p class="lede">LayoutXLM keeps the v2 architecture and objectives and changes the data and the text side: the encoder is initialised from the multilingual InfoXLM, the vocabulary is a 250,002-entry SentencePiece model, and pretraining uses 30 million documents in 53 languages. Its paper also introduces XFUND, FUNSD-style forms in seven more languages.</p>
+      <h4>Data pipeline</h4>
+      <ul class="notes">
+        <li><b>Collection:</b> publicly available born-digital multilingual PDFs, downloaded "following the principles and policies of Common Crawl", parsed with PyMuPDF for text, layout and page images — no OCR needed.</li>
+        <li><b>Cleaning:</b> discard documents under 200 characters; detect language with BlingFire and keep a document only if its language score exceeds 0.5.</li>
+        <li><b>Sampling:</b> languages sampled with probability pₗ ∝ (nₗ / n)^0.7, the XLM-style smoothing with the exponent InfoXLM used, to lift low-resource languages. This yields 22M multilingual documents, plus 8M scanned English pages sampled from IIT-CDIP, 30M in total.</li>
+        <li><b>Boxes per token:</b> character-level boxes merged per SentencePiece token (<a href="#subwords">sub-words</a>).</li>
+        <li><b>Compute and size:</b> 64 V100 GPUs; about 345M (base) and 625M (large) parameters by the paper's count.</li>
+      </ul>
+      <h4>XFUND</h4>
+      <p>Form templates in Chinese, Japanese, Spanish, French, Italian, German and Portuguese were collected from the web, emptied, filled with synthetic content by annotators (typed or handwritten, each template used once), scanned, OCR'd with the Microsoft Read API and labelled with FUNSD's entity types and key–value links. Each language has 199 forms, 149 for training and 50 for testing — 1,393 in all. Two tasks are defined: semantic entity recognition (SER, BIO labelling) and relation extraction (RE, a biaffine classifier over candidate entity pairs).</p>
+      <h4>Results (LayoutXLM paper, Table 2: fine-tune and test on the same language)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Task</th><th>FUNSD (en)</th><th>ZH</th><th>JA</th><th>ES</th><th>FR</th><th>IT</th><th>DE</th><th>PT</th><th>Avg.</th></tr>
+        <tr><td>XLM-R base</td><td>SER</td><td>0.667</td><td>0.8774</td><td>0.7761</td><td>0.6105</td><td>0.6743</td><td>0.6687</td><td>0.6814</td><td>0.6818</td><td>0.7047</td></tr>
+        <tr><td>InfoXLM base</td><td>SER</td><td>0.6852</td><td>0.8868</td><td>0.7865</td><td>0.6230</td><td>0.7015</td><td>0.6751</td><td>0.7063</td><td>0.7008</td><td>0.7207</td></tr>
+        <tr><td>LayoutXLM base</td><td>SER</td><td>0.794</td><td>0.8924</td><td>0.7921</td><td>0.7550</td><td>0.7902</td><td>0.8082</td><td>0.8222</td><td>0.7903</td><td>0.8056</td></tr>
+        <tr><td>LayoutXLM large</td><td>SER</td><td>0.8225</td><td>0.9161</td><td>0.8033</td><td>0.7830</td><td>0.8098</td><td>0.8275</td><td>0.8361</td><td>0.8273</td><td>0.8282</td></tr>
+        <tr><td>LayoutXLM base</td><td>RE</td><td>0.5483</td><td>0.7073</td><td>0.6963</td><td>0.6896</td><td>0.6353</td><td>0.6415</td><td>0.6551</td><td>0.5718</td><td>0.6432</td></tr>
+        <tr><td>LayoutXLM large</td><td>RE</td><td>0.6404</td><td>0.7888</td><td>0.7255</td><td>0.7666</td><td>0.7102</td><td>0.7691</td><td>0.6843</td><td>0.6796</td><td>0.7206</td></tr>
+      </table>
+      <p>Zero-shot transfer — fine-tune on English FUNSD only, test on each XFUND language — is much harder: LayoutXLM-base averages 0.5561 SER F1 across the eight columns, against 0.4119 for InfoXLM-base, so layout knowledge transfers across languages better than text alone but far from fully.</p>
+      <div class="callout"><b>Takeaway:</b> LayoutXLM shows the v2 recipe transfers to other scripts when the tokenizer, the box granularity and the corpus change with it. For a new language, the OCR engine must cover it too — the model does not read.</div>
+    </section>
+
+    <!-- 18 ───────────────────────────────────────────── -->
+    <section class="topic" id="v3-arch" data-nav="v3: patches instead of a CNN">
+      <h3><span class="idx">18</span> v3: linear patches instead of a CNN</h3>
+      <p class="lede">LayoutLMv3 removes the convolutional backbone. The page image is resized to 224 × 224, cut into 16 × 16-pixel patches, and each patch is flattened and linearly projected to the model width — the ViT recipe. The v3 paper describes itself as the first multimodal document AI model that does not rely on a pre-trained CNN or Faster R-CNN for image features.</p>
+      <div class="formula"><span class="lbl">patch count for an H × W image and patch size P</span><span class="eq">M = H·W / P² = 224·224 / 16² = 14 · 14 = 196</span>
+<span class="lbl">image embedding: linear projection plus learnable 1-D position embedding per patch</span><span class="eq">xₘ = W_patch · flatten(patchₘ) + Pos1D_img(m)        W_patch ∈ ℝ^(D × 3·16·16)</span>
+<span class="lbl">text embedding: RoBERTa word embedding plus 1-D and segment-level 2-D positions</span><span class="eq">yₗ = Tok(wₗ) + Pos1D(l) + Layout(x̂₀, ŷ₀, x̂₁, ŷ₁, ŵ, ĥ of wₗ's segment)</span>
+<span class="lbl">the encoder sees text then image; 1-D and 2-D relative biases as in v2</span><span class="eq">input = [ y₁ … y_L ; x₁ … x_M ]</span></div>
+      <h4>Worked example: what the patches cost</h4>
+      <p>The projection is a 16 × 16 convolution with stride 16 from 3 to 768 channels: 3 · 16 · 16 · 768 weights + 768 biases = 590,592 parameters, the "0.6M" the v3 paper reports for adding image embedding. The v3 paper calls this negligible next to CNN backbones, citing 44M for a ResNet-101; v2's ResNeXt-101-FPN is about 90M. The Transformers implementation also prepends a visual [CLS] token and learns a 197-row position embedding (196 patches + [CLS]), so the image contributes 197 tokens to the sequence.</p>
+      <p>A word's corresponding patches follow from its box: "Total:" at (665, 826, 745, 843) maps to 224-pixel coordinates x 148.96–166.88 and y 185.02–188.83, i.e. patch columns floor(148.96/16) = 9 to floor(166.88/16) = 10 in patch row floor(185.02/16) = 11. Those two patches are what <a href="#v3-pretrain">word–patch alignment</a> checks.</p>
+      <div class="viz" id="viz-patch">
+        <div class="vhead">
+          <span class="vtitle">Patchify, mask, and label word–patch alignment</span>
+          <span class="vhint">resample the masks · change the image mask ratio · click a word</span>
+        </div>
+        <div class="controls">
+          <label>image mask ratio <input type="range" id="patch-ratio" min="0" max="80" step="5" value="40" /><span id="patch-rv" style="min-width:40px;display:inline-block"></span></label>
+          <label>text mask ratio <input type="range" id="patch-tratio" min="0" max="60" step="5" value="30" /><span id="patch-tv" style="min-width:40px;display:inline-block"></span></label>
+          <button class="btn ghost" id="patch-new">Resample</button>
+        </div>
+        <svg id="patch-svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="Page resized to 224 pixels with a 14 by 14 patch grid, blockwise-masked patches, and words labelled aligned, unaligned or masked"></svg>
+        <div class="readout" aria-live="polite" id="patch-read"></div>
+        <p class="vcap">The mock invoice is resized to 224 × 224 (aspect ratio is not preserved, as in the reference processor) and split into 14 × 14 patches. Image masking follows BEiT's blockwise scheme: rectangles of at least 16 patches with aspect ratio between 0.3 and 1/0.3 are added until the ratio is reached. Words are masked independently at the text ratio. A non-masked word is labelled aligned if none of the patches its box overlaps is masked, unaligned otherwise; masked words are excluded, as in the paper. The paper does not spell out the overlap rule; "any overlap" is this figure's assumption.</p>
+      </div>
+      <h4>Other v3 architecture choices</h4>
+      <ul class="notes">
+        <li><b>Segment-level layout</b> for text tokens (<a href="#subwords">sub-words</a>); image patches get their grid cell as a box, and special tokens get zeros.</li>
+        <li><b>RoBERTa initialisation</b> and its byte-level BPE vocabulary (50,265 entries) replace BERT/UniLMv2 WordPiece; the maximum text length stays 512 (the configuration lists 514 positions because RoBERTa's position ids start after the padding index).</li>
+        <li><b>1-D position embeddings for patches:</b> the authors "have not observed improvements from using 2-D position embeddings in [their] preliminary experiments".</li>
+        <li><b>Training stability:</b> attention computed in the CogView form, softmax(QᵀK/√d) = softmax( (QᵀK/(a√d) − max(QᵀK/(a√d))) · a ) with a = 32, which rescales before subtracting the maximum.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> v3 spends 0.6M parameters on image input where v2 spent about 90M, and gets the image into the sequence at 196 patch tokens — more visual tokens than v2's 49, each looking at a quarter of the area.</div>
+    </section>
+
+    <!-- 19 ───────────────────────────────────────────── -->
+    <section class="topic" id="v3-pretrain" data-nav="v3 pretraining: MLM, MIM, WPA">
+      <h3><span class="idx">19</span> v3 pretraining: MLM, MIM and word–patch alignment</h3>
+      <p class="lede">v3's argument is that text and image objectives should look alike. Text uses masked language modelling over discrete word tokens; image uses masked image modelling over discrete visual tokens produced by an image tokenizer; and word–patch alignment ties the two by asking whether a word's image patches were masked. The total loss is the plain sum.</p>
+      <div class="formula"><span class="lbl">MLM: mask 30% of text tokens in spans, lengths from Poisson(<span class="keep">λ</span> = 3); layout kept</span><span class="eq">ℒ_MLM = − ∑_(l ∈ L′) log p( yₗ | X_masked , Y_masked )</span>
+<span class="lbl">MIM: blockwise-mask about 40% of patches; predict each masked patch's visual token id (8,192-way)</span><span class="eq">ℒ_MIM = − ∑_(m ∈ M′) log p( zₘ | X_masked , Y_masked )</span>
+<span class="lbl">WPA: for each unmasked text token, aligned / unaligned (two-layer MLP head)</span><span class="eq">ℒ_WPA = − ∑_(l ∉ L′) log p( aₗ | X_masked , Y_masked )        ℒ = ℒ_MLM + ℒ_MIM + ℒ_WPA</span></div>
+      <h4>The image tokenizer</h4>
+      <p>MIM's targets come from a discrete VAE image tokenizer, the approach of DALL·E and BEiT. The v3 paper initialises its tokenizer from the one in DiT (arXiv 2203.02378), a self-supervised document image Transformer; the DiT paper trained that dVAE on the 42 million page images of IIT-CDIP because the DALL·E tokenizer, trained on natural images, reconstructed documents poorly. It has an 8,192-entry codebook and downsamples by 8, so a 112 × 112 input — the released configuration's <code>second_input_size</code> — would yield a 14 × 14 grid of codes, one target per 16 × 16 patch of the 224 × 224 image (the v3 paper itself does not state the tokenizer's input size). The tokenizer is used only to make labels and is not counted in the model's parameters.</p>
+      <h4>Worked example: one sequence</h4>
+      <p>With 512 text tokens, 30% masking hides about 154 tokens in spans averaging 3 tokens — roughly 51 spans. With 196 patches, 40% masking hides about 78 patches in rectangular blocks. WPA is then computed on the roughly 358 unmasked text tokens. If "Total:" is unmasked but patch (11, 10) is masked, its WPA label is unaligned; if both (11, 9) and (11, 10) are visible, aligned.</p>
+      <div class="viz" id="viz-span">
+        <div class="vhead">
+          <span class="vtitle">Span masking with Poisson lengths</span>
+          <span class="vhint">change the mean span length and the ratio · resample</span>
+        </div>
+        <div class="controls">
+          <label>mean span <span class="keep">λ</span> <input type="range" id="span-lam" min="1" max="6" step="0.5" value="3" /><span id="span-lv" style="min-width:36px;display:inline-block"></span></label>
+          <label>mask ratio <input type="range" id="span-ratio" min="10" max="50" step="5" value="30" /><span id="span-rv" style="min-width:40px;display:inline-block"></span></label>
+          <button class="btn ghost" id="span-new">Resample</button>
+        </div>
+        <svg id="span-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="A strip of 512 token cells with masked spans highlighted and a histogram of sampled span lengths against the Poisson distribution"></svg>
+        <div class="readout" aria-live="polite" id="span-read"></div>
+        <p class="vcap">A 512-token sequence; span lengths are drawn from Poisson(λ) with a seeded generator, zero-length draws are redrawn (an assumption — implementations differ), and spans are placed at random non-overlapping starts until the ratio is reached (the last span is clipped). Bars are the sampled length histogram; dots are the Poisson probabilities renormalised over lengths ≥ 1.</p>
+      </div>
+      <h4>What each objective is worth (v3 paper, Table 3: base, 1M pages, 150k steps)</h4>
+      <table class="cmp">
+        <tr><th>#</th><th>Image input</th><th>Objectives</th><th>Params</th><th>FUNSD</th><th>CORD</th><th>RVL-CDIP</th><th>PubLayNet mAP</th></tr>
+        <tr><td>1</td><td>none</td><td>MLM</td><td>125M</td><td>88.64</td><td>96.27</td><td>95.33</td><td>not applicable</td></tr>
+        <tr><td>2</td><td>linear</td><td>MLM</td><td>126M</td><td>89.39</td><td>96.11</td><td>95.00</td><td>loss diverges</td></tr>
+        <tr><td>3</td><td>linear</td><td>MLM + MIM</td><td>132M</td><td>89.19</td><td>96.30</td><td>95.42</td><td>94.38</td></tr>
+        <tr><td>4</td><td>linear</td><td>MLM + MIM + WPA</td><td>133M</td><td>89.78</td><td>96.49</td><td>95.53</td><td>94.43</td></tr>
+      </table>
+      <p>Adding patches without an image objective (#2) helps FUNSD (+0.75) but hurts CORD and RVL-CDIP and makes layout-detection fine-tuning diverge; MIM restores CORD and RVL-CDIP and makes PubLayNet trainable (while FUNSD dips by 0.20), and WPA improves every column. The parameter column counts pretraining heads: the paper puts the MIM head at 6.9M and the WPA head at 0.6M, which roughly accounts for #3 and #4 reading 132M and 133M.</p>
+      <div class="callout"><b>Takeaway:</b> v3's objectives are symmetric — discrete tokens reconstructed on both sides — plus an alignment label that falls out of the masking for free. Without MIM, the cheap linear patches help FUNSD slightly but hurt the other tasks and cannot be fine-tuned for layout detection.</div>
+    </section>
+
+    <!-- 20 ───────────────────────────────────────────── -->
+    <section class="topic" id="v3-results" data-nav="v3: configurations and results">
+      <h3><span class="idx">20</span> v3: configurations, recipes and results</h3>
+      <p class="lede">Base: 12 layers, 12 heads, width 768, feed-forward 3,072. Large: 24 layers, 16 heads, width 1,024, feed-forward 4,096. Both pretrained on 11 million IIT-CDIP pages — of the roughly 42 million pages the collection splits into — with no image augmentation. The paper reports 133M and 368M parameters.</p>
+      <h4>Recipes (v3 paper, Section 3)</h4>
+      <table class="cmp">
+        <tr><th>Stage</th><th>Settings</th></tr>
+        <tr><td>Pretraining</td><td>Adam, batch 2,048, 500,000 steps, weight decay 0.01, (β₁, β₂) = (0.9, 0.98); base lr 1 × 10⁻⁴ with 4.8% warm-up; large lr 5 × 10⁻⁵ with 10% warm-up; RoBERTa init; tokenizer init from DiT</td></tr>
+        <tr><td>FUNSD</td><td>1,000 steps, lr 1 × 10⁻⁵, batch 16; linear head per token</td></tr>
+        <tr><td>CORD</td><td>lr 5 × 10⁻⁵, batch 64; MLP head per token</td></tr>
+        <tr><td>RVL-CDIP</td><td>20,000 steps, batch 64, lr 2 × 10⁻⁵; MLP on [CLS]; OCR from Microsoft Read API</td></tr>
+        <tr><td>DocVQA</td><td>extractive start/end classifier; base 100,000 steps, batch 128, lr 3 × 10⁻⁵, warm-up 0.048; large 200,000 steps, batch 32, lr 1 × 10⁻⁵, warm-up 0.1; train split only</td></tr>
+        <tr><td>PubLayNet</td><td>Cascade R-CNN with FPN (Detectron2), features from layers 4, 6, 8, 12 of base; AdamW, 60,000 steps, 1,000 warm-up, weight decay 0.05, batch 32, lr 2 × 10⁻⁴; no flips or crops; no relative positions; image only</td></tr>
+      </table>
+      <h4>Results (v3 paper, Tables 1 and 2)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Params (paper)</th><th>FUNSD F1</th><th>CORD F1</th><th>RVL-CDIP acc.</th><th>DocVQA ANLS</th></tr>
+        <tr><td>LayoutLM-base (+ image)</td><td>160M</td><td>79.27</td><td>—</td><td>94.42</td><td>—</td></tr>
+        <tr><td>LayoutLMv2-base</td><td>200M</td><td>82.76</td><td>94.95</td><td>95.25</td><td>78.08</td></tr>
+        <tr><td>LayoutLMv3-base</td><td>133M</td><td>90.29</td><td>96.56</td><td>95.44</td><td>78.76</td></tr>
+        <tr><td>LayoutLM-large</td><td>343M</td><td>77.89</td><td>—</td><td>91.90</td><td>—</td></tr>
+        <tr><td>LayoutLMv2-large</td><td>426M</td><td>84.20</td><td>96.01</td><td>95.64</td><td>83.48</td></tr>
+        <tr><td>LayoutLMv3-large</td><td>368M</td><td>92.08</td><td>97.46</td><td>95.93</td><td>83.37</td></tr>
+      </table>
+      <p>On PubLayNet (validation mAP @ IoU 0.50:0.95, image only) LayoutLMv3-base with Cascade R-CNN scores 95.1 overall — text 94.5, title 90.6, list 95.5, table 97.9, figure 97.0 — against 94.5 for DiT-base in the same framework; the largest gain is on titles, which the authors attribute to language pretraining since titles are small and identifiable by content.</p>
+      <h4>Reading the table fairly</h4>
+      <ul class="notes">
+        <li><b>FUNSD:</b> v3 and StructuralLM use segment-level boxes, the rest word-level; the v3 paper itself says the two "are not directly comparable". Part of the jump from 82.76 to 90.29 may be the box granularity rather than the architecture.</li>
+        <li><b>DocVQA:</b> v3-large (83.37) is slightly below v2-large (83.48) at equal train-only data; the paper marks the models that score higher (TILT, StructuralLM) as using more DocVQA training data and "expected to score higher".</li>
+        <li><b>Parameters:</b> the 133M includes pretraining heads (<a href="#params">parameter counts</a>); the deployable encoder is about 125M.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> v3 beats v2 on every task in the table except large-size DocVQA (83.37 vs 83.48), with fewer parameters and no detector, and is the first family member that doubles as a layout-detection backbone. Its FUNSD lead is real but partly protocol.</div>
+    </section>
+
+    <!-- 21 ───────────────────────────────────────────── -->
+    <section class="topic" id="params" data-nav="Parameter counts, recomputed">
+      <h3><span class="idx">21</span> Parameter counts, recomputed from the configurations</h3>
+      <p class="lede">The papers give rounded parameter counts, and several of them differ from what the released configurations add up to — some explained by pretraining heads, two (LayoutLM-large and LayoutXLM-base) not explained by the papers. Recomputing from the configuration files — vocabulary, width, depth, table sizes, backbone — shows where each count comes from and what the reported numbers include.</p>
+      <div class="formula"><span class="lbl">a BERT-style encoder with a pooler (vocab V, positions P, segment types T, width d, depth L)</span><span class="eq">N_enc = V·d + P·d + T·d + 2d  +  L·(12d² + 13d)  +  (d² + d)</span>
+<span class="lbl">v1 layout tables (R = 1024 rows): the paper's two, or the implementation's four</span><span class="eq">paper: 2·R·d        implementation: 4·R·d   (X, Y, H, W)</span>
+<span class="lbl">v2 / v3 layout slices and relative-bias tables (h heads)</span><span class="eq">R·(2c + 2s)   with 4c + 2s = d        biases: 32·h + 2·64·h</span></div>
+      <h4>Worked example: LayoutLM-base</h4>
+      <p>V = 30,522, P = 512, T = 2, d = 768, L = 12. Word embeddings 30,522 · 768 = 23,440,896; 1-D positions 393,216; segments 1,536; embedding LayerNorm 1,536; twelve layers at 12·768² + 13·768 = 7,087,872 each, 85,054,464 in all; pooler 590,592. That is BERT-base's 109,482,240. The paper's two 1024 × 768 layout tables add 1,572,864 for 111,055,104; the implementation's four add 3,145,728 for <b>112,627,968</b> — the "113M" the paper reports sits closer to the latter, and closer still (113.25M) if the masked-LM head is counted.</p>
+      <div class="viz" id="viz-params">
+        <div class="vhead">
+          <span class="vtitle">Where the parameters live, per family member</span>
+          <span class="vhint">pick a model · compare the recomputed total with the paper's figure</span>
+        </div>
+        <div class="controls">
+          <label>model <select id="par-model"></select></label>
+          <label><input type="checkbox" id="par-heads" /> include pretraining heads (v1: MLM transform; v3: MIM + WPA)</label>
+        </div>
+        <svg id="par-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Stacked horizontal bar of parameter groups for the selected LayoutLM model with the paper-reported total marked"></svg>
+        <div class="readout" aria-live="polite" id="par-read"></div>
+        <p class="vcap">Every group is computed in the script from the released configuration values (Hugging Face Hub <code>config.json</code> for each checkpoint) with the formulas above. The ResNeXt-101 32×8d FPN backbone is counted as its convolution weights (86,539,456) plus the four lateral and four output FPN convolutions (3,344,384), with batch-norm affine terms treated as frozen buffers as in Detectron2's default; counting them as trainable adds 202,880. The v3 head sizes are inferred: a dense + LayerNorm + 8,192-way linear MIM head and a two-layer MLP WPA head reproduce the paper's 6.9M and 0.6M at base size to the precision stated (6,891,776 and 592,130), and the same shapes are assumed at large size.</p>
+      </div>
+      <h4>Reconciling the reported numbers</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Paper</th><th>Recomputed</th><th>Why they differ</th></tr>
+        <tr><td>LayoutLM-base</td><td>113M</td><td>111.1M (paper's 2 tables) · 112.6M (implementation's 4)</td><td>rounding; the paper's figure matches the implementation's layout tables</td></tr>
+        <tr><td>LayoutLM-large</td><td>343M</td><td>337.2M (2 tables) · 339.3M (4 tables) · 340.4M with the MLM head</td><td>not explained in the paper; the same paper lists BERT-large as 340M, whose exact count with pooler is 335.1M, so its large-size figures appear to be loose</td></tr>
+        <tr><td>LayoutLMv2-base</td><td>≈200M</td><td>200.1M</td><td>agrees (≈110M encoder + ≈90M visual backbone)</td></tr>
+        <tr><td>LayoutLMv2-large</td><td>≈426M</td><td>426.0M</td><td>agrees</td></tr>
+        <tr><td>LayoutXLM-base</td><td>≈345M</td><td>368.7M</td><td>the 250,002 × 768 vocabulary alone is 192.0M; the paper does not break its figure down. Only the base checkpoint is public, so the large figure (625M) cannot be recomputed from a released configuration</td></tr>
+        <tr><td>LayoutLMv3-base</td><td>133M</td><td>125.3M encoder · 132.8M with MIM (6.9M) and WPA (0.6M) heads</td><td>the paper's count includes the pretraining heads (its Table 3: 126M → 132M → 133M as heads are added)</td></tr>
+        <tr><td>LayoutLMv3-large</td><td>368M</td><td>356.0M encoder · ≈366.5M with heads of the assumed shapes</td><td>heads, as for base; the remaining ≈1.5M is not explained by the paper</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> quote LayoutLMv3-base as ≈125M if you mean the model you deploy and 133M if you mean the paper's figure; quote LayoutLM-large as ≈339M by configuration arithmetic. The layout tables themselves are small — 0.5M to 3.1M parameters at base size, up to 4.2M in the implementation of LayoutLM-large — so layout is almost free in parameters.</div>
+    </section>
+
+    <!-- 22 ───────────────────────────────────────────── -->
+    <section class="topic" id="benchmarks" data-nav="The family on the benchmarks">
+      <h3><span class="idx">22</span> The family on the benchmarks, with settings</h3>
+      <p class="lede">One chart for all four members across the tasks they share, each bar labelled with the setting that produced it. The source is the paper that first reported each number; where a later paper reran a model, both are shown.</p>
+      <div class="viz" id="viz-bench">
+        <div class="vhead">
+          <span class="vtitle">Scores by task, model and setting</span>
+          <span class="vhint">choose a task · hover or read the setting under each bar</span>
+        </div>
+        <div class="controls">
+          <label>task <select id="bench-task"><option value="funsd">FUNSD F1</option><option value="cord">CORD F1</option><option value="sroie">SROIE F1</option><option value="rvl">RVL-CDIP accuracy</option><option value="docvqa">DocVQA ANLS</option><option value="xfund">XFUND SER F1 (8-column average)</option></select></label>
+        </div>
+        <svg id="bench-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="Horizontal bar chart of benchmark scores for LayoutLM family members, labelled with their settings"></svg>
+        <div class="readout" aria-live="polite" id="bench-read"></div>
+        <p class="vcap">Values are copied into a source-labelled array in the script from the v1 paper (Tables 1, 4, 5), the v2 paper (Tables 2–4, appendix), the LayoutXLM paper (Table 2) and the v3 paper (Table 1). Bars are coloured by generation; the axis starts at the lowest value shown minus five points, so bar lengths exaggerate differences — read the numbers.</p>
+      </div>
+      <h4>Two numbers that are often misquoted</h4>
+      <ul class="notes">
+        <li><b>LayoutLM-large on FUNSD</b> is 0.7789 in its own paper (11M pages, 1 epoch) and 0.7895 in the v2 paper's rerun. The v3 table uses 77.89.</li>
+        <li><b>DocVQA "0.73 → 0.87"</b> mixes settings: 0.7295 in the v2 abstract matches no number in the paper's tables and is most plausibly a transposition of LayoutLM-large's 0.7259 (every other starting value in that abstract is a LayoutLM-large figure), 0.7259 is LayoutLM-large fine-tuned on train only, and 0.8672 is LayoutLMv2-large fine-tuned on train + dev after question-generation pre-fine-tuning. The like-for-like large comparison is 0.7259 → 0.8348.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> within the family, each generation improves on the last on almost every task at equal settings; v3's margins are largest on FUNSD (with the segment-box caveat) and smallest on RVL-CDIP and DocVQA.</div>
+    </section>
+
+    <!-- 23 ───────────────────────────────────────────── -->
+    <section class="topic" id="finetune" data-nav="Fine-tuning recipes per task">
+      <h3><span class="idx">23</span> Fine-tuning recipes per task</h3>
+      <p class="lede">All four members are fine-tuned end-to-end with a small task head. Three head shapes cover almost every use: a classifier per token for field extraction, start and end classifiers for extractive question answering, and a classifier on [CLS] (plus pooled visual features in v1/v2) for page classification.</p>
+      <h4>Token classification with BIO labels (FUNSD, CORD, SROIE, XFUND SER)</h4>
+      <p>Each entity type T gets two labels, B-T for the first word of an entity and I-T for the rest, plus O for words outside any entity. FUNSD's four types give 2·3 + 1 = 7 labels (its "other" class is usually mapped to O). CORD's 30 fields give 2·30 + 1 = 61 under plain BIO; SROIE's four keys give 9. v1 used the finer {B, I, E, S, O} scheme; the v2 and LayoutXLM papers state BIO, and the v3 paper does not name its tagging scheme.</p>
+      <table class="cmp">
+        <tr><th>Word</th><th>FUNSD entity</th><th>BIO label</th></tr>
+        <tr><td>ACME</td><td>header "ACME SUPPLIES"</td><td>B-HEADER</td></tr>
+        <tr><td>SUPPLIES</td><td>same entity</td><td>I-HEADER</td></tr>
+        <tr><td>Total:</td><td>question</td><td>B-QUESTION</td></tr>
+        <tr><td>$1,240.00</td><td>answer</td><td>B-ANSWER (first sub-word "$"; the other five get −100)</td></tr>
+        <tr><td>Thank</td><td>other</td><td>O</td></tr>
+      </table>
+      <p>Evaluation groups predicted B/I runs back into entities and scores entity-level F1; see <a href="../nlp/named-entity-recognition.html#bio">Named Entity Recognition</a> for the scheme and its evaluation. Linking keys to values (FUNSD's and XFUND's relation task) needs a second head over entity pairs, such as LayoutXLM's biaffine classifier.</p>
+      <h4>Extractive question answering (DocVQA)</h4>
+      <ul class="notes">
+        <li>Input: [CLS] question [SEP] OCR words [SEP] (+ visual tokens). Question tokens are in segment [A], context in [B] (visual in [C] for v2).</li>
+        <li>Boxes: context tokens get their word boxes; a common convention gives question tokens and [CLS] (0, 0, 0, 0) and [SEP] (1000, 1000, 1000, 1000), as in the Transformers documentation's example.</li>
+        <li>Head: two linear classifiers over context tokens give start and end logits; the answer is the highest-scoring valid span, mapped back to OCR words.</li>
+        <li>Labels: DocVQA answers are free text, so training spans are found by heuristic matching in the OCR output; v2 reports the found spans reach over 97% ANLS on train and validation. Questions whose answer is not in the OCR text cannot be answered by this head at all.</li>
+      </ul>
+      <h4>Page classification (RVL-CDIP)</h4>
+      <p>v1: LayoutLM output concatenated with a Faster R-CNN whole-page embedding, then softmax. v2: [CLS] output concatenated with a pooled pre-encoder visual feature and a pooled post-encoder visual feature. v3: an MLP on the [CLS] output. The papers' fine-tuning lengths range from 30 epochs (v1) to 20,000 steps at batch 64 (v3).</p>
+      <h4>Hyperparameters the papers report</h4>
+      <table class="cmp">
+        <tr><th>Task</th><th>v1</th><th>v3</th></tr>
+        <tr><td>FUNSD</td><td>100 epochs, batch 16, lr 5 × 10⁻⁵</td><td>1,000 steps, batch 16, lr 1 × 10⁻⁵</td></tr>
+        <tr><td>CORD</td><td>—</td><td>batch 64, lr 5 × 10⁻⁵</td></tr>
+        <tr><td>RVL-CDIP</td><td>30 epochs, batch 40, lr 2 × 10⁻⁵</td><td>20,000 steps, batch 64, lr 2 × 10⁻⁵</td></tr>
+        <tr><td>DocVQA</td><td>—</td><td>base: 100k steps, batch 128, lr 3 × 10⁻⁵</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> fine-tuning LayoutLM is BERT fine-tuning with boxes (and, from v2, an image) added to every example. The details that matter are label alignment to sub-words, the box convention for special and question tokens, and matching the checkpoint's preprocessing.</div>
+    </section>
+
+    <!-- 24 ───────────────────────────────────────────── -->
+    <section class="topic" id="inputs" data-nav="Input construction and sequence budget">
+      <h3><span class="idx">24</span> Input construction, the sequence budget, and long documents</h3>
+      <p class="lede">Every member has 512 text positions. v2 and LayoutXLM add 49 visual tokens and v3 adds 197 (196 patches plus a visual [CLS] in the reference implementation), so one forward pass sees at most 561 or 709 tokens. A dense page, a long contract or a multi-page file does not fit, and the text must be windowed.</p>
+      <div class="formula"><span class="lbl">text capacity of one window: [CLS] … [SEP], plus q question tokens and a second [SEP] if present</span><span class="eq">c = 510  (no question)        c = 509 − q  (question of q tokens; 508 − q for v3's RoBERTa-style pair, which puts two separators between question and context)        n_total = 512 + n_vis,   n_vis ∈ {0, 49, 197}</span>
+<span class="lbl">windows needed for n sub-word tokens with capacity c and overlap (stride) s</span><span class="eq">k = 1 + ceil( max(0, n − c) / (c − s) )</span>
+<span class="lbl">attention cost per head per layer grows with the square of the total</span><span class="eq">v2: 561² = 314,721 scores        v3: 709² = 502,681 scores</span></div>
+      <h4>Worked example</h4>
+      <p>A page with 450 OCR words at an average of 1.4 sub-words per word gives 630 text tokens. For token classification the capacity is c = 510; with a 128-token overlap, k = 1 + ceil(120 / 382) = 2 windows. For DocVQA with a 20-token question the capacity drops to 509 − 20 = 489 (488 with v3's tokenizer) and the answer can lie in either window, so both are scored and the best span kept. The v2 paper fine-tunes DocVQA at L = 384 rather than 512.</p>
+      <div class="viz" id="viz-budget">
+        <div class="vhead">
+          <span class="vtitle">Sequence-budget calculator</span>
+          <span class="vhint">set the page · choose a model · see windows, tokens and attention size</span>
+        </div>
+        <div class="controls">
+          <label>model <select id="bud-model"><option value="v1">LayoutLM v1</option><option value="v2">LayoutLMv2 / LayoutXLM</option><option value="v3" selected>LayoutLMv3</option></select></label>
+          <label>words <input type="range" id="bud-words" min="50" max="2000" step="50" value="450" /><span id="bud-wv" style="min-width:44px;display:inline-block"></span></label>
+          <label>sub-words / word <input type="range" id="bud-spw" min="1" max="2.5" step="0.1" value="1.4" /><span id="bud-sv" style="min-width:32px;display:inline-block"></span></label>
+          <label>question tokens <input type="range" id="bud-q" min="0" max="60" step="5" value="0" /><span id="bud-qv" style="min-width:28px;display:inline-block"></span></label>
+          <label>overlap <input type="range" id="bud-stride" min="0" max="256" step="32" value="128" /><span id="bud-stv" style="min-width:32px;display:inline-block"></span></label>
+        </div>
+        <svg id="bud-svg" width="640" height="260" viewBox="0 0 640 260" role="img" aria-label="Windows of text tokens laid over the document's token stream, each with its visual tokens and special tokens"></svg>
+        <div class="readout" aria-live="polite" id="bud-read"></div>
+        <p class="vcap">The sub-words-per-word ratio is an assumption to vary, not a measured constant: it depends on the tokenizer (WordPiece, BPE, SentencePiece), the language and how much of the page is numbers and codes. Visual token counts are from the released configurations (7 × 7 for v2; 14 × 14 plus a visual [CLS] for v3). Every window repeats the whole image's visual tokens. With a question, the LayoutLMv3 choice uses the RoBERTa-style pair (two separators, capacity 508 − q); the v2 / LayoutXLM choice uses the BERT-style count (509 − q), although LayoutXLM's XLM-R tokenizer is also RoBERTa-style and would lose one more position.</p>
+      </div>
+      <h4>Strategies for long documents</h4>
+      <ul class="notes">
+        <li><b>Overlapping windows</b> (the tokenizers' overflow-with-stride option): predict per window, and for tokens that appear in two windows keep the prediction from the window where the token is further from an edge.</li>
+        <li><b>Page by page</b> for multi-page files: each page is its own example with its own image; cross-page fields need a merging step outside the model.</li>
+        <li><b>First page only</b> for classification is a common shortcut, since RVL-CDIP labels are per page.</li>
+        <li>v2 pretraining itself took a random sliding window of the text when a page exceeded 512 tokens.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the 512-position limit is the family's hardest practical constraint. Plan windows and a merge rule before choosing a checkpoint, and remember that each window pays the full visual-token cost again.</div>
+    </section>
+
+    <!-- 25 ───────────────────────────────────────────── -->
+    <section class="topic" id="compare" data-nav="v1, v2, LayoutXLM and v3 compared">
+      <h3><span class="idx">25</span> v1, v2, LayoutXLM and v3 compared</h3>
+      <p class="lede">One table of design choices, from the papers and the released configurations. The rows that change most — image input, layout granularity, objectives — are the ones that explain the benchmark differences.</p>
+      <table class="cmp">
+        <tr><th></th><th>LayoutLM v1</th><th>LayoutLMv2</th><th>LayoutXLM</th><th>LayoutLMv3</th></tr>
+        <tr><td>arXiv (first version)</td><td>Dec 2019</td><td>Dec 2020</td><td>Apr 2021</td><td>Apr 2022</td></tr>
+        <tr><td>Text initialisation</td><td>BERT</td><td>UniLMv2</td><td>InfoXLM</td><td>RoBERTa</td></tr>
+        <tr><td>Tokenizer / vocabulary</td><td>WordPiece, 30,522</td><td>WordPiece, 30,522</td><td>SentencePiece, 250,002</td><td>byte-level BPE, 50,265</td></tr>
+        <tr><td>Text positions</td><td>512</td><td>512</td><td>512</td><td>512</td></tr>
+        <tr><td>Image input</td><td>Faster R-CNN ROI features, fine-tuning only</td><td>ResNeXt-101-FPN, 224², pooled 7 × 7</td><td>as v2</td><td>linear 16 × 16 patches of 224²</td></tr>
+        <tr><td>Visual tokens</td><td>none in the sequence</td><td>49</td><td>49</td><td>196 (+1 visual [CLS] in the implementation)</td></tr>
+        <tr><td>Layout embedding</td><td>X, Y tables summed (paper); + H, W (implementation)</td><td>six slices concatenated</td><td>as v2</td><td>as v2</td></tr>
+        <tr><td>Box granularity</td><td>word</td><td>word</td><td>character boxes merged per token</td><td>segment</td></tr>
+        <tr><td>Relative attention bias</td><td>no</td><td>1-D + 2-D</td><td>per paper, as v2; released base configuration disables both</td><td>1-D + 2-D</td></tr>
+        <tr><td>Pretraining objectives</td><td>MVLM (+ optional MDC)</td><td>MVLM, TIA, TIM</td><td>multilingual MVLM, TIA, TIM</td><td>MLM (span), MIM, WPA</td></tr>
+        <tr><td>Pretraining data</td><td>IIT-CDIP 11M</td><td>IIT-CDIP 11M</td><td>22M multilingual PDFs + 8M IIT-CDIP</td><td>IIT-CDIP 11M</td></tr>
+        <tr><td>Params, paper (base / large)</td><td>113M / 343M</td><td>200M / 426M</td><td>345M / 625M</td><td>133M / 368M</td></tr>
+        <tr><td>Params, recomputed</td><td>112.6M / 339.3M</td><td>200.1M / 426.0M</td><td>368.7M / —</td><td>125.3M / 356.0M (encoders)</td></tr>
+        <tr><td>Hub licence tag (weights)</td><td>MIT (base)</td><td>CC BY-NC-SA 4.0</td><td>CC BY-NC-SA 4.0</td><td>CC BY-NC-SA 4.0</td></tr>
+      </table>
+      <h4>The arc in three sentences</h4>
+      <ul class="notes">
+        <li>v1 showed that coordinates alone, pretrained at scale, beat text-only encoders on forms and receipts.</li>
+        <li>v2 moved the image into pretraining and added relative spatial attention, which mattered most for question answering (+10.9 ANLS at large size) and form labelling.</li>
+        <li>v3 replaced the expensive CNN with patches and unified the text and image objectives, reducing parameters while beating v2 on every shared task except large-size DocVQA, where it is 0.11 ANLS behind; LayoutXLM carried the v2 recipe to 53 languages.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> if you need a single default today among these four, v3 is the most accurate on most benchmarks and lighter than v2 and LayoutXLM (v1 is smaller still, without an image input) — but check its non-commercial licence and its segment-box convention before adopting it.</div>
+    </section>
+
+    <!-- 26 ───────────────────────────────────────────── -->
+    <section class="topic" id="relatives" data-nav="Close relatives">
+      <h3><span class="idx">26</span> Close relatives: MarkupLM, LiLT, LayoutReader and others</h3>
+      <p class="lede">Several models reuse LayoutLM's idea — give each token a structural position and pretrain — while changing what "position" means or how it is wired in. They are context here, not full treatments; the hub's <a href="document-ai-models.html#compare">comparison table</a> lists their scores.</p>
+      <h4>From the same research group</h4>
+      <ul class="notes">
+        <li><b>MarkupLM</b> ("MarkupLM: Pre-training of Text and Markup Language for Visually-rich Document Understanding", arXiv 2110.08518). For HTML and XML pages, where there are no pixel boxes but there is a DOM tree: each token gets an <em>XPath embedding</em> built from the tag names and sibling subscripts along its XPath, in place of the 2-D embedding. Evaluated on web reading comprehension (WebSRC) and structured web data extraction (SWDE).</li>
+        <li><b>LayoutReader</b> ("LayoutReader: Pre-training of Text and Layout for Reading Order Detection", arXiv 2108.11591). Builds a sequence-to-sequence reading-order model on a LayoutLM encoder, with the ReadingBank dataset of 500,000 page images — a direct attack on the <a href="#ocr">reading-order problem</a>.</li>
+        <li><b>DiT</b> (arXiv 2203.02378). An image-only document Transformer pretrained BEiT-style on 42M pages; its dVAE tokenizer supplies v3's MIM targets.</li>
+      </ul>
+      <h4>From other groups</h4>
+      <ul class="notes">
+        <li><b>LiLT</b> ("LiLT: A Simple yet Effective Language-Independent Layout Transformer for Structured Document Understanding", arXiv 2202.13669). A separate, small layout Transformer runs in parallel with any RoBERTa-like text encoder and exchanges attention scores with it (bi-directional attention complementation, BiACM). Pretrained once on English IIT-CDIP, it can be paired with a monolingual or multilingual text model for another language — an alternative route to LayoutXLM's goal.</li>
+        <li><b>StructuralLM</b> (arXiv 2105.11210). Introduced segment-level ("cell") layout, which v3 adopted, and a task that predicts a cell's position on the page.</li>
+        <li><b>BROS</b> (arXiv 2108.04539). Encodes relative positions between text blocks and uses area masking; text + layout only.</li>
+        <li><b>DocFormer</b> (arXiv 2106.11539) keeps separate visual and text streams that share spatial embeddings; <b>UDOP</b> (arXiv 2212.02623) unifies vision, text and layout in an encoder–decoder that generates outputs.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the LayoutLM idea generalises beyond page boxes: any structural coordinate — a DOM path, a table cell, a reading-order index — can be embedded and pretrained the same way.</div>
+    </section>
+
+    <!-- 27 ───────────────────────────────────────────── -->
+    <section class="topic" id="vs-ocrfree" data-nav="LayoutLM vs Donut and VLM readers">
+      <h3><span class="idx">27</span> LayoutLM versus Donut and vision-language document readers</h3>
+      <p class="lede">LayoutLM is the clearest example of the OCR-based design: an external engine reads, the model interprets. <a href="donut.html">Donut</a> is the clearest OCR-free counterpart: a Swin encoder reads the pixels at 2560 × 1920 and a decoder generates the answer. General vision-language models now read documents the same way at dynamic resolution. The category-level trade-off is covered on the hub (<a href="document-ai-models.html#pipeline">pipeline versus end-to-end</a>); here are the LayoutLM-specific consequences.</p>
+      <h4>Where LayoutLM's design is strong</h4>
+      <ul class="notes">
+        <li><b>Every output is grounded.</b> A token-classification or span answer is a set of OCR words with boxes, so it can be highlighted on the page and checked; a generative reader can produce text that is not on the page.</li>
+        <li><b>Cheap per page.</b> A 125M-parameter encoder at 224 × 224 plus an OCR call, against thousands of image tokens for an OCR-free model (the hub's <a href="document-ai-models.html#tokens">token-budget section</a> works the numbers).</li>
+        <li><b>Born-digital PDFs</b> have exact text and boxes, removing OCR error entirely — the setting where an OCR-based encoder has the least to lose.</li>
+      </ul>
+      <h4>Where it is weak</h4>
+      <ul class="notes">
+        <li><b>OCR errors are unrecoverable</b> and compound with field length; handwriting, low-quality photos and unusual scripts are where OCR typically fails first. The Donut paper reports its model ahead of the LayoutLMv2-Large-QG leaderboard entry on DocVQA's handwritten questions (72.1 vs 67.3 ANLS) despite a much lower overall score (67.5 vs 86.7).</li>
+        <li><b>Outputs are limited to what the head can express:</b> labels over existing words, or a single span. Nested records (line items), normalised values ("18 March 2024" → "2024-03-18"), yes/no or counting questions need post-processing or a generative model.</li>
+        <li><b>Protocols differ:</b> when the Donut paper reruns LayoutLM and LayoutLMv2 on CORD under its end-to-end protocol they score 78.4 and 78.9, not the ≈95 entity F1 of the LayoutLM papers — different tasks, not contradictory results.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> choose LayoutLM when text is reliable (good OCR or born-digital PDFs) and the task is labelling or extracting existing words; choose an OCR-free model or a VLM when reading itself is hard or the output must be generated. The hub's <a href="document-ai-models.html#choose">how-to-choose section</a> gives the full decision sequence.</div>
+    </section>
+
+    <!-- 28 ───────────────────────────────────────────── -->
+    <section class="topic" id="licensing" data-nav="Licences and availability">
+      <h3><span class="idx">28</span> Licences and availability</h3>
+      <p class="lede">The code and the weights are licensed separately, and the weights of v2, v3 and LayoutXLM are tagged non-commercial. This is often the deciding factor in production use, ahead of any benchmark difference.</p>
+      <table class="cmp">
+        <tr><th>Checkpoint (Hugging Face Hub, microsoft/…)</th><th>Licence tag on the model page</th></tr>
+        <tr><td>layoutlm-base-uncased</td><td>MIT</td></tr>
+        <tr><td>layoutlm-large-uncased</td><td>no licence tag</td></tr>
+        <tr><td>layoutlmv2-base-uncased, layoutlmv2-large-uncased</td><td>CC BY-NC-SA 4.0</td></tr>
+        <tr><td>layoutxlm-base</td><td>CC BY-NC-SA 4.0 (no public large checkpoint)</td></tr>
+        <tr><td>layoutlmv3-base, layoutlmv3-large</td><td>CC BY-NC-SA 4.0</td></tr>
+      </table>
+      <h4>What this means in practice</h4>
+      <ul class="notes">
+        <li><b>CC BY-NC-SA 4.0</b> is Attribution–NonCommercial–ShareAlike: use and adaptation are allowed with attribution, not for commercial purposes, and adaptations must carry the same licence. The LayoutLMv3 project README in Microsoft's repository states the same licence for "the content of this project".</li>
+        <li><b>The modelling code</b> in the Transformers library is Apache-2.0, but a permissive code licence does not relicense the weights.</li>
+        <li><b>Alternatives when the licence rules v2/v3 out:</b> LayoutLM v1 base (MIT tag), fine-tuned derivatives only if their own licence and provenance allow it, or relatives with permissive weights such as LiLT paired with a permissively licensed text encoder — check each checkpoint's page, since tags can change.</li>
+      </ul>
+      <p>Licence tags were read from the Hub model pages when this note was written; they are not legal advice, and the page itself is the authority.</p>
+      <div class="callout"><b>Takeaway:</b> check the weights' licence before the benchmark table. v3 is the family's strongest model on most benchmarks and also non-commercial; v1 base is the permissively tagged member.</div>
+    </section>
+
+    <!-- 29 ───────────────────────────────────────────── -->
+    <section class="topic" id="limitations" data-nav="Limitations">
+      <h3><span class="idx">29</span> Limitations</h3>
+      <p class="lede">Most of LayoutLM's limitations follow from two design facts: it consumes someone else's reading of the page, and it is a 512-position encoder with small task heads.</p>
+      <h4>Inherited from the OCR interface</h4>
+      <ul class="notes">
+        <li><b>OCR dependence.</b> Recognition errors, missed words and merged or split boxes pass straight into the input. Published scores mostly use official OCR annotations (FUNSD, CORD, SROIE) or a strong commercial engine, so they are optimistic for a pipeline built on a weaker engine.</li>
+        <li><b>Reading order.</b> 1-D positions and the 1-D attention bias come from the engine's ordering; multi-column pages, tables and rotated text can serialise badly. The 2-D signals partly compensate, but nothing in the model reorders tokens.</li>
+        <li><b>Language coverage</b> is set by the OCR engine as much as by the model; LayoutXLM covers 53 pretraining languages only if the OCR does.</li>
+      </ul>
+      <h4>Inherited from the encoder design</h4>
+      <ul class="notes">
+        <li><b>512 text positions</b>, so dense and multi-page documents need windowing and merge logic (<a href="#inputs">input construction</a>).</li>
+        <li><b>Low image resolution</b> — 224 × 224 in v2 and v3 — gives layout and appearance cues but cannot read small print or fine marks such as ticked checkboxes reliably.</li>
+        <li><b>Extractive outputs only:</b> answers must be spans or labels of existing tokens; no normalisation, arithmetic or free-form generation.</li>
+        <li><b>Pretraining domain:</b> IIT-CDIP is overwhelmingly English office and legal documents released in tobacco-industry litigation and scanned decades ago; receipts, modern invoices, scientific papers and forms in other languages are largely out of its distribution, and the small labelled sets are what adapts the model.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> LayoutLM is strong exactly where its assumptions hold — good OCR, one page's worth of text, answers that are words on the page — and brittle when any of the three fails.</div>
+    </section>
+
+    <!-- 30 ───────────────────────────────────────────── -->
+    <section class="topic" id="pitfalls" data-nav="Pitfalls">
+      <h3><span class="idx">30</span> Pitfalls</h3>
+      <p class="lede">The failures below are silent: the model runs, the loss goes down, and the scores are simply worse than they should be. Each is cheap to check once you know to look.</p>
+      <h4>Coordinates</h4>
+      <ul class="notes">
+        <li><b>Normalising by the wrong size.</b> Divide pixel boxes by the original page width and height, not by the 224 × 224 resized image or by a PDF's point size when boxes are in pixels. The Transformers documentation says explicitly to use the size "before resizing the image".</li>
+        <li><b>Out-of-range ids.</b> Values below 0 or above 1023 raise index errors; values between 1001 and 1023 do not, but should not occur in coordinates normalised the pretraining way. Clamp to 0…1000.</li>
+        <li><b>Swapped conventions.</b> LayoutLM expects (x₀, y₀, x₁, y₁) with the origin at the top left; some OCR engines return (x, y, width, height) or polygons.</li>
+        <li><b>Degenerate boxes.</b> x₁ &lt; x₀ gives a negative width; v3's implementation clips width and height into 0…1023, but a wrong box is still wrong.</li>
+      </ul>
+      <h4>Tokens and labels</h4>
+      <ul class="notes">
+        <li><b>Sub-word boxes.</b> Every sub-word must receive its word's box; building boxes per sub-word from character offsets without the checkpoint's convention creates a mismatch. For labels, use the first-sub-word convention (others −100) or label all sub-words — consistently in training and evaluation.</li>
+        <li><b>Box granularity.</b> Feeding word boxes to a checkpoint fine-tuned on segment boxes (or the reverse) shifts the input distribution; v3's published FUNSD numbers used segment boxes.</li>
+        <li><b>Special-token boxes.</b> Use the pretraining convention for [CLS], [SEP] and padding.</li>
+      </ul>
+      <h4>Images and processors</h4>
+      <ul class="notes">
+        <li><b>Channel order and normalisation.</b> v2 expects BGR and normalises inside the model; v3 expects RGB normalised by its image processor. Feeding v3-style tensors to v2 (or the reverse) runs without error.</li>
+        <li><b>Mixing processors.</b> Each version has its own processor: tokenizer (WordPiece, SentencePiece or BPE), image size and normalisation. The v3 resources on the Transformers documentation reuse v2 notebooks and warn to use the v2 processor there.</li>
+        <li><b>Built-in OCR.</b> The v2/v3 image processors run Tesseract by default (<code>apply_ocr=True</code>); when you already have OCR, turn it off and pass words and normalised boxes, or you will train on one engine's output and infer on another's.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> before training, plot a few examples' normalised boxes back over their page images and print the token–box–label triples of one example. Most LayoutLM bugs are visible in that one picture.</div>
+    </section>
+
+    <!-- 31 ───────────────────────────────────────────── -->
+    <section class="topic" id="cheatsheet" data-nav="Cheat sheet">
+      <h3><span class="idx">31</span> Cheat sheet</h3>
+      <p class="lede">The numbers and conventions most often needed when reading about or using the family, in one place. Sources are the four papers and the released configurations, as cited in the sections above.</p>
+      <h4>Numbers and conventions</h4>
+      <table class="cmp">
+        <tr><th>Item</th><th>Value</th></tr>
+        <tr><td>Box normalisation</td><td>floor(1000 · coordinate / page size), ids 0…1000, tables of 1,024 rows</td></tr>
+        <tr><td>v1 layout lookups</td><td>X(x̂₀) + Y(ŷ₀) + X(x̂₁) + Y(ŷ₁); implementation adds H(ĥ) + W(ŵ)</td></tr>
+        <tr><td>v2/v3 layout vector</td><td>[X(x̂₀) | Y(ŷ₀) | X(x̂₁) | Y(ŷ₁) | H(ĥ) | W(ŵ)]; base 4·128 + 2·128 = 768</td></tr>
+        <tr><td>Relative bias buckets</td><td>1-D: 32 up to 128 tokens; 2-D: 64 per axis up to 256 units; per head, shared across layers</td></tr>
+        <tr><td>Visual tokens</td><td>v2/LayoutXLM 7 × 7 = 49; v3 (224/16)² = 196 (+1 [CLS])</td></tr>
+        <tr><td>Max sequence</td><td>512 text; +49 (v2) = 561; +197 (v3) = 709</td></tr>
+        <tr><td>MVLM</td><td>15% selected; 80/10/10 [MASK]/random/same; boxes kept</td></tr>
+        <tr><td>TIA / TIM</td><td>15% of lines covered / 15% images replaced + 5% dropped</td></tr>
+        <tr><td>v3 MLM / MIM</td><td>30% of text in Poisson(3) spans / ≈40% of patches blockwise; 8,192 visual tokens from DiT's dVAE</td></tr>
+        <tr><td>Pretraining data</td><td>IIT-CDIP ≈11M page images (v1, v2, v3); LayoutXLM 30M in 53 languages</td></tr>
+        <tr><td>Parameters (paper)</td><td>v1 113M/343M · v2 200M/426M · LayoutXLM 345M/625M · v3 133M/368M</td></tr>
+        <tr><td>Parameters (recomputed)</td><td>v1 112.6M/339.3M · v2 200.1M/426.0M · LayoutXLM-base 368.7M · v3 encoder 125.3M/356.0M</td></tr>
+        <tr><td>Headline scores (large)</td><td>FUNSD v1 77.89 · v2 84.20 · v3 92.08 (segment boxes); DocVQA train-only v1 72.59 · v2 83.48 · v3 83.37</td></tr>
+        <tr><td>Heads</td><td>token BIO labels; start/end span; [CLS] (+ pooled visual) classification</td></tr>
+        <tr><td>Weights licence</td><td>v1 base MIT; v2, v3, LayoutXLM CC BY-NC-SA 4.0</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> four integers per word, 512 positions, 49 or 196 image tokens, and a non-commercial licence from v2 on — those five facts decide most practical questions about the family.</div>
+    </section>
+
+    <!-- 32 ───────────────────────────────────────────── -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">32</span> Takeaways</h3>
+      <p class="lede">The family in eight statements, each backed by a section above. If only one thing is remembered, it should be that LayoutLM interprets an OCR engine's reading of the page: its strengths and its failures are both inherited from that interface.</p>
+      <h4>The family in eight statements</h4>
+      <ul class="notes">
+        <li><b>Layout is an input embedding.</b> Box corners on a 0–1000 grid index learned tables and are added to token embeddings; this costs 0.5M–3.1M parameters at base size (up to 4.2M in v1-large's implementation) and lifts FUNSD by about 18 F1 over same-size BERT in v1.</li>
+        <li><b>Masked-token pretraining with boxes kept</b> (MVLM) is what makes the layout tables informative; more pretraining pages helped monotonically in v1.</li>
+        <li><b>v2 put the image into pretraining</b> as 49 CNN tokens and added relative 1-D and 2-D attention biases; token-level text–image alignment (TIA) was worth more than page-level matching (TIM).</li>
+        <li><b>LayoutXLM</b> carried the v2 recipe to 53 languages with character-merged token boxes and introduced XFUND; cross-lingual zero-shot transfer works partially, not fully.</li>
+        <li><b>v3 replaced the CNN with 0.6M parameters of linear patches</b> and made text and image objectives symmetric (MLM, MIM, WPA); without MIM the patches help FUNSD slightly but hurt CORD and RVL-CDIP and break layout detection.</li>
+        <li><b>Numbers need their settings:</b> word vs segment boxes on FUNSD, train vs train + dev + generated questions on DocVQA, and paper vs recomputed parameter counts all change the story.</li>
+        <li><b>512 positions and extractive heads</b> bound what the family can do; long documents need windows, and generated or normalised answers need another model.</li>
+        <li><b>Licensing</b> — non-commercial weights for v2, v3 and LayoutXLM — often decides adoption before accuracy does.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> LayoutLM is the reference design for OCR-based document understanding. Read the <a href="document-ai-models.html">Document AI Models</a> hub for where it sits in the field, and <a href="donut.html">Donut</a> for the design that removes the OCR step.</div>
+    </section>
+
+    <section class="topic" id="papers" data-nav="Research papers">
       <h3><span class="idx">📄</span> Research papers</h3>
-      <p class="lede">Primary sources for the LayoutLM family (Microsoft Research).</p>
+      <p class="lede">Primary sources for the LayoutLM family, then the relatives, datasets and building blocks this page cites, by title and identifier.</p>
+      <h4>The LayoutLM family</h4>
       <ul class="notes">
-        <li><b>LayoutLM</b> — Xu et al., 2019 (KDD 2020). <a href="https://arxiv.org/abs/1912.13318">arXiv:1912.13318</a></li>
-        <li><b>LayoutLMv2</b> — Xu et al., 2020 (ACL 2021). <a href="https://arxiv.org/abs/2012.14740">arXiv:2012.14740</a></li>
-        <li><b>LayoutLMv3</b> — Huang et al., 2022 (ACM MM 2022). <a href="https://arxiv.org/abs/2204.08387">arXiv:2204.08387</a></li>
+        <li><b>"LayoutLM: Pre-training of Text and Layout for Document Image Understanding"</b> (2019, arXiv 1912.13318; KDD 2020) — 2-D position embeddings, MVLM, MDC, IIT-CDIP pretraining.</li>
+        <li><b>"LayoutLMv2: Multi-modal Pre-training for Visually-rich Document Understanding"</b> (2020, arXiv 2012.14740; ACL 2021) — visual tokens, spatial-aware self-attention, TIA, TIM.</li>
+        <li><b>"LayoutXLM: Multimodal Pre-training for Multilingual Visually-rich Document Understanding"</b> (2021, arXiv 2104.08836) — 53-language pretraining and the XFUND benchmark.</li>
+        <li><b>"LayoutLMv3: Pre-training for Document AI with Unified Text and Image Masking"</b> (2022, arXiv 2204.08387; ACM Multimedia 2022) — linear patches, MLM + MIM + WPA, segment-level layout.</li>
+      </ul>
+      <h4>Relatives</h4>
+      <ul class="notes">
+        <li><b>"MarkupLM: Pre-training of Text and Markup Language for Visually-rich Document Understanding"</b> (2021, arXiv 2110.08518).</li>
+        <li><b>"LayoutReader: Pre-training of Text and Layout for Reading Order Detection"</b> (2021, arXiv 2108.11591) — ReadingBank.</li>
+        <li><b>"DiT: Self-supervised Pre-training for Document Image Transformer"</b> (2022, arXiv 2203.02378) — the document dVAE tokenizer used by v3.</li>
+        <li><b>"LiLT: A Simple yet Effective Language-Independent Layout Transformer for Structured Document Understanding"</b> (2022, arXiv 2202.13669).</li>
+        <li><b>"StructuralLM: Structural Pre-training for Form Understanding"</b> (2021, arXiv 2105.11210).</li>
+        <li><b>"BROS: A Pre-trained Language Model Focusing on Text and Layout for Better Key Information Extraction from Documents"</b> (2021, arXiv 2108.04539).</li>
+        <li><b>"DocFormer: End-to-End Transformer for Document Understanding"</b> (2021, arXiv 2106.11539).</li>
+        <li><b>"Unifying Vision, Text, and Layout for Universal Document Processing"</b> (2022, arXiv 2212.02623) — UDOP.</li>
+        <li><b>"OCR-free Document Understanding Transformer"</b> (2021, arXiv 2111.15664) — Donut, the OCR-free counterpart.</li>
+      </ul>
+      <h4>Datasets</h4>
+      <ul class="notes">
+        <li><b>"FUNSD: A Dataset for Form Understanding in Noisy Scanned Documents"</b> (2019, arXiv 1905.13538).</li>
+        <li><b>"ICDAR2019 Competition on Scanned Receipt OCR and Information Extraction"</b> (2021, arXiv 2103.10213) — SROIE.</li>
+        <li><b>"CORD: A Consolidated Receipt Dataset for Post-OCR Parsing"</b> (2019, NeurIPS Document Intelligence Workshop).</li>
+        <li><b>"Kleister: A novel task for Information Extraction involving Long Documents with Complex Layout"</b> (2020, arXiv 2003.02356).</li>
+        <li><b>"Evaluation of Deep Convolutional Nets for Document Image Classification and Retrieval"</b> (2015, arXiv 1502.07058) — RVL-CDIP.</li>
+        <li><b>"DocVQA: A Dataset for VQA on Document Images"</b> (2020, arXiv 2007.00398).</li>
+        <li><b>"PubLayNet: largest dataset ever for document layout analysis"</b> (2019, arXiv 1908.07836).</li>
+        <li><b>"Building a Test Collection for Complex Document Information Processing"</b> (2006, SIGIR) — IIT-CDIP.</li>
+      </ul>
+      <h4>Building blocks</h4>
+      <ul class="notes">
+        <li><b>"UniLMv2: Pseudo-Masked Language Models for Unified Language Model Pre-Training"</b> (2020, arXiv 2002.12804) — v2's text initialisation.</li>
+        <li><b>"InfoXLM: An Information-Theoretic Framework for Cross-Lingual Language Model Pre-Training"</b> (2020, arXiv 2007.07834) — LayoutXLM's initialisation.</li>
+        <li><b>"Aggregated Residual Transformations for Deep Neural Networks"</b> (2016, arXiv 1611.05431) — ResNeXt; <b>"Feature Pyramid Networks for Object Detection"</b> (2016, arXiv 1612.03144) — FPN.</li>
+        <li><b>"Faster R-CNN: Towards Real-Time Object Detection with Region Proposal Networks"</b> (2015, arXiv 1506.01497) — v1's image features.</li>
+        <li><b>"Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer"</b> (2019, arXiv 1910.10683) — T5, source of the relative-position bucketing.</li>
+        <li><b>"BEiT: BERT Pre-Training of Image Transformers"</b> (2021, arXiv 2106.08254) — masked image modelling with visual tokens, blockwise masking.</li>
+        <li><b>"Zero-Shot Text-to-Image Generation"</b> (2021, arXiv 2102.12092) — DALL·E's discrete VAE.</li>
+        <li><b>"ViLT: Vision-and-Language Transformer Without Convolution or Region Supervision"</b> (2021, arXiv 2102.03334) — linear patch embeddings in a multimodal Transformer.</li>
+        <li><b>"SpanBERT: Improving Pre-training by Representing and Predicting Spans"</b> (2019, arXiv 1907.10529) — span masking.</li>
+        <li><b>"CogView: Mastering Text-to-Image Generation via Transformers"</b> (2021, arXiv 2105.13290) — the attention rescaling v3 uses for stability.</li>
       </ul>
     </section>
 
