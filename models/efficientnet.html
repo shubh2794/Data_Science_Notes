@@ -1,0 +1,1413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · EfficientNet</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>EfficientNet</h1>
+      <p>A family of convolutional image classifiers, B0 to B7, built in two moves: a small baseline network found by architecture search, and one rule, <b>compound scaling</b>, that grows its depth, width and input resolution together by fixed ratios. The paper (“EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks”, arXiv 1905.11946, 2019) matched the best ImageNet accuracy of its time with about an eighth of the parameters. This page covers the scaling rule and its arithmetic, the MBConv block, the B0 architecture counted layer by layer, the training recipe, the results, and what later work showed about the gap between FLOPs and real speed.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Model Architectures</span>
+        <span class="pill">Computer Vision</span>
+        <span class="pill">ConvNets</span>
+        <span class="pill">Model scaling</span>
+        <span class="pill">Neural architecture search</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="overview" data-nav="What EfficientNet is">
+      <h3><span class="idx">01</span> What EfficientNet is</h3>
+      <p class="lede"><b>EfficientNet is a baseline convolutional network (B0) plus a rule for scaling it.</b> The rule multiplies the number of layers by <code>d</code>, the number of channels by <code>w</code> and the input side length by <code>r</code>, and ties all three to one knob, the <b>compound coefficient φ</b>. The family B1–B7 is B0 scaled by larger values of φ.</p>
+      <div class="formula"><span class="lbl">compound scaling, the whole idea in four lines</span><span class="eq">depth:       d = αᵠ</span>
+<span class="eq">width:       w = βᵠ</span>
+<span class="eq">resolution:  r = γᵠ</span>
+<span class="eq">subject to   α · β² · γ² ≈ 2,    α ≥ 1, β ≥ 1, γ ≥ 1</span>
+<span class="lbl">found once, by a small grid search on B0</span><span class="eq">α = 1.2    β = 1.1    γ = 1.15      →  α·β²·γ² = 1.92027</span></div>
+
+      <h4>The two separable contributions</h4>
+      <ul class="notes">
+        <li><b>A method for scaling.</b> FLOPs of a convolutional network grow roughly as <code>d · w² · r²</code>, so the constraint <code>α·β²·γ² ≈ 2</code> means each step of φ roughly <b>doubles</b> the compute. φ says how much bigger; α, β, γ say how to split the extra compute between depth, width and resolution. You search α, β, γ once on the small model and then reuse them at every size.</li>
+        <li><b>A good thing to scale.</b> Scaling does not change the layer types, so the baseline matters. B0 came from a neural architecture search over a MobileNet-style space. It is built from <b>MBConv</b> blocks (inverted residual bottlenecks with depthwise convolutions) with <b>squeeze-and-excitation</b> and the <b>Swish/SiLU</b> activation, and it costs about 0.39 B multiply-adds and 5.3 M parameters at 224×224.</li>
+      </ul>
+
+      <h4>What it achieved, stated with its caveats</h4>
+      <ul class="notes">
+        <li>EfficientNet-B7 reached <b>84.3%</b> ImageNet top-1 (validation, single crop) with <b>66 M</b> parameters and <b>37 B</b> FLOPs. GPipe reported the same 84.3% with 557 M parameters, so B7 used about 8.4× fewer parameters.</li>
+        <li>EfficientNet-B4 reached 82.9% at 4.2 B FLOPs, close to ResNet-50's 4.1 B FLOPs and 76.0%. (The introduction quotes 83.0% and +6.7 for this comparison; Table 2 says 82.9%. §33 lists the mismatches found.)</li>
+        <li>The efficiency is measured in <b>parameters and FLOPs</b>. On GPUs and TPUs, where depthwise convolutions and large activation maps are memory-bound, the wall-clock advantage is much smaller, and later work found it can reverse. §28–§31 cover this.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> EfficientNet = an NAS-found MBConv baseline + one knob φ that raises depth, width and resolution together as <code>1.2ᵠ</code>, <code>1.1ᵠ</code>, <code>1.15ᵠ</code>, which roughly doubles FLOPs per unit of φ. The scaling rule is the transferable idea. The specific B0–B7 checkpoints are one application of it.</div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="motivation" data-nav="Why scaling needed a rule">
+      <h3><span class="idx">02</span> Why scaling needed a rule</h3>
+      <p class="lede">Before 2019, a bigger model usually meant a model that had been scaled along one axis. Deeper ResNets (18 → 200 layers), wider WideResNets, or larger inputs as in GPipe (480×480). How to pick among these, or combine them, was left to manual tuning.</p>
+
+      <h4>The status quo the paper was reacting to</h4>
+      <ul class="notes">
+        <li><b>Depth</b> was the default axis because <a href="../deep-learning/residual-skip-connections.html">residual connections</a> made it trainable. Returns diminish, though: the paper cites a ResNet-1000 that is about as accurate as a ResNet-101.</li>
+        <li><b>Width</b> (channels per layer) was the usual axis for small models. MobileNet's “width multiplier” shrinks or grows every layer's channel count by one factor. The paper points out that some literature calls this a “depth multiplier”, which means the same as its width coefficient <code>w</code>. The naming is a common source of confusion.</li>
+        <li><b>Resolution</b> had drifted upward: 224 in early networks, 299 for Inception-v3, 331 for NASNet, 480 for GPipe. It was rarely treated as a design variable in its own right.</li>
+        <li>Each axis alone saturates near 80% on the paper's baseline (§06). Tuning two or three at once by hand is expensive, because every candidate is a full ImageNet training run.</li>
+      </ul>
+
+      <h4>The central question, as the paper frames it</h4>
+      <ul class="notes">
+        <li>Is there a <b>principled</b> way to scale a ConvNet that gives better accuracy for the same added compute than scaling one dimension? The answer offered is empirical, not theoretical. Balance the three dimensions, and a <b>constant ratio</b> between them, found on the small model, keeps working as the model grows.</li>
+        <li>A second practical motive: large models were hitting accelerator memory limits (GPipe needed pipeline parallelism across devices). Further accuracy gains needed better <b>efficiency</b>, not just more parameters.</li>
+      </ul>
+      <div class="formula"><span class="lbl">the budget arithmetic that motivates a rule</span><span class="eq">you have 2× the FLOPs.  options:</span>
+<span class="eq">  depth only        d = 2.00, w = 1,     r = 1       →  FLOPs × 2.00</span>
+<span class="eq">  width only        d = 1,    w = 1.414, r = 1       →  FLOPs × 2.00</span>
+<span class="eq">  resolution only   d = 1,    w = 1,     r = 1.414   →  FLOPs × 2.00</span>
+<span class="eq">  compound (φ = 1)  d = 1.2,  w = 1.1,   r = 1.15    →  FLOPs × 1.92</span></div>
+      <div class="callout"><b>Takeaway:</b> the contribution is less a new layer than a <b>budget allocation policy</b>. For a given increase in compute, it tells you how much to spend on depth, how much on width and how much on pixels, and claims one fixed split works across a 100× range of model sizes.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="scope" data-nav="Prerequisites &amp; scope">
+      <h3><span class="idx">03</span> Prerequisites, lineage, and what this page leaves elsewhere</h3>
+      <p class="lede">EfficientNet assembles known parts. It is easier to read once you can name each part and its source.</p>
+
+      <h4>The parts and where each came from</h4>
+      <table class="cmp">
+        <tr><th>Component</th><th>Origin</th><th>Role in EfficientNet</th></tr>
+        <tr><td>Depthwise separable convolution</td><td>Xception / MobileNetV1 (2017)</td><td>The spatial filtering inside every MBConv. About <code>1/C_out + 1/k²</code> the cost of a full <code>k×k</code> convolution; see <a href="../deep-learning/convolutional-networks.html#dws">depthwise-separable convolution</a>.</td></tr>
+        <tr><td>Inverted residual, linear bottleneck (MBConv)</td><td>MobileNetV2 (2018)</td><td>The block: expand with 1×1, filter depthwise, project with a linear 1×1, skip between the narrow ends.</td></tr>
+        <tr><td>Squeeze-and-excitation</td><td>SENet (2018)</td><td>Channel gating inside each block; §19.</td></tr>
+        <tr><td>Platform-aware multi-objective NAS</td><td>MnasNet (2019)</td><td>Same search space and a similar reward, with FLOPs in place of phone latency; §14.</td></tr>
+        <tr><td>Swish / SiLU</td><td>Searching for Activation Functions (2017); SiLU (2017/2018)</td><td>The nonlinearity everywhere except the projection; §20.</td></tr>
+        <tr><td>Stochastic depth</td><td>Deep Networks with Stochastic Depth (2016)</td><td>Regulariser on the residual blocks; §21.</td></tr>
+        <tr><td>AutoAugment</td><td>AutoAugment (2019)</td><td>The augmentation policy in the paper's ImageNet recipe.</td></tr>
+      </table>
+
+      <div class="callout"><b>What this page does NOT cover, and where it lives.</b> Generic convolution mechanics are on <a href="../deep-learning/convolutional-networks.html">Convolutional Networks</a>: shape arithmetic, the parameter/MAC/activation counts of one layer (<a href="../deep-learning/convolutional-networks.html#counting">counting one layer exactly</a>), <a href="../deep-learning/convolutional-networks.html#rf">receptive fields</a>, <a href="../deep-learning/convolutional-networks.html#onexone">1×1 convolutions</a>, <a href="../deep-learning/convolutional-networks.html#dws">depthwise separable convolution and its cost ratio</a>, and <a href="../deep-learning/convolutional-networks.html#lineage">the architecture lineage</a>, whose “compound scaling” row this page expands. Why skip connections make depth trainable, and stochastic depth in general, are on <a href="../deep-learning/residual-skip-connections.html">Residual &amp; Skip Connections</a> (see its <a href="../deep-learning/residual-skip-connections.html#stochastic-depth">stochastic depth section</a>). How to adapt a pretrained backbone (freezing, BatchNorm in frozen layers, discriminative learning rates) is on <a href="../deep-learning/fine-tuning-transfer-learning.html">Fine-Tuning &amp; Transfer Learning</a>. Optimisers, BatchNorm, dropout and augmentation in general are on <a href="../deep-learning/neural-network-training.html">Neural Network Training</a>. This page only covers what EfficientNet does with them.</div>
+
+      <h4>Vocabulary used throughout</h4>
+      <ul class="notes">
+        <li><b>FLOPs</b> in this paper means <b>multiply-adds (MACs)</b>, following the MobileNet/MnasNet convention. B0's “0.39 B FLOPs” is 0.39 B MACs, about 0.78 B floating-point operations in the strict sense. Every cost this page computes is in MACs, to stay comparable with the paper.</li>
+        <li><b>Stage</b>: a run of identical blocks sharing one resolution and channel count (Table 1 row). <b>Block</b> and <b>layer</b> both mean one MBConv here, following the paper's <code>L̂ᵢ</code>.</li>
+        <li><b>φ</b> (phi): the compound coefficient. <b>d, w, r</b>: the depth, width and resolution multipliers relative to B0.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> nearly every part of EfficientNet existed before it. The new parts are the scaling rule, the observation behind it, and a baseline searched for FLOPs rather than for a specific phone.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="formulation" data-nav="The scaling problem, formally">
+      <h3><span class="idx">04</span> The scaling problem, formally (equations 1–2)</h3>
+      <p class="lede">The paper first writes a ConvNet as a list of stages. Then it restricts scaling to changes that leave every layer's type alone. That restriction is what makes the problem small enough to search.</p>
+
+      <h4>A network as stages of repeated layers</h4>
+      <p>A layer is a function <code>Yᵢ = Fᵢ(Xᵢ)</code> on a tensor of shape <code>⟨Hᵢ, Wᵢ, Cᵢ⟩</code> (batch omitted). A network is their composition. Real ConvNets group layers into <b>stages</b> in which one layer type repeats, apart from the first layer, which often downsamples. ResNet has five such stages, and B0 has nine rows in Table 1. So:</p>
+      <div class="formula"><span class="lbl">equation 1: a ConvNet as s stages</span><span class="eq">N  =  ⨀ᵢ₌₁…ₛ  Fᵢᴸⁱ ( X⟨Hᵢ, Wᵢ, Cᵢ⟩ )</span>
+<span class="eq">Fᵢᴸⁱ   : layer type Fᵢ repeated Lᵢ times in stage i</span>
+<span class="eq">⨀      : composition over the stages, first to last</span>
+<span class="eq">⟨Hᵢ, Wᵢ, Cᵢ⟩ : input shape of stage i</span></div>
+
+      <h4>Model scaling as an optimisation over three scalars</h4>
+      <p>Architecture design searches over <code>Fᵢ</code>. <b>Model scaling</b> keeps every <code>F̂ᵢ</code> of a baseline fixed and only changes how many times each is repeated (<code>Lᵢ</code>), how many channels it has (<code>Cᵢ</code>), and at what resolution it runs (<code>Hᵢ, Wᵢ</code>). Choosing those per stage is still a large space. The paper therefore requires <b>all stages to scale by the same ratio</b>, which leaves three scalars:</p>
+      <div class="formula"><span class="lbl">equation 2: the constrained scaling problem</span><span class="eq">max over d, w, r      Accuracy( N(d, w, r) )</span>
+<span class="eq">s.t.  N(d, w, r) = ⨀ᵢ₌₁…ₛ  [ F̂ᵢ repeated d·L̂ᵢ times ] ( X⟨ r·Ĥᵢ , r·Ŵᵢ , w·Ĉᵢ ⟩ )</span>
+<span class="eq">      Memory(N) ≤ target memory</span>
+<span class="eq">      FLOPS(N)  ≤ target flops</span>
+<span class="lbl">hatted symbols are the baseline's (Table 1)</span><span class="eq">F̂ᵢ, L̂ᵢ, Ĥᵢ, Ŵᵢ, Ĉᵢ  fixed;   d, w, r  free</span></div>
+
+      <h4>What the uniform-ratio assumption gives up</h4>
+      <ul class="notes">
+        <li><b>Per-stage allocation.</b> Some stages might benefit from extra depth more than others. EfficientNetV2 later argued exactly this and added layers mainly to its later stages (§29). Equation 2 cannot represent that.</li>
+        <li><b>Integer effects.</b> <code>d·L̂ᵢ</code> and <code>w·Ĉᵢ</code> must be integers, and the reference code rounds them (§13). The realised network is therefore not exactly <code>N(d, w, r)</code>. For small <code>L̂ᵢ</code> the realised depth ratio can be far from <code>d</code>.</li>
+        <li><b>Memory is a constraint in the formulation but not in the method.</b> Equation 2 includes a memory bound, but the rule in equation 3 only controls FLOPs. Activation memory grows with <code>d·w·r²</code>, and it is what later limited the large models in practice (§28).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> by fixing the operators and forcing one ratio per dimension across all stages, the paper turns “design a bigger network” into “choose three numbers”. The rest of the method is about choosing them well.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="flops" data-nav="Why FLOPs ∝ d·w²·r²">
+      <h3><span class="idx">05</span> Why FLOPs grow as d · w² · r², and why only approximately</h3>
+      <p class="lede">The constraint <code>α·β²·γ² ≈ 2</code> comes from one cost formula. The exponents are exactly 1, 2 and 2 for an ordinary convolution, and they are not exact for the blocks EfficientNet actually uses.</p>
+
+      <h4>Derivation for one ordinary convolution</h4>
+      <p>A <code>k×k</code> convolution from <code>C_in</code> to <code>C_out</code> channels, producing an <code>H′×W′</code> map, does one multiply-add per weight per output position (full derivation on <a href="../deep-learning/convolutional-networks.html#counting">counting one layer exactly</a>):</p>
+      <div class="formula"><span class="lbl">cost of one ordinary conv layer</span><span class="eq">MACs = H′ · W′ · k² · C_in · C_out</span>
+<span class="lbl">scale width by w and resolution by r</span><span class="eq">C_in → w·C_in,   C_out → w·C_out,   H′ → r·H′,   W′ → r·W′</span>
+<span class="eq">MACs → (r·H′)(r·W′) · k² · (w·C_in)(w·C_out) = w² · r² · MACs</span>
+<span class="lbl">scale depth by d</span><span class="eq">d times as many such layers  →  d · MACs</span>
+<span class="lbl">together</span><span class="eq">total MACs ∝ d · w² · r²</span></div>
+      <p>Width enters squared because it multiplies <b>both</b> the input and output channel counts. Resolution enters squared because it multiplies <b>both</b> spatial sides. Depth enters linearly because it only adds more layers of the same cost. So doubling depth doubles FLOPs, and doubling width or resolution quadruples them.</p>
+
+      <h4>Hand-worked: one 3×3 layer, 64 → 64 channels, 56×56 output</h4>
+      <div class="formula"><span class="lbl">baseline</span><span class="eq">56 · 56 · 9 · 64 · 64 = 3 136 · 36 864 = 115 605 504 MACs  ≈ 115.6 M</span>
+<span class="lbl">w = 2 (128 → 128)</span><span class="eq">56 · 56 · 9 · 128 · 128 = 462 422 016  = 4.00 × baseline</span>
+<span class="lbl">r = 2 (112 × 112 output)</span><span class="eq">112 · 112 · 9 · 64 · 64 = 462 422 016  = 4.00 × baseline</span>
+<span class="lbl">d = 2 (two such layers)</span><span class="eq">2 · 115 605 504 = 231 211 008  = 2.00 × baseline</span></div>
+
+      <h4>Why it is only approximate for EfficientNet</h4>
+      <ul class="notes">
+        <li><b>Depthwise convolutions are linear in width.</b> A depthwise <code>k×k</code> on <code>C</code> channels costs <code>H′W′·k²·C</code>, which is one <code>C</code>, not two. Scaling width by <code>w</code> multiplies it by <code>w · r²</code>, not <code>w² · r²</code>.</li>
+        <li><b>The SE MLP ignores resolution.</b> Its two small dense layers act on a pooled vector, so they scale like <code>w²</code> with no <code>r²</code>. The final FC layer scales like <code>w</code> only (1280·w inputs, 1000 outputs).</li>
+        <li><b>The stem's input has 3 channels whatever the width</b>, so the stem is linear in <code>w</code>.</li>
+        <li><b>Rounding</b> of channels to multiples of 8 and of repeats up to integers (§13) moves every scaled model off the ideal curve. The paper's footnote 3 says “FLOPS may differ from theoretical value due to rounding.”</li>
+        <li><b>Why the approximation is still good:</b> in B0, counted below, the 1×1 convolutions (expand, project, head), which really do scale as <code>w²·r²</code>, account for about <b>87%</b> of all MACs, and about <b>94%</b> in B7. The linear-in-width terms are a small correction.</li>
+      </ul>
+
+      <div class="viz" id="viz-flops">
+        <div class="vhead">
+          <span class="vtitle">How each multiplier moves the bill</span>
+          <span class="vhint">the ideal law (lines) against an exact recount of B0 scaled one axis at a time (dots)</span>
+        </div>
+        <div class="controls">
+          <label>multiplier <input type="range" id="flops-m" min="1" max="3" step="0.05" value="2"></label>
+          <label>y axis
+            <select id="flops-scale"><option value="lin">linear</option><option value="log">log</option></select>
+          </label>
+        </div>
+        <svg id="flops-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Line chart: FLOPs multiplier as a function of the depth, width and resolution multipliers, with exact recounts of B0 as points"></svg>
+        <div class="readout" aria-live="polite" id="flops-read"></div>
+      </div>
+      <p>The figure recounts the whole B0 network under each single-axis scaling, using the reference rounding rules, and plots the exact MAC ratio beside the ideal <code>d</code>, <code>w²</code>, <code>r²</code> curves. Width lands slightly <b>below</b> <code>w²</code> because of the depthwise and FC terms. Resolution lands slightly below <code>r²</code> because the FC and SE terms do not scale with pixels. Depth tracks <code>d</code> in steps, because stage repeats are rounded up.</p>
+      <div class="callout"><b>Takeaway:</b> <code>FLOPs ∝ d·w²·r²</code> is exact for plain convolutions. For EfficientNet it holds for the 1×1 convolutions, which are about 87% (B0) to 94% (B7) of the compute, and the rest grows more slowly, so realised costs land a little below the law. The exponents are why β and γ appear squared in the constraint and α does not.</div>
+    </section>
+
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="single" data-nav="Single-axis scaling saturates">
+      <h3><span class="idx">06</span> Scaling one axis at a time saturates (Figure 3, Observation 1)</h3>
+      <p class="lede">The empirical starting point: take the B0 baseline, scale one of width, depth or resolution, and plot ImageNet top-1 against FLOPs. All three curves rise and then flatten near 80%.</p>
+
+      <div class="viz" id="viz-sat">
+        <div class="vhead">
+          <span class="vtitle">Single-dimension scaling of B0</span>
+          <span class="vhint">x: MACs recounted from the spec · y: accuracy read off the paper's Figure 3 (approximate, ±0.2)</span>
+        </div>
+        <div class="controls">
+          <label>show
+            <select id="sat-show"><option value="all">all three</option><option value="w">width only</option><option value="d">depth only</option><option value="r">resolution only</option></select>
+          </label>
+          <label>x axis
+            <select id="sat-x"><option value="lin">linear</option><option value="log">log₂</option></select>
+          </label>
+          <label>x positions
+            <select id="sat-src"><option value="recount">recounted from the spec</option><option value="paper">as plotted in the paper</option></select>
+          </label>
+        </div>
+        <svg id="sat-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Line chart: ImageNet top-1 against FLOPs for width, depth and resolution scaling of the baseline, each flattening near 80 percent"></svg>
+        <div class="readout" aria-live="polite" id="sat-read"></div>
+      </div>
+
+      <h4>What the three panels show</h4>
+      <table class="cmp">
+        <tr><th>Axis</th><th>Settings tried</th><th>Top-1, read off the plot</th><th>MACs, recounted from the spec</th><th>x position on the paper's plot</th></tr>
+        <tr><td>Width <code>w</code></td><td>1.0, 1.4, 1.8, 2.6, 3.8, 5.0</td><td>≈ 76.1, 77.5, 78.5, 79.5, 80.0, 80.3</td><td>0.39 → 8.72 B</td><td>≈ 0.5 → ≈ 8.2 B</td></tr>
+        <tr><td>Depth <code>d</code></td><td>1, 2, 3, 4, 6, 8</td><td>≈ 76.1, 78.5, 78.8, 79.0, 80.0, 80.0</td><td>0.39 → 3.18 B</td><td>≈ 0.5 → ≈ 3.6 B</td></tr>
+        <tr><td>Resolution <code>r</code></td><td>1.0, 1.3, 1.5, 1.7, 1.9, 2.2, 2.5 (224 → 560 px)</td><td>≈ 76.1, 77.7, 78.1, 78.8, 79.1, 79.5, 79.7</td><td>0.39 → 2.46 B</td><td>≈ 0.5 → ≈ 3.1 B</td></tr>
+      </table>
+      <p>The accuracies are read off the published plot, which has no table, so treat them as ±0.2 points. The recounted MAC column uses the reference implementation's rounding, and it <b>does not match the plot's x positions exactly</b>. The paper plots its baseline near 0.5 B, but its own Table 2 gives B0 0.39 B, and our count gives 0.388 B. Its r = 2.5 point is plotted near 3.1 B against our 2.46 B, and its w = 5.0 point near 8.2 B against our 8.72 B. The paper does not explain the offsets, and they are not one constant factor (about 1.3× at the baseline, 0.94× at w = 5). One bound does not depend on how FLOPs are counted: no operation grows faster than <code>r²</code>, so if B0 costs 0.39 B, the <code>r = 2.5</code> model cannot cost more than 6.25 × 0.39 = 2.44 B. The plotted 3.1 B is 6.2× the plotted 0.5 B baseline, so Figure 3 appears to use a counter that puts the baseline near 0.5 B rather than Table 2's 0.39 B. The figure below lets you plot either set of x positions. The shape of the curves is the same either way.</p>
+
+      <h4>Hand-worked: the diminishing return, in points per doubling</h4>
+      <div class="formula"><span class="lbl">width, early step vs late step (recounted MACs)</span><span class="eq">w 1.0 → 1.4 :  MACs 0.39 → 0.75 B  (×1.93)   top-1  +≈1.4</span>
+<span class="eq">w 3.8 → 5.0 :  MACs 5.07 → 8.72 B  (×1.72)   top-1  +≈0.3</span>
+<span class="lbl">normalise to “points per doubling of compute”</span><span class="eq">early:  1.4 / log₂(1.93) = 1.4 / 0.95 ≈ 1.5 points per doubling</span>
+<span class="eq">late:   0.3 / log₂(1.72) = 0.3 / 0.78 ≈ 0.4 points per doubling</span></div>
+      <p>The late doubling buys roughly a quarter of what the early one did. Depth shows the same pattern: 1 → 2 gains about 2.4 points, and 6 → 8 gains essentially nothing on the plot.</p>
+
+      <div class="callout"><b>Observation 1 (the paper's words, lightly condensed):</b> scaling up any one of width, depth or resolution improves accuracy, but the gain diminishes as the model gets bigger.</div>
+
+      <h4>One detail to notice</h4>
+      <ul class="notes">
+        <li>The baseline point in Figure 3 sits near <b>76.1%</b>. Table 2 lists B0 at 77.1% and Table 7 lists the same baseline at 77.3%. The paper does not explain the gap. A plausible reason is a shorter or different training setup for the scaling study, but that is an inference, not something the paper states. Compare the curves' shapes, not their absolute level, against Table 2.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> each axis alone follows a concave, saturating curve in log-compute. Above roughly 2 B MACs, single-axis scaling of this baseline adds well under a point per doubling.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="axes" data-nav="What each axis buys">
+      <h3><span class="idx">07</span> What each axis buys, and why each one runs out</h3>
+      <p class="lede">The saturation has a different cause on each axis, and seeing the three causes is what makes the balancing argument plausible.</p>
+
+      <h4>Depth: more composition, harder optimisation</h4>
+      <ul class="notes">
+        <li><b>Buys:</b> more nonlinear stages, so richer and more abstract features, plus a larger receptive field (each extra <code>k×k</code> layer adds <code>(k−1)·jump</code> pixels).</li>
+        <li><b>Runs out because:</b> optimisation gets harder with depth (vanishing gradients), and residual connections and BatchNorm only partly fix it. The paper's example is ResNet-1000 matching ResNet-101. The mechanics are on <a href="../deep-learning/residual-skip-connections.html">Residual &amp; Skip Connections</a>.</li>
+      </ul>
+
+      <h4>Width: finer features, shallow abstraction</h4>
+      <ul class="notes">
+        <li><b>Buys:</b> more filters per layer, so more fine-grained patterns at each level of abstraction. Wide networks are also easier to train, as the WideResNet results showed.</li>
+        <li><b>Runs out because:</b> a very wide but shallow network has many detectors at each level and too few levels. It struggles to build high-level features.</li>
+      </ul>
+
+      <h4>Resolution: more pixels, same field of view</h4>
+      <ul class="notes">
+        <li><b>Buys:</b> more pixels per object, so fine texture and small objects survive downsampling. Detection networks run at 600+ px for this reason.</li>
+        <li><b>Runs out because:</b> with a fixed network, each unit's receptive field, measured in pixels, stays the same while objects grow in pixels. A unit that covered a whole dog's face at 224 px covers part of it at 560 px. The network has more detail but no more capacity or context to use it.</li>
+      </ul>
+
+      <h4>Hand-worked: B0's receptive field, and why it is not the whole story</h4>
+      <p>Using the recursion from <a href="../deep-learning/convolutional-networks.html#rf">the receptive-field section</a> (<code>r ← r + (k−1)·j</code>, then <code>j ← j·s</code>), with the 1×1 convolutions contributing nothing:</p>
+      <div class="formula"><span class="lbl">theoretical receptive field at the end of each stage (pixels), B0</span><span class="eq">stem 3 · st2 7 · st3 19 · st4 67 · st5 147 · st6 339 · st7 787 · st8 851     (jump 32)</span>
+<span class="lbl">same, depth coefficient d = 2 (repeats 2,4,4,6,6,8,2)</span><span class="eq">stem 3 · st2 11 · st3 39 · st4 151 · st5 327 · st6 711 · st7 1671 · st8 1799</span></div>
+      <p>B0's final layer already has a <b>theoretical</b> receptive field of 851 px, far larger than its 224-px input. So “add depth so the receptive field covers the bigger image” cannot be literally about the theoretical field. What depth increases is the <b>effective</b> receptive field, the central region that actually carries gradient mass, which is much smaller and grows roughly with the square root of depth (see <a href="../deep-learning/convolutional-networks.html#erf">effective vs theoretical receptive field</a>). The paper's intuition is best read in that effective sense.</p>
+      <div class="callout"><b>Takeaway:</b> depth runs out on optimisation, width on abstraction, resolution on context. Each axis is limited by what the other two supply, and that points to scaling them together.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="interaction" data-nav="The axes interact">
+      <h3><span class="idx">08</span> The axes interact (Figure 4, Observation 2)</h3>
+      <p class="lede">If the axes were independent, the best width curve would be the same whatever the depth and resolution. Figure 4 shows it is not. Width scaling on a deeper, higher-resolution base keeps paying off after the plain one has flattened.</p>
+
+      <h4>The experiment</h4>
+      <p>Four baselines, each then scaled in width only, with every dot on a line a different <code>w</code>:</p>
+      <table class="cmp">
+        <tr><th>Baseline</th><th>MBConv blocks (recount)</th><th>Input</th><th>Baseline MACs (recount)</th><th>Paper's description</th></tr>
+        <tr><td>d = 1.0, r = 1.0</td><td>16</td><td>224</td><td>0.39 B</td><td>“18 convolutional layers, 224×224”</td></tr>
+        <tr><td>d = 1.0, r = 1.3</td><td>16</td><td>291</td><td>0.72 B</td><td>—</td></tr>
+        <tr><td>d = 2.0, r = 1.0</td><td>32</td><td>224</td><td>0.79 B</td><td>—</td></tr>
+        <tr><td>d = 2.0, r = 1.3</td><td>32</td><td>291</td><td>1.48 B</td><td>“36 layers with resolution 299×299”</td></tr>
+      </table>
+      <p>Reading the published plot (approximate, ±0.2 points and ±1 B): the plain <code>d=1, r=1</code> line flattens near <b>80.4%</b> and its last point is at about 16 B. The <code>d=2, r=1</code> line flattens near <b>80.7%</b> even at about 24 B. The <code>d=1, r=1.3</code> line reaches about <b>81.7%</b> at about 23 B. The balanced <code>d=2, r=1.3</code> line reaches about <b>82.0%</b> at about 19 B. At similar compute, the balanced base ends about 1.5 points above the plain one. Most of that gain goes with the resolution increase, and depth alone adds only about 0.3.</p>
+      <h4>Three small mismatches in how Figure 4 is described</h4>
+      <ul class="notes">
+        <li>The caption says the last baseline runs at <b>299×299</b>, but <code>r = 1.3</code> times 224 is <b>291.2</b>. 299 corresponds to <code>r ≈ 1.335</code>. The legend and the caption cannot both be exact. The likeliest reading is that “1.3” is a rounded label for 299/224, so this is imprecision rather than an error. This page uses 291 px for its recounts, which may understate that baseline's cost by about 5%.</li>
+        <li>The main text says “with deeper (d=2.0) and higher resolution (<b>r=2.0</b>)”, but the plotted line is <code>r = 1.3</code>. The text's r=2.0 appears to be a slip.</li>
+        <li>“36 layers” for <code>d=2</code>: the reference rounding gives 32 MBConv blocks, and adding the stem and head gives 34. Counting the stem, head and FC gives 35. The paper's layer-counting convention is not stated, so this may be convention rather than error. The first baseline's “18” does match 16 blocks + stem + head, and 36 is exactly 2 × 18, which suggests the caption simply doubled the layer count.</li>
+      </ul>
+
+      <div class="callout"><b>Observation 2:</b> to pursue better accuracy and efficiency, it is critical to balance all dimensions of network width, depth and resolution during scaling.</div>
+
+      <h4>Why interaction is the expected result</h4>
+      <ul class="notes">
+        <li>Higher resolution puts more pixels on each object, so you need more depth to grow the effective receptive field over it and more width to hold the extra fine-grained patterns it exposes.</li>
+        <li>This is a statement about the <b>marginal value</b> of each axis: it depends on where the other two are. With interaction like this, scaling one axis at a time with the others fixed will usually miss the optimum. It is the same reason one-at-a-time hyperparameter search misses the optimum when parameters interact (see <a href="../machine-learning/hyperparameter-tuning.html#why-random">why random beats grid</a>).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> width scaling on a deeper, higher-resolution base beats width scaling on the plain base at equal FLOPs. That result motivates spending compute on all three axes at once.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="compound" data-nav="Compound scaling (eq. 3)">
+      <h3><span class="idx">09</span> Compound scaling (equation 3)</h3>
+      <p class="lede">Having argued for balance, the paper chooses the simplest balanced rule: scale each axis geometrically in one shared exponent φ.</p>
+      <div class="formula"><span class="lbl">equation 3</span><span class="eq">depth       d = αᵠ</span>
+<span class="eq">width       w = βᵠ</span>
+<span class="eq">resolution  r = γᵠ</span>
+<span class="eq">s.t.  α · β² · γ² ≈ 2,    α ≥ 1,  β ≥ 1,  γ ≥ 1</span>
+<span class="lbl">consequence, from section 05</span><span class="eq">FLOPs(φ) ≈ FLOPs(0) · (α·β²·γ²)ᵠ ≈ FLOPs(0) · 2ᵠ</span></div>
+
+      <div class="viz" id="viz-modes">
+        <div class="vhead">
+          <span class="vtitle">Five ways to grow the same network</span>
+          <span class="vhint">bar height = channels, bar count = layers, input square = resolution · every mode is matched to the compound model's compute</span>
+        </div>
+        <div class="controls">
+          <label>φ <input type="range" id="modes-phi" min="0" max="4" step="0.25" value="2"></label>
+          <label>match budget of single-axis modes
+            <select id="modes-match"><option value="same">to compound's 1.92ᵠ</option><option value="raw">no — same φ exponent per axis</option></select>
+          </label>
+        </div>
+        <svg id="modes-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Schematic: baseline, width, depth, resolution and compound scaling drawn as stacks of layers and input squares"></svg>
+        <div class="readout" aria-live="polite" id="modes-read"></div>
+      </div>
+
+      <h4>How to read the rule</h4>
+      <ul class="notes">
+        <li><b>φ is the budget knob</b>, set by the user: “I have about 2ᵠ times the FLOPs of B0.”</li>
+        <li><b>α, β, γ are the split</b>, set once by search. Taking logs makes the split explicit: <code>log(FLOP ratio) = φ·(log α + 2 log β + 2 log γ)</code>, so a fixed fraction of each extra doubling goes to each axis. §10 computes that fraction.</li>
+        <li><b>Geometric, not linear.</b> Equal <i>ratios</i> per unit φ, not equal increments. That matches how the three terms enter the cost multiplicatively.</li>
+        <li><b>Why the constraint equals 2 rather than anything else:</b> convenience. It makes φ read as log₂ of the FLOP ratio. Any constant above 1 would define the same family with φ rescaled.</li>
+      </ul>
+
+      <h4>Hand-worked: φ = 2 from the formula</h4>
+      <div class="formula"><span class="lbl"><span class="keep">α = 1.2, β = 1.1, γ = 1.15, φ = 2</span></span><span class="eq">d = 1.2²  = 1.44      w = 1.1²  = 1.21      r = 1.15² = 1.3225  → 224·1.3225 = 296.2 px</span>
+<span class="eq">ideal FLOP ratio  = 1.44 · 1.21² · 1.3225² = 1.44 · 1.4641 · 1.74901 = 3.6874  ( = 1.92027² )</span></div>
+      <p>The paper's Table 3 and Table 7 “compound scale” rows use <code>d=1.4, w=1.2, r=1.3</code>. That is close to this φ = 2 point, rounded, and not the φ = 1 point <code>(1.2, 1.1, 1.15)</code>. They are compared against single-axis models of about 4× FLOPs (<code>d=4</code>, <code>w=2</code>, <code>r=2</code>), so the comparison is at roughly the φ ≈ 2 budget.</p>
+      <div class="callout"><b>Takeaway:</b> compound scaling fixes the <b>direction</b> of growth in (log d, log w, log r) space, and φ moves along that ray. Everything else in the method is about choosing the ray.</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="grid" data-nav="The grid search &amp; α·β²·γ²">
+      <h3><span class="idx">10</span> The grid search, and α·β²·γ² = 1.92, not 2</h3>
+      <p class="lede">Step 1 of the method fixes φ = 1 and searches α, β, γ on B0 under the constraint. Step 2 freezes them and scales. The reported optimum is α = 1.2, β = 1.1, γ = 1.15.</p>
+
+      <h4>The product, computed exactly</h4>
+      <div class="formula"><span class="lbl"><span class="keep">α · β² · γ²</span></span><span class="eq">1.2 · 1.1² · 1.15² = 1.2 · 1.21 · 1.3225 = 1.452 · 1.3225 = 1.920270</span>
+<span class="lbl">what that does to the family's budget</span><span class="eq">φ = 1 : 1.920 vs 2   ( −4.0% )</span>
+<span class="eq">φ = 3 : 7.08  vs 8   ( −11.5% )</span>
+<span class="eq">φ = 7 : 96.3  vs 128 ( −24.8% )</span></div>
+      <p>So “≈ 2” allows about a 4% shortfall per unit of φ, which compounds. A φ = 7 model would ideally cost about 96× B0, not 128×. The released B7, counted exactly in §12, costs <b>97.6×</b> B0. That is very close to 1.92⁷, although, as §11 shows, B7's individual multipliers are not the formula's.</p>
+
+      <h4>How the extra compute is split</h4>
+      <div class="formula"><span class="lbl">share of each doubling spent on each axis, in log-FLOPs</span><span class="eq">log α    = ln 1.2  = 0.1823    →  27.9%  to depth</span>
+<span class="eq">2 log β  = 2 ln 1.1 = 0.1906   →  29.2%  to width</span>
+<span class="eq">2 log γ  = 2 ln 1.15 = 0.2795  →  42.8%  to resolution</span>
+<span class="eq">sum = 0.6525 = ln 1.92027</span></div>
+      <p>Resolution gets the largest share of the compute growth. Later critiques target this choice: ResNet-RS argues resolution should grow <b>more slowly</b>, and EfficientNetV2 capped it at 480 (§29, §31).</p>
+
+      <div class="viz" id="viz-grid">
+        <div class="vhead">
+          <span class="vtitle">Constraint explorer</span>
+          <span class="vhint">choose α; the plane shows (β, γ) with the α·β²·γ² = 2 curve, a ±5% band, and a 0.05-step grid</span>
+        </div>
+        <div class="controls">
+          <label><span>α</span> <input type="range" id="grid-a" min="1" max="2" step="0.05" value="1.2"></label>
+          <label><span>β</span> <input type="range" id="grid-b" min="1" max="1.4" step="0.05" value="1.1"></label>
+          <label><span>γ</span> <input type="range" id="grid-g" min="1" max="1.4" step="0.05" value="1.15"></label>
+        </div>
+        <svg id="grid-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Plane of beta against gamma showing the curve where alpha times beta squared times gamma squared equals two, with grid points coloured by whether they satisfy the constraint"></svg>
+        <div class="readout" aria-live="polite" id="grid-read"></div>
+      </div>
+
+      <h4>What the paper does not report about the search</h4>
+      <ul class="notes">
+        <li>The grid's range, step, the tolerance on “≈ 2”, how many candidates were trained, and for how long. The figure's 0.05 step and ±5% band are illustrative choices, not the paper's.</li>
+        <li>Whether the optimum was sharp or the neighbourhood was flat. With 0.05 steps, many (α, β, γ) triples satisfy the constraint to within a few percent, and small ImageNet accuracy differences between them may be within run-to-run noise.</li>
+        <li>The paper notes that searching α, β, γ directly on a large model could do better, but is too expensive. Searching once on the small model and reusing the result is the cost-saving assumption. Nothing in the paper shows the optimum is the same at every size.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> α·β²·γ² is <b>1.92</b>, so each φ step buys about 1.92× compute, not 2×. About 43% of the log-compute growth goes to resolution, the largest share of the three.</div>
+    </section>
+
+
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="phi-levels" data-nav="φ for each B-level">
+      <h3><span class="idx">11</span> What φ gives each B-level, and what the released models actually use</h3>
+      <p class="lede">The paper says B1–B7 are obtained by scaling B0 “with different φ”, but it never lists the φ values. The released code does not use φ at all. It hard-codes a (width, depth, resolution) triple per model, and those triples are <b>not</b> integer powers of (1.1, 1.2, 1.15).</p>
+
+      <h4>The pure formula, φ = 0 … 7</h4>
+      <table class="cmp">
+        <tr><th>φ</th><th>d = 1.2ᵠ</th><th>w = 1.1ᵠ</th><th>r = 1.15ᵠ → px</th><th>ideal FLOPs 1.92ᵠ</th><th>realised FLOPs after rounding (recount)</th></tr>
+        <tr><td>0</td><td>1.000</td><td>1.000</td><td>1.000 → 224</td><td>1.00×</td><td>1.00× (0.39 B)</td></tr>
+        <tr><td>1</td><td>1.200</td><td>1.100</td><td>1.150 → 258</td><td>1.92×</td><td>2.57× (1.00 B)</td></tr>
+        <tr><td>2</td><td>1.440</td><td>1.210</td><td>1.323 → 296</td><td>3.69×</td><td>4.69× (1.82 B)</td></tr>
+        <tr><td>3</td><td>1.728</td><td>1.331</td><td>1.521 → 341</td><td>7.08×</td><td>8.42× (3.27 B)</td></tr>
+        <tr><td>4</td><td>2.074</td><td>1.464</td><td>1.749 → 392</td><td>13.6×</td><td>16.4× (6.35 B)</td></tr>
+        <tr><td>5</td><td>2.488</td><td>1.611</td><td>2.011 → 451</td><td>26.1×</td><td>29.4× (11.4 B)</td></tr>
+        <tr><td>6</td><td>2.986</td><td>1.772</td><td>2.313 → 518</td><td>50.1×</td><td>52.0× (20.2 B)</td></tr>
+        <tr><td>7</td><td>3.583</td><td>1.949</td><td>2.660 → 596</td><td>96.3×</td><td>102.5× (39.8 B)</td></tr>
+      </table>
+      <p>The last column builds the network the formula describes, with channels rounded to multiples of 8 and repeats rounded <b>up</b> (§13), and counts it. At small φ, rounding inflates the cost a lot. At φ = 1 the ceiling turns the repeats (1,2,2,3,3,4,1) into (2,3,3,4,4,5,2), <b>44% more blocks</b> for a nominal 20%, and the 40-channel stage rounds up to 48. The realised model is 2.57× B0, not 1.92×. The paper's own numbers agree: the released B2, which is φ = 1 in width and depth, is listed at 1.0 B FLOPs against B0's 0.39 B, a ratio of 2.56. This is not a contradiction in the paper, whose footnote 3 warns that rounding moves FLOPs off the theoretical value. It is a measure of how large that effect is at small φ. At large φ the rounding errors are relatively small and the realised cost approaches the ideal.</p>
+
+      <h4>Back-solving φ from the released coefficients</h4>
+      <p>For each released model, solve <code>φ_w = ln w / ln 1.1</code>, <code>φ_d = ln d / ln 1.2</code>, <code>φ_r = ln(res/224) / ln 1.15</code>. If the model came from the formula, the three would agree:</p>
+      <table class="cmp">
+        <tr><th>Model</th><th>w, d, res (released)</th><th>φ from width</th><th>φ from depth</th><th>φ from resolution</th><th>log₁.₉₂ of realised FLOP ratio</th></tr>
+        <tr><td>B1</td><td>1.0, 1.1, 240</td><td>0.00</td><td>0.52</td><td>0.49</td><td>0.88</td></tr>
+        <tr><td>B2</td><td>1.1, 1.2, 260</td><td>1.00</td><td>1.00</td><td>1.07</td><td>1.45</td></tr>
+        <tr><td>B3</td><td>1.2, 1.4, 300</td><td>1.91</td><td>1.85</td><td>2.09</td><td>2.38</td></tr>
+        <tr><td>B4</td><td>1.4, 1.8, 380</td><td>3.53</td><td>3.22</td><td>3.78</td><td>3.73</td></tr>
+        <tr><td>B5</td><td>1.6, 2.2, 456</td><td>4.93</td><td>4.32</td><td>5.09</td><td>5.03</td></tr>
+        <tr><td>B6</td><td>1.8, 2.6, 528</td><td>6.17</td><td>5.24</td><td>6.14</td><td>5.97</td></tr>
+        <tr><td>B7</td><td>2.0, 3.1, 600</td><td>7.27</td><td>6.21</td><td>7.05</td><td>7.02</td></tr>
+      </table>
+
+      <h4>Reading the table</h4>
+      <ul class="notes">
+        <li><b>B2 is φ = 1 exactly</b> on width and depth (1.1 = β, 1.2 = α), with resolution rounded from 257.6 to 260. <b>B3 is close to φ = 2</b> (1.2 ≈ 1.21, 1.4 ≈ 1.44, 300 ≈ 296).</li>
+        <li><b>B1 is not on the ray.</b> It keeps width at 1.0 and moves only depth and resolution about half a step. It is a hand-placed intermediate point.</li>
+        <li><b>From B4 up, width and resolution track φ ≈ 3.5–7, and depth lags by about one unit.</b> B7's width 2.0 is 1.1⁷·³ and its resolution 600 is 1.15⁷·⁰, but its depth 3.1 is only 1.2⁶·². The released large models are relatively shallower than the formula would make them.</li>
+        <li>Measured by compute, B5, B6 and B7 sit at φ ≈ 5.0, 6.0 and 7.0 (log base 1.92 of their FLOP ratios), and B1–B4 somewhat below n. B7 costs 97.6× B0 against 1.92027⁷ = 96.3×. The <b>total</b> budget follows the rule well, while the <b>split</b> between the axes was adjusted, presumably by hand, and with round numbers.</li>
+      </ul>
+
+      <div class="viz" id="viz-phi">
+        <div class="vhead">
+          <span class="vtitle">The formula's ray against the released points</span>
+          <span class="vhint">lines: αᵠ, βᵠ, γᵠ (normalised to B0) · dots: released coefficients placed at their FLOP-implied φ</span>
+        </div>
+        <div class="controls">
+          <label>place released models at
+            <select id="phi-place"><option value="flops">φ implied by realised FLOPs</option><option value="index">naive reading φ = n for Bn</option></select>
+          </label>
+          <label>φ marker <input type="range" id="phi-phi" min="0" max="7" step="0.1" value="3"></label>
+        </div>
+        <svg id="phi-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Line chart of depth, width and resolution multipliers against phi, with the released B1 to B7 coefficients as points"></svg>
+        <div class="readout" aria-live="polite" id="phi-read"></div>
+      </div>
+      <div class="callout"><b>Takeaway:</b> “Bn = B0 scaled by φ = n” is not how the released models were built. B2 and B3 are close to φ = 1 and 2. Above that, width and resolution roughly follow the formula and depth is held back. Use the released triples, not αᵠ, βᵠ, γᵠ, when you need the real architecture.</div>
+    </section>
+
+    <!-- 12 ───────────────────────────────────────────── -->
+    <section class="topic" id="released" data-nav="The released B0–B7 configs">
+      <h3><span class="idx">12</span> The released B0–B7 configurations, counted</h3>
+      <p class="lede">The reference TensorFlow implementation (<code>efficientnet_builder.py</code>) defines every model with four numbers: width coefficient, depth coefficient, resolution, dropout rate. Everything else follows from B0's block list and the rounding functions.</p>
+
+      <table class="cmp">
+        <tr><th>Model</th><th>width</th><th>depth</th><th>res</th><th>dropout</th><th>MBConv blocks</th><th>stage repeats</th><th>params (recount / paper)</th><th>MACs (recount / paper)</th></tr>
+        <tr><td>B0</td><td>1.0</td><td>1.0</td><td>224</td><td>0.2</td><td>16</td><td>1,2,2,3,3,4,1</td><td>5.29 M / 5.3 M</td><td>0.388 B / 0.39 B</td></tr>
+        <tr><td>B1</td><td>1.0</td><td>1.1</td><td>240</td><td>0.2</td><td>23</td><td>2,3,3,4,4,5,2</td><td>7.79 M / 7.8 M</td><td>0.691 B / 0.70 B</td></tr>
+        <tr><td>B2</td><td>1.1</td><td>1.2</td><td>260</td><td>0.3</td><td>23</td><td>2,3,3,4,4,5,2</td><td>9.11 M / 9.2 M</td><td>0.999 B / 1.0 B</td></tr>
+        <tr><td>B3</td><td>1.2</td><td>1.4</td><td>300</td><td>0.3</td><td>26</td><td>2,3,3,5,5,6,2</td><td>12.23 M / 12 M</td><td>1.84 B / 1.8 B</td></tr>
+        <tr><td>B4</td><td>1.4</td><td>1.8</td><td>380</td><td>0.4</td><td>32</td><td>2,4,4,6,6,8,2</td><td>19.34 M / 19 M</td><td>4.41 B / 4.2 B</td></tr>
+        <tr><td>B5</td><td>1.6</td><td>2.2</td><td>456</td><td>0.4</td><td>39</td><td>3,5,5,7,7,9,3</td><td>30.39 M / 30 M</td><td>10.31 B / 9.9 B</td></tr>
+        <tr><td>B6</td><td>1.8</td><td>2.6</td><td>528</td><td>0.5</td><td>45</td><td>3,6,6,8,8,11,3</td><td>43.04 M / 43 M</td><td>19.14 B / 19 B</td></tr>
+        <tr><td>B7</td><td>2.0</td><td>3.1</td><td>600</td><td>0.5</td><td>55</td><td>4,7,7,10,10,13,4</td><td>66.35 M / 66 M</td><td>37.87 B / 37 B</td></tr>
+      </table>
+      <p>The recount includes every convolution, both SE layers with biases, BatchNorm's trainable scale and shift, and the 1000-way classifier. It excludes BatchNorm running statistics, which are buffers, not learned parameters. The parameter counts equal torchvision's published <code>num_params</code> for its ports of these checkpoints (for example 19 341 616 for B4 and 30 389 784 for B5). They agree with Table 2 to rounding except B2, which counts 9.11 M against a printed 9.2 M (9.18 M if BatchNorm buffers are included, though that convention would put B1 at 7.9 M rather than the printed 7.8 M). MACs agree within about 2% for B0–B3, B6 and B7, but B4 (4.41 vs 4.2 B, +5%) and B5 (10.31 vs 9.9 B, +4%) come out higher. An independent counter gives nearly the same values: torchvision's model documentation lists 4.39 and 10.27 GFLOPS (its unit is multiply-adds here) for B4 and B5. The EfficientNetV2 paper, from the same authors, lists B5 at 10 B. Counting conventions differ (whether the SE rescale is counted, whether odd maps round up or down at a stride), but the variants tried here (with or without the rescale, ceil or floor sizing) do not reproduce 4.2 B and 9.9 B while also matching the other six models. The paper does not state its counter, so its FLOPs are best treated as ±5%.</p>
+
+      <h4>Things the table shows that the paper does not say</h4>
+      <ul class="notes">
+        <li><b>Dropout is a stepped approximation of linear.</b> The text says dropout rises “linearly” from 0.2 (B0) to 0.5 (B7). The config gives 0.2, 0.2, 0.3, 0.3, 0.4, 0.4, 0.5, 0.5: it does rise at a constant average rate, but in steps of 0.1 every two models. An exactly linear schedule would be 0.2, 0.243, 0.286, … , 0.5. This is loose wording, not a substantive disagreement.</li>
+        <li><b>Depth is quantised coarsely.</b> B1 and B2 have the same 23 blocks despite depth coefficients 1.1 and 1.2, because <code>ceil(1.1·r)</code> and <code>ceil(1.2·r)</code> agree for every stage repeat r ∈ {1,2,3,4}. B1's nominal 10% depth increase is really 44% more blocks.</li>
+        <li><b>Parameters grow more slowly than FLOPs.</b> B7 has 12.5× B0's parameters but 97.6× its compute. Resolution adds compute and no parameters, which is the point of spending about 43% of the budget there.</li>
+        <li><b>Two larger members exist in the same file:</b> B8 (width 2.2, depth 3.6, 672 px) and L2 (width 4.3, depth 5.3, 800 px). L2 was the student in the later Noisy Student work (§32). Neither appears in the 2019 paper.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the parameter column agrees with the paper to within about 1% (and with torchvision to the unit), and the FLOP column within about 5%. The dropout schedule is stepped, and the depth multiplier is heavily quantised at the small end. When you need these models precisely, use this table, not the paper's prose.</div>
+    </section>
+
+    <!-- 13 ───────────────────────────────────────────── -->
+    <section class="topic" id="rounding" data-nav="Channel &amp; repeat rounding">
+      <h3><span class="idx">13</span> Channel rounding (round_filters) and repeat rounding (round_repeats)</h3>
+      <p class="lede">A width multiplier of 1.1 turns 40 channels into 44, and hardware prefers multiples of 8. A depth multiplier of 1.1 turns 3 layers into 3.3, and a network cannot have 0.3 of a layer. Two small functions decide what is actually built, and at small φ they matter more than the formula.</p>
+
+      <div class="formula"><span class="lbl">round_filters (divisor 8, as in the reference code)</span><span class="eq">x   = filters · w</span>
+<span class="eq">new = max( 8 , floor( (x + 4) / 8 ) · 8 )        ← nearest multiple of 8, ties up</span>
+<span class="eq">if new &lt; 0.9 · x :  new = new + 8                 ← never round down by more than 10%</span>
+<span class="lbl">round_repeats</span><span class="eq">repeats' = ceil( d · repeats )                      ← always rounds UP</span></div>
+
+      <h4>Worked examples</h4>
+      <table class="cmp">
+        <tr><th>filters · w</th><th>x</th><th>(x + 4)/8, floored, ×8</th><th>0.9·x check</th><th>result</th><th>effective width</th></tr>
+        <tr><td>32 · 1.1 (B2 stem)</td><td>35.2</td><td>floor(4.9)·8 = 32</td><td>32 ≥ 31.68 ✓</td><td><b>32</b></td><td>1.00×, rounded down</td></tr>
+        <tr><td>40 · 1.1 (B2 stage 4)</td><td>44.0</td><td>floor(6.0)·8 = 48</td><td>—</td><td><b>48</b></td><td>1.20×, rounded up</td></tr>
+        <tr><td>112 · 1.1 (B2 stage 6)</td><td>123.2</td><td>floor(15.9)·8 = 120</td><td>120 ≥ 110.9 ✓</td><td><b>120</b></td><td>1.07×</td></tr>
+        <tr><td>24 · 1.4 (B4 stage 3)</td><td>33.6</td><td>floor(4.7)·8 = 32</td><td>32 ≥ 30.24 ✓</td><td><b>32</b></td><td>1.33×</td></tr>
+        <tr><td>32 · 1.4 (B4 stem)</td><td>44.8</td><td>floor(6.1)·8 = 48</td><td>—</td><td><b>48</b></td><td>1.50×</td></tr>
+        <tr><td>32 · 0.37 (a shrunk model)</td><td>11.84</td><td>floor(1.98)·8 = 8</td><td>8 &lt; 10.66 ✗ → +8</td><td><b>16</b></td><td>0.50× (the 10% guard fired)</td></tr>
+      </table>
+      <p>So a “1.1× wider” B2 has stage widths that grew by 0% (stem), 0%, 0%, 20%, 10%, 7%, 8%, 10% and 10% (head): 32, 16, 24, 48, 88, 120, 208, 352, 1408. The width multiplier is exact only on average.</p>
+
+      <h4>round_repeats, worked for B7 (d = 3.1)</h4>
+      <div class="formula"><span class="lbl">stage repeats of B0 → B7</span><span class="eq">3.1 · (1, 2, 2, 3, 3, 4, 1) = (3.1, 6.2, 6.2, 9.3, 9.3, 12.4, 3.1)</span>
+<span class="eq">ceil                        = (4,   7,   7,   10,  10,  13,   4 )   sum = 55 blocks</span>
+<span class="eq">effective depth ratio       = 55 / 16 = 3.44   (nominal 3.1)</span></div>
+
+      <div class="viz" id="viz-round">
+        <div class="vhead">
+          <span class="vtitle">round_filters and round_repeats, live</span>
+          <span class="vhint">bars: requested (w·C) vs built channel count for every stage · the 10% guard is highlighted when it fires</span>
+        </div>
+        <div class="controls">
+          <label>width w <input type="range" id="round-w" min="0.25" max="2.5" step="0.05" value="1.1"></label>
+          <label>depth d <input type="range" id="round-d" min="1" max="3.5" step="0.1" value="1.1"></label>
+        </div>
+        <svg id="round-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Bar chart comparing requested and rounded channel counts per stage, with the rounded repeats listed"></svg>
+        <div class="readout" aria-live="polite" id="round-read"></div>
+      </div>
+      <div class="callout"><b>Takeaway:</b> channels round to the nearest multiple of 8, but never more than 10% down. Repeats always round up. The two together are why realised FLOPs overshoot <code>1.92ᵠ</code> at small φ, and why B1 is 44% deeper than its 1.1 suggests.</div>
+    </section>
+
+    <!-- 14 ───────────────────────────────────────────── -->
+    <section class="topic" id="nas" data-nav="The NAS that found B0">
+      <h3><span class="idx">14</span> The architecture search that produced B0</h3>
+      <p class="lede">Scaling cannot fix a weak baseline, because scaling never changes <code>F̂ᵢ</code>. B0 was found with the MnasNet search space and a MnasNet-style multi-objective reward. The one difference the paper names is <b>FLOPs instead of measured phone latency</b> in the reward.</p>
+
+      <div class="formula"><span class="lbl">the multi-objective reward</span><span class="eq">reward(m) = ACC(m) · [ FLOPS(m) / T ]ʷ</span>
+<span class="eq">T = 400 M  (target FLOPs)          w = −0.07</span>
+<span class="lbl">where −0.07 comes from (MnasNet's reasoning)</span><span class="eq">“doubling the cost buys about 5% relative accuracy”  →  2ʷ = 1/1.05</span>
+<span class="eq">w = −ln 1.05 / ln 2 = −0.0704</span></div>
+
+      <h4>What the exponent means</h4>
+      <ul class="notes">
+        <li><code>w</code> is the <b>exchange rate</b> between accuracy and cost. With <code>w = −0.07</code>, a model that doubles FLOPs must raise accuracy by a factor of <code>2⁰·⁰⁷ = 1.0497</code>, about <b>5% relative</b>, just to keep the same reward. Halving FLOPs is rewarded by the same factor.</li>
+        <li>It is a <b>soft</b> constraint. Nothing forbids 600 M FLOPs, it is just discounted. MnasNet defined the exponent piecewise, one value below T and another above. Setting 0 below and −1 above gave a hard constraint, and −0.07 on both sides gave the soft one. EfficientNet uses a single exponent, the symmetric soft setting.</li>
+        <li>The objective is <b>scale-free in cost</b>. Only the ratio FLOPS/T matters, so the reward traces a smooth Pareto front rather than a cliff at T.</li>
+      </ul>
+
+      <h4>Hand-worked: three candidates</h4>
+      <div class="formula"><span class="lbl">T = 400 M, w = −0.07</span><span class="eq">A: 76.0% at 400 M   → 0.760 · pow(1.0, −0.07) = 0.760 · 1.00000 = 0.7600</span>
+<span class="eq">B: 77.5% at 800 M   → 0.775 · pow(2.0, −0.07) = 0.775 · 0.95264 = 0.7383</span>
+<span class="eq">C: 74.0% at 200 M   → 0.740 · pow(0.5, −0.07) = 0.740 · 1.04971 = 0.7768</span>
+<span class="lbl">break-even accuracy for B to tie A</span><span class="eq">0.760 · pow(2, 0.07) = 0.760 · 1.04971 = 79.78%</span></div>
+      <p>B's +1.5 points is not enough, because at double the cost it would need about +3.8. C <b>wins</b>, trading 2 points for half the compute. With the reward symmetric around T, being cheaper is rewarded as much as being more expensive is penalised. The target is where the search is centred, not a ceiling. B0 landed at 0.39 B, within 3% of T.</p>
+
+      <div class="viz" id="viz-nas">
+        <div class="vhead">
+          <span class="vtitle">Reward landscape ACC · (FLOPS/T)ʷ</span>
+          <span class="vhint">iso-reward curves in (FLOPs, accuracy) space; drag the candidate with the sliders</span>
+        </div>
+        <div class="controls">
+          <label>w <input type="range" id="nas-w" min="-0.3" max="0" step="0.01" value="-0.07"></label>
+          <label>candidate FLOPs (M) <input type="range" id="nas-f" min="100" max="1600" step="10" value="800"></label>
+          <label>candidate top-1 (%) <input type="range" id="nas-a" min="70" max="82" step="0.1" value="77.5"></label>
+        </div>
+        <svg id="nas-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Iso-reward curves of accuracy times FLOPs over target to the power w, with a reference model at the target and a movable candidate"></svg>
+        <div class="readout" aria-live="polite" id="nas-read"></div>
+      </div>
+
+      <h4>The search space and procedure (inherited from MnasNet)</h4>
+      <ul class="notes">
+        <li><b>Factorised hierarchical space.</b> The network is split into a fixed number of blocks (stages). Each stage independently chooses its convolution type (regular, depthwise, or mobile inverted bottleneck with expansion 3 or 6), kernel size (3×3 or 5×5), squeeze-and-excitation ratio (0 or 0.25), skip operation, output channels, and number of repeated layers. Layers <i>within</i> a stage are identical, which is exactly the <code>Fᵢᴸⁱ</code> structure equation 1 assumes.</li>
+        <li><b>Search algorithm.</b> MnasNet used a recurrent controller trained with reinforcement learning (policy gradient via PPO). Each sampled child network was trained briefly on a proxy ImageNet task and scored with the reward above. The EfficientNet paper states only that it used “the same search space” and a multi-objective search. It does not report compute, number of samples or proxy settings for the B0 search.</li>
+        <li><b>Why FLOPs and not latency:</b> “we are not targeting any specific hardware device.” That choice is what makes B0 hardware-neutral on paper, and it is also the root of the later speed critiques (§28).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> B0 is, as far as the paper says, MnasNet's search setup rerun with a FLOP budget of 400 M and a 5%-per-doubling exchange rate. Because the reward is soft, the result sits at the target by choice, not by force. Because it is FLOP-based, it inherits no knowledge of how fast any particular chip runs it.</div>
+    </section>
+
+    <!-- 15 ───────────────────────────────────────────── -->
+    <section class="topic" id="b0" data-nav="B0, stage by stage">
+      <h3><span class="idx">15</span> The B0 architecture, stage by stage (Table 1)</h3>
+      <p class="lede">Nine rows: a stem, seven stages of MBConv blocks, and a head. Resolution halves five times from 224 to 7, and channels grow from 32 to 320 before the 1280-wide head.</p>
+
+      <table class="cmp">
+        <tr><th>Stage</th><th>Operator</th><th>Input res</th><th>Out ch</th><th>Layers</th><th>Stride (first layer)</th><th>Expansion → hidden width</th></tr>
+        <tr><td>1</td><td>Conv3×3</td><td>224×224</td><td>32</td><td>1</td><td>2</td><td>—</td></tr>
+        <tr><td>2</td><td>MBConv1, k3×3</td><td>112×112</td><td>16</td><td>1</td><td>1</td><td>1 → 32 (no expand conv)</td></tr>
+        <tr><td>3</td><td>MBConv6, k3×3</td><td>112×112</td><td>24</td><td>2</td><td>2</td><td>6 → 96, then 144</td></tr>
+        <tr><td>4</td><td>MBConv6, k5×5</td><td>56×56</td><td>40</td><td>2</td><td>2</td><td>6 → 144, then 240</td></tr>
+        <tr><td>5</td><td>MBConv6, k3×3</td><td>28×28</td><td>80</td><td>3</td><td>2</td><td>6 → 240, then 480</td></tr>
+        <tr><td>6</td><td>MBConv6, k5×5</td><td>14×14</td><td>112</td><td>3</td><td>1</td><td>6 → 480, then 672</td></tr>
+        <tr><td>7</td><td>MBConv6, k5×5</td><td>14×14</td><td>192</td><td>4</td><td>2</td><td>6 → 672, then 1152</td></tr>
+        <tr><td>8</td><td>MBConv6, k3×3</td><td>7×7</td><td>320</td><td>1</td><td>1</td><td>6 → 1152</td></tr>
+        <tr><td>9</td><td>Conv1×1 &amp; Pooling &amp; FC</td><td>7×7</td><td>1280</td><td>1</td><td>—</td><td>—</td></tr>
+      </table>
+      <p>The table's “Resolution” column is each stage's <b>input</b> resolution. The strides come from the reference block strings (<code>s11</code>/<code>s22</code>). The stride sits on the depthwise convolution of a stage's first block. Stage 7 is where 14 → 7 happens, even though its row says 14×14.</p>
+
+      <div class="viz" id="viz-arch">
+        <div class="vhead">
+          <span class="vtitle">The network, drawn to scale and counted live</span>
+          <span class="vhint">block height ∝ channels (log), width ∝ repeats · hover a stage for its params and MACs, computed from the spec</span>
+        </div>
+        <div class="controls">
+          <label>model
+            <select id="arch-model"><option value="0">B0</option><option value="1">B1</option><option value="2">B2</option><option value="3">B3</option><option value="4">B4</option><option value="5">B5</option><option value="6">B6</option><option value="7">B7</option></select>
+          </label>
+          <label>colour by
+            <select id="arch-color"><option value="M">MACs</option><option value="P">parameters</option><option value="act">activation elements</option></select>
+          </label>
+        </div>
+        <svg id="arch-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Stage diagram of the selected EfficientNet model with per-stage parameter and MAC counts on hover"></svg>
+        <div class="readout" aria-live="polite" id="arch-read"></div>
+      </div>
+
+      <h4>Design features worth noticing</h4>
+      <ul class="notes">
+        <li><b>Mixed kernel sizes.</b> The search chose 5×5 depthwise kernels in stages 4, 6 and 7. In depthwise form a 5×5 costs 25/9 ≈ 2.8× a 3×3 on the <i>depthwise</i> term only, and the depthwise term is under 10% of the network's MACs (§05), so larger kernels are cheap here in a way they are not in ordinary convolutions.</li>
+        <li><b>Stage 2 has no expansion</b> (MBConv1). The search chose this and the paper gives no reason. A likely one: with 32 input channels at 112×112, expanding 6× would create a 192-channel map at the highest resolution in the network, which is expensive in both FLOPs and memory.</li>
+        <li><b>Channel counts are small.</b> The widest block output is 320, while ResNet-50 reaches 2048. Capacity comes from the 6× expanded hidden width (up to 1152) inside blocks and from the 1280-wide head.</li>
+        <li><b>SE in every block</b>, with the squeeze width set to a quarter of the block's <i>input</i> channels (§19).</li>
+        <li><b>Head</b>: 1×1 conv 320 → 1280, global average pooling, dropout (0.2 for B0), then a 1280 × 1000 fully connected layer. The head holds 32% of B0's parameters and 5.5% of its MACs.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> B0 is a 3×3 stride-2 stem, seven MBConv stages at expansion 6 (except the first), mixed 3×3/5×5 kernels, SE in every block, and a 1280-channel head. The paper calls it “similar to MnasNet”. It differs from MnasNet-A1, which uses SE in only some stages, an expansion-3 stage, and different stage widths. It is a mobile network that happens to scale well.</div>
+    </section>
+
+
+    <!-- 16 ───────────────────────────────────────────── -->
+    <section class="topic" id="counting" data-nav="B0 counted: 5.29 M, 0.39 B">
+      <h3><span class="idx">16</span> B0 counted in full: 5.29 M parameters, 0.388 B MACs</h3>
+      <p class="lede">Table 2's “5.3M params, 0.39B FLOPs” can be reproduced exactly from the block list. Recounting it shows where the parameters sit and where the compute sits, and the two are in different places.</p>
+
+      <h4>Per-stage totals (recomputed from the reference spec)</h4>
+      <table class="cmp">
+        <tr><th>Stage</th><th>What</th><th>Params</th><th>% params</th><th>MACs</th><th>% MACs</th></tr>
+        <tr><td>1</td><td>stem 3×3 s2, 3 → 32, + BN</td><td>928</td><td>0.02%</td><td>10 838 016</td><td>2.8%</td></tr>
+        <tr><td>2</td><td>MBConv1 k3, 32 → 16, ×1</td><td>1 448</td><td>0.03%</td><td>10 437 120</td><td>2.7%</td></tr>
+        <tr><td>3</td><td>MBConv6 k3, → 24, ×2</td><td>16 714</td><td>0.3%</td><td>55 697 856</td><td>14.4%</td></tr>
+        <tr><td>4</td><td>MBConv6 k5, → 40, ×2</td><td>46 640</td><td>0.9%</td><td>38 240 640</td><td>9.9%</td></tr>
+        <tr><td>5</td><td>MBConv6 k3, → 80, ×3</td><td>242 930</td><td>4.6%</td><td>43 790 400</td><td>11.3%</td></tr>
+        <tr><td>6</td><td>MBConv6 k5, → 112, ×3</td><td>543 148</td><td>10.3%</td><td>86 459 904</td><td>22.3%</td></tr>
+        <tr><td>7</td><td>MBConv6 k5, → 192, ×4</td><td>2 026 348</td><td>38.3%</td><td>91 730 496</td><td>23.6%</td></tr>
+        <tr><td>8</td><td>MBConv6 k3, → 320, ×1</td><td>717 232</td><td>13.6%</td><td>29 576 448</td><td>7.6%</td></tr>
+        <tr><td>9</td><td>1×1 320 → 1280 + BN; FC 1280 → 1000</td><td>412 160 + 1 281 000</td><td>32.0%</td><td>20 070 400 + 1 280 000</td><td>5.5%</td></tr>
+        <tr><td></td><td><b>total</b></td><td><b>5 288 548</b></td><td>100%</td><td><b>388 121 280</b></td><td>100%</td></tr>
+      </table>
+
+      <h4>Conventions behind the count</h4>
+      <ul class="notes">
+        <li>Convolutions have no bias (BatchNorm follows each one). Each BatchNorm contributes 2 learned parameters per channel (scale γ, shift β). The two SE convolutions have biases. The classifier has a bias.</li>
+        <li>BatchNorm's running mean and variance are buffers, not parameters. There are 21 008 BN channels in B0, so 42 016 buffers. Keras reports B0 as “5 330 571 total, 5 288 548 trainable, 42 023 non-trainable”. The 42 023 is exactly these 42 016 buffers plus 7 values of its input-normalisation layer, so the trainable count matches ours exactly.</li>
+        <li>MACs count every multiply-add in the convolutions, the SE MLP and the FC, plus one multiply per element for the SE rescale. BatchNorm, activations, pooling and the residual additions are elementwise and excluded, as is usual.</li>
+      </ul>
+
+      <h4>Where parameters and compute sit</h4>
+      <ul class="notes">
+        <li><b>Parameters are at the end.</b> Stages 7–9 hold <b>84%</b> of the parameters (38.3 + 13.6 + 32.0), because weight counts scale with channels² and channels are largest there. The FC layer alone is 24% of the network.</li>
+        <li><b>Compute is in the middle.</b> Stages 3, 6 and 7 do 60% of the MACs. Early stages are cheap in parameters and costly in arithmetic because of their large maps, and late stages the reverse. This is the pattern described on <a href="../deep-learning/convolutional-networks.html#counting">counting one layer exactly</a>.</li>
+        <li><b>By operation type:</b> the expand 1×1s do 166.2 M MACs (42.8%), project 1×1s 152.3 M (39.2%), depthwise 34.5 M (8.9%), stem 10.8 M (2.8%), head 1×1 20.1 M (5.2%), SE 2.9 M (0.8%), FC 1.3 M (0.3%). The 1×1 convolutions together are <b>87.2%</b>.</li>
+        <li><b>SE is cheap in compute, not in parameters.</b> 0.8% of MACs but 636 540 parameters, <b>12.0%</b> of B0.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> 5 288 548 parameters and 388.1 M MACs, matching the paper's 5.3 M / 0.39 B. The 1×1 convolutions do 87% of the arithmetic, and the last three stages hold 84% of the weights.</div>
+    </section>
+
+    <!-- 17 ───────────────────────────────────────────── -->
+    <section class="topic" id="mbconv" data-nav="The MBConv block">
+      <h3><span class="idx">17</span> The MBConv block: inverted residual with a linear bottleneck</h3>
+      <p class="lede">Every stage after the stem is a stack of one block type, the mobile inverted bottleneck from MobileNetV2 with squeeze-and-excitation added. Four operations in a fixed order, plus a skip connection when the shapes allow.</p>
+
+      <div class="formula"><span class="lbl">MBConv(e, k), input x of shape H × W × C_in</span><span class="eq">1. expand     h₁ = swish( BN( Conv1×1(x) ) )           C_in → e·C_in        (skipped when e = 1)</span>
+<span class="eq">2. depthwise  h₂ = swish( BN( DWConv k×k, stride s (h₁) ) )  e·C_in → e·C_in, H → H/s</span>
+<span class="eq">3. SE         h₃ = h₂ ⊙ σ( W₂ · swish( W₁ · GAP(h₂) + b₁ ) + b₂ )</span>
+<span class="eq">4. project    h₄ = BN( Conv1×1(h₃) )                    e·C_in → C_out      ← NO activation</span>
+<span class="eq">5. skip       y  = x + DropPath(h₄)   if s = 1 and C_in = C_out,  else  y = h₄</span></div>
+
+      <div class="viz" id="viz-mb">
+        <div class="vhead">
+          <span class="vtitle">One MBConv block, live</span>
+          <span class="vhint">bar height ∝ channels · the counts below are computed from the settings, term by term</span>
+        </div>
+        <div class="controls">
+          <label>C_in <select id="mb-cin"><option>16</option><option>24</option><option selected>40</option><option>80</option><option>112</option><option>192</option></select></label>
+          <label>C_out <select id="mb-cout"><option>24</option><option>40</option><option selected>80</option><option>112</option><option>192</option><option>320</option></select></label>
+          <label>expansion <select id="mb-e"><option>1</option><option>3</option><option>4</option><option selected>6</option></select></label>
+          <label>kernel <select id="mb-k"><option selected>3</option><option>5</option><option>7</option></select></label>
+          <label>stride <select id="mb-s"><option>1</option><option selected>2</option></select></label>
+          <label>input H <select id="mb-h"><option>112</option><option>56</option><option selected>28</option><option>14</option></select></label>
+          <label>SE <select id="mb-se"><option value="1" selected>on (0.25 of C_in)</option><option value="0">off</option></select></label>
+        </div>
+        <svg id="mb-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Diagram of an MBConv block showing the expand, depthwise, squeeze-and-excitation and projection stages with channel counts"></svg>
+        <div class="readout" aria-live="polite" id="mb-read"></div>
+      </div>
+
+      <h4>Why each design choice</h4>
+      <ul class="notes">
+        <li><b>“Inverted”:</b> a ResNet bottleneck goes wide → narrow → wide and puts the skip on the wide ends. MBConv goes narrow → wide → narrow and puts the skip on the <b>narrow</b> ends. The tensors that cross block boundaries, and are kept for the skip, are small. The expensive spatial filtering happens in the wide space, where a depthwise conv is cheap because it costs <code>k²</code> per channel instead of <code>k²·C</code>.</li>
+        <li><b>“Linear bottleneck”:</b> the projection has no activation. MobileNetV2's argument is that a ReLU applied in a low-dimensional space destroys information: once the manifold of features is squeezed into few channels, zeroing half of each coordinate is lossy. A linear projection keeps it. EfficientNet uses Swish rather than ReLU, but keeps the projection linear.</li>
+        <li><b>Expansion 6</b> is MobileNetV2's default. The depthwise stage works on six times the input channels. Expansion 1 (stage 2) drops the expand conv entirely.</li>
+        <li><b>Skip only when shapes match.</b> The reference code adds the residual only if stride is 1 <b>and</b> input channels equal output channels. There is no projection shortcut, unlike ResNet's. The first block of every stage therefore has no skip. B0 has 9 skip-connected blocks out of 16.</li>
+        <li><b>DropPath</b> (stochastic depth) is applied only on skip-connected blocks, because only there does dropping the branch leave a valid identity path. See §21 for the per-block rate.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> MBConv = 1×1 expand (×e) → k×k depthwise (stride here) → SE gate → 1×1 linear project → add input if the shape is unchanged. Wide in the middle, narrow at the ends, no activation after the projection.</div>
+    </section>
+
+    <!-- 18 ───────────────────────────────────────────── -->
+    <section class="topic" id="mbconv-cost" data-nav="MBConv cost, worked">
+      <h3><span class="idx">18</span> The cost of one MBConv block, derived and worked</h3>
+      <p class="lede">With the block written out, its parameter and MAC counts follow term by term. Two worked blocks from B0 show which terms dominate.</p>
+
+      <div class="formula"><span class="lbl">MBConv(e, k, s): input H×H×C_in, output H′×H′×C_out, H′ = ceil(H/s), E = e·C_in, S = floor(C_in/4)</span><span class="eq">term        params                      MACs</span>
+<span class="eq">expand      C_in·E                      H² · C_in · E          (0 if e = 1)</span>
+<span class="eq">depthwise   k²·E                        H′² · k² · E</span>
+<span class="eq">SE          E·S + S + S·E + E           2·E·S  (+ H′²·E for the rescale)</span>
+<span class="eq">project     E·C_out                     H′² · E · C_out</span>
+<span class="eq">BN          2·(E [if e≠1] + E + C_out)  —</span></div>
+
+      <h4>Worked block 1: stage 5, first block (40 → 80, e = 6, k = 3, s = 2, 28 → 14)</h4>
+      <div class="formula"><span class="lbl">E = 6·40 = 240, S = floor(40/4) = 10, H = 28, H′ = 14</span><span class="eq">expand    params  40·240          =  9 600      MACs 28²·40·240   = 7 526 400</span>
+<span class="eq">depthwise params  9·240           =  2 160      MACs 14²·9·240    =   423 360</span>
+<span class="eq">SE        params  2400+10+2400+240 = 5 050      MACs 2·240·10 + 14²·240 = 4 800 + 47 040 = 51 840</span>
+<span class="eq">project   params  240·80          = 19 200      MACs 14²·240·80   = 3 763 200</span>
+<span class="eq">BN        params  2·(240+240+80)  =  1 120</span>
+<span class="eq">total     params 37 130                         MACs 11 764 800</span></div>
+      <p>The expand conv does <b>64%</b> of this block's MACs because it runs <b>before</b> the stride, at 28×28. The projection runs after, at 14×14. The depthwise conv, the operation the block is built around, is 3.6%.</p>
+
+      <h4>Worked block 2: stage 5, a repeated block (80 → 80, e = 6, k = 3, s = 1, 14 → 14)</h4>
+      <div class="formula"><span class="lbl">E = 480, S = 20</span><span class="eq">expand 38 400 / 7 526 400    depthwise 4 320 / 846 720    SE 19 700 / 113 280</span>
+<span class="eq">project 38 400 / 7 526 400   BN 2 080</span>
+<span class="eq">total   params 102 900        MACs 16 012 800        skip: yes (s = 1, 80 = 80)</span></div>
+
+      <h4>The general pattern, from the formula</h4>
+      <ul class="notes">
+        <li>For stride-1 blocks with <code>C_in = C_out = C</code>, expand and project each cost <code>H²·e·C²</code> and depthwise costs <code>H²·k²·e·C</code>. The ratio of depthwise to 1×1 work is <code>k² / (2C)</code>: 9/160 = 5.6% at C = 80 with 3×3. The depthwise term matters only when channels are very few, as in stage 2.</li>
+        <li>Going from <b>k = 3 to k = 5</b> raises that ratio by 25/9. For stage 6 (C = 112) it moves from 4.0% to 11.2% of the 1×1 work, which is why the search could afford 5×5 kernels.</li>
+        <li>The SE parameter count is about <code>2·E·C_in/4 = e·C_in²/2</code>, which equals half of one 1×1 conv's parameters at e = 6. So SE adds about a fifth of the block's weights at negligible compute (19.1% in worked block 2).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> per block, the two 1×1 convolutions carry nearly all the MACs and most of the parameters. The depthwise conv that names the design is a few percent of the arithmetic. That is efficient in FLOPs, and §28 shows why it is not necessarily fast.</div>
+    </section>
+
+    <!-- 19 ───────────────────────────────────────────── -->
+    <section class="topic" id="se" data-nav="Squeeze-and-excitation">
+      <h3><span class="idx">19</span> Squeeze-and-excitation inside MBConv</h3>
+      <p class="lede">SE turns each block's channels into a context-dependent reweighting. It pools the whole map to one number per channel, passes that vector through a tiny two-layer MLP, and multiplies every channel by the resulting gate in (0, 1).</p>
+
+      <div class="formula"><span class="lbl">squeeze-and-excitation on a map h of shape H × W × E</span><span class="eq">squeeze   zᶜ = (1 / HW) · Σᵢⱼ h[i, j, c]                 global average pool → vector z ∈ ℝᴱ</span>
+<span class="eq">excite    g  = σ( W₂ · swish( W₁ z + b₁ ) + b₂ )          W₁ : S × E,   W₂ : E × S</span>
+<span class="eq">scale     h′[i, j, c] = gᶜ · h[i, j, c]</span>
+<span class="lbl">EfficientNet's choice of squeeze width S</span><span class="eq">S = max(1, floor(0.25 · C_in))      ← a quarter of the BLOCK INPUT channels</span></div>
+
+      <h4>The ratio is of the input channels, not the expanded ones</h4>
+      <ul class="notes">
+        <li>The reference code computes <code>num_reduced_filters = int(input_filters · se_ratio)</code> with <code>se_ratio = 0.25</code>, where <code>input_filters</code> is the block's <b>input</b> width, not the expanded width it gates. Torchvision's implementation does the same (<code>max(1, input_channels // 4)</code>).</li>
+        <li>With expansion 6, a squeeze of <code>C_in/4</code> is <b>E/24</b> of the gated width. So relative to the channels it gates, EfficientNet's SE bottleneck is narrower than SENet's original <code>E/16</code>, not wider as “0.25” suggests.</li>
+        <li>The inner activation is <b>Swish</b> in EfficientNet, where SENet used ReLU, and the gate is a sigmoid.</li>
+      </ul>
+
+      <h4>Hand-worked gate</h4>
+      <div class="formula"><span class="lbl">four channels, squeeze width 2 (numbers chosen for the example)</span><span class="eq">z = (0.8, 0.1, 0.5, 0.0)</span>
+<span class="eq">W₁ = [[1, 0, 1, 0], [0, 1, 0, 1]],  b₁ = 0      → u = (1.3, 0.1) → swish(u) = (1.0216, 0.0525)</span>
+<span class="eq">W₂ = [[2, 0], [−2, 0], [1, 1], [0, −3]], b₂ = 0 → (2.0432, −2.0432, 1.0741, −0.1575)</span>
+<span class="eq">g = σ(·) = (0.885, 0.115, 0.745, 0.461)</span></div>
+      <p>Channel 1 (strongly active, and correlated through <code>W</code> with channel 3) is kept at 89%. Channel 2 is suppressed to 11%. The gate depends on the <b>whole image's</b> statistics, which gives each 3×3 or 5×5 filter a global context signal it could not otherwise see.</p>
+
+      <div class="viz" id="viz-se">
+        <div class="vhead">
+          <span class="vtitle">SE gating on eight channels</span>
+          <span class="vhint">left: pooled channel means · middle: gates σ(·) · right: rescaled means · weights fixed, input editable</span>
+        </div>
+        <div class="controls">
+          <label>scene
+            <select id="se-scene"><option value="0">textured object</option><option value="1">flat background</option><option value="2">edge-heavy</option></select>
+          </label>
+          <label>boost channel 1 <input type="range" id="se-boost" min="-1" max="2" step="0.1" value="0"></label>
+          <label>squeeze width S <select id="se-s"><option>1</option><option selected>2</option><option>4</option></select></label>
+        </div>
+        <svg id="se-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Bar charts showing pooled channel means, sigmoid gates, and the rescaled channel means of a squeeze-and-excitation module"></svg>
+        <div class="readout" aria-live="polite" id="se-read"></div>
+      </div>
+
+      <h4>Cost, and where it bites</h4>
+      <ul class="notes">
+        <li>Compute is negligible (0.8% of B0's MACs), but the parameters are 12% of B0 (§16).</li>
+        <li><b>It is a global synchronisation point.</b> Every spatial position must be pooled before any output can be scaled. That needs a full pass over the expanded map, which makes it harder to fuse the block into one streaming kernel and adds memory traffic. EfficientNet-Lite removes SE; its release notes give the reason as poor support on some mobile accelerators (§32).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> SE = global pool → tiny MLP (squeeze to a quarter of the block's input channels) → sigmoid gates on every channel. It is cheap in FLOPs, 12% of the parameters, and it adds a global synchronisation point inside every block.</div>
+    </section>
+
+    <!-- 20 ───────────────────────────────────────────── -->
+    <section class="topic" id="swish" data-nav="Swish / SiLU">
+      <h3><span class="idx">20</span> The activation: Swish, also called SiLU</h3>
+      <p class="lede">EfficientNet replaces ReLU with <code>x · σ(x)</code>. The function was found by an automated search over activation formulas, and the same function had been proposed earlier as the sigmoid-weighted linear unit (SiLU). It is smooth, non-monotonic, and unbounded above.</p>
+
+      <div class="formula"><span class="lbl">definition and derivative</span><span class="eq">swish(x) = x · σ(x) = x / (1 + e⁻ˣ)</span>
+<span class="eq">swish′(x) = σ(x) + x · σ(x) · (1 − σ(x)) = σ(x) · (1 + x · (1 − σ(x)))</span>
+<span class="lbl">parametric form from the search paper</span><span class="eq">swish_b(x) = x · σ(b·x)       b → ∞ : ReLU,   b = 0 : x/2,   b = 1 : SiLU (“Swish-1”)</span></div>
+
+      <h4>Hand-worked values</h4>
+      <table class="cmp">
+        <tr><th>x</th><th>σ(x)</th><th>swish(x)</th><th>swish′(x)</th><th>ReLU(x)</th></tr>
+        <tr><td>−3</td><td>0.0474</td><td>−0.1423</td><td>−0.0881</td><td>0</td></tr>
+        <tr><td>−1.2785</td><td>0.2178</td><td>−0.2785 (minimum)</td><td>0.0000</td><td>0</td></tr>
+        <tr><td>−1</td><td>0.2689</td><td>−0.2689</td><td>0.0723</td><td>0</td></tr>
+        <tr><td>0</td><td>0.5000</td><td>0</td><td>0.5000</td><td>0</td></tr>
+        <tr><td>1</td><td>0.7311</td><td>0.7311</td><td>0.9277</td><td>1</td></tr>
+        <tr><td>3</td><td>0.9526</td><td>2.8577</td><td>1.0881</td><td>3</td></tr>
+      </table>
+
+      <div class="viz" id="viz-swish">
+        <div class="vhead">
+          <span class="vtitle">Swish against ReLU, and their gradients</span>
+          <span class="vhint">solid: function · dashed: derivative · the parameter b interpolates between x/2 and ReLU</span>
+        </div>
+        <div class="controls">
+          <label>b <input type="range" id="swish-b" min="0" max="10" step="0.1" value="1"></label>
+          <label>probe x <input type="range" id="swish-x" min="-5" max="5" step="0.05" value="-1.25"></label>
+        </div>
+        <svg id="swish-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Plot of the swish function with adjustable b against ReLU, with both derivatives"></svg>
+        <div class="readout" aria-live="polite" id="swish-read"></div>
+      </div>
+
+      <h4>What it changes, and what it costs</h4>
+      <ul class="notes">
+        <li><b>A small but nonzero gradient for negative inputs</b> (−0.088 at x = −3, 0.072 at x = −1), so units do not “die” the way ReLU units can (see <a href="../deep-learning/neural-network-training.html#dying-relu">the dying ReLU</a>).</li>
+        <li><b>The derivative exceeds 1</b> for x above 1.2785, the mirror image of the minimum. It peaks at 1.0998 near x ≈ 2.40 and then decays back towards 1. This is harmless in a BatchNormed network but worth knowing.</li>
+        <li><b>Memory:</b> the backward pass needs <code>σ(x)</code>, so a naive implementation stores extra tensors. The reference code's native swish uses a custom gradient to save memory, and frameworks now ship fused SiLU kernels.</li>
+        <li><b>Quantisation:</b> the sigmoid is awkward in int8. EfficientNet-Lite switches to ReLU6. MobileNetV3's “hard-swish” <code>x · ReLU6(x+3)/6</code> is a piecewise-linear approximation (the reference builder includes it as an option).</li>
+        <li>How much Swish alone contributes to EfficientNet's accuracy is not ablated in the paper. The search paper reported gains of a few tenths to about a point over ReLU on ImageNet models.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> Swish = x·σ(x): ReLU-like for large |x|, smooth near zero, slightly negative with a minimum of −0.2785 at x ≈ −1.28. It helps accuracy a little and costs something in memory and quantisation friendliness.</div>
+    </section>
+
+    <!-- 21 ───────────────────────────────────────────── -->
+    <section class="topic" id="training" data-nav="The training recipe">
+      <h3><span class="idx">21</span> The ImageNet training recipe</h3>
+      <p class="lede">The paper gives the recipe in one paragraph, and the reference code and the EfficientNetV2 paper fill in what it leaves out. The recipe accounts for part of the published accuracy, and the paper says so: gains come “from both better architectures, better scaling, and better training settings”.</p>
+
+      <table class="cmp">
+        <tr><th>Setting</th><th>Value</th><th>Source</th></tr>
+        <tr><td>Optimiser</td><td>RMSProp, decay 0.9, momentum 0.9</td><td>paper</td></tr>
+        <tr><td>BatchNorm momentum</td><td>0.99 (TF convention: running = 0.99·running + 0.01·batch; PyTorch <code>momentum=0.01</code>), ε = 1e-3</td><td>paper; ε from reference code</td></tr>
+        <tr><td>Weight decay</td><td>1e-5</td><td>paper</td></tr>
+        <tr><td>Learning rate</td><td>0.256, ×0.97 every 2.4 epochs</td><td>paper</td></tr>
+        <tr><td>Batch size</td><td>4096 (0.256 = 0.016 × 4096/256, the code's linear-scaling rule; code default 2048 → 0.128)</td><td>inferred from the lr and the code's rule; the EfficientNetV2 paper uses 4096 for its own runs, which it says “largely follow EfficientNets”</td></tr>
+        <tr><td>Warmup / length</td><td>5 warmup epochs; 350 epochs</td><td>reference code; EfficientNetV2 paper</td></tr>
+        <tr><td>Activation</td><td>SiLU / Swish-1</td><td>paper</td></tr>
+        <tr><td>Augmentation</td><td>AutoAugment (ImageNet policy)</td><td>paper</td></tr>
+        <tr><td>Stochastic depth</td><td>survival probability 0.8, scaled per block</td><td>paper; per-block rule from reference code</td></tr>
+        <tr><td>Dropout before FC</td><td>0.2 (B0) → 0.5 (B7), in steps</td><td>paper; exact values from reference config</td></tr>
+        <tr><td>Label smoothing; weight EMA</td><td>0.1; decay 0.9999</td><td>reference code only</td></tr>
+        <tr><td>Model selection</td><td>25 K training images held out as “minival”; early-stop on minival; report on the validation set</td><td>paper</td></tr>
+      </table>
+
+      <h4>Hand-worked: the learning-rate schedule</h4>
+      <div class="formula"><span class="lbl">staircase exponential decay (ignoring the 5-epoch warmup)</span><span class="eq">lr(epoch) = 0.256 · pow(0.97, floor(epoch / 2.4))</span>
+<span class="eq">epoch  24 : 0.256 · 0.97¹⁰  = 0.256 · 0.7374 = 0.1888</span>
+<span class="eq">epoch 100 : 0.256 · 0.97⁴¹  = 0.256 · 0.2868 = 0.0734</span>
+<span class="eq">epoch 350 : 0.256 · 0.97¹⁴⁵ = 0.256 · 0.01208 = 0.00309</span></div>
+
+      <h4>Hand-worked: stochastic depth is not uniform</h4>
+      <p>The reference code sets block <code>i</code>'s survival probability (i = 0 … N−1) to <code>1 − 0.2 · i / N</code>. The 0.8 is the floor, approached by the <b>last</b> block, as in the linear-decay rule of the original stochastic-depth paper. For B0, N = 16:</p>
+      <div class="formula"><span class="lbl">B0, survival by block index</span><span class="eq">block 0: 1.000   block 8: 0.900   block 15: 1 − 0.2·15/16 = 0.8125</span>
+<span class="lbl">but only the 9 skip-connected blocks can be dropped (indices 2, 4, 6, 7, 9, 10, 12, 13, 14)</span><span class="eq">expected blocks dropped per step = (0.2/16) · (2+4+6+7+9+10+12+13+14) = 0.0125 · 77 = 0.96</span></div>
+
+      <div class="viz" id="viz-train">
+        <div class="vhead">
+          <span class="vtitle">Schedules in the recipe</span>
+          <span class="vhint">learning rate over training, or per-block survival probability for the chosen model, both from the formulas above</span>
+        </div>
+        <div class="controls">
+          <label>show
+            <select id="train-show"><option value="lr">learning rate</option><option value="sd">stochastic-depth survival per block</option></select>
+          </label>
+          <label>batch size <select id="train-bs"><option>512</option><option>1024</option><option>2048</option><option selected>4096</option></select></label>
+          <label>model (for survival) <select id="train-model"><option value="0">B0</option><option value="3">B3</option><option value="7">B7</option></select></label>
+        </div>
+        <svg id="train-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Plot of the learning rate schedule or per-block stochastic depth survival probability"></svg>
+        <div class="readout" aria-live="polite" id="train-read"></div>
+      </div>
+
+      <h4>Why each piece is there</h4>
+      <ul class="notes">
+        <li><b>RMSProp with momentum and a tiny weight decay</b> is inherited from the MnasNet/MobileNet recipes, which are tuned for depthwise-heavy networks. Depthwise weights have few parameters per filter and are easily over-regularised, hence the 1e-5 decay (ResNets typically use 1e-4). Optimiser mechanics are covered in <a href="../deep-learning/neural-network-training.html#adagrad">AdaGrad &amp; RMSProp</a>.</li>
+        <li><b>Regularisation grows with size.</b> Dropout 0.2 → 0.5 and, in later checkpoints, stronger augmentation. The paper's rule is “bigger models need more regularisation”. EfficientNetV2 develops that into regularisation that also changes with image size <i>during</i> training (§29).</li>
+        <li><b>Minival early stopping</b> avoids selecting the checkpoint on the validation set that is then reported. Many papers of the period did not describe how they selected checkpoints, so this is a point in the paper's favour.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> RMSProp(0.9, 0.9), lr 0.256 at batch 4096 decaying 0.97 per 2.4 epochs, wd 1e-5, BN momentum 0.99, Swish, AutoAugment, per-block stochastic depth down to 0.8, stepped dropout 0.2 → 0.5. The core of it is in the paper; batch size, warmup, the per-block drop rule, the exact dropout steps, label smoothing and EMA come from the code. The recipe is part of the result.</div>
+    </section>
+
+
+    <!-- 22 ───────────────────────────────────────────── -->
+    <section class="topic" id="imagenet" data-nav="ImageNet results (Table 2)">
+      <h3><span class="idx">22</span> ImageNet results (Table 2), with every ratio rechecked</h3>
+      <p class="lede">Table 2 groups each EfficientNet with earlier ConvNets of similar accuracy and reports how many times more parameters and FLOPs the older model needs. The ratios can be recomputed from the table's own columns. Most match, and two do not.</p>
+
+      <table class="cmp">
+        <tr><th>EfficientNet</th><th>Top-1 / Top-5</th><th>Params</th><th>FLOPs</th><th>Compared with (top-1, params, FLOPs)</th><th>Param ratio: paper / recomputed</th><th>FLOP ratio: paper / recomputed</th></tr>
+        <tr><td>B0</td><td>77.1 / 93.3</td><td>5.3 M</td><td>0.39 B</td><td>ResNet-50 (76.0, 26 M, 4.1 B)<br>DenseNet-169 (76.2, 14 M, 3.5 B)</td><td>4.9 / 4.91<br>2.6 / 2.64</td><td>11 / 10.5<br>8.9 / 8.97</td></tr>
+        <tr><td>B1</td><td>79.1 / 94.4</td><td>7.8 M</td><td>0.70 B</td><td>ResNet-152 (77.8, 60 M, 11 B)<br>DenseNet-264 (77.9, 34 M, 6.0 B)<br>Inception-v3 (78.8, 24 M, 5.7 B)<br>Xception (79.0, 23 M, 8.4 B)</td><td>7.6 / 7.69<br>4.3 / 4.36<br>3.0 / 3.08<br>3.0 / 2.95</td><td>16 / 15.7<br>8.6 / 8.57<br>8.1 / 8.14<br>12 / 12.0</td></tr>
+        <tr><td>B2</td><td>80.1 / 94.9</td><td>9.2 M</td><td>1.0 B</td><td>Inception-v4 (80.0, 48 M, 13 B)<br>Inception-ResNet-v2 (80.1, 56 M, 13 B)</td><td>5.2 / 5.22<br>6.1 / 6.09</td><td>13 / 13.0<br>13 / 13.0</td></tr>
+        <tr><td>B3</td><td>81.6 / 95.7</td><td>12 M</td><td>1.8 B</td><td>ResNeXt-101 (80.9, 84 M, 32 B)<br>PolyNet (81.3, 92 M, 35 B)</td><td>7.0 / 7.00<br>7.7 / 7.67</td><td>18 / 17.8<br>19 / 19.4</td></tr>
+        <tr><td>B4</td><td>82.9 / 96.4</td><td>19 M</td><td>4.2 B</td><td>SENet (82.7, 146 M, 42 B)<br>NASNet-A (82.7, 89 M, 24 B)<br>AmoebaNet-A (82.8, 87 M, 23 B)<br>PNASNet (82.9, 86 M, 23 B)</td><td>7.7 / 7.68<br>4.7 / 4.68<br>4.6 / 4.58<br>4.5 / 4.53</td><td>10 / 10.0<br>5.7 / 5.71<br>5.5 / 5.48<br><b>6.0 / 5.48</b></td></tr>
+        <tr><td>B5</td><td>83.6 / 96.7</td><td>30 M</td><td>9.9 B</td><td>AmoebaNet-C (83.5, 155 M, 41 B)</td><td>5.2 / 5.17</td><td>4.1 / 4.14</td></tr>
+        <tr><td>B6</td><td>84.0 / 96.8</td><td>43 M</td><td>19 B</td><td>—</td><td>—</td><td>—</td></tr>
+        <tr><td>B7</td><td>84.3 / 97.0</td><td>66 M</td><td>37 B</td><td>GPipe (84.3, 557 M, —)</td><td>8.4 / 8.44</td><td>—</td></tr>
+      </table>
+      <p>Two entries do not follow from the table's own columns. <b>PNASNet's FLOP ratio</b> is printed as 6.0×, but 23 B / 4.2 B = 5.5×, the same as AmoebaNet-A's identical 23 B. Either the ratio or the 23 B is wrong, and the PNASNet paper (“Progressive Neural Architecture Search”, arXiv 1712.00559) points to the 23 B: it reports PNASNet-5 at 25.0 B multiply-adds, and 25 / 4.2 = 5.95 ≈ 6.0×. <b>ResNet-152's parameter ratio</b> is printed as 7.6× here and in Figure 1's caption (“7.6x smaller”), while 60 / 7.8 = 7.69 rounds to 7.7. A few others (DenseNet-169 8.9 vs 8.97, DenseNet-264 4.3 vs 4.36) are one unit low in the last digit, which could be truncation or could come from unrounded inputs that the table does not show.</p>
+
+      <div class="viz" id="viz-scatter">
+        <div class="vhead">
+          <span class="vtitle">Accuracy against size and compute (Table 2)</span>
+          <span class="vhint">EfficientNet frontier in colour, comparison ConvNets in grey · hover a point</span>
+        </div>
+        <div class="controls">
+          <label>x axis
+            <select id="sc-x"><option value="P">parameters</option><option value="F">FLOPs</option></select>
+          </label>
+          <label>scale
+            <select id="sc-scale"><option value="log">log</option><option value="lin">linear</option></select>
+          </label>
+        </div>
+        <svg id="sc-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Scatter plot of ImageNet top-1 accuracy against parameters or FLOPs for EfficientNet B0 to B7 and comparison ConvNets"></svg>
+        <div class="readout" aria-live="polite" id="sc-read"></div>
+      </div>
+
+      <h4>What the table does and does not show</h4>
+      <ul class="notes">
+        <li><b>It shows</b> a consistent frontier: at every accuracy level from 77% to 84%, an EfficientNet uses 2.6–8.4× fewer parameters and 4.1–19× fewer FLOPs than the comparison ConvNets grouped with it.</li>
+        <li><b>It does not control the recipe.</b> The EfficientNets were trained with AutoAugment, Swish, stochastic depth and a 350-epoch RMSProp schedule, and the comparison numbers are as published by their authors, often with simpler recipes. ResNet-50 retrained with a modern recipe reaches about 80% (80.4% in “ResNet strikes back: An improved training procedure in timm”, arXiv 2110.00476), and §31 shows the same effect for ResNet-200. The table measures architecture + scaling + recipe together, as the paper acknowledges.</li>
+        <li><b>It does not measure speed.</b> FLOPs and parameters are proxies, and §24 and §28 show how far they are from wall-clock time on some hardware.</li>
+        <li><b>It excludes</b> ensembles, multi-crop evaluation and models pretrained on extra data (e.g. 3.5 B Instagram images), as the footnote says.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> Table 2's frontier is real in parameters and FLOPs. Recomputed from the table's own columns, the ratios hold, except PNASNet's FLOP ratio (5.5× from the printed 23 B; the 6.0× matches PNASNet's own 25 B). The comparison mixes architecture with training recipe.</div>
+    </section>
+
+    <!-- 23 ───────────────────────────────────────────── -->
+    <section class="topic" id="other-nets" data-nav="Scaling MobileNets &amp; ResNet">
+      <h3><span class="idx">23</span> Compound scaling applied to other networks (Table 3)</h3>
+      <p class="lede">To separate the scaling rule from the B0 architecture, the paper scales three existing networks about 4× in FLOPs, by single axes and by compound scaling, and trains each.</p>
+      <table class="cmp">
+        <tr><th>Base</th><th>Scaling</th><th>FLOPs</th><th>FLOP ratio to base</th><th>Top-1</th><th>vs best single-axis</th></tr>
+        <tr><td rowspan="4">MobileNetV1 (0.6 B, 70.6%)</td><td>width w = 2</td><td>2.2 B</td><td>3.7×</td><td>74.2%</td><td></td></tr>
+        <tr><td>resolution r = 2</td><td>2.2 B</td><td>3.7×</td><td>72.7%</td><td></td></tr>
+        <tr><td>compound d=1.4, w=1.2, r=1.3</td><td>2.3 B</td><td>3.8×</td><td>75.6%</td><td>+1.4</td></tr>
+        <tr><td colspan="4"><i>no depth-only row is reported for MobileNetV1</i></td></tr>
+        <tr><td rowspan="4">MobileNetV2 (0.3 B, 72.0%)</td><td>depth d = 4</td><td>1.2 B</td><td>4.0×</td><td>76.8%</td><td></td></tr>
+        <tr><td>width w = 2</td><td>1.1 B</td><td>3.7×</td><td>76.4%</td><td></td></tr>
+        <tr><td>resolution r = 2</td><td>1.2 B</td><td>4.0×</td><td>74.8%</td><td></td></tr>
+        <tr><td>compound</td><td>1.3 B</td><td>4.3×</td><td>77.4%</td><td>+0.6</td></tr>
+        <tr><td rowspan="4">ResNet-50 (4.1 B, 76.0%)</td><td>depth d = 4</td><td>16.2 B</td><td>4.0×</td><td>78.1%</td><td></td></tr>
+        <tr><td>width w = 2</td><td>14.7 B</td><td>3.6×</td><td>77.7%</td><td></td></tr>
+        <tr><td>resolution r = 2</td><td>16.4 B</td><td>4.0×</td><td>77.5%</td><td></td></tr>
+        <tr><td>compound</td><td>16.7 B</td><td>4.1×</td><td>78.8%</td><td>+0.7</td></tr>
+      </table>
+
+      <h4>How to read it critically</h4>
+      <ul class="notes">
+        <li><b>In all three groups the compound model has slightly more FLOPs</b> than the single-axis models it beats: 2.3 vs 2.2 B, 1.3 vs 1.2 B, 16.7 vs 16.4 B, that is +2% to +8%. At these slopes (§06 measured about 0.4–1.5 points per doubling), 8% more compute (0.12 doublings) is worth under two tenths of a point. The +0.6 to +1.4 margins are much larger than that, so the conclusion survives the mismatch.</li>
+        <li><b>Only one compound setting is given</b> (for MobileNetV1). The coefficients used for MobileNetV2 and ResNet-50 are not reported, nor whether α, β, γ were re-searched for each base.</li>
+        <li><b>Single runs.</b> No error bars. ImageNet seed-to-seed spread is commonly reported at about ±0.1–0.2 points, so +0.6 is probably real and small, and +1.4 is clearly real.</li>
+        <li><b>Resolution-only is the weakest</b> in every group. That fits §07: pixels without the capacity to use them saturate fastest.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> compound scaling beats the best single axis on three different base networks at about 4× FLOPs, by +0.6 to +1.4 points, with a slight FLOP advantage that is too small to explain the margins. The idea is not specific to B0.</div>
+    </section>
+
+    <!-- 24 ───────────────────────────────────────────── -->
+    <section class="topic" id="latency" data-nav="CPU latency (Table 4)">
+      <h3><span class="idx">24</span> The latency evidence (Table 4), and its narrow scope</h3>
+      <p class="lede">The paper's only wall-clock measurement: batch size 1, a single core of an Intel Xeon E5-2690 CPU, averaged over 20 runs.</p>
+      <table class="cmp">
+        <tr><th>Model</th><th>Top-1 (as printed in Table 4)</th><th>Latency</th><th>Speedup</th><th>FLOP ratio (Table 2)</th></tr>
+        <tr><td>ResNet-152</td><td>77.8%</td><td>0.554 s</td><td rowspan="2">0.554 / 0.098 = 5.65 → 5.7×</td><td rowspan="2">11 / 0.70 = 15.7×</td></tr>
+        <tr><td>EfficientNet-B1</td><td><b>78.8%</b></td><td>0.098 s</td></tr>
+        <tr><td>GPipe</td><td>84.3%</td><td>19.0 s</td><td rowspan="2">19.0 / 3.1 = 6.13 → 6.1×</td><td rowspan="2">GPipe FLOPs not given</td></tr>
+        <tr><td>EfficientNet-B7</td><td><b>84.4%</b></td><td>3.1 s</td></tr>
+      </table>
+
+      <h4>What to take from it</h4>
+      <ul class="notes">
+        <li><b>The speedup is much smaller than the FLOP reduction.</b> B1 has 15.7× fewer FLOPs than ResNet-152 but is only 5.7× faster, so it achieves about a third of ResNet's FLOPs per second on this CPU. Depthwise and SE operations do little arithmetic per byte moved, so they run below peak (§28).</li>
+        <li><b>Single-core CPU at batch 1</b> is among the regimes most favourable to low-FLOP networks. One core has modest peak arithmetic relative to its memory bandwidth, so arithmetic tends to dominate runtime. On GPUs and TPUs at large batch the picture changes, and the paper did not measure those.</li>
+        <li><b>The accuracy column disagrees with Table 2.</b> B1 is 79.1% in Table 2 and Figure 1 but 78.8% here. B7 is 84.3% in Table 2 and the abstract but 84.4% here. The paper does not say whether Table 4 used different checkpoints or evaluation. The reference repository's README also quotes B7 at 84.4% top-1, so two B7 numbers circulate from the authors. The latency comparison is unaffected, but quote Table 2's accuracies.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> on one CPU core at batch 1, B1 is 5.7× faster than ResNet-152 and B7 6.1× faster than GPipe. That is real, but it is about a third of what the FLOP ratio would predict, and it says nothing about accelerators.</div>
+    </section>
+
+    <!-- 25 ───────────────────────────────────────────── -->
+    <section class="topic" id="transfer" data-nav="Transfer learning (Tables 5–6)">
+      <h3><span class="idx">25</span> Transfer learning (Tables 5 and 6, Figure 6)</h3>
+      <p class="lede">Eight datasets, ImageNet-pretrained checkpoints, fine-tuned with the settings of earlier transfer studies. Two comparisons: against the best <i>publicly available</i> models, and against the best <i>reported</i> results, including GPipe and domain-adaptive transfer (DAT).</p>
+
+      <table class="cmp">
+        <tr><th>Dataset (train / test / classes)</th><th>Public best</th><th>EfficientNet</th><th>Best reported</th><th>EfficientNet</th><th>Outcome vs best reported</th></tr>
+        <tr><td>CIFAR-10 (50 000 / 10 000 / 10)</td><td>NASNet-A 98.0%, 85 M</td><td>B0 98.1%, 4 M</td><td>GPipe 99.0%, 556 M</td><td>B7 98.9%, 64 M</td><td>−0.1</td></tr>
+        <tr><td>CIFAR-100 (50 000 / 10 000 / 100)</td><td>NASNet-A 87.5%, 85 M</td><td>B0 88.1%, 4 M</td><td>GPipe 91.3%</td><td>B7 91.7%</td><td>+0.4</td></tr>
+        <tr><td>Birdsnap (47 386 / 2 443 / 500)</td><td>Inception-v4 81.8%, 41 M</td><td>B5 82.0%, 28 M</td><td>GPipe 83.6%</td><td>B7 84.3%</td><td>+0.7</td></tr>
+        <tr><td>Stanford Cars (8 144 / 8 041 / 196)</td><td>Inception-v4 93.4%</td><td>B3 93.6%, 10 M</td><td>DAT 94.8%</td><td>B7 94.7%</td><td>−0.1</td></tr>
+        <tr><td>Flowers (2 040 / 6 149 / 102)</td><td>Inception-v4 98.5%</td><td>B5 98.5%</td><td>DAT 97.7%</td><td>B7 98.8%</td><td>+1.1</td></tr>
+        <tr><td>FGVC Aircraft (6 667 / 3 333 / 100)</td><td>Inception-v4 90.9%</td><td>B3 90.7%</td><td>DAT 92.9%</td><td>B7 92.9%</td><td>tie</td></tr>
+        <tr><td>Oxford-IIIT Pets (3 680 / 3 369 / 37)</td><td>ResNet-152 94.5%, 58 M</td><td>B4 94.8%, 17 M</td><td>GPipe 95.9%</td><td>B6 95.4%, 41 M</td><td>−0.5</td></tr>
+        <tr><td>Food-101 (75 750 / 25 250 / 101)</td><td>Inception-v4 90.8%</td><td>B4 91.5%, 17 M</td><td>GPipe 93.0%</td><td>B7 93.0%</td><td>tie</td></tr>
+      </table>
+
+      <h4>“State of the art on 5 of 8”, counted</h4>
+      <p>Against best reported results, EfficientNet is strictly higher on <b>3</b> datasets (CIFAR-100, Birdsnap, Flowers), <b>ties on 2</b> (Aircraft 92.9, Food-101 93.0), and is lower on 3 (CIFAR-10 by 0.1, Cars by 0.1, Pets by 0.5). The “5 of 8” counts the ties. Every margin except Flowers and Pets is within 0.7 points, and several test sets are small (Birdsnap's 2 443 images give a binomial standard error of about 0.7 points at 84%). Treat these as parity with far fewer parameters rather than clear wins.</p>
+
+      <h4>The parameter counts, and one ratio that does not add up</h4>
+      <ul class="notes">
+        <li>Transfer models have smaller heads: B7's 2560 × 1000 classifier (2.56 M) becomes 2560 × 100 on CIFAR-100. Recounting with each dataset's class count gives B0 4.02 M (CIFAR-10), B7 about 64.0 M, B6 40.8 M (Pets). These match the table's 4 M, 64 M and 41 M.</li>
+        <li>The recount gives B3 10.8–11.0 M where the table says 10 M, B4 17.6–17.7 M (table 17 M), and B5 28.5 M (Flowers) and 29.4 M (Birdsnap, 500 classes) where the table says 28 M for both. These are truncations and small gaps, not errors in substance.</li>
+        <li><b>Pets' printed ratio is wrong on its face:</b> ResNet-152's 58 M against B4's 17 M is 3.4×, but the table says 5.6×. The “4.7×” geometric mean over the public column reproduces only if 5.6 is used (with 3.4 it is 4.4×). The “9.6×” mean over the best-reported column does reproduce: the geometric mean of 8.7, 8.7, 8.7, 14 and 8.7 is 9.57. Using the recomputed parameter counts for both public-column ratios (figure below), the geometric mean is 4.2×.</li>
+      </ul>
+
+      <div class="viz" id="viz-transfer">
+        <div class="vhead">
+          <span class="vtitle">Transfer accuracy and parameter cost</span>
+          <span class="vhint">bars: accuracy vs the comparison model · labels: parameter counts recomputed for each dataset's class count</span>
+        </div>
+        <div class="controls">
+          <label>compare with
+            <select id="tr-cmp"><option value="pub">best public model</option><option value="best">best reported result</option></select>
+          </label>
+          <label>show
+            <select id="tr-show"><option value="acc">accuracy difference</option><option value="ratio">parameter ratio</option></select>
+          </label>
+        </div>
+        <svg id="tr-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Bar chart of transfer learning accuracy differences or parameter ratios between EfficientNet and comparison models on eight datasets"></svg>
+        <div class="readout" aria-live="polite" id="tr-read"></div>
+      </div>
+      <p>Figure 6 of the paper plots accuracy against parameters (log scale) for eight datasets. On each, the EfficientNet curve lies to the left of the other families, at the same accuracy with fewer parameters. The fine-tuning procedure itself (freezing, learning rates, BatchNorm handling) is standard and is covered on <a href="../deep-learning/fine-tuning-transfer-learning.html">Fine-Tuning &amp; Transfer Learning</a>.</p>
+      <div class="callout"><b>Takeaway:</b> ImageNet efficiency carries over to transfer. EfficientNets match or beat published results at 4–21× fewer parameters, but the state-of-the-art claims are mostly within noise, and two of the “five” are ties.</div>
+    </section>
+
+    <!-- 26 ───────────────────────────────────────────── -->
+    <section class="topic" id="disentangle" data-nav="Scaling vs architecture (Table 7)">
+      <h3><span class="idx">26</span> Separating the scaling rule from the architecture (Figure 8, Table 7, Figure 7)</h3>
+      <p class="lede">The cleanest experiment in the paper keeps B0 fixed and changes only how it is scaled. Any difference then comes from the scaling rule.</p>
+
+      <table class="cmp">
+        <tr><th>Model (from B0)</th><th>FLOPs (paper)</th><th>MACs (recount, reference rounding)</th><th>Top-1</th></tr>
+        <tr><td>Baseline (B0)</td><td>0.4 B</td><td>0.388 B</td><td>77.3%</td></tr>
+        <tr><td>depth d = 4</td><td>1.8 B</td><td>1.585 B</td><td>79.0%</td></tr>
+        <tr><td>width w = 2</td><td>1.8 B</td><td>1.455 B</td><td>78.9%</td></tr>
+        <tr><td>resolution r = 2 (448 px)</td><td>1.9 B</td><td>1.547 B</td><td>79.1%</td></tr>
+        <tr><td>compound d = 1.4, w = 1.2, r = 1.3 (291 px)</td><td>1.8 B</td><td>1.809 B</td><td><b>81.1%</b></td></tr>
+      </table>
+
+      <h4>What the recount adds</h4>
+      <ul class="notes">
+        <li>The paper prints all four scaled models at 1.8–1.9 B. Recounted with the reference rounding, the <b>compound</b> model is 1.81 B, matching, but the <b>single-axis</b> models come out at 1.46–1.59 B, 12–20% <b>cheaper</b>. A bound that does not depend on the counter makes the point sharper: width and resolution scaling can at most quadruple a network's cost, so with B0 at 0.39 B (Table 2), <code>w = 2</code> and <code>r = 2</code> cannot exceed 1.56 B, yet Table 7 prints 1.8 and 1.9 B. Table 7 (like Figure 3, §06) therefore seems to use a counter that puts the baseline nearer 0.45–0.5 B, and under such a counter the compound model would also be above the printed 1.8 B. Which models were really cheaper cannot be settled from the paper. At §06's slopes (roughly 0.4–1 point per doubling in this range), a 15–25% compute difference is worth about 0.1–0.3 points, well below the 2.0–2.2 point gap, so the conclusion survives either way.</li>
+        <li>The gap in the table is <b>+2.0 to +2.2</b> points (81.1 against 79.1, 79.0 and 78.9). The text says compound scaling improves accuracy “by up to 2.5%” over single-dimension methods. That sentence describes Figure 8's curves, not Table 7, so it is not a contradiction; it just cannot be checked against the tables.</li>
+        <li>The baseline here is 77.3%, while Table 2 gives B0 77.1% and Figure 3's baseline sits near 76.1%. There are three different numbers for the same starting network.</li>
+      </ul>
+
+      <h4>Figure 8: whole curves, not points</h4>
+      <p>Figure 8 plots accuracy against FLOPs (0–5 B) for width, depth, resolution and compound scaling of B0. The compound curve lies above all three single-axis curves across the range, and the gap widens as FLOPs grow. That matches Observation 1 (single axes saturate) and Observation 2 (balance helps).</p>
+
+      <h4>Figure 7: class activation maps</h4>
+      <ul class="notes">
+        <li>The paper shows CAMs (the class-weighted sum of the final feature maps) for two validation images, “bakeshop” and “maze”, under the five models of Table 7. The “bakeshop” image is several macarons on a plate. The baseline and wider models put one blob in the middle, and the higher-resolution model scatters small spots. The compound model lights up the individual macarons. The “maze” image is a circular maze. The compound model's map is a ring following the maze's circular shape, while the others highlight two lobes or a partial arc.</li>
+        <li><b>Evidential weight: illustrative only.</b> The paper says the images are randomly picked, but two images are anecdotes, there is no quantitative localisation metric, and CAM quality is a debated proxy for what a network “uses”. Read it as a picture consistent with the accuracy numbers, not as independent evidence.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> with the architecture held fixed, compound scaling beats the best single axis by about 2 points at about 1.8 B FLOPs. Table 7's FLOPs are not consistent with Table 2's 0.39 B baseline, so the exact compute match is uncertain, but the margin is far larger than any plausible mismatch could explain. The CAM figure is illustration, not evidence.</div>
+    </section>
+
+    <!-- 27 ───────────────────────────────────────────── -->
+    <section class="topic" id="val-test" data-nav="Validation vs test (Table 8)">
+      <h3><span class="idx">27</span> Validation against test accuracy (Table 8)</h3>
+      <p class="lede">By 2019 most papers reported ImageNet <b>validation</b> accuracy, and since hyperparameters are often tuned on that set, it can be optimistic. The appendix submits all eight models to the held-out 100 000-image test server.</p>
+      <table class="cmp">
+        <tr><th></th><th>B0</th><th>B1</th><th>B2</th><th>B3</th><th>B4</th><th>B5</th><th>B6</th><th>B7</th></tr>
+        <tr><td>val top-1</td><td>77.11</td><td>79.13</td><td>80.07</td><td>81.59</td><td>82.89</td><td>83.60</td><td>83.95</td><td>84.26</td></tr>
+        <tr><td>test top-1</td><td>77.23</td><td>79.17</td><td>80.16</td><td>81.72</td><td>82.94</td><td>83.69</td><td>84.04</td><td>84.33</td></tr>
+        <tr><td>test − val</td><td>+0.12</td><td>+0.04</td><td>+0.09</td><td>+0.13</td><td>+0.05</td><td>+0.09</td><td>+0.09</td><td>+0.07</td></tr>
+        <tr><td>val top-5</td><td>93.35</td><td>94.47</td><td>94.90</td><td>95.67</td><td>96.37</td><td>96.71</td><td>96.76</td><td>96.97</td></tr>
+        <tr><td>test top-5</td><td>93.45</td><td>94.43</td><td>94.98</td><td>95.70</td><td>96.27</td><td>96.64</td><td>96.86</td><td>96.94</td></tr>
+        <tr><td>test − val</td><td>+0.10</td><td>−0.04</td><td>+0.08</td><td>+0.03</td><td>−0.10</td><td>−0.07</td><td>+0.10</td><td>−0.03</td></tr>
+      </table>
+      <h4>Reading the differences</h4>
+      <ul class="notes">
+        <li><b>Top-1 on test is higher on all eight models</b>, by 0.04–0.13 points, with a mean of +0.085. Top-5 differences go both ways (mean +0.009). There is no sign of overfitting to the validation set, which is what minival early stopping (§21) is meant to prevent.</li>
+        <li>The standard error of a top-1 estimate at about 80% is <code>√(0.8·0.2/50 000) ≈ 0.18</code> points on the 50 000-image validation set, and 0.13 points on the 100 000-image test set. Every difference in the table is within about one standard error. The consistent sign on top-1 is mild and could be chance.</li>
+        <li><b>Rounding check against Table 2:</b> all eight top-1 values round to Table 2's numbers. Top-5 matches for six models, including four where truncation would have given a different digit (95.67 → 95.7, 96.37 → 96.4, 96.76 → 96.8, 96.97 → 97.0), so Table 2 rounds. The exceptions are B1, whose 94.47 is printed as 94.4 (it rounds to 94.5), and B0, whose 93.35 is printed as 93.3 (a tie that could round either way in floating point). The B1 value is a one-off slip, not a convention.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> test accuracy matches validation to within ±0.13 points for every model. Table 8 gives no sign that the validation numbers used in the rest of the paper are optimistic.</div>
+    </section>
+
+
+    <!-- 28 ───────────────────────────────────────────── -->
+    <section class="topic" id="flops-latency" data-nav="FLOPs ≠ latency">
+      <h3><span class="idx">28</span> FLOPs are not latency: depthwise convolutions, memory traffic and activation size</h3>
+      <p class="lede">EfficientNet optimised FLOPs because FLOPs are hardware-neutral. The price is that the resulting network does little arithmetic per byte of data it moves, and on GPUs and TPUs data movement, not arithmetic, often sets the speed.</p>
+
+      <h4>The roofline argument in one paragraph</h4>
+      <p>An operation is <b>compute-bound</b> if it performs more arithmetic per byte moved than the hardware's ratio of peak compute to memory bandwidth (the “ridge point”), and <b>memory-bound</b> otherwise. A V100, for example, offers about 125 TFLOP/s of fp16 tensor-core arithmetic against about 900 GB/s of memory bandwidth, so the ridge is roughly 139 FLOPs, or about 70 MACs, per byte. Below that, adding FLOPs is nearly free and removing them saves nearly nothing. What matters is bytes moved.</p>
+
+      <h4>Hand-worked: arithmetic intensity of the two halves of an MBConv</h4>
+      <div class="formula"><span class="lbl">stage-5 repeated block, 14×14, E = 480, fp16 (2 bytes), batch 1, minimum traffic</span><span class="eq">depthwise 3×3:  MACs 14²·9·480 = 846 720</span>
+<span class="eq">                bytes ≥ (in 94 080 + out 94 080 + weights 4 320) · 2 = 384 960   → 2.2 MACs/byte</span>
+<span class="eq">project 1×1 480 → 80:  MACs 14²·480·80 = 7 526 400</span>
+<span class="eq">                bytes ≥ (in 94 080 + out 15 680 + weights 38 400) · 2 = 296 320   → 25.4 MACs/byte</span>
+<span class="lbl">upper bounds as batch grows (weights amortised)</span><span class="eq">depthwise k×k:   k² MACs per output element, ≥ 2 elements moved  → ≤ k²/4 MACs/byte  (2.25 for 3×3)</span>
+<span class="eq">1×1 C_in → C_out: C_in·C_out MACs per pixel, (C_in + C_out)·2 bytes → 480·80 / 1120 = 34.3 MACs/byte</span></div>
+      <p>The depthwise convolution sits <b>30× below</b> the ridge regardless of batch size, and even the 1×1 convolutions are below it at these narrow widths. A ResNet bottleneck's 3×3 convolution on 256 channels does 9·256 = 2 304 MACs per output element and is comfortably compute-bound. FLOPs undercount EfficientNet's real cost, and the undercount grows with the hardware's ratio of arithmetic to bandwidth.</p>
+
+      <h4>Activation memory: what large resolution does to training</h4>
+      <div class="viz" id="viz-mem">
+        <div class="vhead">
+          <span class="vtitle">Stored activations per training image</span>
+          <span class="vhint">rough count of the feature maps kept for the backward pass (each conv, BN and activation output), computed from the spec at every resolution</span>
+        </div>
+        <div class="controls">
+          <label>model
+            <select id="mem-model"><option value="0">B0</option><option value="3">B3</option><option value="4">B4</option><option value="6">B6</option><option value="7" selected>B7</option></select>
+          </label>
+          <label>precision <select id="mem-prec"><option value="32">fp32</option><option value="16">fp16 / bf16</option></select></label>
+          <label>activation budget (GiB) <input type="range" id="mem-gpu" min="8" max="80" step="4" value="16"></label>
+        </div>
+        <svg id="mem-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Log plot of activation memory per training image against input resolution for the selected EfficientNet and for ResNet-50"></svg>
+        <div class="readout" aria-live="polite" id="mem-read"></div>
+      </div>
+      <ul class="notes">
+        <li>Counted this way, B0 at 224 stores about 21.9 M activation elements per image (84 MiB in fp32), <b>less</b> than ResNet-50's 32.0 M (122 MiB). B7 at 600 stores about <b>962 M</b> (3.6 GiB fp32), <b>30×</b> ResNet-50, while B7 has 2.6× ResNet-50's parameters. Real frameworks fuse or recompute some of these tensors, so treat the numbers as an upper-side estimate that is right in ratio.</li>
+        <li>Activation memory grows like <code>d · w · r²</code> (one factor of width, not two), so the 43% share of compute given to resolution (§10) turns into an even larger share of memory. This is why B7 trains at small per-device batch sizes, and why small batches then slow training and interfere with BatchNorm statistics.</li>
+        <li>Arithmetic per stored element is low. B0 does 17.7 MACs per activation element and B7 39.4, against ResNet-50's 127.6. Each byte written to memory gets 3–7× less use.</li>
+      </ul>
+
+      <h4>Evidence from later measurements</h4>
+      <table class="cmp">
+        <tr><th>Claim</th><th>Source</th><th>Evidential status</th></tr>
+        <tr><td>RegNet models outperform EfficientNets under comparable training while being <b>up to 5× faster on GPUs</b>.</td><td>“Designing Network Design Spaces” (arXiv 2003.13678)</td><td>Controlled re-training of both families in the same codebase. GPU inference and training timing. Strong for GPUs.</td></tr>
+        <tr><td>A ResNet-RS model with 1.8× the FLOPs of B6 is <b>2.7× faster</b> per training step on TPUv3 and uses 7.3 GB against 16.6 GB of memory. Across sizes, ResNet-RS is 1.7–2.7× faster on TPUs and 2.1–3.3× on GPUs at matched accuracy.</td><td>“Revisiting ResNets: Improved Training and Scaling Strategies” (arXiv 2103.07579)</td><td>Measured, same hardware, both families trained with strong recipes. Note that the paper counts FLOPs as 2 × MACs (B6 appears as 38 B).</td></tr>
+        <tr><td>Depthwise convolutions “often cannot fully utilize modern accelerators”. Replacing early MBConv stages with fused convolutions raises training throughput despite more FLOPs.</td><td>“EfficientNetV2” (arXiv 2104.00298)</td><td>Measured by the original authors (Table 3 there). The concession comes from the same group that designed EfficientNet.</td></tr>
+        <tr><td>On one CPU core at batch 1, B1 is 5.7× faster than ResNet-152.</td><td>This paper, Table 4</td><td>Measured, but in the regime most favourable to low FLOPs.</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> EfficientNet's efficiency is real in FLOPs and parameters, and on a CPU at batch 1. On GPUs and TPUs, depthwise convolutions (about 2 MACs per byte) and large high-resolution activation maps make it memory-bound. Networks with similar or up to about 2× its FLOPs have been measured 2–5× faster. If you care about wall-clock time, measure wall-clock time.</div>
+    </section>
+
+    <!-- 29 ───────────────────────────────────────────── -->
+    <section class="topic" id="v2" data-nav="EfficientNetV2 (2021)">
+      <h3><span class="idx">29</span> EfficientNetV2 (2021): the authors' own revision</h3>
+      <p class="lede">“EfficientNetV2: Smaller Models and Faster Training” (arXiv 2104.00298, ICML 2021) keeps the idea of searching a baseline and scaling it, but optimises <b>training speed</b> and parameters rather than FLOPs. It diagnoses three specific problems in V1.</p>
+
+      <h4>The three bottlenecks, with the paper's measurements</h4>
+      <ul class="notes">
+        <li><b>Very large images train slowly.</b> On B6, training at 512 px reaches 84.3% top-1 and fits only batch 32 per TPUv3 core (42 images/s/core, out of memory at 128). Training at 380 px reaches <b>84.6%</b> and fits batch 128 (93 images/s/core). Training smaller was both faster (up to 2.2×) and slightly more accurate. That is the train/test resolution effect of §30.</li>
+        <li><b>Depthwise convolutions are slow in early layers.</b> Replacing MBConv with <b>Fused-MBConv</b> (the 1×1 expand and 3×3 depthwise merged into one regular 3×3 convolution) in the early stages of B4 increases FLOPs from 4.5 B to 7.5 B, yet raises TPU training throughput from 262 to 362 images/s/core. Fusing every stage is worse: 34.4 B FLOPs, 132 M parameters, 1.1 points less accurate, and slower on TPU than no fusion at all (254 vs 262 images/s/core), though still faster on V100 (206 vs 155).</li>
+        <li><b>Scaling every stage equally is sub-optimal.</b> V2 adds layers mostly to later stages and caps inference resolution at <b>480</b>.</li>
+      </ul>
+
+      <div class="viz" id="viz-fused">
+        <div class="vhead">
+          <span class="vtitle">Fused-MBConv in B4 (as reported in EfficientNetV2, Table 3)</span>
+          <span class="vhint">reported measurements, not recomputed · pick the metric</span>
+        </div>
+        <div class="controls">
+          <label>metric
+            <select id="fused-metric"><option value="tpu">TPU training throughput</option><option value="gpu">V100 training throughput</option><option value="flops">FLOPs</option><option value="params">parameters</option><option value="acc">top-1</option></select>
+          </label>
+        </div>
+        <svg id="fused-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Bar chart of throughput, FLOPs, parameters or accuracy for EfficientNet-B4 with increasing numbers of stages replaced by Fused-MBConv"></svg>
+        <div class="readout" aria-live="polite" id="fused-read"></div>
+      </div>
+
+      <h4>What else changed</h4>
+      <ul class="notes">
+        <li><b>Training-aware NAS.</b> The search space adds Fused-MBConv as an operator, with kernel sizes 3×3 or 5×5 and expansion ratios 1, 4 or 6. The network it found uses only 3×3 kernels and expansion 4 in several stages. The reward combines accuracy, normalised training step time and parameter size, with the step time measured on real hardware. The found V2-S also drops V1's last stride-1 stage.</li>
+        <li><b>Progressive learning with adaptive regularisation.</b> Training is split into four stages of about 87 epochs each. Image size rises from 128 px to 300 px (S) or 380 px (M, L), and regularisation strength rises with it: RandAugment magnitude 5 → 15/20/25, mixup α 0 → 0/0.2/0.4, dropout 0.1 → 0.3/0.4/0.5. The rationale is that small images mean small effective capacity, which needs weak regularisation. Fixed regularisation across sizes was, the authors argue, why earlier progressive resizing lost accuracy.</li>
+        <li><b>Results (ImageNet-1k only, from Table 7 there):</b> V2-S 83.9%, 22 M params, 8.8 B FLOPs, 7.1 h training. V2-M 85.1%, 54 M, 24 B, 13 h. V2-L 85.7%, 120 M, 53 B, 24 h. In the same table, B7 is listed at 84.7% with 66 M, 38 B FLOPs, 139 h. That 84.7% matches the RandAugment-trained B7 checkpoint in the reference repository, not the paper's 84.3%. V2-M matches B7's accuracy in about <b>11× less training time</b> (139 / 13 = 10.7), and V100 inference is 57 ms against 170 ms. With ImageNet-21k pretraining, V2-L reaches 86.8% and V2-XL 87.3%.</li>
+      </ul>
+      <p><b>Evidential status:</b> measured by the original group, with training times normalised to 32 TPU cores and inference timed in a common third-party codebase (timm, V100, batch 16). The comparisons with other families use each model's published or reproduced accuracy. The within-family comparisons (V1 against V2) are the most reliable.</p>
+      <div class="callout"><b>Takeaway:</b> V2 addresses V1's weaknesses directly. It uses fewer depthwise convolutions early in the network, caps resolution, scales later stages more, and changes image size and regularisation together during training. It gets B7's accuracy in a tenth of the training time.</div>
+    </section>
+
+    <!-- 30 ───────────────────────────────────────────── -->
+    <section class="topic" id="resolution" data-nav="Train/test resolution discrepancy">
+      <h3><span class="idx">30</span> The train/test resolution discrepancy</h3>
+      <p class="lede">EfficientNet trains and tests at the same nominal resolution. “Fixing the train-test resolution discrepancy” (FixRes, arXiv 1906.06423) showed that the standard augmentation makes those two resolutions effectively different, and that evaluating at a higher resolution than training improves accuracy.</p>
+
+      <h4>The mechanism</h4>
+      <ul class="notes">
+        <li>Training uses <b>random-resized crops</b>: a random region, typically 8–100% of the image area, is resized up to the training size. On average objects therefore appear <b>larger</b> in training images than in the evaluation <b>centre crop</b>, which shows most of the image at the same pixel size.</li>
+        <li>So at equal nominal resolution the network sees objects at a smaller apparent size at test time than it learned on. Testing at a <b>higher</b> resolution restores the apparent object size, at the cost of shifting activation statistics (pooled features get sparser and larger in magnitude), which FixRes corrects by fine-tuning the classifier and BatchNorm at the test resolution.</li>
+        <li>The reference EfficientNet evaluation takes a centre crop of <code>res / (res + 32)</code> of the shorter side (0.875 for B0 at 224, 0.949 for B7 at 600) and resizes it to <code>res</code>.</li>
+      </ul>
+
+      <h4>Reported effects (each paper's own claims)</h4>
+      <table class="cmp">
+        <tr><th>Claim</th><th>Source</th><th>Status</th></tr>
+        <tr><td>ResNet-50 trained at 128×128 reaches 77.1% when tested at 224. Trained at 224, it reaches 79.8% with the test-resolution fix.</td><td>FixRes (arXiv 1906.06423)</td><td>Measured. The gain comes cheaply at train time.</td></tr>
+        <tr><td>FixEfficientNet-B0 reaches 79.3% with 5.3 M parameters, against 77.1% for B0. FixEfficientNet-L2 (with Noisy Student's extra 300 M unlabeled images) reaches 88.5%.</td><td>“Fixing the train-test resolution discrepancy: FixEfficientNet” (arXiv 2003.08237)</td><td>Measured. Part of the B0 gain also comes from the stronger recipe used, not only the resolution fix.</td></tr>
+        <tr><td>Training B6 at 380 instead of 512 is up to 2.2× faster (largely because the smaller images fit batch 128 per core instead of 32) and 0.3 points more accurate, with no fine-tuning afterwards.</td><td>EfficientNetV2 (Table 2 there)</td><td>Measured.</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> the resolution the compound rule assigns is best treated as a <b>test</b> resolution. Training noticeably below it (EfficientNetV2 used 380 for B6's 528, about 72%) was faster and at least as accurate in the reported experiments. It is one of the cheapest changes to try in an EfficientNet training run.</div>
+    </section>
+
+    <!-- 31 ───────────────────────────────────────────── -->
+    <section class="topic" id="critiques" data-nav="Rescaling critiques">
+      <h3><span class="idx">31</span> Critiques of the scaling rule itself</h3>
+      <p class="lede">The strongest later critique does not say compound scaling is wrong. It says the best allocation depends on training length and data regime, and that EfficientNet's comparisons mixed the scaling rule with a much better training recipe.</p>
+
+      <h4>“Revisiting ResNets: Improved Training and Scaling Strategies” (Bello et al., arXiv 2103.07579)</h4>
+      <ul class="notes">
+        <li><b>Recipe beats architecture, at this scale.</b> A ResNet-200 goes from 79.0% to 82.2% (+3.2) with training changes alone: longer training, cosine schedule, label smoothing, RandAugment, stochastic depth, dropout, EMA, and <b>lower</b> weight decay. Adding two small architecture changes (ResNet-D and SE) gives 83.4%. That is a larger gain than many architecture papers of the period report.</li>
+        <li><b>The best scaling direction depends on the regime.</b> Over depths 26–400 and resolutions 128–448, depth scaling beat width scaling when training was long enough to overfit (350 epochs), and width scaling was preferable in short runs. A fixed α, β, γ found on a small model in one regime cannot capture this.</li>
+        <li><b>Resolution should grow more slowly.</b> Returns diminished beyond about 320 px, while EfficientNet goes to 600 (and L2 to 800). Slower resolution scaling improved EfficientNets as well on a speed-accuracy basis.</li>
+        <li><b>FLOPs fail to predict accuracy for large models</b> in the bounded-data regime. Error against FLOPs follows a power law for small models and breaks for large ones, so FLOP-matched comparisons are less informative at the top end.</li>
+      </ul>
+      <p><b>Evidential status:</b> a large, controlled sweep on one architecture family (ResNets) with a strong fixed recipe. It shows the regime-dependence well. How far it transfers to MBConv networks is argued, not shown to the same depth.</p>
+
+      <h4>Other results that bear on the scaling rule</h4>
+      <ul class="notes">
+        <li><b>RegNet</b> (“Designing Network Design Spaces”, arXiv 2003.13678) derives simple quantised-linear width/depth rules from design-space statistics and reports GPU speed advantages of up to 5× at matched accuracy under a common recipe. On GPUs, it finds activation count predicts runtime better than FLOPs do.</li>
+        <li><b>NFNets</b> (“High-Performance Large-Scale Image Recognition Without Normalization”, arXiv 2102.06171) report matching B7's accuracy while being up to 8.7× faster to train. That is another data point that FLOP-efficient is not train-efficient.</li>
+        <li>What survives: <b>scaling several axes together beats scaling one</b>, a view later work largely shares; ResNet-RS itself scales depth and resolution together, just with different ratios. What is contested: the specific ratios, their constancy across sizes, and the aggressive growth in resolution.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> “balance depth, width and resolution” is well supported. “Use α = 1.2, β = 1.1, γ = 1.15 at every size” is not: the optimal split depends on training length and data. Part of EfficientNet's lead over 2019 ResNets was recipe, not architecture.</div>
+    </section>
+
+    <!-- 32 ───────────────────────────────────────────── -->
+    <section class="topic" id="family" data-nav="Lite, EfficientDet &amp; descendants">
+      <h3><span class="idx">32</span> The wider family: Lite, EfficientDet, and larger checkpoints</h3>
+      <p class="lede">The same baseline-plus-rule pattern was reused for edge devices, for object detection, and as the student network for semi-supervised training at 300 M-image scale.</p>
+
+      <h4>EfficientNet-Lite (edge and int8)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>width</th><th>depth</th><th>res</th><th>dropout</th></tr>
+        <tr><td>Lite0</td><td>1.0</td><td>1.0</td><td>224</td><td>0.2</td></tr>
+        <tr><td>Lite1</td><td>1.0</td><td>1.1</td><td>240</td><td>0.2</td></tr>
+        <tr><td>Lite2</td><td>1.1</td><td>1.2</td><td>260</td><td>0.3</td></tr>
+        <tr><td>Lite3</td><td>1.2</td><td>1.4</td><td>280</td><td>0.3</td></tr>
+        <tr><td>Lite4</td><td>1.4</td><td>1.8</td><td>300</td><td>0.3</td></tr>
+      </table>
+      <ul class="notes">
+        <li>Changes from the reference Lite builder: <b>SE removed</b> (the release notes say it is poorly supported on some mobile accelerators), <b>ReLU6 instead of Swish</b> (bounded, so easier to quantise), and <b>stem and head not scaled</b> (<code>fix_head_stem</code>). Lite3 and Lite4 use lower resolutions (280, 300) than B3 and B4 (300, 380), a cap on resolution about a year before V2 made the same choice.</li>
+      </ul>
+
+      <h4>EfficientDet (arXiv 1911.09070): compound scaling for detection</h4>
+      <div class="formula"><span class="lbl">EfficientDet's scaling rules, detector <span class="keep">φ = 0 … 7</span></span><span class="eq">backbone        EfficientNet-Bφ (reusing its ImageNet checkpoint)</span>
+<span class="eq">BiFPN width     W = 64 · 1.35ᵠ        (1.35 from a grid over 1.2 … 1.45)</span>
+<span class="eq">BiFPN depth     D = 3 + φ</span>
+<span class="eq">box/class depth D = 3 + floor(φ / 3)</span>
+<span class="eq">input size      R = 512 + 128 · φ</span></div>
+      <ul class="notes">
+        <li><b>BiFPN</b> is a feature pyramid with top-down and bottom-up paths, repeated D times, that fuses features with <b>learned non-negative weights</b> (normalised by their sum), since inputs at different resolutions contribute unequally.</li>
+        <li>The published table departs from its own formula in places, as the classification family does. D5 uses 1280 px where 512 + 640 = 1152. BiFPN depth for D5, D6 and D7 is 7, 8, 8 where 3 + φ gives 8, 9, 10. D7 uses 1536 px where the rule gives 1408, and reuses the B6 backbone. Widths are rounded (86.4 → 88, 116.6 → 112, 212.6 → 224, 387.4 → 384).</li>
+        <li>The final arXiv version reports <b>55.1 AP</b> on COCO test-dev with 77 M parameters and 410 B FLOPs (the abstract names the model D7; the results table lists this configuration as D7x), and claims 4–9× fewer parameters and 13–42× fewer FLOPs than earlier detectors. Earlier versions of the paper reported lower headline numbers. The same FLOPs-versus-latency caveat (§28) applies.</li>
+      </ul>
+
+      <h4>Larger checkpoints trained after the paper</h4>
+      <ul class="notes">
+        <li><b>RandAugment</b> (arXiv 1909.13719) replaces AutoAugment and reports B7 at 85.0% in its own paper. The RandAugment B7 checkpoint released in the reference repository is listed at 84.7%, and that is the B7 figure EfficientNetV2 later compares against.</li>
+        <li><b>AdvProp</b> (“Adversarial Examples Improve Image Recognition”, arXiv 1911.09665) uses adversarial examples with separate BatchNorm statistics and reports B8 at 85.5% without extra data.</li>
+        <li><b>Noisy Student</b> (“Self-training with Noisy Student improves ImageNet classification”, arXiv 1911.04252) trains an EfficientNet-L2 student (width 4.3, depth 5.3, 800 px) on ImageNet plus 300 M pseudo-labelled images and reports 88.4% top-1. That was state of the art at the time, and it came from data and training, not architecture.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> “search a small model, then scale by fixed ratios” reappears in Lite, EfficientDet and V2. Every one of them rounds or overrides its own rule somewhere, which suggests treating the rule as a strong default rather than a law.</div>
+    </section>
+
+    <!-- 33 ───────────────────────────────────────────── -->
+    <section class="topic" id="inconsistencies" data-nav="Where the paper disagrees with itself">
+      <h3><span class="idx">33</span> Where the paper's numbers disagree with each other, or with a recount</h3>
+      <p class="lede">None of these changes the paper's conclusions. They matter when you quote a number, and they are the reason this page recomputes rather than copies.</p>
+      <table class="cmp">
+        <tr><th>#</th><th>Item</th><th>One place says</th><th>Another place (or the recount) says</th></tr>
+        <tr><td>1</td><td>GPipe parameters</td><td>557 M (related work, Table 2)</td><td>556 M (Figure 1 legend, Table 5)</td></tr>
+        <tr><td>2</td><td>B7 top-1</td><td>84.3% (abstract, Table 2, Figure 1); val 84.26 (Table 8)</td><td>84.4% (Table 4; also the reference repository's README)</td></tr>
+        <tr><td>3</td><td>B1 top-1</td><td>79.1% (Table 2, Figure 1)</td><td>78.8% (Table 4)</td></tr>
+        <tr><td>4</td><td>NASNet-A top-1</td><td>82.7% (Table 2, Figure 1)</td><td>80.7% (Figure 5 legend; the point itself is plotted at about 82.7%, so the legend is the typo)</td></tr>
+        <tr><td>5</td><td>SENet parameters</td><td>145 M (related work)</td><td>146 M (Table 2, Figure 1)</td></tr>
+        <tr><td>6</td><td>B4 against ResNet-50</td><td>76.3% → 83.0%, +6.7 (introduction)</td><td>76.0% and 82.9%, +6.9 (Table 2)</td></tr>
+        <tr><td>7</td><td>PNASNet FLOP ratio</td><td>6.0× (Table 2)</td><td>23 / 4.2 = 5.5× from the same table; PNASNet's own paper gives 25.0 B, which does give 6.0×, so the 23 B is the likely typo</td></tr>
+        <tr><td>8</td><td>ResNet-152 parameter ratio</td><td>7.6× (Table 2, Figure 1 caption)</td><td>60 / 7.8 = 7.69 → 7.7×</td></tr>
+        <tr><td>9</td><td>Pets parameter ratio</td><td>5.6× (Table 5)</td><td>58 / 17 = 3.4×</td></tr>
+        <tr><td>10</td><td>Figure 4 last baseline</td><td>“299×299”, “36 layers”; text “r=2.0”</td><td>r = 1.3 → 291 px; 32 blocks (34–35 layers); plotted r = 1.3</td></tr>
+        <tr><td>11</td><td>Baseline (B0) top-1</td><td>77.1% (Table 2)</td><td>77.3% (Table 7); ≈ 76.1% (Figure 3)</td></tr>
+        <tr><td>12</td><td>Figure 3 x positions</td><td>baseline plotted at ≈ 0.5 B, r = 2.5 at ≈ 3.1 B</td><td>0.39 B (Table 2; recount 0.388); r = 2.5 can be at most 6.25 × 0.39 = 2.44 B under any counter (recount 2.46 B with rounding of 560 px maps)</td></tr>
+        <tr><td>13</td><td>Table 7 single-axis FLOPs</td><td>1.8, 1.8, 1.9 B</td><td>w = 2 and r = 2 can be at most 4 × 0.39 = 1.56 B under any counter; recount 1.59, 1.46, 1.55 B (compound 1.81 matches)</td></tr>
+        <tr><td>14</td><td>Dropout schedule</td><td>“linearly increase … 0.2 to 0.5”</td><td>released config 0.2, 0.2, 0.3, 0.3, 0.4, 0.4, 0.5, 0.5 (a stepped approximation; loose wording)</td></tr>
+        <tr><td>15</td><td>B1–B7 as φ-scaled B0</td><td>“scale up baseline network with different φ”</td><td>released triples are not integer powers; depth lags width and resolution (§11)</td></tr>
+        <tr><td>16</td><td>B4 / B5 FLOPs</td><td>4.2 B / 9.9 B</td><td>recount 4.41 B / 10.31 B (+5% / +4%); torchvision's documentation lists 4.39 / 10.27</td></tr>
+        <tr><td>17</td><td>Table 2 top-5</td><td>B1 94.4%</td><td>Table 8 val 94.47 → 94.5 (the other top-5 values are correctly rounded, so this is a single slip)</td></tr>
+        <tr><td>18</td><td>Transfer parameter counts</td><td>B3 10 M; B5 28 M on Birdsnap</td><td>recount 10.8–11.0 M; 29.4 M with a 500-class head</td></tr>
+        <tr><td>19</td><td>“State of the art on 5 of 8”</td><td>5 datasets</td><td>3 strict improvements + 2 ties (Aircraft, Food-101)</td></tr>
+        <tr><td>20</td><td>Figure 5 legend</td><td>“ResNet-152 (Xie et al., 2017)”, “AmeobaNet”</td><td>ResNet-152 is He et al., 2016; typo for AmoebaNet</td></tr>
+      </table>
+
+      <h4>Checked and not counted as inconsistencies</h4>
+      <ul class="notes">
+        <li><b>α·β²·γ² = 1.9203, not 2.</b> The paper states the constraint as “≈ 2”, and 1.92 satisfies it. §10 works out what the 4% shortfall does to the family's budget, but it is not a contradiction.</li>
+        <li><b>“Up to 2.5%” in the Discussion</b> against Table 7's largest gap of 2.2 points (81.1 − 78.9). The sentence describes Figure 8's curves, so it cannot be checked against Table 7 and does not contradict it.</li>
+        <li><b>Realised FLOPs above 1.92ᵠ at small φ</b> (2.57× B0 at φ = 1 after rounding, §11). The paper's footnote 3 says FLOPs may differ from theory because of rounding, and its own B2 (1.0 B vs 0.39 B) shows the same ratio.</li>
+      </ul>
+
+      <h4>Deliberate choices on this page</h4>
+      <ul class="notes">
+        <li>All costs are <b>MACs</b>, called FLOPs where quoting the paper, following its convention. Papers that count 2 FLOPs per MAC (e.g. ResNet-RS's Table 3) show EfficientNet values twice as large.</li>
+        <li>Parameter counts are trainable parameters only. BatchNorm running statistics are excluded, which is why Keras's “total” is 42 023 higher for B0.</li>
+        <li>Where accuracies come from plots (Figures 3 and 4), they are marked as read-offs with their uncertainty.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> when quoting EfficientNet numbers, use Table 2 for accuracy, parameters and FLOPs, Table 8 for exact validation and test values, and the released config for architecture. Treat the prose, captions and legends as secondary.</div>
+    </section>
+
+    <!-- 34 ───────────────────────────────────────────── -->
+    <section class="topic" id="practice" data-nav="Using EfficientNet in practice">
+      <h3><span class="idx">34</span> Using EfficientNet in practice</h3>
+      <p class="lede">EfficientNet is still a common pretrained backbone, especially B0–B4. Using it well mostly comes down to resolution, preprocessing, BatchNorm, and memory.</p>
+
+      <h4>Which size for which budget</h4>
+      <table class="cmp">
+        <tr><th>Situation</th><th>Reasonable starting point</th><th>Why</th></tr>
+        <tr><td>Mobile / CPU inference, tight latency</td><td>B0, or Lite0–Lite2 if you will quantise to int8</td><td>Low FLOPs pay off on CPUs at batch 1. Lite avoids SE and Swish, which are awkward in int8.</td></tr>
+        <tr><td>Server classification or fine-tuning, moderate data</td><td>B2–B4</td><td>Good accuracy per parameter, and still trainable at useful batch sizes.</td></tr>
+        <tr><td>Maximum accuracy from a V1 backbone</td><td>B5–B7, with heavy memory planning</td><td>Returns per extra FLOP are small (B6 → B7 buys +0.3 points for 1.98× FLOPs).</td></tr>
+        <tr><td>GPU/TPU training throughput matters</td><td>EfficientNetV2-S/M, or a ResNet-RS / RegNet / ConvNeXt-class model</td><td>Fewer depthwise convolutions, smaller images, and faster on accelerators (§28–§31).</td></tr>
+        <tr><td>Dense prediction (detection, segmentation)</td><td>EfficientNet backbone + BiFPN (EfficientDet), or a feature pyramid on B3–B5</td><td>Multi-scale features. Watch activation memory at detection resolutions.</td></tr>
+      </table>
+
+      <h4>Resolution and preprocessing</h4>
+      <ul class="notes">
+        <li><b>Match the checkpoint's resolution</b> (B3 = 300, B4 = 380, …) or train at slightly less and test at the native size (§30). Feeding B7 224-px images wastes most of what makes it B7. Feeding B0 600-px images gives a train/test mismatch in apparent object size.</li>
+        <li><b>Normalisation differs by implementation.</b> The TF reference normalises with ImageNet mean and standard deviation on the 0–255 scale. The Keras application models include rescaling and normalisation <b>inside</b> the model and expect raw 0–255 pixels. PyTorch implementations expect 0–1 tensors normalised with ImageNet statistics. Use the transforms bundled with the weights you load, since resize size and interpolation (often bicubic) differ per model.</li>
+        <li>Evaluation crop: the reference takes a centre crop of <code>res/(res+32)</code> of the short side. Other codebases use other ratios, which shifts accuracy by a few tenths.</li>
+      </ul>
+
+      <h4>Fine-tuning notes specific to this architecture</h4>
+      <ul class="notes">
+        <li><b>BatchNorm momentum conventions are opposite</b> between frameworks: TF 0.99 corresponds to PyTorch <code>momentum=0.01</code>. Porting the number literally makes running statistics track single batches. With small batches, freeze the BN statistics (see <a href="../deep-learning/fine-tuning-transfer-learning.html#batchnorm">BatchNorm when frozen</a>).</li>
+        <li><b>Keep drop-path and dropout</b> near the checkpoint's values (0.8 survival floor, 0.2–0.5 dropout) as a starting point when fine-tuning the whole network on small data. They were set for these model sizes, though not tuned for your dataset.</li>
+        <li><b>Optimiser:</b> the RMSProp recipe is tuned for ImageNet training from scratch. For fine-tuning, SGD with momentum or AdamW at a small learning rate is the usual choice. Tiny weight decay (1e-5) was chosen for depthwise weights. Large decay on depthwise and SE parameters can hurt.</li>
+        <li><b>Memory:</b> by §28's estimate, B7 at 600 px stores about 3.6 GiB (fp32) or 1.8 GiB (fp16) of activations per image, so a 16 GiB device holds only single-digit batches. Use mixed precision, gradient checkpointing, a lower training resolution, or a smaller model.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> B0–B4 at their native resolution, the checkpoint's own preprocessing, BN handled with the right momentum convention, and a memory plan before choosing B5+. For accelerator throughput, start from V2 instead.</div>
+    </section>
+
+    <!-- 35 ───────────────────────────────────────────── -->
+    <section class="topic" id="pitfalls" data-nav="Pitfalls">
+      <h3><span class="idx">35</span> Pitfalls</h3>
+      <p class="lede">Most EfficientNet surprises come from treating a proxy (FLOPs, a nominal multiplier, a caption number) as the real quantity.</p>
+      <h4>Architecture and configuration</h4>
+      <ul class="notes">
+        <li><b>Equating FLOPs with speed.</b> B4 has about ResNet-50's FLOPs but, in commonly published GPU benchmarks, much lower throughput. Benchmark on the target hardware and batch size.</li>
+        <li><b>Computing B-level architectures from αᵠ, βᵠ, γᵠ.</b> The released models use hand-set triples (§11). A “B4” built from φ = 4 has depth 2.07, not 1.8, and resolution 392, not 380.</li>
+        <li><b>Assuming the multipliers are exact.</b> Channel rounding moves individual stages by as much as 20% at w = 1.1 (40 → 48) and repeat rounding makes B1 44% deeper, not 10%.</li>
+        <li><b>Quoting SE's ratio as “0.25 of the expanded channels”.</b> It is 0.25 of the block's <i>input</i> channels, which is 1/24 of the expanded width at expansion 6.</li>
+        <li><b>Adding a nonlinearity after the projection</b> in a re-implementation. The linear bottleneck is deliberate.</li>
+        <li><b>Adding a projection shortcut</b> to the first block of a stage. The reference has no skip there at all, and a shortcut changes the parameter count and behaviour.</li>
+      </ul>
+      <h4>Training, preprocessing and deployment</h4>
+      <ul class="notes">
+        <li><b>Porting BN momentum literally</b> across frameworks (0.99 vs 0.01).</li>
+        <li><b>Wrong preprocessing:</b> double-normalising Keras models (which normalise internally), or using a 224-px pipeline on a B3+ checkpoint.</li>
+        <li><b>Out-of-memory at B6/B7</b> from not budgeting activations. Parameter count (43–66 M) says nothing about activation memory.</li>
+        <li><b>Comparing against a weakly trained baseline</b> and crediting the architecture. Much of the 2019 gap was the recipe (§31).</li>
+        <li><b>Mixing MAC and FLOP conventions</b> across papers, which gives a spurious 2× (§33).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> read the config, not the formula. Count activations, not parameters. Time on your hardware, not in FLOPs.</div>
+    </section>
+
+    <!-- 36 ───────────────────────────────────────────── -->
+    <section class="topic" id="cheatsheet" data-nav="Cheat sheet">
+      <h3><span class="idx">36</span> Cheat sheet</h3>
+      <p class="lede">The numbers and rules worth having to hand, all of them checked above.</p>
+      <h4>Formulas</h4>
+      <div class="formula"><span class="lbl">scaling</span><span class="eq">d = αᵠ, w = βᵠ, r = γᵠ;  α = 1.2, β = 1.1, γ = 1.15;  α·β²·γ² = 1.9203</span>
+<span class="eq">FLOPs ∝ d · w² · r²   (exact for plain conv; depthwise ∝ d·w·r²; ≈ 87–94% of EfficientNet is 1×1)</span>
+<span class="eq">log-FLOP split: 27.9% depth · 29.2% width · 42.8% resolution</span>
+<span class="lbl">rounding</span><span class="eq">channels: nearest multiple of 8, never &gt; 10% down;  repeats: ceil(d · r)</span>
+<span class="lbl">NAS reward</span><span class="eq">ACC · (FLOPS / 400M)ʷ,  w = −0.07  ⇔  2× cost must buy ×1.0497 accuracy</span>
+<span class="lbl">MBConv(e, k, s)</span><span class="eq">1×1 expand → k×k depthwise (stride) → SE (S = C_in/4) → 1×1 linear project → + x if s = 1 and C_in = C_out</span>
+<span class="lbl">swish</span><span class="eq">x·σ(x); min −0.2785 at x = −1.2785; derivative &gt; 1 for x &gt; 1.2785, max 1.0998</span></div>
+      <h4>The released configurations, counted</h4>
+      <table class="cmp">
+        <tr><th></th><th>B0</th><th>B1</th><th>B2</th><th>B3</th><th>B4</th><th>B5</th><th>B6</th><th>B7</th></tr>
+        <tr><td>width / depth</td><td>1.0 / 1.0</td><td>1.0 / 1.1</td><td>1.1 / 1.2</td><td>1.2 / 1.4</td><td>1.4 / 1.8</td><td>1.6 / 2.2</td><td>1.8 / 2.6</td><td>2.0 / 3.1</td></tr>
+        <tr><td>resolution</td><td>224</td><td>240</td><td>260</td><td>300</td><td>380</td><td>456</td><td>528</td><td>600</td></tr>
+        <tr><td>dropout</td><td>0.2</td><td>0.2</td><td>0.3</td><td>0.3</td><td>0.4</td><td>0.4</td><td>0.5</td><td>0.5</td></tr>
+        <tr><td>MBConv blocks</td><td>16</td><td>23</td><td>23</td><td>26</td><td>32</td><td>39</td><td>45</td><td>55</td></tr>
+        <tr><td>params (M)</td><td>5.29</td><td>7.79</td><td>9.11</td><td>12.23</td><td>19.34</td><td>30.39</td><td>43.04</td><td>66.35</td></tr>
+        <tr><td>MACs (B, recount)</td><td>0.388</td><td>0.691</td><td>0.999</td><td>1.84</td><td>4.41</td><td>10.31</td><td>19.14</td><td>37.87</td></tr>
+        <tr><td>top-1 val (Table 8)</td><td>77.11</td><td>79.13</td><td>80.07</td><td>81.59</td><td>82.89</td><td>83.60</td><td>83.95</td><td>84.26</td></tr>
+      </table>
+      <h4>The recipe</h4>
+      <div class="formula"><span class="lbl">training</span><span class="eq">RMSProp(decay 0.9, momentum 0.9) · lr 0.256 @ batch 4096, ×0.97 / 2.4 epochs · wd 1e-5 · BN momentum 0.99</span>
+<span class="eq">Swish · AutoAugment · stochastic depth survival 1 − 0.2·i/N · dropout 0.2 → 0.5 · 25k minival early stopping</span></div>
+      <div class="callout"><b>Takeaway:</b> one table of configs, one constraint equal to 1.92, one block type. Everything else on this page explains or qualifies these.</div>
+    </section>
+
+    <!-- 37 ───────────────────────────────────────────── -->
+    <section class="topic" id="takeaways" data-nav="What to remember">
+      <h3><span class="idx">37</span> What to remember</h3>
+      <p class="lede">The ideas that outlived the checkpoints.</p>
+      <h4>The method</h4>
+      <ul class="notes">
+        <li><b>Scaling is an allocation problem.</b> Depth, width and resolution interact. Growing them together beat growing any one by about 0.6–2.2 points at roughly 4× compute in the paper's comparisons (single runs, no error bars).</li>
+        <li><b>The compound rule</b> fixes a direction in (log d, log w, log r) space, found once on a small model. φ moves along it, and each unit of φ multiplies FLOPs by about 1.92.</li>
+        <li><b>The released family only loosely follows the rule.</b> B2 ≈ φ = 1 and B3 ≈ φ = 2. Above that, depth lags, and rounding dominates at small sizes. Use the config table.</li>
+        <li><b>B0 is MnasNet's search rerun for FLOPs</b>: MBConv + SE + Swish, 5.29 M parameters, 0.388 B MACs, 87% of it in 1×1 convolutions.</li>
+      </ul>
+      <h4>The caveats</h4>
+      <ul class="notes">
+        <li><b>The recipe matters as much as the design:</b> RMSProp, AutoAugment, stochastic depth, stepped dropout, 350 epochs. Later work showed old architectures closing much of the gap with the same care.</li>
+        <li><b>FLOPs are not time.</b> Depthwise convolutions and large activation maps are memory-bound. On accelerators, networks with similar or up to about 2× the FLOPs have been measured 2–5× faster, and EfficientNetV2 is the authors' own correction.</li>
+        <li><b>Train smaller than you test</b>, and scale resolution more cautiously than 1.15ᵠ.</li>
+        <li>Related pages: generic mechanics on <a href="../deep-learning/convolutional-networks.html">Convolutional Networks</a>; skips and stochastic depth on <a href="../deep-learning/residual-skip-connections.html">Residual &amp; Skip Connections</a>; adapting the backbone on <a href="../deep-learning/fine-tuning-transfer-learning.html">Fine-Tuning &amp; Transfer Learning</a>; the transformer alternative on <a href="../vision/vision-transformers.html">Vision Transformers</a>; deployment compression on <a href="../mlops/model-acceleration.html">Model Acceleration</a>.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> keep the principle (balanced, rule-based scaling of a searched baseline). Discard the specifics when your hardware, training length or data regime differs from the paper's, and verify every number against a recount.</div>
+    </section>
+
+    <section class="topic" id="papers" data-nav="Research papers">
+      <h3><span class="idx">📄</span> Research papers</h3>
+      <p class="lede">The paper, the work it builds on, and the follow-ups discussed above, by title and arXiv id.</p>
+      <h4>The paper and its components</h4>
+      <ul class="notes">
+        <li><b>“EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks”</b> (arXiv 1905.11946, 2019): compound scaling, B0–B7.</li>
+        <li><b>“MobileNetV2: Inverted Residuals and Linear Bottlenecks”</b> (arXiv 1801.04381, 2018): the MBConv block.</li>
+        <li><b>“MnasNet: Platform-Aware Neural Architecture Search for Mobile”</b> (arXiv 1807.11626, 2018): the search space and multi-objective reward.</li>
+        <li><b>“Squeeze-and-Excitation Networks”</b> (arXiv 1709.01507, 2017): channel gating.</li>
+        <li><b>“Searching for Activation Functions”</b> (arXiv 1710.05941, 2017), and <b>“Sigmoid-Weighted Linear Units for Neural Network Function Approximation in Reinforcement Learning”</b> (arXiv 1702.03118, 2017): Swish / SiLU.</li>
+        <li><b>“Deep Networks with Stochastic Depth”</b> (arXiv 1603.09382, 2016): drop-path with linearly decaying survival.</li>
+        <li><b>“AutoAugment: Learning Augmentation Policies from Data”</b> (arXiv 1805.09501, 2018) and <b>“RandAugment”</b> (arXiv 1909.13719, 2019).</li>
+      </ul>
+      <h4>Follow-ups and critiques</h4>
+      <ul class="notes">
+        <li><b>“Fixing the train-test resolution discrepancy”</b> (arXiv 1906.06423, 2019) and <b>“… : FixEfficientNet”</b> (arXiv 2003.08237, 2020).</li>
+        <li><b>“EfficientDet: Scalable and Efficient Object Detection”</b> (arXiv 1911.09070, 2019): BiFPN and compound scaling for detection.</li>
+        <li><b>“Self-training with Noisy Student improves ImageNet classification”</b> (arXiv 1911.04252, 2019) and <b>“Adversarial Examples Improve Image Recognition”</b> (arXiv 1911.09665, 2019): L2 and B8.</li>
+        <li><b>“Designing Network Design Spaces”</b> (arXiv 2003.13678, 2020): RegNet and the GPU-speed comparison.</li>
+        <li><b>“Revisiting ResNets: Improved Training and Scaling Strategies”</b> (arXiv 2103.07579, 2021): recipe versus architecture, regime-dependent scaling.</li>
+        <li><b>“High-Performance Large-Scale Image Recognition Without Normalization”</b> (arXiv 2102.06171, 2021): NFNets.</li>
+        <li><b>“EfficientNetV2: Smaller Models and Faster Training”</b> (arXiv 2104.00298, 2021): Fused-MBConv, progressive learning, training-aware NAS.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="efficientnet.viz.js"></script>
+</body>
+</html>

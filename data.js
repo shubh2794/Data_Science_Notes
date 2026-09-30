@@ -257,6 +257,7 @@ const nodes = [
   {id:"CLIP", group:"models", level:2, link:"models/clip.html", desc:"Contrastive Language-Image Pre-training — dual image/text encoders aligned in a shared embedding space; zero-shot vision and the backbone of text-to-image models."},
   {id:"LayoutLM", group:"models", level:2, link:"models/layoutlm.html", desc:"The Document-AI family (v1→v2→v3) that fuses text, 2D layout (OCR bounding boxes), and image in one Transformer for visually-rich document understanding — forms, receipts, invoices, doc classification, and document VQA."},
   {id:"Donut", group:"models", level:2, link:"models/donut.html", desc:"OCR-free Document Understanding Transformer — a Swin vision encoder + BART-style decoder that reads document pixels and generates structured output (JSON) directly, no OCR. Pretrained with SynthDoG; DONUT-hole distills/prunes it for the edge."},
+  {id:"EfficientNet", group:"models", level:2, link:"models/efficientnet.html", desc:"Compound model scaling for ConvNets: grow depth, width and input resolution together (d = αᵠ, w = βᵠ, r = γᵠ, α·β²·γ² ≈ 2) from a NAS-found MBConv + squeeze-and-excitation baseline (B0), giving the B0–B7 family, plus its FLOPs-vs-latency critiques and the EfficientNetV2 follow-up."},
 
   // ===== aman-coverage additions (curated gaps) =====
   {id:"Speech & Audio", group:"speech", level:1, desc:"Processing and generating audio and speech — features, recognition, and synthesis across the audio modality."},
@@ -292,7 +293,7 @@ const tree = {
   "LLMs & Generative AI":["Large Language Models","Context Engineering","Parameter-Efficient Fine-Tuning","Policy / Preference Optimization","LLM-as-a-Judge","Diffusion LLMs","Vision-Language Models","Reasoning in LLMs","Hallucination & Factuality","Context-Length Extension"],
   "Agentic AI":["Agents","Agentic RL","Agent Skills","Agentic Design Patterns","Computer Control"],
   "Speech & Audio":["Speech Processing"],
-  "Model Architectures":["BERT","GPT","CLIP","LayoutLM","Donut"],
+  "Model Architectures":["BERT","GPT","CLIP","LayoutLM","Donut","EfficientNet"],
 };
 
 /* level-3 sub-topics: parent topic id → ordered child ids. The parent keeps its
@@ -486,6 +487,9 @@ const cross = [
   ["Differential Privacy","Data Quality & Governance"],
   ["Speech Processing","Transformers"],["Speech Processing","Embeddings"],["Speech Processing","Vision-Language Models"],
   ["BERT","Encoder vs Decoder Models"],["BERT","Transformers"],["BERT","Fine-Tuning & Transfer Learning"],["BERT","Language Models"],["BERT","Named Entity Recognition"],["BERT","Textual Entailment"],
+  ["EfficientNet","CNNs"],["EfficientNet","Residual / Skip Connections"],["EfficientNet","Fine-Tuning & Transfer Learning"],["EfficientNet","Image Classification"],
+  ["EfficientNet","Object Detection"],["EfficientNet","Vision Transformers"],["EfficientNet","Model Acceleration"],["EfficientNet","Hyperparameter Tuning"],
+  ["EfficientNet","Neural Network Training"],["EfficientNet","Knowledge Distillation"],["EfficientNet","DL Architectures Compared"],["EfficientNet","CLIP"],
   ["GPT","Large Language Models"],["GPT","Transformers"],["GPT","Encoder vs Decoder Models"],["GPT","Policy / Preference Optimization"],["GPT","Attention"],
   ["GPT","Tokenization"],["GPT","Language Models"],["GPT","Context Engineering"],["GPT","Hallucination & Factuality"],["GPT","Context-Length Extension"],
   ["GPT","Speculative Decoding"],["GPT","Model Acceleration"],["GPT","Residual / Skip Connections"],["GPT","Reasoning in LLMs"],["GPT","LLMOps"],["GPT","RAG"],

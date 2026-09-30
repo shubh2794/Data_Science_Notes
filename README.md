@@ -82,7 +82,7 @@ data-eng/MLOps/viz stubs).
 | Data Engineering | `data-engineering/` | 🟡 Data Preprocessing, Sampling/Imbalance, Quality/Governance, Differential Privacy (originals ETL/Warehouse/Feature Store/Stream = stubs) |
 | MLOps & Deployment | `mlops/` | 🟡 LLMOps, Model Acceleration, A/B Testing, Federated Learning (originals Deploy/Monitor/CI-CD/Tracking = stubs) |
 | Speech & Audio | `speech/` | ✅ Speech Processing (1/1) |
-| Model Architectures | `models/` | ✅ BERT, GPT, CLIP, LayoutLM (v1/v2/v3), Donut (each with notes + research papers + visuals) — add more models here |
+| Model Architectures | `models/` | ✅ BERT, GPT, CLIP, LayoutLM (v1/v2/v3), Donut, EfficientNet (each with notes + research papers + visuals) — add more models here |
 | Math & Statistics | `math/` | 🟡 Linear Algebra (hub + 6 sub-topic pages: Vectors & Vector Spaces, Matrices & Rank, Systems/Determinants/Inverses, Projections & Least-Squares, Eigendecomposition & SVD, Quadratic Forms/Covariance/PCA), Calculus, Optimization — Probability, Statistics = stubs |
 | Programming & Tools | `programming-tools/` | ⏳ Scaffold nodes only |
 | Data Systems | `databases/` | 🟡 Vector Databases (HNSW) — relational/NoSQL, indexing, transactions, distributed storage, streaming, lakes, scaling patterns = stubs |
