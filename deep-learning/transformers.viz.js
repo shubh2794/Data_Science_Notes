@@ -50,6 +50,14 @@
     33  #ll-svg   the logit lens on the trained model
     34  #f3-svg   the three families at one budget, counted exactly
     35  #bg-svg   the bugs that do not crash, measured
+    36  #ck-svg   configuration → bytes → shards → load-time peak → device placement
+    37  #bm-svg   attention backends: memory held and a roofline time model
+    38  #pg-svg   contiguous reservation against paged KV allocation
+    39  #kv-svg   KV-cache strategies over one generation
+    40  #lp-svg   one step through the logits-processor pipeline
+    41  #cs-svg   contrastive search against greedy on a looping toy model
+    42  #px-svg   strided perplexity: windows, scored tokens, context
+    43  #ct-svg   a chat-template renderer
 
    Every number these print is recomputed from the data they draw.          */
 
@@ -2271,5 +2279,604 @@ const TR = (function () {
   }
   d3.select("#bg-c").on("change", draw);
   ["bg-L", "bg-p", "bg-seed"].forEach(id => d3.select("#" + id).on("input", draw));
+  draw();
+})();
+
+
+/* ══════════ inference figures (§36–§51) ══════════════════════════════════
+   Each is its own IIFE, exits quietly without its svg, and wraps its draw in
+   try/catch so one figure's failure is printed in its own readout instead of
+   stopping the page. Every printed number is computed below from the
+   configuration it draws.                                                   */
+const INF = (function () {
+  /* §22's closed form, tensor by tensor, for the configurations the figures use */
+  const CFG = {
+    "1b":  { name: "1B-class", V: 128256, d: 2048, L: 16, h: 32, g: 8, dk: 64, dff: 8192, tied: true, E: 0 },
+    "8b":  { name: "8B-class", V: 128256, d: 4096, L: 32, h: 32, g: 8, dk: 128, dff: 14336, tied: false, E: 0 },
+    "7b":  { name: "7B-class MHA", V: 32000, d: 4096, L: 32, h: 32, g: 32, dk: 128, dff: 11008, tied: false, E: 0 },
+    "moe": { name: "8 × 7B experts", V: 32000, d: 4096, L: 32, h: 32, g: 8, dk: 128, dff: 14336, tied: false, E: 8 },
+    "70b": { name: "70B-class", V: 32000, d: 8192, L: 80, h: 64, g: 8, dk: 128, dff: 28672, tied: false, E: 0 }
+  };
+  function tensors(c) {
+    const T = [], d = c.d;
+    T.push({ n: "embed", p: c.V * d, unit: "embed" });
+    for (let l = 0; l < c.L; l++) {
+      const u = "block" + l;
+      T.push({ n: `L${l}.in_norm`, p: d, unit: u });
+      T.push({ n: `L${l}.q`, p: d * c.h * c.dk, unit: u });
+      T.push({ n: `L${l}.k`, p: d * c.g * c.dk, unit: u });
+      T.push({ n: `L${l}.v`, p: d * c.g * c.dk, unit: u });
+      T.push({ n: `L${l}.o`, p: c.h * c.dk * d, unit: u });
+      T.push({ n: `L${l}.post_norm`, p: d, unit: u });
+      if (c.E) {
+        T.push({ n: `L${l}.router`, p: d * c.E, unit: u });
+        for (let e = 0; e < c.E; e++) ["w1", "w3", "w2"].forEach(w => T.push({ n: `L${l}.e${e}.${w}`, p: d * c.dff, unit: u }));
+      } else ["gate", "up", "down"].forEach(w => T.push({ n: `L${l}.${w}`, p: d * c.dff, unit: u }));
+    }
+    T.push({ n: "final_norm", p: d, unit: "head" });
+    if (!c.tied) T.push({ n: "lm_head", p: c.V * d, unit: "head" });
+    return T;
+  }
+  const total = c => tensors(c).reduce((s, t) => s + t.p, 0);
+  const kvPerTok = (c, b) => 2 * c.L * c.g * c.dk * (b || 2);
+  const GB = x => x / 1e9, GiB = x => x / 1073741824, MiB = x => x / 1048576;
+  function bytesStr(x) {
+    if (x >= 1e12) return DL.fmt(x / 1e12, 2) + " TB";
+    if (x >= 1e9) return DL.fmt(x / 1e9, 2) + " GB";
+    if (x >= 1e6) return DL.fmt(x / 1e6, 1) + " MB";
+    if (x >= 1e3) return DL.fmt(x / 1e3, 1) + " kB";
+    return Math.round(x) + " B";
+  }
+  function ibytes(x) {
+    if (x >= 1073741824) return DL.fmt(x / 1073741824, 2) + " GiB";
+    if (x >= 1048576) return DL.fmt(x / 1048576, 1) + " MiB";
+    if (x >= 1024) return DL.fmt(x / 1024, 1) + " KiB";
+    return Math.round(x) + " B";
+  }
+  function guard(roId, fn) {
+    return function () {
+      try { fn(); }
+      catch (e) {
+        const ro = document.getElementById(roId);
+        if (ro) ro.textContent = "figure error: " + (e && e.message ? e.message : String(e));
+        if (typeof console !== "undefined" && console.error) console.error(e);
+      }
+    };
+  }
+  function softmaxMasked(z) {           /* −∞ entries get exactly 0 */
+    let m = -Infinity; z.forEach(v => { if (v > m) m = v; });
+    const e = z.map(v => (v === -Infinity ? 0 : Math.exp(v - m))), s = e.reduce((a, b) => a + b, 0);
+    return e.map(v => v / s);
+  }
+  const entropy = p => -p.reduce((s, v) => s + (v > 0 ? v * Math.log(v) : 0), 0);
+  return { CFG, tensors, total, kvPerTok, GB, GiB, MiB, bytesStr, ibytes, guard, softmaxMasked, entropy };
+})();
+
+/* ═════════ 36 · #ck-svg — configuration → bytes → shards → load curve → placement ═ */
+(function () {
+  const svg = d3.select("#ck-svg"); if (svg.empty()) return;
+  const W = 760, H = 420, El = id => document.getElementById(id);
+  const draw = INF.guard("ck-readout", function () {
+    const c = INF.CFG[El("ck-m").value], bpp = +El("ck-t").value, cap = +El("ck-s").value * 1e9;
+    const gpu = +El("ck-g").value * 1e9, cpu = +El("ck-c").value * 1e9;
+    const T = INF.tensors(c).map(t => Object.assign({}, t, { b: t.p * bpp }));
+    const M = T.reduce((s, t) => s + t.b, 0), P = T.reduce((s, t) => s + t.p, 0);
+    /* greedy sharding in parameter order */
+    const shards = []; let cur = 0;
+    T.forEach(t => { if (cur > 0 && cur + t.b > cap) { shards.push(cur); cur = 0; } cur += t.b; });
+    if (cur > 0) shards.push(cur);
+    const S = shards.length, maxShard = Math.max(...shards);
+    /* largest conversion group (experts of one layer, stacked + concatenated) */
+    const conv = c.E ? 2 * c.E * c.d * c.dff * bpp : 0;
+    /* load curves */
+    const naiveOne = [], naiveSh = [], meta = [];
+    let acc = 0;
+    for (let k = 0; k <= S; k++) {
+      naiveOne.push(k === 0 ? M : M + (k === S ? M : acc));   // single state dict: grows to M
+      meta.push(acc + (k > 0 && k < S ? conv : 0));
+      naiveSh.push(k === 0 ? M : M + shards[k - 1]);
+      if (k < S) acc += shards[k];
+    }
+    naiveOne[S] = 2 * M; meta[S] = M;
+    const peakOne = 2 * M, peakSh = M + maxShard, peakMeta = M + conv;
+    /* placement: whole units, fastest first */
+    const units = []; T.forEach(t => { const u = units.find(x => x.u === t.unit); if (u) u.b += t.b; else units.push({ u: t.unit, b: t.b }); });
+    let gUsed = 0, cUsed = 0, dUsed = 0, gBlocks = 0, cBlocks = 0, dBlocks = 0, dev = "gpu";
+    units.forEach(u => {
+      if (dev === "gpu" && gUsed + u.b > gpu) dev = "cpu";
+      if (dev === "cpu" && cUsed + u.b > cpu) dev = "disk";
+      const isB = u.u.startsWith("block");
+      if (dev === "gpu") { gUsed += u.b; if (isB) gBlocks++; }
+      else if (dev === "cpu") { cUsed += u.b; if (isB) cBlocks++; }
+      else { dUsed += u.b; if (isB) dBlocks++; }
+    });
+    const tGpu = gUsed / 3.35e12, tCpu = cUsed / 25e9, tDisk = dUsed / 3e9;
+    /* draw */
+    const f = DL.frame(svg, W, H, { l: 50, r: 16, t: 24, b: 34 }), g = f.g;
+    TR.title(g, 0, -8, `${c.name}: ${DL.commas(P)} parameters × ${bpp} B = ${INF.bytesStr(M)} in ${S} shard${S > 1 ? "s" : ""} (cap ${El("ck-s").value} GB)`);
+    const sx = d3.scaleLinear().domain([0, M]).range([0, f.iw]);
+    let x0 = 0;
+    const pal = [DC.accent, DC.teal, DC.violet, DC.a2];
+    shards.forEach((b, i) => {
+      g.append("rect").attr("x", sx(x0)).attr("y", 4).attr("width", Math.max(0.8, sx(b) - 1)).attr("height", 26).attr("rx", 2).attr("fill", pal[i % 4]).attr("fill-opacity", 0.75);
+      if (sx(b) > 34) TR.note(g, sx(x0) + sx(b) / 2, 21, INF.bytesStr(b), DC.bg, 9, "middle");
+      x0 += b;
+    });
+    TR.note(g, 0, 44, `shards in parameter order; largest ${INF.bytesStr(maxShard)}; the index maps ${DL.commas(T.length)} tensor names to them`, DC.muted, 9.5);
+    /* load curves */
+    const gy = 70, ph = f.ih - gy - 10, pw = 390;
+    const g2 = g.append("g").attr("transform", `translate(0,${gy})`);
+    TR.title(g2, 0, -6, "memory in use while loading");
+    const x2 = d3.scaleLinear().domain([0, S]).range([0, pw]), y2 = d3.scaleLinear().domain([0, peakOne * 1.08]).range([ph, 0]);
+    DL.gridY(g2, y2, pw, 4); DL.axisB(g2, x2, ph, Math.min(S, 8), "shards read", v => Number.isInteger(v) ? v : ""); DL.axisL(g2, y2, 4, "", v => INF.bytesStr(v));
+    const line = (arr, col, dash) => DL.curve(g2, arr.map((v, k) => [x2(k), y2(v)]), { stroke: col, w: 2, dash: dash });
+    line(naiveOne, DC.bad); line(naiveSh, DC.a2, "5 3"); line(meta, DC.good);
+    DL.legend(g2, [{ label: `naive, one file: peak ${INF.bytesStr(peakOne)}`, color: DC.bad }, { label: `naive, shard by shard: ${INF.bytesStr(peakSh)}`, color: DC.a2 }, { label: `meta skeleton: ${INF.bytesStr(peakMeta)}`, color: DC.good }], 8, 8, { gap: 13, font: 9 });
+    /* placement */
+    const g3 = g.append("g").attr("transform", `translate(${pw + 60},${gy})`), bw = f.iw - pw - 60;
+    TR.title(g3, 0, -6, "device map: whole blocks, fastest first");
+    const tot = gUsed + cUsed + dUsed, y3 = d3.scaleLinear().domain([0, tot]).range([0, ph - 30]);
+    let yy = 0;
+    [["GPU", gUsed, gBlocks, DC.good], ["CPU", cUsed, cBlocks, DC.a2], ["disk", dUsed, dBlocks, DC.bad]].forEach(r => {
+      if (r[1] <= 0) return;
+      g3.append("rect").attr("x", 0).attr("y", yy).attr("width", 60).attr("height", Math.max(1, y3(r[1]))).attr("fill", r[3]).attr("fill-opacity", 0.75);
+      TR.note(g3, 70, yy + Math.max(10, y3(r[1]) / 2 + 3), `${r[0]}: ${INF.bytesStr(r[1])}, ${r[2]} of ${c.L} blocks`, DC.ink, 9.5);
+      yy += y3(r[1]);
+    });
+    TR.note(g3, 0, ph - 8, `budget GPU ${El("ck-g").value} GB, CPU ${El("ck-c").value} GB`, DC.muted, 9);
+    El("ck-readout").innerHTML =
+      `<b>${DL.commas(P)}</b> parameters at ${bpp} B = <b>${INF.bytesStr(M)}</b> (${DL.fmt(INF.GiB(M), 2)} GiB) in <b>${S}</b> shard${S > 1 ? "s" : ""} under a ${El("ck-s").value} GB cap (largest ${INF.bytesStr(maxShard)}). ` +
+      `Peak while loading: naive from one file <b>${INF.bytesStr(peakOne)}</b>; naive shard by shard ${INF.bytesStr(peakSh)}; meta-device skeleton <b>${INF.bytesStr(peakMeta)}</b>` + (conv ? ` (the model plus one layer's expert stack during conversion, ${INF.bytesStr(conv)})` : "") + `. ` +
+      `Placement: GPU ${INF.bytesStr(gUsed)} (${gBlocks} blocks), CPU ${INF.bytesStr(cUsed)} (${cBlocks}), disk ${INF.bytesStr(dUsed)} (${dBlocks}). ` +
+      `Streaming every weight once per generated token: GPU part ${DL.fmt(tGpu * 1e3, 1)} ms at 3.35 TB/s` + (cUsed ? `, CPU part ${DL.fmt(tCpu, 2)} s at ~25 GB/s` : "") + (dUsed ? `, disk part ${DL.fmt(tDisk, 1)} s at ~3 GB/s` : "") + ` (assumed rates).`;
+  });
+  ["ck-m", "ck-t", "ck-s", "ck-g", "ck-c"].forEach(id => d3.select("#" + id).on("change", draw));
+  draw();
+})();
+
+/* ═════════ 41 · #bm-svg — attention backends: memory and a roofline time model ═ */
+(function () {
+  const svg = d3.select("#bm-svg"); if (svg.empty()) return;
+  const W = 760, H = 400, El = id => document.getElementById(id);
+  const GPU = { a100: { name: "A100", flops: 312e12, bw: 2.04e12 }, h100: { name: "H100", flops: 989e12, bw: 3.35e12 } };
+  const TILE = 128;
+  function keptTiles(n, w) {                  /* causal sliding window of width w, TILE-wide tiles */
+    const nt = Math.ceil(n / TILE); let k = 0;
+    for (let i = 0; i < nt; i++) {
+      const qLo = i * TILE, qHi = Math.min(n, qLo + TILE) - 1;
+      for (let j = 0; j <= i; j++) {
+        const kLo = j * TILE, kHi = Math.min(n, kLo + TILE) - 1;
+        if (qHi - kLo >= 0 && qLo - kHi < w) k++;        /* some pair with 0 ≤ q − k < w */
+      }
+    }
+    return k;
+  }
+  function model(n, h, g, dk, w, G) {
+    const qo = 2 * n * h * dk * 2, kv = 2 * n * g * dk * 2, stats = h * n * 4;
+    const nt = Math.ceil(n / TILE), causal = nt * (nt + 1) / 2, kept = keptTiles(n, w);
+    const kvTile = TILE * 2 * g * dk * 2;
+    const eager = { mem: qo + kv + 2 * h * n * n * 2, fl: 4 * n * n * h * dk, by: qo + kv + 8 * h * n * n };
+    const flash = { mem: qo + kv + stats, fl: 4 * causal * TILE * TILE * h * dk, by: qo + causal * kvTile };
+    const flex = { mem: qo + kv + stats + nt * nt, fl: 4 * kept * TILE * TILE * h * dk, by: qo + kept * kvTile };
+    [eager, flash, flex].forEach(o => { o.t = Math.max(o.fl / G.flops, o.by / G.bw); o.bound = o.fl / G.flops > o.by / G.bw ? "compute" : "bandwidth"; });
+    return { eager, flash, flex, nt, causal, kept };
+  }
+  const draw = INF.guard("bm-readout", function () {
+    const h = +El("bm-h").value, gs = El("bm-g").value, g = gs === "h" ? h : +gs, dk = +El("bm-d").value;
+    const n = Math.pow(2, +El("bm-n").value), w = +El("bm-w").value, G = GPU[El("bm-gpu").value];
+    El("bm-nv").textContent = DL.commas(n);
+    const f = DL.frame(svg, W, H, { l: 58, r: 14, t: 24, b: 38 }), gg = f.g;
+    const pw = (f.iw - 70) / 2, ph = f.ih;
+    const ns = d3.range(9, 18).map(k => Math.pow(2, k));
+    const rows = ns.map(nn => ({ n: nn, m: model(nn, h, g, dk, w, G) }));
+    const x = d3.scaleLog().base(2).domain([512, 131072]).range([0, pw]);
+    const panel = (ox, ttl, key, fmt) => {
+      const p = gg.append("g").attr("transform", `translate(${ox},0)`);
+      TR.title(p, 0, -8, ttl);
+      const vals = rows.flatMap(r => [r.m.eager[key], r.m.flash[key], r.m.flex[key]]);
+      const y = d3.scaleLog().domain([d3.min(vals) / 1.5, d3.max(vals) * 1.5]).range([ph, 0]);
+      DL.axisB(p, x, ph, 5, "sequence length n", v => v >= 1024 ? (v / 1024) + "k" : v);
+      DL.axisL(p, y, 5, "", fmt);
+      [["eager", DC.bad], ["flash", DC.good], ["flex", DC.violet]].forEach(s => DL.curve(p, rows.map(r => [x(r.n), y(r.m[s[0]][key])]), { stroke: s[1], w: 2, dash: s[0] === "flex" ? "5 3" : null }));
+      p.append("line").attr("x1", x(n)).attr("x2", x(n)).attr("y1", 0).attr("y2", ph).attr("stroke", DC.a2).attr("stroke-dasharray", "3 3");
+      return { p, y };
+    };
+    const A = panel(0, "memory held, one layer, batch 1, bf16", "mem", v => INF.bytesStr(v));
+    A.p.append("line").attr("x1", 0).attr("x2", pw).attr("y1", A.y(80e9)).attr("y2", A.y(80e9)).attr("stroke", DC.muted).attr("stroke-dasharray", "6 4");
+    TR.note(A.p, 4, A.y(80e9) - 4, "80 GB device", DC.muted, 9);
+    DL.legend(A.p, [{ label: "eager (S and A materialised)", color: DC.bad }, { label: "flash-style, causal", color: DC.good }, { label: `flex, causal window ${DL.commas(w)}`, color: DC.violet }], 6, 10, { gap: 13, font: 9 });
+    panel(pw + 70, `roofline time model, ${G.name}`, "t", v => v >= 1 ? DL.fmt(v, 1) + " s" : (v >= 1e-3 ? DL.fmt(v * 1e3, 1) + " ms" : DL.fmt(v * 1e6, 0) + " µs"));
+    const m = model(n, h, g, dk, w, G);
+    const fitsE = m.eager.mem <= 80e9;
+    El("bm-readout").innerHTML =
+      `At n = ${DL.commas(n)} with h = ${h}, g = ${g}, dₖ = ${dk}: eager holds <b>${INF.ibytes(m.eager.mem)}</b> (${fitsE ? "fits" : "<b>does not fit</b>"} in 80 GB), a flash-style kernel <b>${INF.ibytes(m.flash.mem)}</b> — ${DL.fmt(m.eager.mem / m.flash.mem, 0)}× less. ` +
+      `Tiles of ${TILE}: ${DL.commas(m.nt * m.nt)} in all, ${DL.commas(m.causal)} causal (${DL.fmt(100 * m.causal / (m.nt * m.nt), 1)}%), ${DL.commas(m.kept)} inside a causal window of ${DL.commas(w)} (${DL.fmt(100 * m.kept / (m.nt * m.nt), 1)}%). ` +
+      `Modelled time on ${G.name}: eager ${DL.fmt(m.eager.t * 1e3, 2)} ms (${m.eager.bound}-bound), flash ${DL.fmt(m.flash.t * 1e3, 2)} ms (${m.flash.bound}-bound), flex window ${DL.fmt(m.flex.t * 1e3, 2)} ms — a lower bound at full utilisation, not a benchmark.`;
+  });
+  ["bm-h", "bm-g", "bm-d", "bm-w", "bm-gpu"].forEach(id => d3.select("#" + id).on("change", draw));
+  d3.select("#bm-n").on("input", draw);
+  draw();
+})();
+
+/* ═════════ 42 · #pg-svg — contiguous reservation against paged allocation ═ */
+(function () {
+  const svg = d3.select("#pg-svg"); if (svg.empty()) return;
+  const W = 760, H = 380, El = id => document.getElementById(id);
+  const draw = INF.guard("pg-readout", function () {
+    const R = +El("pg-r").value, maxL = +El("pg-m").value, B = +El("pg-b").value, seed = +El("pg-seed").value;
+    El("pg-rv").textContent = R; El("pg-seedv").textContent = seed;
+    const rnd = DL.rng(seed * 131 + 7);
+    const lens = d3.range(R).map(() => Math.max(1, Math.round(maxL * (0.03 + 0.97 * Math.pow(rnd(), 1.3)))));
+    const used = d3.sum(lens), reserved = R * maxL;
+    const blocks = lens.map(l => Math.ceil(l / B)), paged = d3.sum(blocks) * B;
+    const bpt = INF.kvPerTok(INF.CFG["8b"]);
+    const f = DL.frame(svg, W, H, { l: 70, r: 14, t: 22, b: 20 }), g = f.g;
+    const rowH = Math.min(22, 170 / R);
+    const x = d3.scaleLinear().domain([0, maxL]).range([0, f.iw - 120]);
+    const col = i => d3.schemeTableau10[i % 10];
+    TR.title(g, 0, -6, `contiguous: every request reserves ${DL.commas(maxL)} slots — utilisation ${DL.fmt(100 * used / reserved, 1)}%`);
+    lens.forEach((l, i) => {
+      const y = 4 + i * rowH;
+      g.append("rect").attr("x", 0).attr("y", y).attr("width", x(maxL)).attr("height", rowH - 2).attr("fill", DC.panel2).attr("stroke", DC.line);
+      g.append("rect").attr("x", 0).attr("y", y).attr("width", x(l)).attr("height", rowH - 2).attr("fill", col(i)).attr("fill-opacity", 0.8);
+      TR.note(g, -6, y + rowH - 4, `req ${i + 1}`, DC.muted, 8.5, "end");
+      TR.note(g, x(maxL) + 6, y + rowH - 4, `${DL.commas(l)} used`, DC.muted, 8.5);
+    });
+    const y0 = 4 + R * rowH + 34;
+    TR.title(g, 0, y0 - 10, `paged, B = ${B}: ${DL.commas(d3.sum(blocks))} blocks from one pool — waste ${DL.fmt(100 * (paged - used) / paged, 2)}%`);
+    const xp = d3.scaleLinear().domain([0, reserved]).range([0, f.iw - 120]);
+    let off = 0;
+    lens.forEach((l, i) => {
+      const a = blocks[i] * B;
+      g.append("rect").attr("x", xp(off)).attr("y", y0).attr("width", Math.max(0.6, xp(l))).attr("height", 30).attr("fill", col(i)).attr("fill-opacity", 0.85);
+      g.append("rect").attr("x", xp(off + l)).attr("y", y0).attr("width", Math.max(0, xp(a - l))).attr("height", 30).attr("fill", DC.bad).attr("fill-opacity", 0.5);
+      off += a;
+    });
+    g.append("rect").attr("x", 0).attr("y", y0 + 38).attr("width", xp(reserved)).attr("height", 12).attr("fill", DC.panel2).attr("stroke", DC.line);
+    g.append("rect").attr("x", 0).attr("y", y0 + 38).attr("width", xp(paged)).attr("height", 12).attr("fill", DC.good).attr("fill-opacity", 0.7);
+    TR.note(g, 0, y0 + 66, `same scale: the green bar is what paging holds, the grey outline what reservation holds (${DL.commas(paged)} against ${DL.commas(reserved)} token slots)`, DC.muted, 9);
+    TR.note(g, 0, y0 + 82, `red slivers: the unused tail of each request's last block — at most ${B - 1} slots each`, DC.muted, 9);
+    El("pg-readout").innerHTML =
+      `Request lengths ${lens.map(v => DL.commas(v)).join(", ")} (total ${DL.commas(used)} tokens). ` +
+      `Contiguous reservation holds ${DL.commas(reserved)} slots — utilisation <b>${DL.fmt(100 * used / reserved, 1)}%</b>, ${INF.ibytes(reserved * bpt)} for an 8B-class model at ${INF.ibytes(bpt)} per token. ` +
+      `Paging with B = ${B} holds ${DL.commas(d3.sum(blocks))} blocks = ${DL.commas(paged)} slots — waste <b>${DL.fmt(100 * (paged - used) / paged, 2)}%</b>, ${INF.ibytes(paged * bpt)}; the waste per sequence is at most ${B - 1} slots whatever the reserved length.`;
+  });
+  ["pg-m", "pg-b"].forEach(id => d3.select("#" + id).on("change", draw));
+  ["pg-r", "pg-seed"].forEach(id => d3.select("#" + id).on("input", draw));
+  draw();
+})();
+
+/* ═════════ 45 · #kv-svg — KV-cache strategies over one generation ═ */
+(function () {
+  const svg = d3.select("#kv-svg"); if (svg.empty()) return;
+  const W = 760, H = 400, El = id => document.getElementById(id);
+  const draw = INF.guard("kv-readout", function () {
+    const c = INF.CFG[El("kv-m").value], Pn = +El("kv-p").value, Nn = +El("kv-n").value, S = +El("kv-s").value;
+    const w = +El("kv-w").value, bits = +El("kv-q").value, bat = +El("kv-b").value;
+    const bpt = INF.kvPerTok(c) * bat, qf = (bits / 8 + 4 / 64) / 2, T = Pn + Nn, RES = 128;
+    const ts = d3.range(0, 201).map(k => Math.round(T * k / 200));
+    const strat = {
+      dynamic: t => t * bpt,
+      static: t => S * bpt,
+      sliding: t => Math.min(t, w) * bpt,
+      hybrid: t => 0.5 * (t + Math.min(t, w)) * bpt,
+      quantised: t => { const r = t <= Pn ? 0 : (t - Pn) % RES; return (t - r) * bpt * qf + r * bpt; },
+      offloaded: t => t * bpt * 2 / c.L
+    };
+    const cols = { dynamic: DC.accent, static: DC.a2, sliding: DC.teal, hybrid: DC.lime, quantised: DC.violet, offloaded: DC.rose };
+    const f = DL.frame(svg, W, H, { l: 60, r: 14, t: 24, b: 38 }), g = f.g;
+    const pw = f.iw - 250, ph = f.ih;
+    const ymax = Math.max(strat.dynamic(T), strat.static(T)) * 1.08;
+    const x = d3.scaleLinear().domain([0, T]).range([0, pw]), y = d3.scaleLinear().domain([0, ymax]).range([ph, 0]);
+    TR.title(g, 0, -8, `${c.name}, batch ${bat}: ${INF.ibytes(bpt / bat)} per token per sequence`);
+    const unit = ymax >= 2 * 1073741824 ? 1073741824 : 1048576, tv = d3.ticks(0, ymax / unit, 4).map(v => v * unit);
+    tv.forEach(v => g.append("line").attr("x1", 0).attr("x2", pw).attr("y1", y(v)).attr("y2", y(v)).attr("stroke", DC.grid));
+    DL.axisB(g, x, ph, 5, "tokens processed", v => DL.big(v));
+    g.append("g").attr("class", "axis").call(d3.axisLeft(y).tickValues(tv).tickFormat(v => INF.ibytes(v)));
+    Object.keys(strat).forEach(k => DL.curve(g, ts.map(t => [x(t), y(strat[k](t))]), { stroke: cols[k], w: k === "static" ? 2.4 : 1.8, dash: (k === "static" && S < T) ? "6 4" : null }));
+    g.append("line").attr("x1", x(Pn)).attr("x2", x(Pn)).attr("y1", 0).attr("y2", ph).attr("stroke", DC.muted).attr("stroke-dasharray", "3 3");
+    TR.note(g, x(Pn) + 4, 10, "end of prompt", DC.muted, 9);
+    /* bars at T */
+    const gb = g.append("g").attr("transform", `translate(${pw + 40},0)`), bw = 200;
+    TR.title(gb, 0, -8, `GPU bytes at t = ${DL.commas(T)}`);
+    const keys = Object.keys(strat), bh = (ph - 20) / keys.length, xb = d3.scaleLinear().domain([0, ymax]).range([0, bw - 70]);
+    keys.forEach((k, i) => {
+      const v = strat[k](T);
+      gb.append("rect").attr("x", 0).attr("y", i * bh).attr("width", Math.max(1, xb(v))).attr("height", bh - 8).attr("fill", cols[k]).attr("fill-opacity", 0.8);
+      TR.note(gb, Math.max(1, xb(v)) + 4, i * bh + bh / 2, INF.ibytes(v), DC.ink, 9);
+      TR.note(gb, 0, i * bh + bh - 10 + 9, k === "hybrid" ? "half sliding, half full" : (k === "offloaded" ? "offloaded (GPU part)" : k), cols[k], 8.5);
+    });
+    const busT = strat.dynamic(T) / 25e9, fits = S >= T;
+    El("kv-readout").innerHTML =
+      `${c.name}: 2·L·g·dₖ·2 B = <b>${INF.ibytes(bpt / bat)}</b> per token per sequence, × batch ${bat}. After ${DL.commas(Pn)} prompt + ${DL.commas(Nn)} new tokens: ` +
+      `dynamic <b>${INF.ibytes(strat.dynamic(T))}</b>; static ${INF.ibytes(strat.static(T))} ` + (fits ? `(${DL.fmt(100 * (1 - T / S), 1)}% of it never written)` : `(<b>too small</b>: max_len ${DL.commas(S)} &lt; ${DL.commas(T)} tokens)`) + `; ` +
+      `sliding w = ${DL.commas(w)} ${INF.ibytes(strat.sliding(T))}; half sliding ${INF.ibytes(strat.hybrid(T))}; quantised ${bits}-bit ${INF.ibytes(strat.quantised(T))} (${DL.fmt(1 / qf, 2)}× smaller per quantised element); ` +
+      `offloaded ${INF.ibytes(strat.offloaded(T))} on the GPU, with ≈ ${INF.ibytes(strat.dynamic(T))} crossing the bus per step — ${DL.fmt(busT * 1e3, 1)} ms at an assumed 25 GB/s.`;
+  });
+  ["kv-m", "kv-p", "kv-n", "kv-s", "kv-w", "kv-q", "kv-b"].forEach(id => d3.select("#" + id).on("change", draw));
+  draw();
+})();
+
+/* ═════════ 46 · #lp-svg — one step through the logits-processor pipeline ═ */
+(function () {
+  const svg = d3.select("#lp-svg"); if (svg.empty()) return;
+  const W = 760, H = 400, El = id => document.getElementById(id);
+  const VOC = ["the", "cat", "sat", "on", "mat", "."], Z0 = [2.0, 1.5, 0.8, -0.3, 1.2, -1.0], CTX = [0, 1, 2, 3, 0];
+  function repPen(z, th) { const seen = new Set(CTX); return z.map((v, i) => seen.has(i) ? (v > 0 ? v / th : v * th) : v); }
+  function ngramBan(z, n) {
+    if (!n) return z.slice();
+    const out = z.slice(), pre = CTX.slice(CTX.length - (n - 1));
+    for (let s = 0; s + n <= CTX.length; s++) {
+      let ok = true; for (let j = 0; j < n - 1; j++) if (CTX[s + j] !== pre[j]) ok = false;
+      if (ok) out[CTX[s + n - 1]] = -Infinity;
+    }
+    return out;
+  }
+  const draw = INF.guard("lp-readout", function () {
+    const th = +El("lp-r").value, n = +El("lp-n").value, T = +El("lp-T").value, k = +El("lp-k").value, pp = +El("lp-p").value, off = +El("lp-o").value;
+    El("lp-rv").textContent = th.toFixed(2); El("lp-Tv").textContent = T.toFixed(1); El("lp-pv").textContent = pp.toFixed(2); El("lp-ov").textContent = off.toFixed(1);
+    const z0 = Z0.map(v => v + off);
+    const z1 = repPen(z0, th), z2 = ngramBan(z1, n), z3 = z2.map(v => v === -Infinity ? v : v / T);
+    let z4 = z3.slice();
+    if (k > 0) { const ord = d3.range(6).sort((a, b) => z3[b] - z3[a]); z4 = z3.map((v, i) => ord.indexOf(i) < k ? v : -Infinity); }
+    const p4 = INF.softmaxMasked(z4), ord4 = d3.range(6).sort((a, b) => p4[b] - p4[a]);
+    const keep = new Set(); let cum = 0;
+    for (const i of ord4) { if (p4[i] <= 0) break; keep.add(i); cum += p4[i]; if (cum >= pp - 1e-12) break; }
+    const z5 = z4.map((v, i) => keep.has(i) ? v : -Infinity);
+    const stages = [["raw", INF.softmaxMasked(z0)], [`repetition ${th.toFixed(2)}`, INF.softmaxMasked(z1)], [n ? `no-repeat ${n}-gram` : "no-repeat off", INF.softmaxMasked(z2)], [`T = ${T.toFixed(1)}`, INF.softmaxMasked(z3)], [k ? `top-k ${k}` : "top-k off", p4], [`top-p ${pp.toFixed(2)}`, INF.softmaxMasked(z5)]];
+    const f = DL.frame(svg, W, H, { l: 30, r: 10, t: 20, b: 30 }), g = f.g;
+    TR.title(g, 0, -4, "context the penalties read:");
+    CTX.forEach((t, i) => { g.append("rect").attr("x", 160 + i * 46).attr("y", -16).attr("width", 42).attr("height", 18).attr("rx", 3).attr("fill", DC.panel2).attr("stroke", th > 1 ? DC.a2 : DC.line); TR.note(g, 160 + i * 46 + 21, -3, VOC[t], DC.ink, 10, "middle"); });
+    const pw = (f.iw - 5 * 14) / 6, ph = f.ih - 60, y = d3.scaleLinear().domain([0, 1]).range([ph, 0]);
+    stages.forEach((st, s) => {
+      const gg = g.append("g").attr("transform", `translate(${s * (pw + 14)},30)`);
+      TR.title(gg, 0, -2, st[0]);
+      const bx = d3.scaleBand().domain(d3.range(6)).range([0, pw]).paddingInner(0.2);
+      if (s === 0) DL.axisL(gg, y, 4); else gg.append("line").attr("x1", 0).attr("x2", 0).attr("y1", 0).attr("y2", ph).attr("stroke", DC.line);
+      st[1].forEach((v, i) => {
+        gg.append("rect").attr("x", bx(i)).attr("y", y(v)).attr("width", bx.bandwidth()).attr("height", ph - y(v)).attr("fill", v > 0 ? (i === 0 ? DC.a2 : DC.accent) : DC.bad).attr("fill-opacity", 0.85);
+        TR.note(gg, bx(i) + bx.bandwidth() / 2, y(v) - 3, v > 0 ? DL.fmt(v, 2) : "0", DC.muted, 7.5, "middle");
+        TR.note(gg, bx(i) + bx.bandwidth() / 2, ph + 11, VOC[i], DC.muted, 8, "middle");
+      });
+      TR.note(gg, 0, ph + 24, `H = ${DL.fmt(INF.entropy(st[1]), 2)} nats`, DC.muted, 8.5);
+    });
+    const pThe0 = INF.softmaxMasked(z0)[0], pThe1 = stages[1][1][0];
+    El("lp-readout").innerHTML =
+      `p(the) through the stages: ${stages.map(s => DL.fmt(s[1][0], 3)).join(" → ")}; entropy ${stages.map(s => DL.fmt(INF.entropy(s[1]), 2)).join(" → ")} nats. ` +
+      `At logit offset ${off.toFixed(1)} the repetition penalty moves p(the) from ${DL.fmt(pThe0, 3)} to <b>${DL.fmt(pThe1, 3)}</b>` + (pThe1 > pThe0 + 1e-9 ? ` — it <b>raised</b> the repeated word, because its logit is negative and was multiplied while unseen words were left alone.` : ` — down, as intended.`) +
+      ` Surviving tokens: ${stages[5][1].map((v, i) => v > 0 ? VOC[i] : null).filter(Boolean).join(", ")}.`;
+  });
+  d3.select("#lp-n").on("change", draw); d3.select("#lp-k").on("change", draw);
+  ["lp-r", "lp-T", "lp-p", "lp-o"].forEach(id => d3.select("#" + id).on("input", draw));
+  draw();
+})();
+
+/* ═════════ 48 · #cs-svg — contrastive search against greedy on a looping toy model ═ */
+(function () {
+  const svg = d3.select("#cs-svg"); if (svg.empty()) return;
+  const W = 760, H = 380, El = id => document.getElementById(id);
+  const WORDS = ["the", "a", "cat", "dog", "sat", "ran", "on", "under", "mat", "rug", "and", "then", "it", "was", "warm", "quiet", "here", "now", "so", "very"];
+  const NV = WORDS.length, STEPS = 16, DIM = 8;
+  function build(seed) {
+    const r = DL.rng(seed * 977 + 13), P = [], E = [];
+    for (let i = 0; i < NV; i++) { const z = d3.range(NV).map(() => DL.randn(r) * 2.2); P.push(DL.softmax(z)); }
+    for (let i = 0; i < NV; i++) { const v = d3.range(DIM).map(() => DL.randn(r)); const nn = Math.hypot(...v); E.push(v.map(x => x / nn)); }
+    return { P, E };
+  }
+  const cos = (a, b) => a.reduce((s, v, i) => s + v * b[i], 0);
+  function run(M, alpha, k) {
+    const seq = [0], log = [];
+    for (let s = 0; s < STEPS; s++) {
+      const p = M.P[seq[seq.length - 1]], cand = d3.range(NV).sort((a, b) => p[b] - p[a]).slice(0, Math.max(1, k));
+      const rows = cand.map(v => { const sim = Math.max(...seq.map(j => cos(M.E[v], M.E[j]))); return { v, p: p[v], sim, sc: (1 - alpha) * p[v] - alpha * sim }; });
+      const best = alpha === 0 ? rows[0] : rows.reduce((a, b) => (b.sc > a.sc ? b : a));
+      log.push(rows.map(r => Object.assign(r, { chosen: r.v === best.v }))); seq.push(best.v);
+    }
+    return { seq, log };
+  }
+  const stats = (M, seq) => {
+    const bg = new Set(); let lp = 0;
+    for (let i = 1; i < seq.length; i++) { bg.add(seq[i - 1] + "," + seq[i]); lp += Math.log(M.P[seq[i - 1]][seq[i]]); }
+    return { distinct: bg.size / (seq.length - 1), lp: lp / (seq.length - 1) };
+  };
+  const draw = INF.guard("cs-readout", function () {
+    const a = +El("cs-a").value, k = +El("cs-k").value, st = +El("cs-s").value, seed = +El("cs-seed").value;
+    El("cs-av").textContent = a.toFixed(2); El("cs-sv").textContent = st; El("cs-seedv").textContent = seed;
+    const M = build(seed), G = run(M, 0, 1), C = run(M, a, k), sG = stats(M, G.seq), sC = stats(M, C.seq);
+    const f = DL.frame(svg, W, H, { l: 84, r: 10, t: 20, b: 16 }), g = f.g, cw = (f.iw) / (STEPS + 1);
+    const row = (y, lab, seq) => {
+      TR.note(g, -8, y + 14, lab, DC.muted, 9.5, "end");
+      seq.forEach((t, i) => {
+        const rep = seq.indexOf(t) < i;
+        g.append("rect").attr("x", i * cw).attr("y", y).attr("width", cw - 2).attr("height", 20).attr("rx", 3).attr("fill", i === 0 ? DC.panel2 : DC.accent).attr("fill-opacity", i === 0 ? 1 : 0.35).attr("stroke", rep ? DC.bad : DC.line).attr("stroke-width", rep ? 1.6 : 0.8);
+        TR.note(g, i * cw + (cw - 2) / 2, y + 14, WORDS[t], DC.ink, 8.5, "middle");
+      });
+    };
+    TR.title(g, 0, -6, "red outline = a word already produced earlier in the row");
+    row(4, "greedy", G.seq); row(32, "contrastive", C.seq);
+    g.append("rect").attr("x", st * cw - 1).attr("y", 30).attr("width", cw).attr("height", 24).attr("fill", "none").attr("stroke", DC.a2).attr("stroke-width", 1.5);
+    /* table */
+    const rows = C.log[st - 1], ty = 90;
+    TR.title(g, 0, ty, `contrastive step ${st}: candidates after "${WORDS[C.seq[st - 1]]}"`);
+    ["candidate", "p(v)", "max cos", "score"].forEach((hd, j) => TR.note(g, j * 90, ty + 18, hd, DC.muted, 9.5));
+    rows.forEach((r, i) => {
+      const yy = ty + 34 + i * 16, colr = r.chosen ? DC.a2 : DC.ink;
+      [WORDS[r.v], DL.fmt(r.p, 3), DL.fmt(r.sim, 3), DL.fmt(r.sc, 3)].forEach((v, j) => TR.note(g, j * 90, yy, v, colr, 10));
+    });
+    /* bars */
+    const gb = g.append("g").attr("transform", `translate(420,${ty + 22})`), bh = 150;
+    TR.title(gb, 0, -12, "distinct-bigram ratio (bars) and mean log p");
+    const yb = d3.scaleLinear().domain([0, 1.12]).range([bh, 0]);
+    [["greedy", sG, DC.bad], ["contrastive", sC, DC.good]].forEach((s, i) => {
+      gb.append("rect").attr("x", i * 70).attr("y", yb(s[1].distinct)).attr("width", 50).attr("height", bh - yb(s[1].distinct)).attr("fill", s[2]).attr("fill-opacity", 0.8);
+      TR.note(gb, i * 70 + 25, yb(s[1].distinct) - 4, DL.fmt(s[1].distinct, 2), DC.ink, 9.5, "middle");
+      TR.note(gb, i * 70 + 25, bh + 12, s[0], DC.muted, 9, "middle");
+      TR.note(g, 0, ty + 34 + rows.length * 16 + 14 + i * 16, `${s[0]}: mean log p per token ${DL.fmt(s[1].lp, 3)}`, s[2], 9.5);
+    });
+    const chosen = rows.find(r => r.chosen);
+    El("cs-readout").innerHTML =
+      `Greedy: <b>${G.seq.map(t => WORDS[t]).join(" ")}</b> — distinct bigrams ${DL.fmt(sG.distinct, 2)}, mean log p ${DL.fmt(sG.lp, 3)}. ` +
+      `Contrastive (k = ${k}, α = ${a.toFixed(2)}): <b>${C.seq.map(t => WORDS[t]).join(" ")}</b> — distinct bigrams ${DL.fmt(sC.distinct, 2)}, mean log p ${DL.fmt(sC.lp, 3)}. ` +
+      `At step ${st} it chose "${WORDS[chosen.v]}" with score ${DL.fmt(1 - a, 2)} × ${DL.fmt(chosen.p, 3)} − ${DL.fmt(a, 2)} × ${DL.fmt(chosen.sim, 3)} = ${DL.fmt(chosen.sc, 3)}` + (a === 0 ? " (α = 0 is greedy)." : ".");
+  });
+  d3.select("#cs-k").on("change", draw);
+  ["cs-a", "cs-s", "cs-seed"].forEach(id => d3.select("#" + id).on("input", draw));
+  draw();
+})();
+
+/* ═════════ 49 · #px-svg — strided perplexity: windows, scored tokens, context ═ */
+(function () {
+  const svg = d3.select("#px-svg"); if (svg.empty()) return;
+  const W = 760, H = 400, El = id => document.getElementById(id);
+  function evalPPL(N, L, s, b) {
+    const nll = c => 2 + b / (1 + c), wins = [], ctx = new Array(N).fill(null);
+    let prev = 0, beg = 0, tot = 0, cnt = 0, proc = 0;
+    for (;;) {
+      const end = Math.min(beg + L, N), trg = end - prev;
+      const first = Math.max(end - trg, beg + 1);
+      wins.push({ beg, end, first });
+      for (let t = first; t < end; t++) { const c = t - beg; ctx[t] = c; tot += nll(c); cnt++; }
+      proc += end - beg; prev = end;
+      if (end === N) break;
+      beg += s;
+    }
+    const full = Math.exp(d3.sum(d3.range(1, N), t => nll(t)) / (N - 1));
+    return { wins, ctx, ppl: Math.exp(tot / cnt), cnt, proc, full, unscored: N - 1 - cnt };
+  }
+  const draw = INF.guard("px-readout", function () {
+    const N = +El("px-N").value, L = +El("px-L").value, sRaw = +El("px-s").value, b = +El("px-b").value, s = Math.min(sRaw, L);
+    El("px-Nv").textContent = N; El("px-sv").textContent = s + (sRaw > L ? " (capped at n_ctx)" : "");
+    const R = evalPPL(N, L, s, b);
+    const f = DL.frame(svg, W, H, { l: 46, r: 14, t: 20, b: 34 }), g = f.g;
+    const x = d3.scaleLinear().domain([0, N]).range([0, f.iw]);
+    const nw = R.wins.length, wh = Math.max(1, Math.min(12, 150 / nw));
+    TR.title(g, 0, -6, `${nw} forward passes of ${L} tokens (dark: context only, bright: scored)`);
+    R.wins.forEach((w, i) => {
+      const y = 4 + i * wh;
+      g.append("rect").attr("x", x(w.beg)).attr("y", y).attr("width", x(w.first) - x(w.beg)).attr("height", wh - 1).attr("fill", DC.muted).attr("fill-opacity", 0.35);
+      g.append("rect").attr("x", x(w.first)).attr("y", y).attr("width", Math.max(0, x(w.end) - x(w.first))).attr("height", wh - 1).attr("fill", DC.accent).attr("fill-opacity", 0.85);
+    });
+    const y1 = 4 + nw * wh + 26, ch = 70;
+    TR.title(g, 0, y1 - 8, "context each token was scored with (red: never scored)");
+    const yc = d3.scaleLinear().domain([0, Math.max(L, 1)]).range([ch, 0]);
+    DL.axisL(g.append("g").attr("transform", `translate(0,${y1})`), yc, 3);
+    R.ctx.forEach((c, t) => {
+      const gx = x(t) + 0.5, bw = Math.max(0.8, x(1) - x(0) - 1);
+      if (c === null) { if (t > 0) g.append("rect").attr("x", gx).attr("y", y1 + ch - 6).attr("width", bw).attr("height", 6).attr("fill", DC.bad); return; }
+      g.append("rect").attr("x", gx).attr("y", y1 + yc(c)).attr("width", bw).attr("height", ch - yc(c)).attr("fill", DC.good).attr("fill-opacity", 0.8);
+    });
+    /* ppl vs stride */
+    const gy = y1 + ch + 30, gh = f.ih - gy, gw = 320;
+    const g3 = g.append("g").attr("transform", `translate(${f.iw - gw},${gy})`);
+    const ss = d3.range(1, L + 1), pp = ss.map(k => evalPPL(N, L, k, b).ppl);
+    const xs = d3.scaleLinear().domain([1, L]).range([0, gw]), ys = d3.scaleLinear().domain([R.full * 0.97, d3.max(pp) * 1.03]).range([gh, 0]);
+    TR.title(g3, 0, -4, "perplexity against stride");
+    DL.axisB(g3, xs, gh, Math.min(6, L), "stride"); DL.axisL(g3, ys, 3);
+    DL.curve(g3, ss.map((k, i) => [xs(k), ys(pp[i])]), { stroke: DC.accent, w: 2 });
+    g3.append("line").attr("x1", 0).attr("x2", gw).attr("y1", ys(R.full)).attr("y2", ys(R.full)).attr("stroke", DC.good).attr("stroke-dasharray", "5 3");
+    g3.append("circle").attr("cx", xs(s)).attr("cy", ys(R.ppl)).attr("r", 4).attr("fill", DC.a2);
+    const meanC = d3.mean(R.ctx.filter(c => c !== null));
+    TR.note(g, 0, gy + 14, `nll(c) = 2 + ${b}/(1 + c) nats`, DC.muted, 9.5);
+    TR.note(g, 0, gy + 30, `stride ${s}: PPL ${DL.fmt(R.ppl, 3)}`, DC.a2, 10.5);
+    TR.note(g, 0, gy + 46, `unbounded context: PPL ${DL.fmt(R.full, 3)}`, DC.good, 10.5);
+    El("px-readout").innerHTML =
+      `N = ${N}, n_ctx = ${L}, stride ${s}: <b>${nw}</b> passes, ${DL.commas(R.proc)} tokens processed, ${R.cnt} of ${N - 1} scorable tokens scored` + (R.unscored ? ` (<b>${R.unscored} never scored</b> — each window's first token when windows do not overlap)` : "") + `, mean context ${DL.fmt(meanC, 2)}. ` +
+      `Perplexity <b>${DL.fmt(R.ppl, 3)}</b>, against ${DL.fmt(R.full, 3)} with unbounded context and ${DL.fmt(pp[L - 1], 3)} with disjoint windows.`;
+  });
+  d3.select("#px-L").on("change", draw); d3.select("#px-b").on("change", draw);
+  ["px-N", "px-s"].forEach(id => d3.select("#" + id).on("input", draw));
+  draw();
+})();
+
+/* ═════════ 50 · #ct-svg — a chat-template renderer ═ */
+(function () {
+  const svg = d3.select("#ct-svg"); if (svg.empty()) return;
+  const W = 760, H = 400, El = id => document.getElementById(id);
+  const BOS = { im: null, tag: null, hdr: "<|begin_of_text|>", inst: "<s>" };
+  function messages(sys, tool) {
+    const m = [];
+    if (sys) m.push({ role: "system", content: "Be brief." });
+    m.push({ role: "user", content: "Hi!" }, { role: "assistant", content: "Hello." });
+    if (tool) m.push({ role: "user", content: "What is 5 times 6?" }, { role: "assistant", call: { name: "multiply", arguments: { a: 5, b: 6 } } }, { role: "tool", name: "multiply", content: "30" }, { role: "assistant", content: "30." });
+    m.push({ role: "user", content: "2+2?" });
+    return m;
+  }
+  function render(fmt, msgs, gp) {
+    const out = [], T = s => out.push({ k: "t", s }), C = s => out.push({ k: "c", s });
+    const body = m => m.call ? null : m.content;
+    let note = "";
+    if (fmt === "im") msgs.forEach(m => {
+      C("<|im_start|>"); T(m.role + "\n");
+      if (m.call) { C("<tool_call>"); T(JSON.stringify({ name: m.call.name, arguments: m.call.arguments })); C("</tool_call>"); }
+      else if (m.role === "tool") { C("<tool_response>"); T(m.content); C("</tool_response>"); }
+      else T(body(m));
+      C("<|im_end|>"); T("\n");
+    });
+    if (fmt === "tag") msgs.forEach(m => {
+      C("<|" + m.role + "|>"); T("\n" + (m.call ? "call " + m.call.name + JSON.stringify(m.call.arguments) : m.content)); C("</s>"); T("\n");
+    });
+    if (fmt === "hdr") { C(BOS.hdr); msgs.forEach(m => { C("<|start_header_id|>"); T(m.role === "tool" ? "ipython" : m.role); C("<|end_header_id|>"); T("\n\n" + (m.call ? JSON.stringify({ name: m.call.name, parameters: m.call.arguments }) : m.content)); C("<|eot_id|>"); }); }
+    if (fmt === "inst") {
+      C(BOS.inst); let pendingSys = null;
+      const plain = msgs.filter(m => !(m.call || m.role === "tool"));
+      if (plain.length !== msgs.length) note = "this format has no tool-call syntax: the tool turns are dropped";
+      plain.forEach((m, i) => {
+        if (m.role === "system") { pendingSys = m.content; note = (note ? note + "; " : "") + "no system role: folded into the first user turn"; return; }
+        if (m.role === "user") { T("[INST] " + (pendingSys ? pendingSys + "\n\n" : "") + m.content + " [/INST]"); pendingSys = null; }
+        else { T(m.content); C("</s>"); T(" "); }
+      });
+    }
+    let open = false;
+    if (gp) {
+      if (fmt === "im") { C("<|im_start|>"); T("assistant\n"); open = true; }
+      if (fmt === "tag") { C("<|assistant|>"); T("\n"); open = true; }
+      if (fmt === "hdr") { C("<|start_header_id|>"); T("assistant"); C("<|end_header_id|>"); T("\n\n"); open = true; }
+      if (fmt === "inst") { open = true; note = (note ? note + "; " : "") + "the generation prompt adds nothing here — [/INST] already ends the user turn"; }
+    } else if (fmt === "inst") open = true;
+    return { out, note, open };
+  }
+  const draw = INF.guard("ct-readout", function () {
+    const fmt = El("ct-f").value, sys = El("ct-sys").checked, gp = El("ct-gp").checked, tool = El("ct-tool").checked, retok = El("ct-bos").checked;
+    const msgs = messages(sys, tool), R = render(fmt, msgs, gp);
+    const seg = R.out.slice();
+    const tmplBos = BOS[fmt] !== null, doubled = retok && tmplBos;
+    if (retok) seg.unshift({ k: "c", s: fmt === "hdr" ? "<|begin_of_text|>" : "<s>", added: true });
+    const f = DL.frame(svg, W, H, { l: 12, r: 12, t: 20, b: 10 }), g = f.g;
+    TR.title(g, 0, -6, "the rendered string (boxes are single control tokens; ↵ is a newline)");
+    const cw = 6.6, lh = 19, maxX = f.iw;
+    let x = 0, y = 12;
+    const put = (s, isCtl, added) => {
+      const w = s.length * cw + (isCtl ? 6 : 0);
+      if (x + w > maxX && x > 0) { x = 0; y += lh; }
+      if (isCtl) {
+        g.append("rect").attr("x", x).attr("y", y - 12).attr("width", w).attr("height", 16).attr("rx", 3).attr("fill", added ? DC.bad : DC.violet).attr("fill-opacity", added ? 0.45 : 0.25).attr("stroke", added ? DC.bad : DC.violet);
+        g.append("text").attr("x", x + 3).attr("y", y).attr("font-family", "SF Mono, Menlo, monospace").attr("font-size", 10.5).attr("fill", DC.ink).attr("xml:space", "preserve").text(s);
+      } else g.append("text").attr("x", x).attr("y", y).attr("font-family", "SF Mono, Menlo, monospace").attr("font-size", 10.5).attr("fill", DC.muted).attr("xml:space", "preserve").text(s);
+      x += w + (isCtl ? 2 : 0);
+    };
+    seg.forEach(sg => {
+      if (sg.k === "c") { put(sg.s, true, sg.added); return; }
+      const parts = sg.s.split("\n");
+      parts.forEach((p, i) => {
+        if (p.length) {
+          let rest = p;
+          while (rest.length) { const room = Math.max(1, Math.floor((maxX - x) / cw)); const chunk = rest.slice(0, room); put(chunk, false); rest = rest.slice(chunk.length); if (rest.length) { x = 0; y += lh; } }
+        }
+        if (i < parts.length - 1) { put("↵", false); x = 0; y += lh; }
+      });
+    });
+    const nCtl = seg.filter(s => s.k === "c").length, nChars = seg.filter(s => s.k === "t").reduce((a, s) => a + s.s.length, 0);
+    const full = seg.map(s => s.s).join(""), tail = full.slice(-28).replace(/\n/g, "↵");
+    const cy = Math.min(f.ih - 40, y + 30);
+    TR.note(g, 0, cy, `${msgs.length} messages · ${nCtl} control tokens · ${nChars} characters of plain text · ends ${R.open ? "with an OPEN assistant turn" : "after a closed turn — the model may continue the user's message"}`, DC.ink, 10);
+    if (R.note) TR.note(g, 0, cy + 16, R.note, DC.a2, 9.5);
+    if (doubled) TR.note(g, 0, cy + 32, "double begin-of-sequence: the template emitted one and the tokenizer added another (red box)", DC.bad, 9.5);
+    El("ct-readout").innerHTML =
+      `${msgs.length} messages rendered to ${DL.commas(full.length)} characters, of which <b>${nCtl}</b> control tokens (each one vocabulary id) and ${nChars} plain characters. Ends with “…${tail.replace(/</g, "&lt;")}” — ${R.open ? "an open assistant turn, so the model writes the reply" : "a closed turn: without the generation prompt the model may continue the user's text"}. ` +
+      (retok ? (doubled ? `<b>Double BOS</b>: the template already begins with its BOS and re-tokenising with special tokens added a second one.` : `Re-tokenising with special tokens adds the tokenizer's BOS if it defines one (some im-marker tokenizers define none); this template emits none itself, so there is at most one.`) : `Tokenised in one step: special tokens exactly as the template wrote them.`) +
+      (R.note ? ` Note: ${R.note}.` : "");
+  });
+  d3.select("#ct-f").on("change", draw);
+  ["ct-sys", "ct-gp", "ct-tool", "ct-bos"].forEach(id => d3.select("#" + id).on("change", draw));
   draw();
 })();
