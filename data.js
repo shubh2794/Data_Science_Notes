@@ -521,7 +521,7 @@ const cross = [
   ["GPT","Large Language Models"],["GPT","Transformers"],["GPT","Encoder vs Decoder Models"],["GPT","Policy / Preference Optimization"],["GPT","Attention"],
   ["GPT","Tokenization"],["GPT","Language Models"],["GPT","Context Engineering"],["GPT","Hallucination & Factuality"],["GPT","Context-Length Extension"],
   ["GPT","Speculative Decoding"],["GPT","Model Acceleration"],["GPT","Residual / Skip Connections"],["GPT","Reasoning in LLMs"],["GPT","LLMOps"],["GPT","RAG"],
-  ["CLIP","Vision-Language Models"],["CLIP","Embeddings"],["CLIP","Diffusion Models"],["CLIP","Transformers"],
+  ["CLIP","Vision-Language Models"],["CLIP","Attention"],["CLIP","Tokenization"],["CLIP","Image Classification"],["CLIP","Fine-Tuning & Transfer Learning"],["CLIP","Distributed Training"],["CLIP","Large Language Models"],["CLIP","NLP Evaluation Metrics"],["CLIP","Model Evaluation"],["CLIP","Embeddings"],["CLIP","Diffusion Models"],["CLIP","Transformers"],
   ["LayoutLM","Document Intelligence"],["LayoutLM","Transformers"],["LayoutLM","Vision Transformers"],
   ["Donut","Document Intelligence"],["Donut","Encoder vs Decoder Models"],["Donut","End-to-End Deep Learning"],["Donut","Knowledge Distillation"],["Donut","Attention"],
   ["Vector Databases (HNSW)","Embeddings"],["Vector Databases (HNSW)","RAG"],["Vector Databases (HNSW)","k-Nearest Neighbors"],["Vector Databases (HNSW)","Indexing"],["Vector Databases (HNSW)","NoSQL"],
