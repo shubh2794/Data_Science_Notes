@@ -264,6 +264,7 @@ const nodes = [
   {id:"LayoutLM", group:"models", level:3, link:"models/layoutlm.html", desc:"The Document-AI family (v1→v2→v3) that fuses text, 2D layout (OCR bounding boxes), and image in one Transformer for visually-rich document understanding — forms, receipts, invoices, doc classification, and document VQA."},
   {id:"Donut", group:"models", level:3, link:"models/donut.html", desc:"OCR-free Document Understanding Transformer — a Swin vision encoder + BART-style decoder that reads document pixels and generates structured output (JSON) directly, no OCR. Pretrained with SynthDoG; DONUT-hole distills/prunes it for the edge."},
   {id:"EfficientNet", group:"models", level:3, link:"models/efficientnet.html", desc:"Compound model scaling for ConvNets: grow depth, width and input resolution together (d = αᵠ, w = βᵠ, r = γᵠ, α·β²·γ² ≈ 2) from a NAS-found MBConv + squeeze-and-excitation baseline (B0), giving the B0–B7 family, plus its FLOPs-vs-latency critiques and the EfficientNetV2 follow-up."},
+  {id:"Whisper", group:"models", level:3, link:"models/whisper.html", desc:"Whisper — OpenAI's log-mel Transformer encoder–decoder trained on 680,000 hours of weakly supervised web audio: special-token task format, 20 ms timestamp tokens, sizes from tiny to large-v3 and turbo, zero-shot robustness, and long-form decoding with temperature fallback."},
   {id:"Llama", group:"models", level:3, link:"models/llama.html", desc:"Meta's open-weight decoder family (LLaMA → Llama 2 → Llama 3/3.1/3.2/3.3 → Llama 4): the RMSNorm/SwiGLU/RoPE bias-free block, training small models far past compute-optimal, GQA, the 128K vocabulary and 128K context via RoPE base 500k and llama3 scaling, Llama 2-Chat's RLHF and Ghost Attention, Llama 4's MoE and interleaved NoPE layers — with every config's parameters, KV cache and compute recomputed."},
 
   // ===== aman-coverage additions (curated gaps) =====
@@ -310,7 +311,7 @@ const subtree = {
   "Vision Models":["EfficientNet"],
   "NLP Models":["BERT"],
   "LLM Families":["GPT","Llama"],
-  "Audio Models":[],
+  "Audio Models":["Whisper"],
   "Multimodal Models":["CLIP"],
   "Document AI Models":["LayoutLM","Donut"],
   "Classical Neural Networks":["Perceptrons & Early Learning Rules","Hopfield Networks & Associative Memory","Boltzmann Machines & RBMs","Self-Organizing Maps & Competitive Learning","Radial Basis Function Networks","Neuro-Fuzzy Systems","Kalman Filter Training","Neural System Identification & Control","Neuroevolution & Growing Networks","Neural Network Hardware"],
@@ -326,6 +327,7 @@ const subtree = {
 /* cross edges. 3rd element "isa" = hierarchy bridge (is-a / builds-on),
    oriented child → parent; rendered as a dotted arrow in the graph. */
 const cross = [
+  ["Whisper","Speech Processing"],["Whisper","Transformers"],["Whisper","Attention"],["Whisper","Encoder vs Decoder Models"],["Whisper","Tokenization"],["Whisper","Machine Translation"],["Whisper","NLP Evaluation Metrics"],["Whisper","Knowledge Distillation"],["Whisper","Speculative Decoding"],["Whisper","Hallucination & Factuality"],["Whisper","GPT"],["Whisper","Fine-Tuning & Transfer Learning"],["Whisper","Language Models"],
   ["Llama","Transformers"],["Llama","Attention"],["Llama","Mixture of Experts"],["Llama","Context-Length Extension"],["Llama","Policy / Preference Optimization"],["Llama","Tokenization"],["Llama","Knowledge Distillation"],["Llama","Parameter-Efficient Fine-Tuning"],["Llama","Model Acceleration"],["Llama","Large Language Models"],["Llama","Vision-Language Models"],
   ["Neural System Identification & Control","World Models & JEPA"],["Neural System Identification & Control","State Space Models"],
   ["Deep Learning in Practice","ML Strategy"],["Deep Learning in Practice","Model Acceleration"],["Deep Learning in Practice","Model Evaluation"],["Deep Learning in Practice","CNNs"],
