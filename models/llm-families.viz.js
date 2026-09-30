@@ -11,7 +11,8 @@ const LF = (function(){
   /* ── the spec: published configurations (config.json / technical reports) ──
      att: "mha" | "gqa" | "mla";  win: sliding window;  pat: "all" local, "alt" 1:1, "g6" five local then one global
      E/k/fe/shared/kdense: MoE;  tokens: reported training tokens (null = undisclosed)
-     rep/repA: report's round numbers;  t: arXiv report date (decimal year) */
+     rep/repA: report's round numbers;  t: arXiv report date (decimal year; GPT-2 has no arXiv version, so its release month)
+     Gemma 1/2 V = 256,128 follows the reports' tables (the Hugging Face configs list 256,000). */
   const M = [
     {id:"gpt2",  name:"GPT-2 XL",        fam:"GPT",   t:2019.12, mon:"Feb 2019", gpt:true, L:48, d:1600, h:25, kv:25, hd:64, f:6400, V:50257, n:1024, tied:true,
      pos:"learned", norm:"pre-LN", act:"GELU", ctx:1024, tokens:null, rep:1.5e9, repLabel:"1.5B"},

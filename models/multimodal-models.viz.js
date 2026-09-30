@@ -328,7 +328,7 @@ MMV.safe("cost", function(){
     {id:"v7",  name:"Vicuna v1.5 7B (Llama 2 7B)",  L:32, d:4096, h:32, hk:32, hd:128, f:11008, gated:true,  V:32000,  tied:false, reported:6.74e9, repLabel:"6.74B total"},
     {id:"v13", name:"Vicuna v1.5 13B (Llama 2 13B)",L:40, d:5120, h:40, hk:40, hd:128, f:13824, gated:true,  V:32000,  tied:false, reported:13.0e9, repLabel:"13.0B total"},
     {id:"g2",  name:"Gemma 2B",                      L:18, d:2048, h:8,  hk:1,  hd:256, f:16384, gated:true,  V:256128, tied:true,  reportedNE:1981884416, repLabel:"1,981,884,416 non-embedding"},
-    {id:"opt", name:"OPT-2.7B",                      L:32, d:2560, h:32, hk:32, hd:80,  f:10240, gated:false, V:50272,  tied:true,  reported:2.7e9, repLabel:"2.7B total"}
+    {id:"opt", name:"OPT-2.7B",                      L:32, d:2560, h:32, hk:32, hd:80,  f:10240, gated:false, V:50272,  tied:true,  reported:2.7e9, repLabel:"the nominal 2.7B (learned position embeddings, biases and norms not computed)"}
   ];
   const VIS = [
     {id:"q32",  name:"32 · BLIP-2 Q-Former", q:32},

@@ -50,7 +50,7 @@ const AV = (function(){
     CONV.kernel.forEach(k=>{ fe += cin*ch*k; cin = ch; });  // conv layers, no bias
     fe += 2*ch;                                             // group norm after the first layer
     const proj = 2*ch + ch*d + d;                           // layer norm + linear to d
-    const pos = d*(d/16)*128 + d;                           // grouped positional conv, kernel 128, 16 groups (+ weight-norm gain)
+    const pos = d*(d/16)*128 + d;                           // grouped positional conv, kernel 128, 16 groups, + bias (the 128-entry weight-norm gain is not counted)
     const blocks = c.L*(4*d*d + 4*d + 2*d + d*c.F + c.F + c.F*d + d + 2*d) + 2*d;
     const parts = [{k:"conv feature encoder", v:fe}, {k:"projection to d", v:proj}, {k:"positional conv", v:pos}, {k:"Transformer blocks", v:blocks}];
     return {parts, total: parts.reduce((a,p)=>a+p.v,0)};
@@ -152,7 +152,7 @@ AV.safe("axes", function(){
     {name:"WavLM",          v:["raw waveform","self-supervised","CTC (fine-tune)","encoder-only"], hours:94000, note:"Base+ / Large on 94 k h (Libri-Light 60 k, GigaSpeech 10 k, VoxPopuli English 24 k); denoising masked prediction"},
     {name:"XLS-R",          v:["raw waveform","self-supervised","CTC (fine-tune)","encoder-only"], hours:436000, note:"436 k h across 128 languages; wav2vec 2.0 objective at 0.3B, 1B and 2B"},
     {name:"MMS",            v:["raw waveform","self-supervised","CTC (fine-tune)","encoder-only"], hours:491000, note:"491 k h across 1,406 languages; CTC recognition for 1,107 languages"},
-    {name:"Conformer",      v:["log-mel","supervised","transducer","encoder + prediction net"], hours:960, note:"trained on 960 h of transcribed LibriSpeech; 80-channel filterbanks, single-LSTM decoder"},
+    {name:"Conformer",      v:["log-mel","supervised","transducer","encoder + prediction net"], hours:960, note:"trained on 960 h of transcribed LibriSpeech; 80-channel filterbanks subsampled to 40 ms, single-LSTM transducer decoder"},
     {name:"Deep Speech 2",  v:["spectrogram","supervised","CTC","encoder-only"], hours:11940, note:"11,940 h of transcribed English; 3 conv + 7 bidirectional recurrent layers, CTC loss"}
   ];
   const sel = document.getElementById("ax-axis");

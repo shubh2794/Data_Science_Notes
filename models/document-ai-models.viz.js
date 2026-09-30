@@ -34,7 +34,7 @@ const DV = (function(){
 const DOC_MODELS = [
   {name:"LayoutLM",   arxiv:"1912.13318", lane:"ocr",  text:"OCR", layout:"absolute 2D", image:"CNN regions (fine-tune only)", head:"encoder", res:null, resNote:"no image in pretraining", params:343e6, paramsNote:"LARGE"},
   {name:"LayoutLMv2", arxiv:"2012.14740", lane:"ocr",  text:"OCR", layout:"2D + spatial bias", image:"CNN grid", head:"encoder", res:[224,224], params:426e6, paramsNote:"LARGE"},
-  {name:"LayoutXLM",  arxiv:"2104.08836", lane:"ocr",  text:"OCR", layout:"2D + spatial bias", image:"CNN grid", head:"encoder", res:[224,224], params:null, paramsNote:"not stated in paper"},
+  {name:"LayoutXLM",  arxiv:"2104.08836", lane:"ocr",  text:"OCR", layout:"2D + spatial bias", image:"CNN grid", head:"encoder", res:[224,224], params:625e6, paramsNote:"LARGE; BASE ≈ 345M"},
   {name:"DocFormer",  arxiv:"2106.11539", lane:"ocr",  text:"OCR", layout:"shared spatial emb.", image:"CNN grid", head:"encoder", res:null, resNote:"not stated here", params:536e6, paramsNote:"LARGE"},
   {name:"Donut",      arxiv:"2111.15664", lane:"free", text:"pixels", layout:"implicit (pixels)", image:"Swin", head:"encoder–decoder", res:[2560,1920], params:143e6, paramsNote:"single size"},
   {name:"LiLT",       arxiv:"2202.13669", lane:"ocr",  text:"OCR", layout:"layout stream", image:"none", head:"encoder", res:null, resNote:"text + layout only", params:null, paramsNote:"text model + 6.1M layout flow"},
@@ -216,7 +216,7 @@ DV.safe("tokens", function(){
     donut: {H:2560, W:1920, patch:4, stages:4},
     nougat:{H:896,  W:672,  patch:4, stages:4},
     p2s:   {maxPatches:2048, p:16},
-    qwen:  {f:28, minPx:100*28*28, maxPx:16384*28*28}
+    qwen:  {f:28, minPx:4*28*28, maxPx:16384*28*28}   /* released checkpoints' preprocessor_config: min_pixels 3,136, max_pixels 12,845,056 */
   };
   const swinFinal = s => (s.H/(s.patch*Math.pow(2,s.stages-1))) * (s.W/(s.patch*Math.pow(2,s.stages-1)));
   const swinFirst = s => (s.H/s.patch) * (s.W/s.patch);

@@ -27,8 +27,8 @@ const NV = (function(){
     "electra-small": {name:"ELECTRA-Small",    fam:"enc",   L:12, d:256,  f:1024, h:4,  V:30522,  E:128, P:512, T:2, bias:true, embLN:true, reported:14e6, repLabel:"14M", ckpt:null},
     "electra-base":  {name:"ELECTRA-Base",     fam:"enc",   L:12, d:768,  f:3072, h:12, V:30522,  P:512, T:2, bias:true, embLN:true, reported:110e6, repLabel:"110M", ckpt:null},
     "electra-large": {name:"ELECTRA-Large",    fam:"enc",   L:24, d:1024, f:4096, h:16, V:30522,  P:512, T:2, bias:true, embLN:true, reported:335e6, repLabel:"335M", ckpt:null},
-    "deberta-v3-base":{name:"DeBERTa-v3-base", fam:"enc",   L:12, d:768,  f:3072, h:12, V:128100, P:0, T:0, bias:true, pooler:true, embLN:true, relRows:512, reported:184e6, repLabel:"86M backbone + 98M embedding", ckpt:null},
-    "deberta-v3-large":{name:"DeBERTa-v3-large",fam:"enc",  L:24, d:1024, f:4096, h:16, V:128100, P:0, T:0, bias:true, pooler:true, embLN:true, relRows:512, reported:435e6, repLabel:"304M backbone + 131M embedding", ckpt:null},
+    "deberta-v3-base":{name:"DeBERTa-v3-base", fam:"enc",   L:12, d:768,  f:3072, h:12, V:128100, P:0, T:0, bias:true, embLN:true, relRows:512, reported:184e6, repLabel:"86M backbone + 98M embedding", ckpt:null},
+    "deberta-v3-large":{name:"DeBERTa-v3-large",fam:"enc",  L:24, d:1024, f:4096, h:16, V:128100, P:0, T:0, bias:true, embLN:true, relRows:512, reported:435e6, repLabel:"304M backbone + 131M embedding", ckpt:null},
     "modernbert-base":{name:"ModernBERT-base", fam:"enc",   L:22, d:768,  f:1152, h:12, V:50368,  P:0, T:0, bias:false, gated:true, embLN:true, finalNorm:true, skipFirstNorm:true, reported:149e6, repLabel:"149M", ckpt:149655232},
     "modernbert-large":{name:"ModernBERT-large",fam:"enc",  L:28, d:1024, f:2624, h:16, V:50368,  P:0, T:0, bias:false, gated:true, embLN:true, finalNorm:true, skipFirstNorm:true, reported:395e6, repLabel:"395M", ckpt:395881664},
     "t5-small":      {name:"T5-Small",         fam:"encdec",L:6,  d:512,  f:2048, h:8,  dkv:64,  V:32128, P:0, bias:false, t5rel:32, finalNorm:true, reported:60e6,  repLabel:"60M",  ckpt:60506880},
@@ -97,17 +97,18 @@ NV.safe("timeline", function(){
     {name:"RoBERTa",    t:2019 + 6/12,  fam:"enc",    cfg:"roberta-large", lo:"roberta-base", what:"same architecture as BERT, NSP dropped, dynamic masking, byte-level BPE, 160GB of text and far longer training"},
     {name:"ALBERT",     t:2019 + 8/12,  fam:"enc",    n:235e6, lo:"albert-base", what:"factorised embeddings and cross-layer parameter sharing; sentence-order prediction replaces NSP"},
     {name:"T5",         t:2019 + 9/12,  fam:"encdec", cfg:"t5-11b", lo:"t5-small", what:"every task written as text-to-text; span corruption with sentinel tokens; C4 corpus; relative position biases"},
-    {name:"BART",       t:2019 + 9.9/12,fam:"encdec", cfg:"bart-large", lo:"bart-base", what:"denoising autoencoder: text infilling with Poisson(3) spans plus sentence permutation, decoded by an autoregressive decoder"},
+    {name:"BART",       t:2019 + 9.4/12,fam:"encdec", cfg:"bart-large", lo:"bart-base", what:"denoising autoencoder: text infilling with Poisson(3) spans plus sentence permutation, decoded by an autoregressive decoder"},
     {name:"ELECTRA",    t:2020 + 2/12,  fam:"enc",    cfg:"electra-large", lo:"electra-small", what:"replaced-token detection: a small generator corrupts, the discriminator classifies every position"},
     {name:"DeBERTa",    t:2020 + 5/12,  fam:"enc",    n:1.5e9, what:"disentangled content / relative-position attention and an enhanced mask decoder; scaled to 1.5B parameters"},
-    {name:"mT5",        t:2020 + 9/12,  fam:"encdec", cfg:"mt5-xxl", lo:"t5-small", what:"T5 recipe on mC4 covering 101 languages; a 250k-entry SentencePiece vocabulary"},
+    {name:"mT5",        t:2020 + 9/12,  fam:"encdec", cfg:"mt5-xxl", lo:{L:8, d:512, f:1024, h:6, dkv:64, V:250112, fam:"encdec", bias:false, gated:true, untied:true, t5rel:32, finalNorm:true} /* mT5-Small config */, what:"T5 recipe on mC4 covering 101 languages; a 250k-entry SentencePiece vocabulary"},
     {name:"DeBERTaV3",  t:2021 + 10/12, fam:"enc",    cfg:"deberta-v3-large", lo:"deberta-v3-base", what:"ELECTRA-style replaced-token detection with gradient-disentangled embedding sharing; 128k vocabulary"},
-    {name:"Flan-T5",    t:2022 + 9/12,  fam:"encdec", cfg:"flan-t5-xxl", lo:"t5-small", what:"T5 v1.1-style checkpoints instruction-tuned on roughly 1.8k tasks; strong zero- and few-shot use"},
+    {name:"Flan-T5",    t:2022 + 9/12,  fam:"encdec", cfg:"flan-t5-xxl", lo:{L:8, d:512, f:1024, h:6, dkv:64, V:32128, fam:"encdec", bias:false, gated:true, untied:true, t5rel:32, finalNorm:true} /* Flan-T5-Small (T5 v1.1-Small) config */, what:"T5 v1.1-style checkpoints instruction-tuned on roughly 1.8k tasks; strong zero- and few-shot use"},
     {name:"ModernBERT", t:2024 + 11/12, fam:"enc",    cfg:"modernbert-large", lo:"modernbert-base", what:"RoPE, GeGLU, alternating local/global attention, unpadding, 8,192-token context, 2T tokens of text and code"}
   ];
   ev.forEach(e => {
     if (e.cfg) e.n = params(M[e.cfg]).total;
     if (typeof e.lo === "string") e.loN = params(M[e.lo]).total;
+    else if (e.lo) e.loN = params(e.lo).total;
   });
   const x = d3.scaleLinear().domain([2017.8, 2025.3]).range([m.l, W-m.r]);
   const y = d3.scaleLog().domain([5e6, 3e10]).range([H-m.b, m.t]);

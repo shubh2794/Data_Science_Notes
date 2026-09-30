@@ -182,7 +182,7 @@ VMV.safe("lineage", function(){
   /* top1 = ImageNet top-1 (%) as reported; err = reported top-1 error where the paper gives error */
   const MS = [
     {name:"AlexNet",      t:2012.9,  err:40.7, params:60,   mix:"convolution", sup:"IN-1k labels", proto:"single CNN, ILSVRC-2012 val (paper reports 40.7% top-1 error)", std:true},
-    {name:"VGG-19",       t:2014.7,  err:24.8, params:144,  mix:"convolution", sup:"IN-1k labels", proto:"single net, multi-crop + dense val (24.8% top-1 error)", std:true},
+    {name:"VGG-19",       t:2014.7,  err:24.4, params:144,  mix:"convolution", sup:"IN-1k labels", proto:"single net, multi-crop + dense val (24.4% top-1 error; 24.8% with dense evaluation alone)", std:true},
     {name:"ResNet-152",   t:2015.95, err:21.43, params:60,  mix:"convolution", sup:"IN-1k labels", proto:"single model, 10-crop val (21.43% top-1 error)", std:true},
     {name:"EfficientNet-B7", t:2019.4, top1:84.3, params:66, mix:"convolution", sup:"IN-1k labels", proto:"single crop at 600²", std:true},
     {name:"ViT-H/14",     t:2020.8,  top1:88.55, params:632, mix:"global attn", sup:"large labelled", proto:"pretrained on JFT-300M, fine-tuned on ImageNet", std:false},
