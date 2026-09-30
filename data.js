@@ -487,6 +487,8 @@ const cross = [
   ["Speech Processing","Transformers"],["Speech Processing","Embeddings"],["Speech Processing","Vision-Language Models"],
   ["BERT","Encoder vs Decoder Models"],["BERT","Transformers"],["BERT","Fine-Tuning & Transfer Learning"],["BERT","Language Models"],["BERT","Named Entity Recognition"],["BERT","Textual Entailment"],
   ["GPT","Large Language Models"],["GPT","Transformers"],["GPT","Encoder vs Decoder Models"],["GPT","Policy / Preference Optimization"],["GPT","Attention"],
+  ["GPT","Tokenization"],["GPT","Language Models"],["GPT","Context Engineering"],["GPT","Hallucination & Factuality"],["GPT","Context-Length Extension"],
+  ["GPT","Speculative Decoding"],["GPT","Model Acceleration"],["GPT","Residual / Skip Connections"],["GPT","Reasoning in LLMs"],["GPT","LLMOps"],["GPT","RAG"],
   ["CLIP","Vision-Language Models"],["CLIP","Embeddings"],["CLIP","Diffusion Models"],["CLIP","Transformers"],
   ["LayoutLM","Document Intelligence"],["LayoutLM","Transformers"],["LayoutLM","Vision Transformers"],
   ["Donut","Document Intelligence"],["Donut","Encoder vs Decoder Models"],["Donut","End-to-End Deep Learning"],["Donut","Knowledge Distillation"],["Donut","Attention"],
