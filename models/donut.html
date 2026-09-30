@@ -6,130 +6,1039 @@
 <title>Interactive Notes · Donut</title>
 <script src="../vendor/d3.min.js"></script>
 <link rel="stylesheet" href="../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+.tokrow{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0;font-family:"SF Mono",Menlo,monospace;font-size:11.5px}
+.tokrow span{padding:2px 5px;border-radius:4px;background:rgba(91,156,255,.16);color:#cfe0ff}
+.tokrow span.sp{background:rgba(255,180,84,.2);color:#ffd9a3}
+.tokrow span.ctl{background:rgba(192,132,252,.2);color:#e9d5ff}
+.tokrow span.bad{background:rgba(248,113,113,.25);color:#fecaca}
+textarea.jsin{width:100%;min-height:92px;background:#10131a;color:#e6e9ef;border:1px solid #2a2f3a;border-radius:8px;font-family:"SF Mono",Menlo,monospace;font-size:12px;padding:8px;box-sizing:border-box}
+pre.jsout{background:#10131a;border:1px solid #2a2f3a;border-radius:8px;padding:8px;font-size:11.5px;white-space:pre-wrap;margin:6px 0 0;color:#cbd5e1}
+</style>
 </head>
 <body>
 <div class="layout">
   <nav class="sidebar" id="sidebar"></nav>
   <main>
     <header class="page">
-      <h1>Donut — OCR-free Document Understanding</h1>
-      <p>An <b>OCR-free</b> document model: instead of running a separate OCR engine and parsing its text, Donut (<i>Do</i>cume<i>n</i>t <i>u</i>nderstanding <i>t</i>ransformer) reads the raw page pixels with a vision encoder and <b>generates the answer directly</b> — a JSON record, a class, a VQA answer — with a Transformer decoder.</p>
+      <h1>Donut — the OCR-free Document Understanding Transformer</h1>
+      <p>Donut is an encoder–decoder Transformer from NAVER CLOVA that reads a document image directly and writes its answer as a token sequence: a Swin Transformer encoder turns the page pixels into a grid of feature vectors, and a BART-style decoder, prompted by a task token, generates a class label, a nested JSON record or a question's answer — with no OCR engine in the system at inference (its largest pretraining set was, however, labelled by one). This note covers it in detail: the problems of OCR pipelines it was built to remove, the preprocessing that puts a page on a 2560 × 1920 canvas, the Swin encoder's stages and windowed attention with their token and cost arithmetic, the multilingual decoder and its tokenizer, a parameter count recomputed from the released configuration, task prompts and the JSON ↔ token conversion, the teacher-forced reading objective, the SynthDoG synthetic-page generator, fine-tuning recipes, the field-F1 and tree-edit-distance metrics, the published results and ablations, limitations, the compressed DONUT-hole with the CKA similarity measure, its relatives Dessurt, Pix2Struct and Nougat, and practical use.</p>
       <div style="margin-top:14px;">
+        <span class="pill">Model Architectures</span>
         <span class="pill">Document AI</span>
         <span class="pill">OCR-free</span>
-        <span class="pill">Encoder-Decoder</span>
-        <span class="pill">Vision-Language</span>
+        <span class="pill">Encoder–decoder</span>
+        <span class="pill">Structured generation</span>
       </div>
     </header>
 
-    <section class="topic" id="why">
-      <h3><span class="idx">01</span> Why drop OCR?</h3>
-      <p class="lede">The classic VDU pipeline is <code>image → OCR → text + boxes → model</code>. Making OCR a hard dependency causes three problems Donut removes.</p>
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="overview" data-nav="What Donut is">
+      <h3><span class="idx">01</span> What Donut is</h3>
+      <p class="lede">Donut (Document understanding transformer; "OCR-free Document Understanding Transformer", arXiv 2111.15664, ECCV 2022) is a Transformer encoder–decoder that maps a document image x to a token sequence y. The encoder is a Swin Transformer that turns the pixels into a set of feature vectors z; the decoder is a four-layer multilingual BART decoder that generates y one token at a time, attending to z through cross-attention. Every task — reading, classification, field extraction, question answering — is trained with the same loss: the cross-entropy of the next token.</p>
+      <div class="formula"><span class="lbl">encoder: the page image becomes a set of n feature vectors of width d</span><span class="eq">z = Swin(x),   x ∈ ℝ^(3 × H × W),   z = {z₁ … zₙ},  zᵢ ∈ ℝ^d        (donut-base: H × W = 2560 × 1920 → n = 80 · 60 = 4,800,  d = 1,024)</span>
+<span class="lbl">training objective: next-token cross-entropy with teacher forcing, over the target tokens after the prompt</span><span class="eq">L(θ) = − Σₜ₌₁ᵐ log p_θ(yₜ | y₁ … yₜ₋₁, z)</span>
+<span class="lbl">inference: start from a task prompt and decode greedily until the end token</span><span class="eq">ŷₜ = argmax_v p_θ(v | prompt, ŷ₁ … ŷₜ₋₁, z),   stop at &lt;/s&gt;;   then JSON = token2json(ŷ)</span></div>
+
+      <h4>What goes in and what comes out</h4>
       <ul class="notes">
-        <li><b>Cost &amp; latency:</b> a separate OCR system is heavy compute on every document.</li>
-        <li><b>Inflexibility:</b> OCR engines are brittle across languages and document types.</li>
-        <li><b>Error propagation:</b> an OCR mistake ("0"→"O") flows downstream and the model never sees the truth.</li>
+        <li><b>Input:</b> one page image, resized and padded onto a fixed canvas (2560 × 1920 pixels, height × width, for the pretrained model), plus a short prompt of special tokens that names the task — <code>&lt;s_cord-v2&gt;</code>, <code>&lt;s_rvlcdip&gt;</code>, or <code>&lt;s_docvqa&gt;&lt;s_question&gt;…&lt;/s_question&gt;&lt;s_answer&gt;</code>.</li>
+        <li><b>Output:</b> a token sequence such as <code>&lt;s_menu&gt;&lt;s_nm&gt;Latte&lt;/s_nm&gt;…&lt;/s_menu&gt;</code>, in which every JSON key is a pair of added special tokens. A deterministic parser turns it back into a JSON object; a key whose closing token is missing is lost.</li>
+        <li><b>Training:</b> pretraining to read the whole page aloud ("pseudo-OCR") on 11M scanned pages and 2M synthetic ones, then fine-tuning on each downstream task with the target written as a token sequence.</li>
       </ul>
-      <div class="callout"><b>One line:</b> Donut is a <b>vision encoder → text decoder</b> trained end-to-end to map a document image straight to structured output — no OCR in the loop. This is <a href="../deep-learning/end-to-end-learning.html">end-to-end learning</a> applied to documents.</div>
+
+      <h4>The pieces and their sizes</h4>
+      <table class="cmp">
+        <tr><th>Part</th><th>donut-base setting</th><th>Where it is explained</th></tr>
+        <tr><td>Vision encoder</td><td>Swin-B variant: patch 4, C = 128, stage depths {2, 2, 14, 2}, window 10 × 10, 74.2M parameters</td><td><a href="#swin">Swin encoder</a>, <a href="#windows">windows</a></td></tr>
+        <tr><td>Text decoder</td><td>mBART-style, 4 layers, d = 1,024, 16 heads, FFN 4,096, 1,536 positions, 127.7M parameters of which 58.9M are the token embedding</td><td><a href="#decoder">decoder</a>, <a href="#params">parameters</a></td></tr>
+        <tr><td>Tokenizer</td><td>SentencePiece (XLM-RoBERTa class), 57,522 base entries + 3 added tokens = 57,525</td><td><a href="#decoder">decoder</a></td></tr>
+        <tr><td>Pretraining data</td><td>IIT-CDIP 11M scanned pages with pseudo-labels from a commercial OCR API; SynthDoG 0.5M pages each in English, Chinese, Japanese, Korean</td><td><a href="#pretrain">pretraining</a>, <a href="#synthdog">SynthDoG</a></td></tr>
+        <tr><td>Interface</td><td>task prompt → generated token sequence → JSON</td><td><a href="#prompts">prompts</a>, <a href="#json">JSON ↔ tokens</a></td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> Donut is "an image captioner whose captions are JSON". The encoder has to learn to read small print from pixels, which is why it needs a high resolution and a reading-style pretraining; the decoder's special key tokens are what make its free-text output parseable into a record.</div>
+      <div class="callout"><b>What this page does NOT cover, and where it lives.</b> The document-AI category as a whole — the OCR-based versus OCR-free split, token budgets across families, every member side by side, how to choose — <a href="document-ai-models.html">Document AI Models</a>. The OCR-based LayoutLM family in depth — <a href="layoutlm.html">LayoutLM</a>. Document processing as a system (OCR engines, layout analysis, tables and forms pipelines) — <a href="../nlp/document-intelligence.html">Document Intelligence</a>. When one network should replace a pipeline in general — <a href="../deep-learning/end-to-end-learning.html">End-to-End Deep Learning</a>. Encoder, decoder and encoder–decoder wirings and their masks — <a href="../deep-learning/encoder-decoder-models.html">Encoder vs Decoder Models</a>; attention mathematics, cross-attention and the KV cache — <a href="../deep-learning/attention.html">Attention</a>. How a ViT patchifies an image, and the ViT family — <a href="../vision/vision-transformers.html">Vision Transformers</a>. Teacher–student distillation losses in general — <a href="../deep-learning/knowledge-distillation.html">Knowledge Distillation</a>; pruning and quantization as deployment tools — <a href="../mlops/model-acceleration.html">Model Acceleration</a>. Sub-word tokenization algorithms — <a href="../nlp/tokenization.html">Tokenization</a>. General vision-language models — <a href="../llm/vision-language-models.html">Vision-Language Models</a>. This page owns Donut and its direct family: its architecture, objectives, data, metrics, results, the DONUT-hole compression, and the relatives Dessurt, Pix2Struct and Nougat as context.</div>
     </section>
 
-    <section class="topic" id="pipeline">
-      <h3><span class="idx">02</span> Pipeline vs OCR-free</h3>
-      <p class="lede">Toggle an OCR error to see why a separate OCR stage is a liability.</p>
-      <div class="viz" id="viz-flow">
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="motivation" data-nav="Why remove the OCR stage">
+      <h3><span class="idx">02</span> Why remove the OCR stage</h3>
+      <p class="lede">Before Donut, visual document understanding (VDU) systems were built in two stages: an OCR engine detects text boxes and recognises their characters, and a model such as BERT, LayoutLM or LayoutLMv2 interprets the recognised words. The Donut paper names three problems with making OCR a hard dependency: its computational cost, its inflexibility across languages and document types, and the propagation of its errors into every later stage.</p>
+      <h4>The three problems, as the paper states them</h4>
+      <ul class="notes">
+        <li><b>Cost.</b> High-quality OCR is expensive at inference time, and a strong engine is itself a large model — the paper notes that a recent advanced OCR system requires more than 80M parameters (its references are CRAFT text detection plus a four-stage recognition framework). In its classification table every OCR-based baseline is written "+ α" parameters, because the OCR engine's parameters and time come on top.</li>
+        <li><b>Inflexibility.</b> An off-the-shelf engine rarely adapts to a new language or domain; training one requires large datasets and substantial compute.</li>
+        <li><b>Error propagation.</b> A misread character becomes a wrong input token, and the downstream model has no access to the pixels to correct it. The paper says this is more severe in languages with complex character sets, such as Korean and Chinese, where OCR quality is relatively low. The usual remedy — a post-OCR correction module — adds system size and maintenance cost.</li>
+      </ul>
+      <h4>What the measurements looked like</h4>
+      <p>The paper's own timings put numbers on the cost argument. On RVL-CDIP classification, LayoutLMv2 takes 1,489 ms per page including Microsoft's OCR API, and Donut 752 ms on an NVIDIA P40 — an older and slower GPU than the A100 used for training. On CORD receipt parsing the BERT, BROS, LayoutLM and LayoutLMv2 baselines take 1.6–1.7 s per receipt and Donut 1.2 s. The appendix also shows that the OCR-based baselines' accuracy on CORD varies strongly with which of four engines (EasyOCR, PaddleOCR, Microsoft Azure, CLOVA OCR) supplies the text, with CLOVA OCR the most accurate there. The tables are in <a href="#results">results</a>; the category-level version of the argument, with a probability model of compounding errors, is on the hub's <a href="document-ai-models.html#pipeline">pipeline versus end-to-end</a> section.</p>
+      <div class="viz" id="viz-pipe">
         <div class="vhead">
-          <span class="vtitle">OCR pipeline vs Donut</span>
-          <span class="vhint">flip the OCR-error switch</span>
+          <span class="vtitle">One receipt through two systems</span>
+          <span class="vhint">pick an OCR failure · watch it travel through the pipeline</span>
         </div>
         <div class="controls">
-          <label><input type="checkbox" id="fl-err"> inject an OCR error</label>
+          <label>OCR failure <select id="pipe-err">
+            <option value="none">none</option>
+            <option value="sub">character substitution (0 → O)</option>
+            <option value="drop">word missed by the detector</option>
+            <option value="split">one line split into two boxes</option>
+            <option value="order">reading order swaps two words</option>
+          </select></label>
         </div>
-        <svg id="fl-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Interactive diagram: OCR pipeline vs Donut"></svg>
-        <div class="readout" aria-live="polite" id="fl-read"></div>
+        <svg id="pipe-svg" width="660" height="330" viewBox="0 0 660 330" role="img" aria-label="Pipeline stages from image through OCR detection, recognition, serialisation and tagging to JSON, beside the single OCR-free path, with fields coloured correct or wrong"></svg>
+        <div class="readout" aria-live="polite" id="pipe-read"></div>
+        <p class="vcap">The receipt content is the example in the Donut paper's Figure 1 (item "3002-Kyoto Choco Mochi", count 2, unit price 14,000, price 28,000; total 50,000, quantity 4). The pipeline's tagger is modelled as perfect — it labels every word it receives correctly — so every wrong field here is caused by the OCR stage alone. Field scores use the Donut evaluation code's field-level F1 (flattened key–value pairs, exact string match). The OCR-free column only shows that OCR errors cannot enter it; Donut makes reading errors of its own, which this figure does not simulate (see <a href="#handwriting">failure cases</a>).</p>
       </div>
+      <div class="callout"><b>Takeaway:</b> the case against OCR is not that OCR is bad but that it is a separate system: its cost is paid on every page, its language coverage caps the whole pipeline's, and its mistakes are invisible to the model that comes after it. Donut's bet is that one network trained end to end can learn to read well enough to make that separation unnecessary.</div>
     </section>
 
-    <section class="topic" id="arch">
-      <h3><span class="idx">03</span> Architecture</h3>
-      <div class="formula"><span class="eq">document image ─▶ [ Swin Transformer encoder ] ─▶ image tokens ─▶ [ BART-style decoder ] ─▶ structured text (JSON)</span></div>
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="tasks" data-nav="Tasks and datasets">
+      <h3><span class="idx">03</span> The tasks and datasets Donut is evaluated on</h3>
+      <p class="lede">The paper evaluates three kinds of task on six datasets: document classification (RVL-CDIP), document information extraction on four datasets — two public (CORD receipts, Chinese train tickets) and two private in-service sets (Japanese business cards, Korean receipts) — and document visual question answering (DocVQA). All of them are posed to Donut as "generate this JSON".</p>
+      <table class="cmp">
+        <tr><th>Dataset</th><th>Task</th><th>Size (train / valid / test)</th><th>Structure</th><th>Metric</th></tr>
+        <tr><td>RVL-CDIP</td><td>page classification</td><td>320K / 40K / 40K images; 16 classes × 25K</td><td>one label</td><td>accuracy</td></tr>
+        <tr><td>CORD</td><td>receipt parsing (Latin script)</td><td>800 / 100 / 100</td><td>30 unique fields; nested groups such as menu → item → {name, count, price}</td><td>field-level F1, TED accuracy</td></tr>
+        <tr><td>Ticket</td><td>Chinese train-ticket parsing</td><td>1.5K train (10% held out as validation) / 0.4K test</td><td>8 fields, each appears once, fixed positions</td><td>field-level F1, TED accuracy</td></tr>
+        <tr><td>Business Card (in-service)</td><td>Japanese business-card parsing</td><td>20K / 0.3K / 0.3K</td><td>11 fields, flat</td><td>field-level F1, TED accuracy</td></tr>
+        <tr><td>Receipt (in-service)</td><td>Korean receipt parsing</td><td>40K / 1K / 1K</td><td>81 unique fields, complex nesting</td><td>field-level F1, TED accuracy</td></tr>
+        <tr><td>DocVQA</td><td>question answering on page images</td><td>50K questions on 12K+ documents; 40K / 5K / 5K questions</td><td>free-text answer</td><td>ANLS (test set via the evaluation server)</td></tr>
+      </table>
+      <h4>Why information extraction is the hard case</h4>
+      <p>The appendix breaks document IE into three sub-skills: (a) reading the text, (b) understanding what it means, and (c) predicting relations and structure among the extracted pieces. Earlier work that extracts a few fixed keys needs only (a) and (b). CORD and the in-service receipt set require (c) as well: which name, count and price belong to the same line item. The paper's Ticket and Business Card sets have depth-1 structure (each key once), CORD depth 2. That is why Donut reports a second, structure-aware metric (<a href="#metrics">tree-edit-distance accuracy</a>) next to field F1.</p>
+      <h4>How the OCR-based baselines solve the same tasks</h4>
+      <ul class="notes">
+        <li><b>Classification:</b> a linear layer and softmax on the [CLS] vector of the encoder.</li>
+        <li><b>IE:</b> BIO tagging of the serialised OCR tokens. For depth-2 structures the paper uses group BIO tags — a pair such as B<sub>g</sub>.I<sub>k</sub> marks both the start or continuation of a group (a menu item) and of a key inside it.</li>
+        <li><b>DocVQA:</b> extractive span prediction — start and end positions over the OCR tokens — so the answer must be a contiguous string of recognised words.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the benchmark set spans a single label (RVL-CDIP), flat records (tickets, business cards), nested records (CORD, Korean receipts) and free-text answers (DocVQA). A generative decoder handles all four with one output interface, where the encoder baselines need a different head for each.</div>
+    </section>
 
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="architecture" data-nav="Architecture at a glance">
+      <h3><span class="idx">04</span> Architecture at a glance</h3>
+      <p class="lede">Donut is a standard encoder–decoder: a vision Transformer encoder (Swin) produces a sequence of image feature vectors, and a text Transformer decoder produces output tokens, reading the image vectors through cross-attention in every layer. Nothing in the network corresponds to text detection, character recognition or reading order; all of that must be learned inside these two modules.</p>
+      <div class="formula"><span class="lbl">shapes through the network (donut-base, one page)</span><span class="eq">pixels 3 × 2560 × 1920  →  patch tokens 640 × 480 × 128  →  …  →  z: 80 × 60 × 1024 = 4,800 vectors</span>
+<span class="lbl">each decoder layer l, for the prefix y₁ … yₜ₋₁</span><span class="eq">h ← h + SelfAttn_causal(LN(h))      h ← h + CrossAttn(LN(h), z)      h ← h + FFN(LN(h))</span>
+<span class="lbl">output distribution over the 57,525-token vocabulary (tied to the input embedding E)</span><span class="eq">p(yₜ | y&lt;ₜ, z) = softmax(E · LN(hₜ))</span></div>
+      <h4>Encoder</h4>
+      <p>The paper says any CNN or Transformer image backbone could serve as the encoder; it chose Swin Transformer because it performed best in a preliminary document-parsing study. Swin first cuts the image into non-overlapping 4 × 4 patches, then applies blocks of window-based multi-head self-attention and a two-layer MLP, with patch-merging layers between stages that halve the grid and double the channel width. The output of the final block — the whole final-stage grid, not a pooled vector — is what the decoder sees.</p>
+      <h4>Decoder</h4>
+      <p>The decoder is BART's decoder, initialised from a publicly available multilingual BART checkpoint (asian-bart-ecjk, an mBART whose vocabulary was pruned to English, Chinese, Japanese and Korean). Only its first four layers are kept, "in further consideration of the speed–accuracy trade-off". It has no encoder of its own on the text side: the image features take the place of BART's text encoder output.</p>
+      <h4>Interface</h4>
+      <p>Training uses teacher forcing: the ground-truth token sequence is fed as decoder input, shifted by one, and every position is a classification. At test time the decoder starts from a task prompt — "inspired by GPT-3", in the paper's words — and generates. New special tokens are added for each task's prompt and for each JSON key; <a href="#prompts">task prompts</a> and <a href="#json">the JSON conversion</a> cover them.</p>
       <div class="viz" id="viz-arch">
         <div class="vhead">
-          <span class="vtitle">Vision encoder → text decoder</span>
-          <span class="vhint">the decoder cross-attends to the encoded image</span>
-        </div>
-        <svg id="arch-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Interactive diagram: Vision encoder → text decoder"></svg>
-        <div class="readout" aria-live="polite" id="arch-read"></div>
-      </div>
-
-      <ul class="notes">
-        <li><b>Vision encoder:</b> a <b>Swin Transformer</b> turns the page image into a sequence of visual embeddings (hierarchical, windowed <a href="../deep-learning/attention.html">attention</a> — good for high-resolution pages).</li>
-        <li><b>Text decoder:</b> a BART-like autoregressive decoder that <b>generates tokens</b> conditioned on the image embeddings via cross-attention — see <a href="../deep-learning/encoder-decoder-models.html">Encoder–Decoder Models</a>.</li>
-        <li><b>Structured output via prompts:</b> a task start-token steers the decoder; for key-information extraction it emits a JSON-like sequence with special field tokens, parsed back into a record.</li>
-      </ul>
-    </section>
-
-    <section class="topic" id="training">
-      <h3><span class="idx">04</span> Pretraining: "read the document"</h3>
-      <ul class="notes">
-        <li><b>Pretext task = pseudo-OCR.</b> Donut is pretrained to <b>read all text</b> in an image (left-to-right, top-to-bottom), which teaches the encoder–decoder to <i>see</i> characters without an external OCR engine.</li>
-        <li><b>SynthDoG</b> — a <b>Synthetic Document Generator</b> renders millions of realistic pages in multiple languages from text corpora + backgrounds, so pretraining isn't bottlenecked by labeled real documents.</li>
-        <li><b>Fine-tuning</b> per task: document classification, key-information extraction (CORD receipts, tickets), and DocVQA — each framed as "generate the target sequence."</li>
-      </ul>
-    </section>
-
-    <section class="topic" id="generate">
-      <h3><span class="idx">05</span> Generating structured output</h3>
-      <p class="lede">For extraction, the decoder emits a tagged sequence token-by-token that parses into JSON. Step through it.</p>
-      <div class="viz" id="viz-gen">
-        <div class="vhead">
-          <span class="vtitle">Autoregressive JSON generation</span>
-          <span class="vhint">step the decoder</span>
+          <span class="vtitle">Encoder → decoder, with sizes</span>
+          <span class="vhint">pick a canvas size · hover a block for its shape</span>
         </div>
         <div class="controls">
-          <button type="button" id="gn-step">▶ step</button>
-          <button type="button" id="gn-reset">⟲ reset</button>
+          <label>canvas (H × W) <select id="arch-res">
+            <option value="2560x1920">2560 × 1920 (pretraining, RVL-CDIP, DocVQA)</option>
+            <option value="1280x960">1280 × 960 (CORD fine-tuning)</option>
+            <option value="960x1280">960 × 1280 (Ticket, Business Card)</option>
+          </select></label>
         </div>
-        <svg id="gn-svg" width="640" height="230" viewBox="0 0 640 230" role="img" aria-label="Interactive diagram: Autoregressive JSON generation"></svg>
-        <div class="readout" aria-live="polite" id="gn-read"></div>
+        <svg id="arch-svg" width="660" height="250" viewBox="0 0 660 250" role="img" aria-label="Block diagram of the Swin encoder's four stages feeding the four-layer decoder through cross-attention, with token counts and widths for the chosen canvas"></svg>
+        <div class="readout" aria-live="polite" id="arch-read"></div>
+        <p class="vcap">Grid sizes are computed from the canvas: stage k has (H / 2^(k+1)) × (W / 2^(k+1)) tokens of width 128 · 2^(k−1). Depths {2, 2, 14, 2}, heads {4, 8, 16, 32} and the decoder's 4 layers × 16 heads × d = 1,024 are from the donut-base configuration on the Hugging Face Hub.</p>
       </div>
+      <div class="callout"><b>Takeaway:</b> architecturally Donut is unremarkable — a Swin encoder, a truncated BART decoder, cross-attention between them. What makes it work is the resolution it runs at, the reading pretraining, and the token interface that turns generation into structured output.</div>
     </section>
 
-    <section class="topic" id="donuthole">
-      <h3><span class="idx">06</span> DONUT-hole — making it small</h3>
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="preprocess" data-nav="From page to canvas">
+      <h3><span class="idx">05</span> From page to canvas: preprocessing</h3>
+      <p class="lede">Donut's encoder is built for one fixed input size, so every page is fitted onto a fixed canvas without distortion: optionally rotated so its long side matches the canvas's, resized so its shorter side equals the canvas's shorter side, shrunk further if it still overflows, and padded to the exact canvas size. Aspect ratio is preserved; any mismatch becomes padding.</p>
+      <div class="formula"><span class="lbl">canvas H × W (height × width); page h × w pixels</span><span class="eq">1. resize:     s₁ = min(H, W) / min(h, w)                       (shorter side → min(H, W))</span>
+<span class="lbl">thumbnail: shrink (never enlarge) to fit inside the canvas, keeping aspect</span><span class="eq">2. thumbnail:  s₂ = min(1, H / (s₁h), W / (s₁w))              final page size ≈ (s₁s₂h) × (s₁s₂w)</span>
+<span class="lbl">pad symmetrically at inference, at a random offset during training</span><span class="eq">3. pad:        top = floor((H − h′) / 2),   left = floor((W − w′) / 2)</span>
+<span class="lbl">normalise each channel (the released Hub processors: mean 0.5, std 0.5)</span><span class="eq">4. x ← (x / 255 − 0.5) / 0.5  ∈ [−1, 1]</span></div>
+      <h4>Worked example: an A4 page scanned at 300 dpi</h4>
+      <p>An A4 page at 300 dpi is 2480 × 3508 pixels (w × h). On the 2560 × 1920 canvas: step 1 scales the shorter side 2480 to 1920, s₁ = 0.7742, giving 1920 × 2715 (w × h). Step 2 finds the height 2715 exceeds 2560 and shrinks by 2560 / 2715 = 0.9429, giving about 1810 × 2560. Step 3 pads (1920 − 1810) = 110 columns, 55 on each side. Overall the page is scaled by 0.73, so 10-point text, whose em is 300 · 10 / 72 = 41.7 pixels in the scan, is about 30 canvas pixels tall — about 7.6 of Swin's 4-pixel patches. The same page on the 1280 × 960 canvas is scaled by 0.365 and its 10-point em shrinks to about 15 pixels, under 4 patches.</p>
+      <h4>Implementation details that matter</h4>
       <ul class="notes">
-        <li>Donut's encoder–decoder is sizable; <b>DONUT-hole</b> (2023) compresses it for <b>edge and production</b> key-information-extraction (e.g. logistics).</li>
-        <li><b>How:</b> <a href="../deep-learning/knowledge-distillation.html">knowledge distillation</a> + <b>pruning</b> ("sparsification") — cut model density by ~<b>54%</b> while preserving accuracy.</li>
-        <li><b>Fidelity check:</b> a Centered Kernel Alignment (CKA) of ~0.79 between original and sparsified representations shows the compressed model keeps the teacher's internal structure.</li>
+        <li><b>Axis alignment.</b> The original code and the Hugging Face <code>DonutImageProcessor</code> rotate a page by 90° when its orientation disagrees with the canvas's (<code>align_long_axis</code>). donut-base's released processor enables it; the CORD fine-tuned processor and the fine-tuning configurations disable it, since receipts are already upright.</li>
+        <li><b>Random padding</b> places the page at a random offset inside the canvas during training (the original <code>prepare_input(random_padding=True)</code>), a cheap augmentation that stops the model from tying content to absolute canvas position.</li>
+        <li><b>Legacy size order.</b> The released <code>preprocessor_config.json</code> files store <code>size</code> as a list [width, height] — [1920, 2560] for donut-base — while the encoder config's <code>image_size</code> is [2560, 1920] as height, width. The Transformers processor reverses list-valued sizes when it loads them, which maps [1920, 2560] back to height 2560, width 1920.</li>
+        <li><b>Channels and normalisation.</b> The model takes three channels; grayscale scans are converted to RGB first. The processors published with the Hub checkpoints normalise with mean 0.5 and standard deviation 0.5 per channel, whereas the original repository's <code>prepare_input</code> uses the ImageNet statistics (mean 0.485, 0.456, 0.406; std 0.229, 0.224, 0.225). Use the processor that ships with the checkpoint you load, and do not mix the two.</li>
       </ul>
+      <div class="viz" id="viz-prep">
+        <div class="vhead">
+          <span class="vtitle">Fitting a page onto the canvas</span>
+          <span class="vhint">pick a page and a canvas · toggle long-axis alignment</span>
+        </div>
+        <div class="controls">
+          <label>page <select id="prep-page">
+            <option value="a4">A4 scan, 300 dpi</option>
+            <option value="letter">US Letter scan, 200 dpi</option>
+            <option value="receipt">80 mm receipt, 300 dpi</option>
+            <option value="slide">landscape slide, 144 dpi</option>
+            <option value="ticket">train ticket, 300 dpi</option>
+          </select></label>
+          <label>canvas <select id="prep-canvas">
+            <option value="2560x1920">2560 × 1920</option>
+            <option value="1280x960">1280 × 960</option>
+            <option value="960x1280">960 × 1280</option>
+          </select></label>
+          <label><input type="checkbox" id="prep-align" /> align long axis</label>
+        </div>
+        <svg id="prep-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="The page drawn at its fitted size inside the canvas with padding shaded, and the size of a 10-point letter in canvas pixels and patches"></svg>
+        <div class="readout" aria-live="polite" id="prep-read"></div>
+        <p class="vcap">Page sizes are physical sizes times scan resolution (A4 210 × 297 mm; US Letter 8.5 × 11 in; an 80 × 200 mm receipt; a 13.33 × 7.5 in slide; an 87 × 55 mm ticket, drawn landscape). The steps follow the Transformers DonutImageProcessor: rotate if enabled and the orientations disagree, resize the shorter side to min(H, W) (integer truncation), thumbnail into H × W, pad centred. A 10-point em is 10/72 inch; its canvas height is that times the page's dpi times the overall scale.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> preprocessing decides how many pixels each character gets before the model sees anything. A tall receipt or a landscape page on a portrait canvas loses much of the canvas to padding; choose the canvas orientation, or enable long-axis alignment, to match the documents.</div>
     </section>
 
-    <section class="topic" id="vslayoutlm">
-      <h3><span class="idx">07</span> Donut vs LayoutLM</h3>
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="swin" data-nav="The Swin encoder">
+      <h3><span class="idx">06</span> The Swin encoder: patches, stages and tokens</h3>
+      <p class="lede">Donut's encoder is Swin-B "with slight modification": the stage depths are {2, 2, 14, 2} instead of Swin-B's {2, 2, 18, 2}, and the attention window is 10 × 10 instead of 7 × 7. Everything else follows Swin-B: 4 × 4 patches, a first-stage width C = 128 that doubles at each stage, heads {4, 8, 16, 32} (32 dimensions per head), relative position bias, and no absolute position embedding.</p>
+      <div class="formula"><span class="lbl">stage k of 4 on an H × W canvas (patch 4, one 2 × 2 merge before each of stages 2 – 4)</span><span class="eq">grid_k = (H / 2^(k+1)) × (W / 2^(k+1))        width C_k = 128 · 2^(k−1)        heads = 4 · 2^(k−1)</span>
+<span class="lbl">patch merging: concatenate each 2 × 2 group, normalise, project 4C → 2C (no bias)</span><span class="eq">z′ = Linear₄꜀→₂꜀(LN([z₀₀ ; z₀₁ ; z₁₀ ; z₁₁]))</span>
+<span class="lbl">windows per stage, windows of M × M tokens (feature maps are padded up to a multiple of M)</span><span class="eq">windows_k = ceil(h_k / M) · ceil(w_k / M)</span></div>
+      <h4>Worked example: token counts at 2560 × 1920</h4>
       <table class="cmp">
-        <tr><th></th><th>Donut</th><th><a href="layoutlm.html">LayoutLM</a></th></tr>
-        <tr><td>OCR</td><td><b>None</b> — reads pixels directly</td><td>Requires OCR words + boxes upfront</td></tr>
-        <tr><td>Shape</td><td>Vision encoder → text decoder (generative)</td><td>Transformer encoder (understanding)</td></tr>
-        <tr><td>Output</td><td>Generates the answer / JSON</td><td>Tags/classifies tokens</td></tr>
-        <tr><td>Strength</td><td>No OCR errors; multilingual; fast</td><td>Strong when good OCR exists; precise span labels</td></tr>
+        <tr><th>Stage</th><th>Blocks</th><th>Grid (h × w)</th><th>Tokens</th><th>Width C</th><th>Heads</th><th>10 × 10 windows</th><th>Pixels per token</th></tr>
+        <tr><td>patch embed</td><td>—</td><td>2560/4 × 1920/4</td><td>307,200</td><td>128</td><td>—</td><td>—</td><td>4 × 4</td></tr>
+        <tr><td>1</td><td>2</td><td>640 × 480</td><td>307,200</td><td>128</td><td>4</td><td>64 · 48 = 3,072</td><td>4 × 4</td></tr>
+        <tr><td>2</td><td>2</td><td>320 × 240</td><td>76,800</td><td>256</td><td>8</td><td>32 · 24 = 768</td><td>8 × 8</td></tr>
+        <tr><td>3</td><td>14</td><td>160 × 120</td><td>19,200</td><td>512</td><td>16</td><td>16 · 12 = 192</td><td>16 × 16</td></tr>
+        <tr><td>4</td><td>2</td><td>80 × 60</td><td>4,800</td><td>1,024</td><td>32</td><td>8 · 6 = 48</td><td>32 × 32</td></tr>
       </table>
-    </section>
-
-    <section class="topic" id="takeaways">
-      <h3><span class="idx">08</span> Takeaways</h3>
+      <p>The decoder receives the 4,800 stage-4 vectors of width 1,024. Every grid side at every stage is divisible by 10 — 640, 480, 320, 240, 160, 120, 80, 60 — so the 2560 × 1920 canvas needs no window padding; the same holds at 1280 × 960 (stage 4: 40 × 30 = 1,200 tokens). A canvas such as Nougat's 896 × 672 is not divisible by 10 at stage 1 (224 × 168), so with a 10 × 10 window the feature map would be padded to 230 × 170.</p>
+      <h4>Why a hierarchical encoder suits pages</h4>
       <ul class="notes">
-        <li><b>OCR-free</b> = a vision encoder–decoder maps document pixels straight to structured output, removing OCR's cost, brittleness, and error propagation.</li>
-        <li><b>Swin encoder + BART decoder</b>, pretrained to "read" pages, with <b>SynthDoG</b> synthetic data filling the data gap.</li>
-        <li><b>DONUT-hole</b> distills + prunes it ~54% smaller for edge deployment.</li>
-        <li>The generative, OCR-free counterpart to the OCR-based <a href="layoutlm.html">LayoutLM</a>; an <a href="../deep-learning/end-to-end-learning.html">end-to-end</a> take on <a href="../nlp/document-intelligence.html">Document Intelligence</a>.</li>
+        <li><b>Fine early, coarse late.</b> Stage 1's 4 × 4-pixel tokens can resolve strokes of small print; stage 4's 32 × 32-pixel tokens each summarise a region about one line of 10-point text tall (about 30 canvas pixels for an A4 page, see <a href="#preprocess">preprocessing</a>) and a few characters wide, a sensible unit for the decoder to attend over.</li>
+        <li><b>Depth where tokens are cheap.</b> A standard Swin-B puts 18 of its 24 blocks in stage 3; Donut keeps 14 of its 20 there, where there are 16× fewer tokens than at stage 1.</li>
+        <li><b>A plain ViT would not scale.</b> A ViT-B with 16 × 16 patches on the same canvas would produce 160 × 120 = 19,200 tokens and compute global attention over all of them in every layer; Swin's windowed attention keeps the cost linear in image area (<a href="#windows">next section</a>). The Donut paper's backbone ablation compares ResNet-152, EfficientNetV2, ViT-B and two Swin-B variants, and finds EfficientNetV2 and Swin best, choosing Swin "due to the high scalability of the Transformer-based architecture and higher performance over the EfficientNetV2's".</li>
       </ul>
+      <div class="viz" id="viz-swin">
+        <div class="vhead">
+          <span class="vtitle">Stages, tokens and attention cost versus canvas size</span>
+          <span class="vhint">pick a canvas and a window size · compare windowed with global attention</span>
+        </div>
+        <div class="controls">
+          <label>canvas (H × W) <select id="swin-res">
+            <option value="2560x1920">2560 × 1920 (donut-base)</option>
+            <option value="2048x1536">2048 × 1536 (donut-proto)</option>
+            <option value="1280x960">1280 × 960 (CORD)</option>
+            <option value="960x1280">960 × 1280 (Ticket)</option>
+            <option value="896x672">896 × 672 (Nougat's canvas)</option>
+            <option value="640x640">640 × 640</option>
+          </select></label>
+          <label>window M <input type="range" id="swin-m" min="4" max="16" step="1" value="10" /> <span id="swin-mv"></span></label>
+          <label><input type="checkbox" id="swin-global" /> show global attention for comparison</label>
+        </div>
+        <svg id="swin-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Four stage bars showing token counts, windows and attention multiply–accumulates per block, on a log scale, with optional global-attention bars"></svg>
+        <div class="readout" aria-live="polite" id="swin-read"></div>
+        <p class="vcap">Costs use the Swin paper's per-block formulas, counting multiply–accumulates and ignoring softmax: windowed Ω = 4hwC² + 2M²hwC, global Ω = 4hwC² + 2(hw)²C, where hw includes window padding. The MLP adds 8hwC² per block. Stage depths {2, 2, 14, 2} are Donut's (donut-proto used {2, 2, 18, 2} with M = 8, which this figure does not switch). Attention-matrix memory assumes the full score matrices of one block, all heads, stored in 16-bit floats — what a plain implementation materialises.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> at Donut's resolution the encoder handles 307,200 tokens in its first stage and hands 4,800 to the decoder. The 64× reduction comes from three patch merges; the affordability of the first stage comes from windowed attention.</div>
     </section>
 
-    <section class="topic" id="papers">
-      <h3><span class="idx">📄</span> Research papers</h3>
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="windows" data-nav="Windows and shifted windows">
+      <h3><span class="idx">07</span> Window attention and shifted windows</h3>
+      <p class="lede">Each Swin block computes self-attention only inside non-overlapping M × M windows of tokens, so a token attends to M² others instead of all hw. Consecutive blocks alternate between the regular window grid (W-MSA) and a grid displaced by (floor(M/2), floor(M/2)) tokens (SW-MSA), which lets information cross window borders. A learned relative position bias B is added to the attention logits inside each window.</p>
+      <div class="formula"><span class="lbl">a pair of consecutive Swin blocks (the Swin paper's Eq. 3)</span><span class="eq">ẑˡ = W-MSA(LN(zˡ⁻¹)) + zˡ⁻¹      zˡ = MLP(LN(ẑˡ)) + ẑˡ      ẑˡ⁺¹ = SW-MSA(LN(zˡ)) + zˡ      zˡ⁺¹ = MLP(LN(ẑˡ⁺¹)) + ẑˡ⁺¹</span>
+<span class="lbl">attention inside one window of M² tokens, head dimension d = 32</span><span class="eq">Attention(Q, K, V) = softmax(QKᵀ / √d + B) V,     B ∈ ℝ^(M² × M²) read from a table B̂ ∈ ℝ^((2M−1) × (2M−1))</span>
+<span class="lbl">cost per attention module (multiply–accumulates, softmax omitted)</span><span class="eq">Ω(MSA) = 4hwC² + 2(hw)²C          Ω(W-MSA) = 4hwC² + 2M²hwC</span></div>
+      <h4>Worked example: stage 1 at 2560 × 1920 with M = 10</h4>
+      <p>Stage 1 has hw = 640 · 480 = 307,200 tokens of width C = 128. The projections cost 4 · 307,200 · 128² = 20,132,659,200 multiply–accumulates in either case. The attention itself costs 2 · 10² · 307,200 · 128 = 7,864,320,000 when windowed, so Ω(W-MSA) ≈ 2.80 × 10¹⁰ per block; computed globally it would cost 2 · 307,200² · 128 ≈ 2.42 × 10¹³, so Ω(MSA) ≈ 2.42 × 10¹³ — about 864 times more. Memory tells the same story: one block's attention scores, 4 heads in 16-bit floats, are 3,072 windows × 4 × 100 × 100 × 2 bytes ≈ 246 MB windowed, against 307,200² × 4 × 2 bytes ≈ 755 GB globally.</p>
+      <table class="cmp">
+        <tr><th>Stage</th><th>hw</th><th>C</th><th>Ω(W-MSA), M = 10</th><th>Ω(MSA)</th><th>Global ÷ windowed</th><th>Scores, windowed</th><th>Scores, global</th></tr>
+        <tr><td>1</td><td>307,200</td><td>128</td><td>2.80 × 10¹⁰</td><td>2.42 × 10¹³</td><td>864×</td><td>246 MB</td><td>755 GB</td></tr>
+        <tr><td>2</td><td>76,800</td><td>256</td><td>2.41 × 10¹⁰</td><td>3.04 × 10¹²</td><td>126×</td><td>123 MB</td><td>94.4 GB</td></tr>
+        <tr><td>3</td><td>19,200</td><td>512</td><td>2.21 × 10¹⁰</td><td>3.98 × 10¹¹</td><td>18×</td><td>61 MB</td><td>11.8 GB</td></tr>
+        <tr><td>4</td><td>4,800</td><td>1,024</td><td>2.11 × 10¹⁰</td><td>6.73 × 10¹⁰</td><td>3.2×</td><td>31 MB</td><td>1.5 GB</td></tr>
+      </table>
+      <p>The windowed cost per block is almost flat across stages (each merge quarters hw and doubles C, so 4hwC² stays the same — 20,132,659,200 at every stage — while 2M²hwC halves), and by stage 4 the global/windowed gap is only about 3× — windowing matters most where the grid is largest.</p>
+      <h4>Shifted windows and the cyclic shift</h4>
+      <p>With only regular windows, no information would ever cross a window border. Shifting the grid by half a window in the next block puts tokens from four neighbouring windows into one window. Naively the shifted grid has (ceil(h/M) + 1) × (ceil(w/M) + 1) windows, some smaller than M × M; Swin instead cyclically rolls the feature map toward the top-left so the number of windows stays the same, and masks attention between tokens that were not neighbours before the roll. The relative-bias table has (2M − 1)² entries per head — 361 at M = 10 — because relative offsets along each axis range over −(M − 1) … M − 1; Swin notes the table can be bicubically interpolated when fine-tuning with a different window size, and the Donut fine-tuning configurations warn that some weights are re-initialised when the input resolution differs from pretraining.</p>
+      <div class="viz" id="viz-window">
+        <div class="vhead">
+          <span class="vtitle">Which tokens a token can attend to</span>
+          <span class="vhint">click a token · switch between regular and shifted windows</span>
+        </div>
+        <div class="controls">
+          <label>block <select id="win-mode">
+            <option value="w">W-MSA (regular windows)</option>
+            <option value="sw">SW-MSA (shifted by floor(M/2))</option>
+            <option value="both">two blocks: W then SW (reach)</option>
+          </select></label>
+          <label>window M <select id="win-m"><option value="4">4</option><option value="5">5</option><option value="3">3</option></select></label>
+        </div>
+        <svg id="win-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="A small token grid with window borders; the clicked token and the tokens it attends to are highlighted"></svg>
+        <div class="readout" aria-live="polite" id="win-read"></div>
+        <p class="vcap">A 20 × 15 token grid with a small window, for legibility (Donut's is 10 × 10 on grids up to 640 × 480). In SW-MSA mode the highlighted set is the token's shifted window with the cyclic-shift mask applied — tokens that are adjacent only because of the wrap-around are excluded. "Two blocks" shows every token whose information can reach the clicked token after a W-MSA block followed by an SW-MSA block.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> windowed attention makes the cost of the first stage linear in page area and roughly equal per block across stages; the alternating shift is what lets a character's evidence travel beyond its window across depth.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="decoder" data-nav="The multilingual decoder">
+      <h3><span class="idx">08</span> The decoder and its multilingual tokenizer</h3>
+      <p class="lede">The decoder is an mBART-style Transformer decoder with 4 layers, width d = 1,024, 16 heads and a 4,096-wide feed-forward layer, initialised from the first four decoder layers of asian-bart-ecjk — a 12 + 12-layer mBART whose embedding table was pruned to the sub-words used by English, Chinese, Japanese and Korean. Its tokenizer is a SentencePiece model loaded as an XLM-RoBERTa tokenizer.</p>
+      <div class="formula"><span class="lbl">decoder input embedding for position t (mBART convention)</span><span class="eq">h⁰ₜ = LN_emb( √d · E[yₜ] + P[t + 2] ),    √d = √1024 = 32,   P has 1,536 + 2 rows</span>
+<span class="lbl">each of the 4 layers (pre-norm), then a final layer norm</span><span class="eq">h ← h + SelfAttn_causal(LN(h));   h ← h + CrossAttn(LN(h), z);   h ← h + W₂ · GELU(W₁ · LN(h))</span>
+<span class="lbl">logits over the vocabulary use the same matrix E (tied weights)</span><span class="eq">logitsₜ = E · LN_final(hₜ)        E ∈ ℝ^(57,525 × 1,024)</span></div>
+      <h4>The configuration</h4>
+      <table class="cmp">
+        <tr><th>Setting</th><th>donut-base</th><th>donut-base-finetuned-cord-v2</th><th>asian-bart-ecjk (initialisation)</th></tr>
+        <tr><td>Layers</td><td>4</td><td>4</td><td>12 encoder + 12 decoder</td></tr>
+        <tr><td>d_model / heads / FFN</td><td>1,024 / 16 / 4,096</td><td>same</td><td>same</td></tr>
+        <tr><td>Vocabulary (rows of E)</td><td>57,525</td><td>57,580</td><td>57,526</td></tr>
+        <tr><td>Max positions</td><td>1,536</td><td>768</td><td>1,024</td></tr>
+        <tr><td>Embedding scale, tied output</td><td>yes, yes</td><td>yes, yes</td><td>yes</td></tr>
+      </table>
+      <p>The base tokenizer has 57,522 entries (the SentencePiece pieces plus <code>&lt;s&gt;</code>, <code>&lt;pad&gt;</code>, <code>&lt;/s&gt;</code>, <code>&lt;unk&gt;</code> and <code>&lt;mask&gt;</code>); donut-base adds <code>&lt;sep/&gt;</code>, <code>&lt;s_iitcdip&gt;</code> and <code>&lt;s_synthdog&gt;</code> (57,525). The CORD fine-tune adds 55 more: the prompt <code>&lt;s_cord-v2&gt;</code> and an opening and closing token for each of 27 CORD keys. The maximum length of 1,536 positions was chosen for pretraining, where the target is the whole page's text; fine-tunes shrink it (CORD 768, tickets 256, DocVQA 128, RVL-CDIP 8), and the original code truncates or interpolates the learned position table when the length changes.</p>
+      <h4>Worked example: how strings tokenize</h4>
+      <table class="cmp">
+        <tr><th>String</th><th>Sub-words (donut-base tokenizer)</th><th>Count</th></tr>
+        <tr><td>Latte</td><td><code>▁La · tte</code></td><td>2</td></tr>
+        <tr><td>3002-Kyoto Choco Mochi</td><td><code>▁300 · 2- · K · yo · to · ▁Cho · co · ▁Mo · chi</code></td><td>9</td></tr>
+        <tr><td>9,000</td><td><code>▁9 · , · 000</code></td><td>3</td></tr>
+        <tr><td>14,000</td><td><code>▁1 · 4,000</code></td><td>2</td></tr>
+        <tr><td>28,000</td><td><code>▁28, · 000</code></td><td>2</td></tr>
+        <tr><td>2017年11月15日</td><td><code>▁2017 · 年 · 11 · 月 · 15 · 日</code></td><td>6</td></tr>
+        <tr><td>广州南站</td><td><code>▁ · 广州 · 南 · 站</code></td><td>4</td></tr>
+      </table>
+      <p>Two things stand out. Numbers split irregularly — "14,000" and "28,000" break at different places, so the model must learn digit strings as several different piece patterns. And CJK text costs roughly one piece per character, where English words often cost one or two pieces, so target length depends on the script as well as the content. (The splits were produced with the released tokenizer; the paper's cross-attention figure shows the model generating "3002-Kyoto Choco Mochi" as exactly these nine pieces.)</p>
+      <div class="callout"><b>Takeaway:</b> the decoder is small (four layers) but wide, and nearly 30% of the whole model's parameters (58.9M of 201.9M) sit in its 57,525 × 1,024 embedding table. The vocabulary, together with the pretraining data, is why Donut is multilingual in four languages and not in others: a script outside it can only be spelled with fall-back pieces or not at all.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="xattn" data-nav="Cross-attention">
+      <h3><span class="idx">09</span> Cross-attention: how the decoder reads the page</h3>
+      <p class="lede">In each decoder layer, every output position forms a query from its hidden state and attends over all 4,800 encoder vectors, which supply the keys and values. This is the only path from pixels to text: to write the next character of an item name, the decoder has to draw its evidence from the region of the page where that name is printed.</p>
+      <div class="formula"><span class="lbl">cross-attention for decoder position t, one head of width 64 (16 heads × 64 = 1,024)</span><span class="eq">αₜ = softmax( (W_Q hₜ) · (W_K z)ᵀ / √64 ) ∈ ℝ^4800,      outputₜ = Σᵢ αₜ,ᵢ · W_V zᵢ</span>
+<span class="lbl">computed once per page and cached for every generated token</span><span class="eq">K, V for 4 layers:  4 × 2 × 4,800 × 1,024 = 39,321,600 values  ≈ 78.6 MB in 16-bit floats</span></div>
+      <h4>What the paper observed</h4>
+      <p>The paper visualises the decoder's cross-attention maps on an unseen receipt while it generates "3002-Kyoto Choco Mochi" and reports that each generated piece attends to the corresponding text region, even though Donut is trained with no localisation supervision. It suggests these maps "can be used as an auxiliary indicator" — a weak, unsupervised form of grounding. They are not boxes: the attention can be diffuse, split across repeated strings, or pulled toward the wrong one of two similar numbers, and nothing in training forces them to be sharp.</p>
+      <h4>Cost of one decoding step</h4>
       <ul class="notes">
-        <li><b>Donut — OCR-free Document Understanding Transformer</b> — Kim et al., 2021 (ECCV 2022). <a href="https://arxiv.org/abs/2111.15664">arXiv:2111.15664</a></li>
-        <li><b>DONUT-hole — DONUT Sparsification</b> — 2023. <a href="https://arxiv.org/abs/2311.05778">arXiv:2311.05778</a></li>
+        <li><b>Cross-attention:</b> per layer, per step, 16 heads × 4,800 scores of 64-dimensional dot products — about 4.9M multiply–accumulates, plus the same again to mix the values; across 4 layers roughly 39M per token, independent of how long the output is so far.</li>
+        <li><b>Self-attention:</b> grows with the prefix length t, but t is at most 768 for CORD and the self-attention KV cache is small compared with the cross-attention cache above.</li>
+        <li><b>Consequence:</b> decoding time grows at least linearly with output length; a long transcription at 1,536 tokens needs roughly 100 times the decoder work of a 15-token record, which is why short targets (a class, a short answer) decode quickly while pretraining-style full-page reading is slow.</li>
+      </ul>
+      <div class="viz" id="viz-xattn">
+        <div class="vhead">
+          <span class="vtitle">What one decoding step looks at</span>
+          <span class="vhint">pick the token being generated · adjust how peaked the attention is</span>
+        </div>
+        <div class="controls">
+          <label>generating <select id="xa-tok"></select></label>
+          <label>focus <input type="range" id="xa-sharp" min="1" max="10" step="1" value="6" /></label>
+        </div>
+        <svg id="xa-svg" width="660" height="330" viewBox="0 0 660 330" role="img" aria-label="A mock receipt with the stage-4 token grid overlaid; cells are shaded by cross-attention weight for the chosen output token"></svg>
+        <div class="readout" aria-live="polite" id="xa-read"></div>
+        <p class="vcap">Illustrative, not model output: the attention map is a softmax over the 4,800-cell (80 × 60) stage-4 grid of a 2560 × 1920 canvas, with logits that fall off with distance from the box of the text being generated (the focus slider scales them), mimicking what the paper's Figure 8 shows. The receipt layout is invented for this note. The readout computes the share of attention mass inside the true box, the entropy, and the effective number of cells attended (e to the entropy).</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> cross-attention is Donut's reading head. It gives a free, unsupervised hint of where each output came from, but it is not a guarantee — which is the root of Donut's grounding and verification problems (<a href="#limitations">limitations</a>).</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="params" data-nav="Parameter count, recomputed">
+      <h3><span class="idx">10</span> Parameter count, recomputed from the configuration</h3>
+      <p class="lede">The Donut paper reports 143M parameters in its classification and IE tables and 176M in its DocVQA table. Both can be reproduced from donut-base's released configuration: the full model has 201,852,024 parameters, of which 58,905,600 are the decoder's token embedding; without that table it has 142,946,424 — the paper's 143M, "parameters for vocabulary omitted for fair comparisons among multi-lingual models".</p>
+      <div class="formula"><span class="lbl">one Swin block of width c, h heads, window M (two layer norms, qkv + output projection, bias table, MLP ×4)</span><span class="eq">P_block = 12c² + 13c + (2M − 1)² · h</span>
+<span class="lbl">patch embedding (4 × 4 × 3 conv + norm) and each patch merge (norm on 4c, linear 4c → 2c without bias)</span><span class="eq">P_embed = 48C + C + 2C        P_merge = 8c + 8c²</span>
+<span class="lbl">one decoder layer of width d, feed-forward f (self-attn, cross-attn, two linears, three norms)</span><span class="eq">P_layer = 8d² + 8d + 2df + f + d + 6d</span>
+<span class="lbl">decoder total (tied output projection adds nothing)</span><span class="eq">P_dec = V·d + (L_pos + 2)·d + 2d + N_layers · P_layer + 2d</span></div>
+      <h4>Worked example: donut-base</h4>
+      <table class="cmp">
+        <tr><th>Component</th><th>Computation</th><th>Parameters</th></tr>
+        <tr><td>Patch embedding</td><td>48 · 128 + 128 + 2 · 128</td><td>6,528</td></tr>
+        <tr><td>Stage 1 (c = 128, 4 heads)</td><td>2 × 199,716 + merge 132,096</td><td>531,528</td></tr>
+        <tr><td>Stage 2 (c = 256, 8 heads)</td><td>2 × 792,648 + merge 526,336</td><td>2,111,632</td></tr>
+        <tr><td>Stage 3 (c = 512, 16 heads)</td><td>14 × 3,158,160 + merge 2,101,248</td><td>46,315,488</td></tr>
+        <tr><td>Stage 4 (c = 1,024, 32 heads)</td><td>2 × 12,607,776</td><td>25,215,552</td></tr>
+        <tr><td><b>Encoder</b></td><td></td><td><b>74,180,728</b></td></tr>
+        <tr><td>Token embedding</td><td>57,525 × 1,024</td><td>58,905,600</td></tr>
+        <tr><td>Position embedding</td><td>1,538 × 1,024</td><td>1,574,912</td></tr>
+        <tr><td>4 decoder layers</td><td>4 × 16,796,672</td><td>67,186,688</td></tr>
+        <tr><td>Embedding and final layer norms</td><td>2 × 2,048</td><td>4,096</td></tr>
+        <tr><td><b>Decoder</b></td><td></td><td><b>127,671,296</b></td></tr>
+        <tr><td><b>Total</b></td><td></td><td><b>201,852,024</b></td></tr>
+        <tr><td>Total without the token embedding</td><td>201,852,024 − 58,905,600</td><td>142,946,424 ≈ 143M</td></tr>
+      </table>
+      <p>These totals match an instantiation of the released configuration in the Transformers library. The paper's 176M for DocVQA is described as counting "token embeddings for English"; the asian-bart project lists its English-only model at a 32k vocabulary (31,999 in that model's configuration), and 31,999 × 1,024 ≈ 32.8M added to 142.9M gives 175.7M ≈ 176M — consistent, though the paper does not state the exact count. DONUT-hole's paper lists DONUT-base as 140M non-embedding + 60M embedding = 200M, which roughly agrees once the 1.57M position table is counted as an embedding (141.4M + 60.5M).</p>
+      <div class="viz" id="viz-params">
+        <div class="vhead">
+          <span class="vtitle">Parameter calculator</span>
+          <span class="vhint">pick a preset or change the configuration · compare with the paper's 143M</span>
+        </div>
+        <div class="controls">
+          <label>preset <select id="par-preset">
+            <option value="base">donut-base</option>
+            <option value="cord">donut-base-finetuned-cord-v2</option>
+            <option value="proto">donut-proto</option>
+            <option value="swinb">standard Swin-B depths and window</option>
+            <option value="custom">custom (use sliders)</option>
+          </select></label>
+          <label>stage-3 depth <input type="range" id="par-d3" min="2" max="18" step="2" value="14" /></label>
+          <label>window <input type="range" id="par-m" min="5" max="12" step="1" value="10" /></label>
+          <label>decoder layers <input type="range" id="par-nl" min="1" max="12" step="1" value="4" /></label>
+          <label>positions <select id="par-pos"><option value="1536">1,536</option><option value="768">768</option><option value="4096">4,096</option></select></label>
+        </div>
+        <svg id="par-svg" width="660" height="240" viewBox="0 0 660 240" role="img" aria-label="Stacked bars splitting parameters into encoder stages, token embedding, position embedding and decoder layers"></svg>
+        <div class="readout" aria-live="polite" id="par-read"></div>
+        <p class="vcap">Every number is computed with the block formulas above from the configuration fields (vocabulary, positions, depths, window, layers). Presets: donut-base and the CORD fine-tune from their Hub configurations; donut-proto from its configuration ({2, 2, 18, 2}, window 8, 768 positions; vocabulary 57,524). Changing a slider switches to "custom". The formula totals for the four presets are 201,852,024; 201,121,912; 213,646,072; 214,412,472. Transformers instantiations of the configurations give the same numbers except for donut-proto, whose configuration loads its encoder as a plain Swin model with a final 2,048-parameter layer norm (213,648,120).</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> a "143M" Donut is really a 202M-parameter network whose largest single tensor is its vocabulary. Encoder, embedding and decoder layers each take roughly a third, which is why compressing Donut (<a href="#donut-hole">DONUT-hole</a>) has to shrink more than one part.</div>
+    </section>
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="prompts" data-nav="Task prompts and start tokens">
+      <h3><span class="idx">11</span> Task prompts and start tokens</h3>
+      <p class="lede">Donut tells the decoder which task to perform with a prompt of special tokens placed before the output. A classification model starts from <code>&lt;s_rvlcdip&gt;</code>, a receipt parser from <code>&lt;s_cord-v2&gt;</code>; a question-answering model starts from <code>&lt;s_docvqa&gt;&lt;s_question&gt;</code>, the question's text, <code>&lt;/s_question&gt;&lt;s_answer&gt;</code>, and generates the answer after it. The prompt is input only: its positions are excluded from the loss.</p>
+      <h4>The prompts used by the released code</h4>
+      <table class="cmp">
+        <tr><th>Task</th><th>Prompt (decoder input before generation)</th><th>Target the decoder learns to write</th><th>Extra special tokens</th></tr>
+        <tr><td>Pretraining (reading)</td><td><code>&lt;s_iitcdip&gt;</code> or <code>&lt;s_synthdog&gt;</code> (the start tokens shipped in donut-base's tokenizer; the paper does not name them)</td><td>the page's text in reading order, then <code>&lt;/s&gt;</code></td><td>the two start tokens</td></tr>
+        <tr><td>RVL-CDIP</td><td><code>&lt;s_rvlcdip&gt;</code></td><td><code>&lt;s_class&gt;&lt;memo/&gt;&lt;/s_class&gt;&lt;/s&gt;</code></td><td>16 class tokens such as <code>&lt;memo/&gt;</code>, <code>&lt;invoice/&gt;</code></td></tr>
+        <tr><td>CORD</td><td><code>&lt;s_cord-v2&gt;</code></td><td><code>&lt;s_menu&gt;&lt;s_nm&gt;…&lt;/s_nm&gt;…&lt;/s_menu&gt;…&lt;/s&gt;</code></td><td>open/close pair per key (54) + prompt</td></tr>
+        <tr><td>Train tickets</td><td><code>&lt;s_zhtrainticket&gt;</code></td><td>eight flat key pairs</td><td>open/close pair per key</td></tr>
+        <tr><td>DocVQA</td><td><code>&lt;s_docvqa&gt;&lt;s_question&gt;</code>question<code>&lt;/s_question&gt;&lt;s_answer&gt;</code></td><td>answer<code>&lt;/s_answer&gt;&lt;/s&gt;</code></td><td><code>&lt;yes/&gt;</code>, <code>&lt;no/&gt;</code></td></tr>
+      </table>
+      <p>The paper's Figure 3 draws the prompts as <code>&lt;classification&gt;</code>, <code>&lt;parsing&gt;</code> and <code>&lt;vqa&gt;&lt;question&gt;…</code>, and its text writes key tokens as [START ∗] and [END ∗] and the class as [memo]. The released code names them differently (as in the table), and the fine-tuned checkpoints expect the code's names exactly — a prompt that does not match the checkpoint is a likely reason for a fine-tuned Donut to generate nothing useful.</p>
+      <h4>How the loss mask is built</h4>
+      <p>The training code tokenizes prompt + target + <code>&lt;/s&gt;</code> as one sequence and copies it into the labels, then sets to −100 (ignored by the cross-entropy) every padding position and every position up to and including the <i>prompt end token</i>. For CORD and RVL-CDIP the prompt end token is the task token itself, so only it is masked; for DocVQA it is <code>&lt;s_answer&gt;</code>, so the whole question is masked and the model is trained only to produce the answer, conditioned on the question it reads as input.</p>
+      <h4>Categorical tokens</h4>
+      <p>Where a field has a small closed set of values, a value can be a single added token instead of free text: the 16 RVL-CDIP classes become <code>&lt;advertisement/&gt;</code> … <code>&lt;specification/&gt;</code>, and DocVQA's yes/no answers become <code>&lt;yes/&gt;</code> and <code>&lt;no/&gt;</code>. Classification then takes three generated tokens plus the end token, which fits within the RVL-CDIP fine-tuning configuration's <code>max_length</code> of 8.</p>
+      <div class="callout"><b>Takeaway:</b> the prompt is Donut's task switch and the loss mask decides what is learned. A new task needs only a new start token, new key tokens, and targets written in the same scheme — no new head.</div>
+    </section>
+
+    <!-- 12 ───────────────────────────────────────────── -->
+    <section class="topic" id="json" data-nav="JSON ↔ token sequence">
+      <h3><span class="idx">12</span> The JSON ↔ token-sequence conversion</h3>
+      <p class="lede">A target record is serialised into tokens by a recursive rule: a dictionary becomes, for each key k, <code>&lt;s_k&gt;</code> + its serialised value + <code>&lt;/s_k&gt;</code>; a list becomes its serialised items joined by <code>&lt;sep/&gt;</code>; a leaf becomes its string, or its categorical token if one exists. The generated sequence is parsed back by matching each opening key token with its closing token; the paper calls the mapping "one-to-one invertible" for well-formed sequences.</p>
+      <div class="formula"><span class="lbl">json2token (the released code's rule)</span><span class="eq">τ(dict) = ‖ₖ ( &lt;s_k&gt; τ(value_k) &lt;/s_k&gt; )     τ(list) = τ(item₁) &lt;sep/&gt; τ(item₂) …     τ(leaf) = str(leaf)</span>
+<span class="lbl">key order: sorted in reverse alphabetical order unless sort_json_key = False (the CORD recipe keeps the dataset's order)</span><span class="eq">keys = sorted(dict, reverse=True)     e.g.  total  &gt;  sub_total  &gt;  menu</span>
+<span class="lbl">token2json: a key whose closing token never appears is lost</span><span class="eq">&lt;s_k&gt; x &lt;/s_k&gt;  →  {k: parse(x)}        &lt;s_k&gt; x  (no &lt;/s_k&gt;)  →  key k lost</span></div>
+      <h4>Worked example</h4>
+      <p>The record {"menu": {"nm": "Latte", "cnt": "2"}, "total": {"total_price": "9,000"}}, with the key order kept, serialises to</p>
+      <div class="tokrow"><span class="ctl">&lt;s_cord-v2&gt;</span><span class="sp">&lt;s_menu&gt;</span><span class="sp">&lt;s_nm&gt;</span><span>▁La</span><span>tte</span><span class="sp">&lt;/s_nm&gt;</span><span class="sp">&lt;s_cnt&gt;</span><span>▁2</span><span class="sp">&lt;/s_cnt&gt;</span><span class="sp">&lt;/s_menu&gt;</span><span class="sp">&lt;s_total&gt;</span><span class="sp">&lt;s_total_price&gt;</span><span>▁9</span><span>,</span><span>000</span><span class="sp">&lt;/s_total_price&gt;</span><span class="sp">&lt;/s_total&gt;</span><span class="ctl">&lt;/s&gt;</span></div>
+      <p>— 18 tokens: the prompt, 10 key tokens (5 keys × open and close), 6 text pieces, and the end token. Two-thirds of the 17 predicted tokens are structure. Parsing reverses it: the first opening token is <code>&lt;s_menu&gt;</code>, its content contains further key tokens so it is parsed recursively into {"nm": "Latte", "cnt": "2"}, and so on. With the default reverse-alphabetical sorting the same record would be written total first, then menu.</p>
+      <h4>What the conversion does not preserve</h4>
+      <ul class="notes">
+        <li><b>Types.</b> Every leaf becomes a string; 2 and "2" serialise identically. Numbers keep whatever formatting the ground truth used ("9,000", "Rp. 39.000").</li>
+        <li><b>One-element lists.</b> The parser returns a list only when it sees <code>&lt;sep/&gt;</code>, so ["Latte"] comes back as "Latte" — harmless for evaluation, which normalises both sides, but a schema consumer must handle both shapes.</li>
+        <li><b>Malformed output.</b> If a closing token is missing, that key is lost without an error. At the top level its opening token is simply deleted; inside a group, the enclosing key's value can come back as raw text with the orphaned tag in it — dropping <code>&lt;/s_total_price&gt;</code> yields {"total": "&lt;s_total_price&gt;11,500"}. If no key tokens are found at all the parser returns {"text_sequence": …} with the raw text. The paper states the policy as "if the output token sequence is wrongly structured, we simply treat the field is lost".</li>
+        <li><b>Vocabulary growth.</b> Each new key adds two tokens and two new rows of the 1,024-wide embedding, initialised fresh; keys that are rare in training get little signal.</li>
+      </ul>
+      <div class="viz" id="viz-json">
+        <div class="vhead">
+          <span class="vtitle">JSON ↔ token sequence</span>
+          <span class="vhint">pick a record or edit the JSON · toggle key sorting · break an end token</span>
+        </div>
+        <div class="controls">
+          <label>record <select id="js-preset">
+            <option value="cord1">receipt, one item (CORD keys)</option>
+            <option value="cord2">receipt, two items and totals</option>
+            <option value="kyoto">the paper's Figure 1 receipt</option>
+            <option value="cls">RVL-CDIP class</option>
+            <option value="vqa">DocVQA question and answer</option>
+            <option value="ticket">train ticket (paper's Figure B)</option>
+          </select></label>
+          <label><input type="checkbox" id="js-sort" /> sort keys (reverse alphabetical)</label>
+          <label><input type="checkbox" id="js-break" /> drop the last closing key token</label>
+          <button class="btn ghost" id="js-apply">convert edited JSON</button>
+        </div>
+        <textarea class="jsin" id="js-text" aria-label="JSON record to convert"></textarea>
+        <div class="tokrow" id="js-toks"></div>
+        <svg id="js-svg" width="660" height="60" viewBox="0 0 660 60" role="img" aria-label="Bar splitting the token sequence into prompt, key tokens, text pieces and end token"></svg>
+        <pre class="jsout" id="js-back"></pre>
+        <div class="readout" aria-live="polite" id="js-read"></div>
+        <p class="vcap">Serialisation and parsing are JavaScript ports of the released <code>json2token</code> and <code>token2json</code>. Sub-word splits of text are the released donut-base tokenizer's, precomputed for every string in the preset records (source: running the tokenizer); for text you type that is not in that table, the chip shows the whole string with a "?" and it is not counted as pieces. Amber chips are key tokens, violet are prompt and end tokens, blue are text pieces.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> the special key tokens are what turn free generation into a parseable record, at the cost of a sequence that is mostly structure. Invertibility holds for well-formed sequences only; a production system should validate the parsed JSON against its schema instead of trusting the parser's silent drops.</div>
+    </section>
+
+    <!-- 13 ───────────────────────────────────────────── -->
+    <section class="topic" id="objective" data-nav="Objective and teacher forcing">
+      <h3><span class="idx">13</span> The objective, teacher forcing and decoding</h3>
+      <p class="lede">Pretraining and every fine-tuning task use the same loss: at each target position, the negative log-probability the decoder assigns to the correct next token, given the image and the correct previous tokens (teacher forcing). All positions are computed in parallel in one forward pass; at inference the model must instead condition on its own previous outputs.</p>
+      <div class="formula"><span class="lbl">sequence loss over target positions t (prompt and padding positions masked with −100)</span><span class="eq">L = − (1 / m) Σₜ log p_θ(yₜ | y₁ … yₜ₋₁, z)          (PyTorch cross-entropy averages over unmasked positions)</span>
+<span class="lbl">derived quantities</span><span class="eq">perplexity = exp(L)          sequence probability = Πₜ p(yₜ | …) = exp(−m · L)</span></div>
+      <h4>Worked example: the loss on a short record</h4>
+      <p>Take the 17 target tokens from <a href="#json">the previous section</a> and suppose the model assigns the probabilities below to the correct token at each step (illustrative values, chosen to show the typical pattern: structure tokens near-certain, text pieces less so).</p>
+      <table class="cmp">
+        <tr><th>t</th><th>Target</th><th>p(target)</th><th>−ln p</th><th>t</th><th>Target</th><th>p(target)</th><th>−ln p</th></tr>
+        <tr><td>1</td><td><code>&lt;s_menu&gt;</code></td><td>0.97</td><td>0.0305</td><td>10</td><td><code>&lt;s_total&gt;</code></td><td>0.96</td><td>0.0408</td></tr>
+        <tr><td>2</td><td><code>&lt;s_nm&gt;</code></td><td>0.99</td><td>0.0101</td><td>11</td><td><code>&lt;s_total_price&gt;</code></td><td>0.97</td><td>0.0305</td></tr>
+        <tr><td>3</td><td><code>▁La</code></td><td>0.62</td><td>0.4780</td><td>12</td><td><code>▁9</code></td><td>0.70</td><td>0.3567</td></tr>
+        <tr><td>4</td><td><code>tte</code></td><td>0.91</td><td>0.0943</td><td>13</td><td><code>,</code></td><td>0.94</td><td>0.0619</td></tr>
+        <tr><td>5</td><td><code>&lt;/s_nm&gt;</code></td><td>0.98</td><td>0.0202</td><td>14</td><td><code>000</code></td><td>0.97</td><td>0.0305</td></tr>
+        <tr><td>6</td><td><code>&lt;s_cnt&gt;</code></td><td>0.95</td><td>0.0513</td><td>15</td><td><code>&lt;/s_total_price&gt;</code></td><td>0.99</td><td>0.0101</td></tr>
+        <tr><td>7</td><td><code>▁2</code></td><td>0.80</td><td>0.2231</td><td>16</td><td><code>&lt;/s_total&gt;</code></td><td>0.99</td><td>0.0101</td></tr>
+        <tr><td>8</td><td><code>&lt;/s_cnt&gt;</code></td><td>0.99</td><td>0.0101</td><td>17</td><td><code>&lt;/s&gt;</code></td><td>0.98</td><td>0.0202</td></tr>
+        <tr><td>9</td><td><code>&lt;/s_menu&gt;</code></td><td>0.93</td><td>0.0726</td><td></td><td></td><td></td><td></td></tr>
+      </table>
+      <p>The summed negative log-likelihood is 1.5507, so the mean loss is L = 1.5507 / 17 = 0.0912, the perplexity exp(0.0912) = 1.096, and the probability of the whole sequence exp(−1.5507) = 0.212. The three text-bearing first pieces (▁La, ▁2, ▁9) contribute 1.058 of the 1.551 — two-thirds of the loss from 3 of 17 positions. That imbalance is typical of structured targets: a low average loss can hide a model that is fluent in structure but still misreads the values that matter.</p>
+      <h4>Teacher forcing versus inference</h4>
+      <p>During training, step 4 conditions on the true "▁La" even if the model would have produced "▁Le". At inference it conditions on its own output, so an early misread changes everything after it — including, possibly, the structure. The mismatch between the two regimes is known as exposure bias. The paper's fine-tuning monitors edit distance of generated sequences on validation data rather than the teacher-forced loss, which measures the inference regime directly.</p>
+      <div class="viz" id="viz-decode">
+        <div class="vhead">
+          <span class="vtitle">Decoding a record one token at a time</span>
+          <span class="vhint">step or run · switch between teacher forcing and free-running with an injected misread</span>
+        </div>
+        <div class="controls">
+          <label>mode <select id="dec-mode">
+            <option value="tf">training: teacher forcing</option>
+            <option value="free">inference: greedy, no errors</option>
+            <option value="err">inference: misread at step 3</option>
+          </select></label>
+          <button class="btn" id="dec-step">step</button>
+          <button class="btn ghost" id="dec-run">run to end</button>
+          <button class="btn ghost" id="dec-reset">reset</button>
+        </div>
+        <svg id="dec-svg" width="660" height="280" viewBox="0 0 660 280" role="img" aria-label="Token-by-token decoding: the decoder input, the top candidate tokens with probabilities at the current step, and the running loss"></svg>
+        <div class="readout" aria-live="polite" id="dec-read"></div>
+        <p class="vcap">The target tokens are the real tokenization of the worked record; the per-step candidate probabilities are illustrative values listed in the script (the correct token's probability matches the table above). In the misread mode the model's top choice at step 3 is "▁Le", and the following steps use a second illustrative table conditioned on that prefix, ending with "Lette" in the parsed JSON. The running loss is only defined under teacher forcing, where the target is known at every step.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> one loss trains every task, and teacher forcing makes it cheap. What it measures is not what is deployed: evaluate generated sequences (edit distance, field F1, TED accuracy), not the training loss, and expect a single early misread to propagate through the rest of the output.</div>
+    </section>
+
+    <!-- 14 ───────────────────────────────────────────── -->
+    <section class="topic" id="pretrain" data-nav="Pretraining: learning to read">
+      <h3><span class="idx">14</span> Pretraining: learning to read</h3>
+      <p class="lede">Donut is pretrained to read: given a page image, generate all of its text in reading order, "from top-left to bottom-right, basically". The paper calls this a pseudo-OCR task and describes the model during pretraining as "a visual language model over the visual corpora". The corpora are 11M real scanned pages from IIT-CDIP and 2M synthetic pages from SynthDoG in four languages.</p>
+      <h4>The data</h4>
+      <ul class="notes">
+        <li><b>IIT-CDIP</b> — 11M scanned English document images (the same collection LayoutLM pretrains on). It has no reliable transcription, so the authors ran the commercial CLOVA OCR API over it to produce pseudo text labels. Donut is therefore OCR-free at inference, but its largest pretraining set was labelled by an OCR engine — its reading ability on real scans is learned partly from OCR outputs, errors included.</li>
+        <li><b>SynthDoG</b> — 0.5M synthetic pages per language for English, Chinese, Japanese and Korean, rendered from Wikipedia text, where the transcription is exact by construction. The paper's argument for synthetic data is that real scanned corpora with transcriptions are not always available, "especially for languages other than English".</li>
+      </ul>
+      <h4>The recipe</h4>
+      <table class="cmp">
+        <tr><th>Setting</th><th>Value</th></tr>
+        <tr><td>Steps, batch, hardware</td><td>200K steps, mini-batch 196, 64 NVIDIA A100 GPUs</td></tr>
+        <tr><td>Optimiser, learning rate</td><td>Adam, initial 1 × 10⁻⁴, decreasing during training</td></tr>
+        <tr><td>Precision, clipping</td><td>fp16; gradient-norm clipping with a maximum chosen between 0.05 and 1.0</td></tr>
+        <tr><td>Input, output length</td><td>2560 × 1920 canvas; decoder max length 1,536</td></tr>
+        <tr><td>Duration</td><td>"about 2–3 GPU days" in the appendix; the repository README says about 2.5 days on 64 A100s</td></tr>
+        <tr><td>Initialisation</td><td>Encoder from timm's ImageNet-pretrained <code>swin_base_patch4_window12_384</code> (in the released code; the first 14 of its 18 stage-3 blocks are kept, and the 23 × 23 relative-bias tables are bicubically resized to 19 × 19 for window 10); decoder from asian-bart-ecjk</td></tr>
+      </table>
+      <p>Worked arithmetic: 200,000 steps × 196 pages = 39.2M page presentations, about 3.0 passes over the 13M-page corpus. The appendix's "GPU days" is most plausibly wall-clock days on the 64-GPU cluster (the README's phrasing); 2.5 days × 64 GPUs would be about 160 A100-days.</p>
+      <h4>What the pretraining ablation found</h4>
+      <p>The paper's Figure 7(a) compares, on CORD accuracy and DocVQA ANLS, no pretraining, an image classification pretraining task, image captioning, and text reading on SynthDoG only, IIT-CDIP only, and both. Reading was "the most simple yet effective approach"; the tasks that impose general image and text knowledge, such as captioning, gave little gain. Synthetic images alone were enough for the IE task (CORD), but DocVQA needed the real IIT-CDIP images, which the authors attribute to IIT-CDIP and DocVQA having similar image distributions. The figure is a bar chart without printed values, so it is described here rather than reproduced.</p>
+      <h4>A smaller first attempt</h4>
+      <p>The appendix reports a preliminary model, DonutProto, pretrained on SynthDoG only (1.2M pages; the README lists English, Japanese and Korean at 0.4M each) with 8 V100 GPUs for 5 days, at 2048 × 1536 with depths {2, 2, 18, 2} and window 8. It reached 94.5 accuracy on RVL-CDIP and 85.4 on CORD, which the paper calls comparable to the full model. The appendix does not say which CORD metric 85.4 is: as TED accuracy it would be 5.5 points below the full model's 90.9, as field F1 1.3 points above its 84.1.</p>
+      <div class="callout"><b>Takeaway:</b> Donut learns to read from a mix of OCR-labelled real scans and perfectly-labelled synthetic pages, with a plain next-token loss. Reading, not general vision–language pretraining, is what transfers to document tasks — and real scans matter for tasks whose test images look like real scans.</div>
+    </section>
+
+    <!-- 15 ───────────────────────────────────────────── -->
+    <section class="topic" id="synthdog" data-nav="SynthDoG">
+      <h3><span class="idx">15</span> SynthDoG: the synthetic document generator</h3>
+      <p class="lede">SynthDoG (Synthetic Document Generator) renders a fake document photo in four layers — a background image, a paper texture, a rule-based text layout, and text content in a chosen language and font — then degrades the result with photographic effects. Because the text is placed by the generator, its transcription is known exactly, so in principle any language with a text corpus, fonts and tokenizer coverage can be pretrained on without a single real labelled page.</p>
+      <h4>The layers, as the appendix describes them</h4>
+      <ul class="notes">
+        <li><b>Background:</b> an ImageNet image, randomly Gaussian-blurred to mimic out-of-focus capture.</li>
+        <li><b>Document:</b> a paper texture sampled from photos the authors collected, applied on white, with random elastic distortion and Gaussian noise, then a random perspective transform to mimic camera angles.</li>
+        <li><b>Layout:</b> a heuristic generator places several rectangular text regions (paragraphs) by randomly stacking grids; each region is split into lines; text size and margins are random.</li>
+        <li><b>Text:</b> words and phrases sampled from Wikipedia in the target language, rendered in Noto fonts (chosen because they cover many scripts) with random colours.</li>
+        <li><b>Post-processing:</b> colour, brightness and contrast adjustment, shadow, motion blur, Gaussian blur and JPEG compression.</li>
+      </ul>
+      <p>The rendering pipeline follows SynthTIGER, the same group's synthetic text-line generator for training text recognisers. The released generator and the four 0.5M-page datasets (synthdog-en, -zh, -ja, -ko) are public.</p>
+      <h4>Selected ranges from the released English configuration</h4>
+      <table class="cmp">
+        <tr><th>Parameter</th><th>Range in config_en.yaml</th><th>Meaning</th></tr>
+        <tr><td>short_size (canvas)</td><td>720 – 1024 px, aspect 1 – 2, landscape with probability 0.5</td><td>size of the whole output image</td></tr>
+        <tr><td>document short_size</td><td>480 – 1024 px; full-screen with probability 0.5</td><td>size of the paper within the image</td></tr>
+        <tr><td>layout max_row / max_col</td><td>10 / 3</td><td>grid from which text regions are stacked</td></tr>
+        <tr><td>text_scale</td><td>0.0334 – 0.1 of the document size</td><td>line height</td></tr>
+        <tr><td>paper alpha</td><td>0 – 0.2</td><td>strength of the paper texture</td></tr>
+        <tr><td>perspective</td><td>each corner kept at 75 – 100%</td><td>camera-angle distortion</td></tr>
+        <tr><td>background blur σ</td><td>0 – 10</td><td>out-of-focus background</td></tr>
+        <tr><td>shadow intensity</td><td>0 – 160</td><td>cast shadow</td></tr>
+        <tr><td>motion blur</td><td>probability 0.5, kernel 3 – 5</td><td>hand shake</td></tr>
+        <tr><td>JPEG quality</td><td>50 – 95</td><td>compression artefacts</td></tr>
+      </table>
+      <div class="viz" id="viz-synth">
+        <div class="vhead">
+          <span class="vtitle">Composing a SynthDoG page layer by layer</span>
+          <span class="vhint">toggle layers · resample · switch language</span>
+        </div>
+        <div class="controls">
+          <label><input type="checkbox" id="sd-bg" checked /> background</label>
+          <label><input type="checkbox" id="sd-paper" checked /> paper</label>
+          <label><input type="checkbox" id="sd-layout" checked /> layout boxes</label>
+          <label><input type="checkbox" id="sd-text" checked /> text</label>
+          <label><input type="checkbox" id="sd-fx" checked /> effects</label>
+          <label>language <select id="sd-lang"><option value="en">English</option><option value="zh">Chinese</option><option value="ja">Japanese</option><option value="ko">Korean</option></select></label>
+          <button class="btn" id="sd-new">resample</button>
+        </div>
+        <svg id="sd-svg" width="660" height="320" viewBox="0 0 660 320" role="img" aria-label="A synthetic page built from background, perspective-warped paper, text regions and text lines, with the sampled generator parameters listed"></svg>
+        <div class="readout" aria-live="polite" id="sd-read"></div>
+        <p class="vcap">A schematic re-implementation for illustration: every random draw is taken from the ranges in the released config_en.yaml (listed in the script), with a seeded generator so "resample" is reproducible. Backgrounds are coloured blobs rather than ImageNet photos and text lines are short placeholder phrases in each script, not Wikipedia; the readout lists the draws and the transcription the generator would emit as the training target.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> SynthDoG turns "pretrain a reader in a new language" into "collect a text corpus and fonts". Its pages look nothing like real invoices, and the ablation shows that is fine for extraction tasks but not for tasks whose test images are real scans.</div>
+    </section>
+
+    <!-- 16 ───────────────────────────────────────────── -->
+    <section class="topic" id="finetune" data-nav="Fine-tuning recipes">
+      <h3><span class="idx">16</span> Fine-tuning recipes per task</h3>
+      <p class="lede">Every downstream model starts from the pretrained multilingual donut-base and is trained with the same next-token loss on targets written as token sequences. What changes per task is the canvas size, the maximum output length, the learning-rate schedule, and the new special tokens. The released configuration files give the recipes behind the published checkpoints.</p>
+      <table class="cmp">
+        <tr><th>Task</th><th>Canvas (H × W)</th><th>max_length</th><th>Batch / GPU</th><th>LR, warm-up</th><th>Epochs × samples</th><th>Clip</th><th>Keys sorted</th></tr>
+        <tr><td>CORD (cord-v2)</td><td>1280 × 960</td><td>768</td><td>8</td><td>3 × 10⁻⁵, 300 steps</td><td>30 × 800</td><td>1.0</td><td>no</td></tr>
+        <tr><td>Train tickets</td><td>960 × 1280</td><td>256</td><td>8</td><td>3 × 10⁻⁵, 300 steps</td><td>10 × 1,368</td><td>1.0</td><td>yes</td></tr>
+        <tr><td>RVL-CDIP</td><td>2560 × 1920</td><td>8</td><td>2</td><td>2 × 10⁻⁵, 10,000 steps</td><td>100 × 320,000</td><td>1.0</td><td>yes</td></tr>
+        <tr><td>DocVQA</td><td>2560 × 1920</td><td>128</td><td>2</td><td>3 × 10⁻⁵, 10,000 steps</td><td>300 × 39,463</td><td>0.25</td><td>yes</td></tr>
+      </table>
+      <h4>Cost</h4>
+      <p>The appendix reports that fine-tuning on CORD or Ticket at 1280 × 960 took about half an hour on one A100, while at 2560 × 1920 on the larger datasets the cost "increased rapidly": with 64 A100s, DocVQA needed about one GPU day and RVL-CDIP about two. The configuration files note that the DocVQA and RVL-CDIP checkpoints were trained on 8 nodes. The paper reports fine-tuning learning rates between 1 × 10⁻⁵ and 1 × 10⁻⁴, selected per task, and monitoring edit distance over generated token sequences for model selection.</p>
+      <h4>Choices worth copying</h4>
+      <ul class="notes">
+        <li><b>Match the canvas to the documents.</b> Receipts go on a portrait canvas, tickets and business cards on a landscape one. The paper used 960 × 1280 for Ticket and Business Card.</li>
+        <li><b>Size max_length from the data.</b> Serialise the longest training target and add margin; a target cut by <code>max_length</code> loses its closing tokens and, with them, its trailing fields.</li>
+        <li><b>Resolution changes are allowed.</b> The CORD configuration's comment warns that when the input resolution differs from the pretraining setting "some weights will be newly initialized (but the model training would be okay)" — the paper's Ticket and Business Card results (960 × 1280) and the released CORD checkpoints (1280 × 960) use smaller canvases than pretraining; the Table 2 CORD result itself was measured at 2560 × 1920.</li>
+        <li><b>Low-resource behaviour.</b> On CORD the paper reports Donut above LayoutLMv2 with only 80 training receipts (10% of the set), and that the 2560 × 1920 canvas was more robust than 1280 × 960 in that extreme low-resource setting.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> fine-tuning Donut is ordinary sequence-to-sequence training. The decisions that matter are the canvas (orientation and resolution), the output length budget, and writing the target JSON consistently — the model learns whatever structure the targets show it.</div>
+    </section>
+
+    <!-- 17 ───────────────────────────────────────────── -->
+    <section class="topic" id="metrics" data-nav="Field F1 and TED accuracy">
+      <h3><span class="idx">17</span> Metrics: field-level F1 and tree-edit-distance accuracy</h3>
+      <p class="lede">Donut reports two metrics for information extraction. Field-level F1 counts a predicted key–value pair as correct only if exactly the same pair is in the ground truth. Tree-edit-distance (TED) accuracy converts both records to trees and measures how many node insertions, deletions and relabellings turn the prediction into the ground truth, normalised by the cost of building the ground truth from an empty tree. The first gives no credit for partial matches and cannot tell which item a field was grouped with (its flattened key paths do record nesting); the second rewards partial matches and scores the grouping.</p>
+      <div class="formula"><span class="lbl">field-level F1, micro-averaged over the test set (flattened (path, value) pairs, exact match)</span><span class="eq">F1 = TP / (TP + (FP + FN) / 2)</span>
+<span class="lbl">TED-based accuracy (the paper's definition; gt, pr, ∅ = ground truth, prediction, empty tree)</span><span class="eq">acc = max(0, 1 − TED(pr, gt) / TED(∅, gt))</span>
+<span class="lbl">edit costs in the released evaluator (zss tree edit distance, Zhang–Shasha)</span><span class="eq">insert / delete: key node 1, leaf "v" = len(v)        relabel: key↔key 0 or 1,  leaf↔leaf = Levenshtein(v, v′),  key↔leaf = 1 + len(leaf)</span></div>
+      <h4>How a record becomes a tree</h4>
+      <p>The evaluator first normalises both records — keys sorted by (length, name), every value wrapped in a list, empty values dropped — then builds a tree: a root, one node per key, a <code>&lt;subtree&gt;</code> node for each dictionary inside a list, and one leaf per string value. Because leaves cost their length to insert, a long missing string costs more than a short one, and a one-character misread costs 1.</p>
+      <h4>Worked example</h4>
+      <p>Ground truth {"menu": [{"nm": "Latte", "cnt": "2", "price": "9,000"}], "total": {"total_price": "9,000"}}. Its tree has key nodes menu, &lt;subtree&gt;, nm, cnt, price, total, &lt;subtree&gt;, total_price (8 nodes, cost 1 each) and leaves "Latte", "2", "9,000", "9,000" (5 + 1 + 5 + 5 = 16), so TED(∅, gt) = 24.</p>
+      <table class="cmp">
+        <tr><th>Prediction differs by</th><th>TED(pr, gt)</th><th>TED accuracy</th><th>Field F1</th></tr>
+        <tr><td>nothing</td><td>0</td><td>1 − 0/24 = 1.000</td><td>1.000</td></tr>
+        <tr><td>price "9,800" instead of "9,000"</td><td>1 (one character)</td><td>1 − 1/24 = 0.958</td><td>3 / (3 + 2/2) = 0.750</td></tr>
+        <tr><td>key "unitprice" instead of "price"</td><td>1 (one key relabel)</td><td>0.958</td><td>0.750</td></tr>
+        <tr><td>"cnt" field missing</td><td>2 (key node + 1-character leaf)</td><td>1 − 2/24 = 0.917</td><td>3 / (3 + 1/2) = 0.857</td></tr>
+        <tr><td>an extra item {"nm": "Cookie", "cnt": "1", "price": "2,500"}</td><td>16</td><td>1 − 16/24 = 0.333</td><td>4 / (4 + 3/2) = 0.727</td></tr>
+        <tr><td>all four values right but flattened (no menu/total groups)</td><td>4</td><td>0.833</td><td>0.000</td></tr>
+        <tr><td>empty output</td><td>24</td><td>0.000</td><td>0.000</td></tr>
+      </table>
+      <p>These values were computed with the released evaluator's code. They show the metrics' different sensitivities: a one-character misread costs a whole field in F1 (0.75) but only 1/24 of TED accuracy; a structurally wrong but textually perfect prediction gets zero F1 — every flattened key path differs — while TED accuracy stays at 0.83; and a hallucinated extra item hurts TED accuracy far more than F1, because the item's characters must all be deleted.</p>
+      <div class="viz" id="viz-ted">
+        <div class="vhead">
+          <span class="vtitle">Tree edit distance on two small records</span>
+          <span class="vhint">pick a prediction · compare the trees and the two metrics</span>
+        </div>
+        <div class="controls">
+          <label>prediction <select id="ted-pred">
+            <option value="exact">exact</option>
+            <option value="char">one character misread</option>
+            <option value="key">wrong key name</option>
+            <option value="miss">missing field</option>
+            <option value="extra">hallucinated extra item</option>
+            <option value="flat">flattened structure</option>
+            <option value="empty">empty output</option>
+          </select></label>
+        </div>
+        <svg id="ted-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Ground-truth and predicted trees side by side, with nodes that differ highlighted"></svg>
+        <div class="readout" aria-live="polite" id="ted-read"></div>
+        <p class="vcap">Both trees are built with the evaluator's normalisation and tree rules; TED is computed in the browser with a Zhang–Shasha implementation using the evaluator's insert, delete and relabel costs, and F1 with its flatten-and-match rule. The browser results reproduce the Python evaluator's numbers in the table above. Nodes drawn in red exist in only one tree or differ in label.</p>
+      </div>
+      <h4>ANLS for DocVQA</h4>
+      <p>DocVQA answers are scored with Average Normalized Levenshtein Similarity: for each question, 1 minus the normalised edit distance to the closest of the accepted answers, set to 0 when the distance is 0.5 or more, averaged over questions. It forgives small misspellings but not wrong answers; its formula is on the hub's <a href="document-ai-models.html#benchmarks">benchmark section</a>.</p>
+      <div class="callout"><b>Takeaway:</b> report both metrics. Field F1 answers "how many fields could be used as-is"; TED accuracy answers "how close is the whole record, structure included". A model that reads well but groups badly, or groups well but misreads characters, looks very different under the two.</div>
+    </section>
+
+    <!-- 18 ───────────────────────────────────────────── -->
+    <section class="topic" id="results" data-nav="Results against OCR-based baselines">
+      <h3><span class="idx">18</span> Results against OCR-based baselines</h3>
+      <p class="lede">On the paper's settings Donut is the most accurate model in the classification comparison and in all four IE comparisons, and at least as fast as every baseline in every timing (it ties WYVERN on CORD at 1.2 s), while its DocVQA score is below the OCR-based LayoutLM and LayoutLMv2 models. Baseline times include their OCR engine; Donut's times were measured on an NVIDIA P40. The OCR-based IE baselines use CLOVA OCR (PaddleOCR for the Chinese tickets); classification and DocVQA timings use the Microsoft OCR API.</p>
+      <h4>Document classification (RVL-CDIP, Table 1)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>OCR</th><th>Parameters</th><th>Time (ms / page)</th><th>Accuracy (%)</th></tr>
+        <tr><td>BERT</td><td>✓</td><td>110M + α</td><td>1,392</td><td>89.81</td></tr>
+        <tr><td>RoBERTa</td><td>✓</td><td>125M + α</td><td>1,392</td><td>90.06</td></tr>
+        <tr><td>LayoutLM</td><td>✓</td><td>113M + α</td><td>1,396</td><td>91.78</td></tr>
+        <tr><td>LayoutLM (with image)</td><td>✓</td><td>160M + α</td><td>1,426</td><td>94.42</td></tr>
+        <tr><td>LayoutLMv2</td><td>✓</td><td>200M + α</td><td>1,489</td><td>95.25</td></tr>
+        <tr><td><b>Donut</b></td><td></td><td>143M</td><td>752</td><td>95.30</td></tr>
+      </table>
+      <h4>Document information extraction (Table 2; F1 = field-level F1, Acc = TED accuracy)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Params</th><th>CORD time / F1 / Acc</th><th>Ticket</th><th>Business Card</th><th>Receipt</th></tr>
+        <tr><td>BERT</td><td>86M + α</td><td>1.6 s / 73.0 / 65.5</td><td>1.7 / 74.3 / 82.4</td><td>1.5 / 40.8 / 72.1</td><td>2.5 / 70.3 / 54.1</td></tr>
+        <tr><td>BROS</td><td>86M + α</td><td>1.7 / 74.7 / 70.0</td><td>—</td><td>—</td><td>—</td></tr>
+        <tr><td>LayoutLM</td><td>89M + α</td><td>1.7 / 78.4 / 81.3</td><td>—</td><td>—</td><td>—</td></tr>
+        <tr><td>LayoutLMv2</td><td>179M + α</td><td>1.7 / 78.9 / 82.4</td><td>1.8 / 87.2 / 90.1</td><td>1.6 / 52.2 / 83.0</td><td>2.6 / 72.9 / 78.0</td></tr>
+        <tr><td><b>Donut</b></td><td>143M</td><td>1.2 / 84.1 / 90.9</td><td>0.6 / 94.1 / 98.7</td><td>1.4 / 57.8 / 84.4</td><td>1.9 / 78.6 / 88.6</td></tr>
+        <tr><td>SPADE</td><td>93M + α</td><td>4.0 / 74.0 / 75.8</td><td>4.5 / 14.9 / 29.4</td><td>4.3 / 32.3 / 51.3</td><td>7.3 / 64.1 / 53.2</td></tr>
+        <tr><td>WYVERN</td><td>106M + α</td><td>1.2 / 43.3 / 46.9</td><td>1.5 / 41.8 / 54.8</td><td>1.7 / 29.9 / 51.5</td><td>3.4 / 71.5 / 82.9</td></tr>
+      </table>
+      <p>Parameter counts in this table omit vocabulary embeddings for all models, "for fair comparisons among multi-lingual models"; BERT and LayoutLMv2 use official multilingual extensions. SPADE is a graph-based extractor over OCR boxes; WYVERN is a Transformer encoder–decoder that generates entities from OCR output — the closest OCR-based analogue of Donut's generative interface. The Business Card set is hard for every model (best F1 57.8).</p>
+      <h4>Document VQA (DocVQA test set, Table 3)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Fine-tuning set</th><th>Parameters</th><th>Time (ms)</th><th>ANLS</th><th>ANLS, handwritten</th></tr>
+        <tr><td>BERT</td><td>train</td><td>110M + α</td><td>1,517</td><td>63.5</td><td>—</td></tr>
+        <tr><td>LayoutLM</td><td>train</td><td>113M + α</td><td>1,519</td><td>69.8</td><td>—</td></tr>
+        <tr><td>LayoutLMv2</td><td>train</td><td>200M + α</td><td>1,610</td><td>78.1</td><td>—</td></tr>
+        <tr><td><b>Donut</b></td><td>train</td><td>176M</td><td>782</td><td>67.5</td><td>72.1</td></tr>
+        <tr><td>LayoutLMv2-Large-QG</td><td>train + dev + QG</td><td>390M + α</td><td>1,698</td><td>86.7</td><td>67.3</td></tr>
+      </table>
+      <div class="viz" id="viz-results">
+        <div class="vhead">
+          <span class="vtitle">Accuracy against time, as the paper reports them</span>
+          <span class="vhint">pick a dataset and metric · marker area ∝ reported parameters</span>
+        </div>
+        <div class="controls">
+          <label>benchmark <select id="res-set">
+            <option value="rvl">RVL-CDIP (accuracy)</option>
+            <option value="cord-f1">CORD (field F1)</option>
+            <option value="cord-acc">CORD (TED accuracy)</option>
+            <option value="ticket-acc">Ticket (TED accuracy)</option>
+            <option value="bc-acc">Business Card (TED accuracy)</option>
+            <option value="rec-acc">Receipt (TED accuracy)</option>
+            <option value="docvqa">DocVQA (ANLS)</option>
+          </select></label>
+        </div>
+        <svg id="res-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Scatter of score against seconds per page for Donut and the OCR-based baselines"></svg>
+        <div class="readout" aria-live="polite" id="res-read"></div>
+        <p class="vcap">Every point is a row of the Donut paper's Tables 1–3 (the arrays in the script are labelled by table). OCR-based models are blue and include OCR time; their parameter counts exclude the OCR engine (the "+ α"), so their markers are drawn with a dashed outline. The readout computes Donut's margin over the best OCR-based model and the speed ratio. Times come from different hardware setups, as the paper describes; compare them within one benchmark only.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> on classification and extraction Donut matched or beat the OCR-based models of its time while being faster end to end, with large TED-accuracy gains on both flat and nested records (Ticket 98.7 vs 90.1, CORD 90.9 vs 82.4) and a small one on Business Card (84.4 vs 83.0). On DocVQA it was 10.6 ANLS behind LayoutLMv2 trained on the same data — reading small text in dense pages is where the OCR-free design paid its price.</div>
+    </section>
+
+    <!-- 19 ───────────────────────────────────────────── -->
+    <section class="topic" id="ablations" data-nav="Ablations: backbone, resolution, OCR">
+      <h3><span class="idx">19</span> Ablations: backbone, resolution, OCR engine and data size</h3>
+      <p class="lede">The paper's further studies isolate four factors: which vision backbone to use, how large the input canvas must be, how much the OCR-based baselines depend on their OCR engine, and how the models behave with few training examples. Most are reported as bar or line charts without printed values; the numbers below are the ones the text states.</p>
+      <h4>Backbone</h4>
+      <p>Figure 7(b) compares ImageNet-pretrained ResNet-152, EfficientNetV2, ViT-B and Swin-B with 18 and with 14 stage-3 blocks, on CORD and DocVQA. EfficientNetV2 and Swin outperform the others; Swin is chosen for its scalability and higher score. The paper attributes the gap to "the high expressiveness of the backbones", not to a document-specific property.</p>
+      <h4>Resolution</h4>
+      <p>Figure 7(c) shows performance growing rapidly with canvas size across 640 × 640, 960 × 960, 1280 × 960 and 2560 × 1920, most clearly on DocVQA, "where the images are larger with many tiny texts". The stated CORD numbers are 91.1 TED accuracy at 0.7 s per image with 1280 × 960 against 90.9 at 1.2 s with 2560 × 1920 (Table 2) — on receipts the larger canvas costs 70% more time for no gain in full-data accuracy, but the paper reports it was more robust with only 80 training examples. The repository lists the released 1280 × 960 CORD-v2 checkpoint at 91.3. The authors note an efficient attention mechanism could reduce the cost but keep the original Transformer for simplicity.</p>
+      <div class="viz" id="viz-res">
+        <div class="vhead">
+          <span class="vtitle">Resolution: what a character gets and what it costs</span>
+          <span class="vhint">slide the canvas size · pick the smallest text on the page</span>
+        </div>
+        <div class="controls">
+          <label>canvas <input type="range" id="rs-i" min="0" max="5" step="1" value="4" /> <span id="rs-v"></span></label>
+          <label>smallest text <select id="rs-pt"><option value="10">10 pt</option><option value="8">8 pt</option><option value="6">6 pt (fine print)</option></select></label>
+        </div>
+        <svg id="rs-svg" width="660" height="290" viewBox="0 0 660 290" role="img" aria-label="Encoder cost and stage-4 tokens against canvas size, with the size of a character in patches and the paper's reported CORD points"></svg>
+        <div class="readout" aria-live="polite" id="rs-read"></div>
+        <p class="vcap">Cost is the encoder's multiply–accumulates from the Swin formulas (depths {2, 2, 14, 2}, window 10, padding included), relative to 2560 × 1920. Character size assumes an A4 page at 300 dpi fitted as in <a href="#preprocess">preprocessing</a>, taking a lowercase letter's height as half the point size. The two CORD points are the paper's (Table 2 and the text of §3.3); 640 × 640 and 960 × 960 appear in Figure 7(c) without printed values, 2048 × 1536 is donut-proto's canvas, and 3840 × 2880 is a hypothetical larger canvas; none of these carries an accuracy marker.</p>
+      </div>
+      <h4>OCR engine</h4>
+      <p>Figure 9 re-runs BERT and LayoutLMv2 on CORD with four OCR engines — EasyOCR (about 27M parameters, open source), PaddleOCR (a mobile model of about 10M, served on CPU), Microsoft Azure and CLOVA OCR — and shows both speed and accuracy of the OCR-based systems varying widely with the engine, with CLOVA OCR most accurate. The comparison supports the paper's claim that an OCR-based model's reported accuracy is partly a property of the OCR it was paired with.</p>
+      <h4>Training-set size</h4>
+      <p>Limiting CORD's training set to 80, 160, 400 and 800 receipts (Figure 9, right), Donut stays robust; with 80 receipts (10%) it already exceeds LayoutLMv2's accuracy, and the 2560 × 1920 variant is the more robust one at that extreme.</p>
+      <div class="callout"><b>Takeaway:</b> resolution is Donut's main dial. Small, well-printed documents such as receipts are served well at 1280 × 960; dense pages with small print need the full 2560 × 1920 or more, at a cost that grows with area.</div>
+    </section>
+
+    <!-- 20 ───────────────────────────────────────────── -->
+    <section class="topic" id="handwriting" data-nav="Handwriting and failure cases">
+      <h3><span class="idx">20</span> Handwriting, robustness and failure cases</h3>
+      <p class="lede">On DocVQA's handwritten questions Donut scores 72.1 ANLS, above LayoutLMv2-Large-QG's 67.3, although its overall score is 19.2 points lower (67.5 vs 86.7). The paper's explanation is the one it opened with: handwriting is where OCR is weakest, and an OCR-based model cannot answer better than its OCR reads.</p>
+      <h4>The paper's three examples (Figure 6)</h4>
+      <table class="cmp">
+        <tr><th>Question</th><th>Answer</th><th>Donut</th><th>LayoutLMv2-Large-QG</th><th>What went wrong</th></tr>
+        <tr><td>What is the phone number given?</td><td>336-723-6100</td><td>336-723-6100</td><td>336-723- 4100</td><td>OCR misread a digit and split the string</td></tr>
+        <tr><td>What is the name of the passenger?</td><td>DR. William J. Darby</td><td>DR. William J. Darby</td><td>DR. William J. Jarry</td><td>OCR misread handwriting</td></tr>
+        <tr><td>What is the Publication No.?</td><td>540</td><td>943</td><td>540</td><td>Donut read another number in the image — the text was too small for its canvas</td></tr>
+      </table>
+      <p>The first two show OCR errors setting an upper bound on the OCR-based model; the third shows Donut's characteristic failure — tiny text in a large image, which the paper says "could be mitigated by scaling the input image size". Note what the third failure looks like: a well-formed, plausible answer taken from elsewhere on the page. Nothing in the output flags it as a guess.</p>
+      <h4>Where the robustness comes from, and where it stops</h4>
+      <ul class="notes">
+        <li><b>Joint reading and understanding.</b> A plausible mechanism, not one the paper tests: the decoder knows the question while it reads, so it can use context ("the passenger's name") to resolve an ambiguous scrawl, where an OCR engine must commit to a transcription first.</li>
+        <li><b>No dedicated handwriting data.</b> Donut's pretraining corpora are IIT-CDIP scans (mostly print, with some handwritten documents — RVL-CDIP's "handwritten" class is drawn from the same collection) and rendered fonts; its handwriting ability presumably comes from those scans. Dessurt, a contemporaneous OCR-free model, instead generated 800,000 lines of synthetic handwriting for pretraining (<a href="#relatives">relatives</a>).</li>
+        <li><b>Low overall DocVQA score.</b> 67.5 ANLS is below even LayoutLM-base with OCR (69.8). Most DocVQA pages are printed, dense and small-fonted — plausibly the setting where a commercial OCR engine reading the full-resolution scan has the advantage over Donut reading a 2560 × 1920 canvas.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> OCR-free models degrade differently from pipelines. A pipeline fails where OCR fails — handwriting, unusual scripts, degraded scans; Donut fails where resolution fails — small print on large pages — and fails fluently, with confident answers that may come from the wrong place.</div>
+    </section>
+
+    <!-- 21 ───────────────────────────────────────────── -->
+    <section class="topic" id="limitations" data-nav="Limitations">
+      <h3><span class="idx">21</span> Limitations</h3>
+      <p class="lede">Donut's design trades an external dependency for constraints inside the model: a fixed canvas that bounds legibility and cost, a single page per input, an output budget, and a generative decoder whose answers are not tied to locations on the page. Some of these are fixable engineering; others are properties of the approach.</p>
+      <h4>Resolution against memory and time</h4>
+      <p>Legibility needs pixels: the fine print that OCR engines read at scan resolution must survive resizing onto the canvas. Doubling both canvas sides quadruples the stage-1 tokens and roughly quadruples encoder cost; activations grow the same way. The paper's own training shows the effect — about half an hour on one A100 for CORD at 1280 × 960 against about a day on 64 A100s for DocVQA at 2560 × 1920 (on a much larger dataset).</p>
+      <h4>Fixed aspect ratio and single pages</h4>
+      <ul class="notes">
+        <li><b>Aspect ratio.</b> Every page is fitted into one rectangle. Very tall or wide documents lose most of the canvas to padding. The Pix2Struct paper fine-tuned Donut on InfographicVQA, whose images are large with extreme aspect ratios, and measured 11.6 ANLS against Pix2Struct-Large's 40.0, speculating that Donut's fixed-aspect scaling is the cause.</li>
+        <li><b>One page.</b> The model reads one image. Multi-page documents need splitting and a merge step outside the model, or page tiling, neither of which the paper addresses.</li>
+        <li><b>Output budget.</b> Generation stops at <code>max_length</code> (1,536 in pretraining, 768 for CORD). A long invoice with many line items can exceed it; the truncated sequence loses its closing tokens and, by the parser's rule, the fields they close.</li>
+      </ul>
+      <h4>Hallucination and grounding</h4>
+      <ul class="notes">
+        <li><b>Generated, not extracted.</b> An OCR-based tagger can only label words that exist; Donut can write any string in its vocabulary. A misread becomes a plausible wrong value, and a value can come from the wrong place on the page (the "943" example).</li>
+        <li><b>No boxes, no confidences by default.</b> The output carries no location. Cross-attention maps give a hint; token probabilities give a rough confidence; neither is calibrated or supervised.</li>
+        <li><b>Repetition.</b> Autoregressive decoders can loop. Nougat, which uses the same encoder–decoder design for long academic pages, reports repetition as a major failure mode and adds anti-repetition augmentation and a logit-variance detector; Donut's short targets make this rarer but not impossible.</li>
+      </ul>
+      <h4>Coverage</h4>
+      <ul class="notes">
+        <li><b>Languages</b> are bounded by the four-language vocabulary and the pretraining data; a new script needs vocabulary changes and new SynthDoG data.</li>
+        <li><b>Pseudo-labels.</b> The 11M real pretraining pages were transcribed by an OCR API, so systematic OCR mistakes on real scans could be learned during pretraining.</li>
+        <li><b>Dense-page reading</b> lags OCR: DocVQA 67.5 against 78.1 for LayoutLMv2 on the same training data.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> use Donut where its failure modes are acceptable — short structured outputs from documents of known format and size — and add what it lacks outside the model: schema validation, per-field confidence thresholds, and a human check for fields that matter.</div>
+    </section>
+
+    <!-- 22 ───────────────────────────────────────────── -->
+    <section class="topic" id="donut-hole" data-nav="DONUT-hole: pruning + distillation">
+      <h3><span class="idx">22</span> DONUT-hole: pruning and distillation for deployment</h3>
+      <p class="lede">DONUT-hole ("DONUT-hole: DONUT Sparsification by Harnessing Knowledge and Optimizing Learning Efficiency", arXiv 2311.05778, 2023, from Vrije Universiteit Amsterdam and Prime Vision BV, with logistics documents as the application) compresses Donut for key-information extraction on parcel labels. It magnitude-prunes the pretrained model and then distils the full model into the pruned one while keeping the pruned weights at zero. The authors report a 54% reduction in model density with performance preserved, and a global CKA similarity of 0.79 between the representations of Donut and DONUT-hole.</p>
+      <h4>The models compared</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>How it is made</th><th>Non-embedding / embedding / total</th></tr>
+        <tr><td>DONUT-base (teacher, "DONUT-base-11M")</td><td>the released donut-base</td><td>140M / 60M / 200M</td></tr>
+        <tr><td>DONUT-base-0.5M</td><td>same architecture, pretrained only on the 500K English SynthDoG pages (reference model)</td><td>140M / 60M / 200M</td></tr>
+        <tr><td>DONUT-small</td><td>Swin-T encoder + a 2-layer BART-small decoder, joined by an adapter bottleneck layer</td><td>37M / 29M / 66M</td></tr>
+        <tr><td>DONUT-small-distilled</td><td>DONUT-small trained with distillation from the teacher</td><td>37M / 29M / 66M</td></tr>
+        <tr><td>DONUT-base-pruned</td><td>teacher magnitude-pruned (the text says to about 50% sparsity of non-embedding weights)</td><td>37M / 60M / 97M</td></tr>
+        <tr><td><b>DONUT-hole</b></td><td>teacher distilled into DONUT-base-pruned, sparsity mask enforced during back-propagation</td><td>37M / 60M / 97M</td></tr>
+      </table>
+      <h4>Reported results (1280 × 960 input, 768-token context)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Reading, SynthDoG-EN (TED acc.)</th><th>CORD-v2 TED / F1</th><th>Parcel Reader TED / F1</th><th>CKA vs teacher</th></tr>
+        <tr><td>DONUT-base-0.5M</td><td>0.92</td><td>0.76 / 0.61</td><td>0.65 / 0.50</td><td>0.93</td></tr>
+        <tr><td>DONUT-small</td><td>0.66</td><td>0.55 / 0.37</td><td>0.44 / 0.26</td><td>0.84</td></tr>
+        <tr><td>DONUT-small-distilled</td><td>0.83</td><td>0.61 / 0.41</td><td>0.50 / 0.35</td><td>0.90</td></tr>
+        <tr><td>DONUT-base-pruned</td><td>0.00</td><td>0.00 / 0.00</td><td>0.24 / 0.05</td><td>0.56</td></tr>
+        <tr><td><b>DONUT-hole</b></td><td>0.96</td><td>0.85 / 0.75</td><td>0.73 / 0.57</td><td>0.79</td></tr>
+      </table>
+      <h4>Reading the numbers carefully</h4>
+      <ul class="notes">
+        <li><b>Pruning alone destroys the model</b> (0.00 on reading and CORD); distillation afterwards recovers it and more — the authors suggest the low-magnitude weights were largely redundant and distillation "reestablishes" the broken connections.</li>
+        <li><b>The comparison baseline is the 0.5M-page model.</b> DONUT-hole beats DONUT-base-0.5M, but its CORD-v2 TED accuracy (0.85) is below the 90.9–91.3 the original Donut reports on CORD; the settings differ (reduced data, two A100s, batch 8, although the paper says it follows Donut's learning-rate schedules), so the paper does not show DONUT-hole matching the released donut-base on CORD.</li>
+        <li><b>"54%" and the table do not line up exactly.</b> By Table 1, total parameters fall from 200M to 97M (a 51.5% reduction) and non-embedding parameters from 140M to 37M (73.6%), while the text describes pruning to "∼50% of sparsity on the non-embedding parameters". The headline 54% density reduction is the authors' figure; the paper does not show the calculation.</li>
+        <li><b>Sparse is not automatically fast.</b> Unstructured magnitude pruning zeroes individual weights. The paper asserts that it increases speed but reports no latency measurements; on GPUs, speed-ups from unstructured sparsity typically require sparse kernels or hardware support.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> DONUT-hole's recipe — prune the big pretrained model, then distil the big model back into it — worked far better in its experiments than distilling into a separately designed small model. Treat its headline numbers as relative to its own reduced-data reference, and measure latency on your own hardware before assuming sparsity is speed.</div>
+    </section>
+
+    <!-- 23 ───────────────────────────────────────────── -->
+    <section class="topic" id="cka" data-nav="CKA: comparing representations">
+      <h3><span class="idx">23</span> CKA: comparing two networks' representations</h3>
+      <p class="lede">Centered Kernel Alignment (CKA; "Similarity of Neural Network Representations Revisited", Kornblith et al., 2019) measures how similar two layers' representations are by comparing the similarity structure they impose on the same m examples. It is invariant to rotations and isotropic scaling of either representation, and does not require the two layers to have the same width, which is why DONUT-hole can compare a pruned or Swin-T-based student with the original.</p>
+      <div class="formula"><span class="lbl">two layers' activations on the same m inputs: X ∈ ℝ^(m × d₁), Y ∈ ℝ^(m × d₂); Gram matrices and centring</span><span class="eq">K = XXᵀ,   L = YYᵀ,   H = Iₘ − (1/m) 11ᵀ,   K′ = HKH,   L′ = HLH</span>
+<span class="lbl">Hilbert–Schmidt independence criterion, as DONUT-hole writes it</span><span class="eq">HSIC₀(K, L) = vec(K′) · vec(L′) / (m − 1)²</span>
+<span class="lbl">CKA normalises HSIC; with linear kernels it equals a feature-space form</span><span class="eq">CKA(K, L) = HSIC₀(K, L) / √(HSIC₀(K, K) · HSIC₀(L, L))  =  ‖Yᶜᵀ Xᶜ‖²_F / (‖Xᶜᵀ Xᶜ‖_F · ‖Yᶜᵀ Yᶜ‖_F)</span></div>
+      <h4>Worked example</h4>
+      <p>Four inputs, a teacher layer with two features and a student layer with one: X = [[2, 0], [0, 1], [−2, 0], [0, −1]] and Y = [[2], [0], [−2], [0]] — the student kept the teacher's high-variance feature and dropped the other. Both are already centred (column means are zero). Then Xᵀ X = [[8, 0], [0, 2]], so ‖XᵀX‖_F = √(64 + 4) = 8.246; Yᵀ Y = [[8]], so ‖YᵀY‖_F = 8; and Yᵀ X = [8, 0], so ‖YᵀX‖²_F = 64. CKA = 64 / (8.246 · 8) = 0.970. Had the student kept the low-variance feature instead, Y = [[0], [1], [0], [−1]], then ‖YᵀX‖²_F = 4, ‖YᵀY‖_F = 2, and CKA = 4 / (8.246 · 2) = 0.243. Rotating X by any angle, or multiplying it by 3, leaves CKA with the original at exactly 1.</p>
+      <p>The kernel form gives the same answer: here K′ = K, and HSIC₀(K, L) = 64 / 9 = 7.11, HSIC₀(K, K) = 68 / 9 = 7.56, HSIC₀(L, L) = 64 / 9 = 7.11, so CKA = 7.11 / √(7.56 · 7.11) = 0.970. The example shows why magnitude pruning and CKA fit together: keeping the directions that carry most of the variance keeps most of the similarity structure.</p>
+      <h4>How DONUT-hole uses it</h4>
+      <p>The paper computes layer-wise CKA between each trained model and DONUT-base-11M, and a global index by averaging layer scores (for decoders of different depth, a student layer is compared with the corresponding teacher layer). Findings it reports: the first encoder and decoder layers are highly similar across all models; encoder layers stay similar whatever the backbone (Swin-T, Swin-B or pruned Swin-B); the largest differences are in the last decoder layer; and DONUT-hole's 0.79, lower than the unpruned models', coexists with the best task scores — which the authors read as a more compact representation, and which is a reminder that CKA measures similarity, not quality.</p>
+      <div class="viz" id="viz-cka">
+        <div class="vhead">
+          <span class="vtitle">Linear CKA between a teacher and a transformed student</span>
+          <span class="vhint">pick a transformation · add noise · watch the Gram matrices and the score</span>
+        </div>
+        <div class="controls">
+          <label>student = <select id="cka-op">
+            <option value="rot">rotation of the teacher</option>
+            <option value="scale">teacher × 3</option>
+            <option value="keephi">keep the high-variance feature</option>
+            <option value="keeplo">keep the low-variance feature</option>
+            <option value="prune">magnitude-prune a random map</option>
+            <option value="rand">unrelated random features</option>
+          </select></label>
+          <label>noise <input type="range" id="cka-noise" min="0" max="10" step="1" value="0" /></label>
+          <label>sparsity <input type="range" id="cka-sp" min="0" max="90" step="10" value="50" /></label>
+        </div>
+        <svg id="cka-svg" width="660" height="260" viewBox="0 0 660 260" role="img" aria-label="Centred Gram matrices of the teacher and student representations as heatmaps, with the CKA value"></svg>
+        <div class="readout" aria-live="polite" id="cka-read"></div>
+        <p class="vcap">The teacher is a fixed 8 × 3 activation matrix (illustrative, listed in the script) with column variances in a 16 : 4 : 1 ratio. The student is computed from it by the chosen operation; "magnitude-prune" multiplies the teacher by a random 3 × 3 map whose smallest-magnitude entries are zeroed at the chosen sparsity; noise adds seeded Gaussian noise with standard deviation noise/10 times the teacher's largest column standard deviation. The heatmaps are the centred Gram matrices K′ and L′; CKA is computed from them with the HSIC formula above, and cross-checked against the feature-space formula.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> CKA asks "do these two layers arrange the same inputs the same way?", ignoring rotation and scale. It is a diagnostic of how much of the teacher's internal structure a compressed model kept, not a score of how well the compressed model works.</div>
+    </section>
+
+    <!-- 24 ───────────────────────────────────────────── -->
+    <section class="topic" id="relatives" data-nav="Relatives: Dessurt, Pix2Struct, Nougat">
+      <h3><span class="idx">24</span> Relatives: Dessurt, Pix2Struct, Nougat and VLM readers</h3>
+      <p class="lede">Donut, with the concurrent Dessurt, opened a line of image-to-text document models that read pixels and generate text. Dessurt appeared at nearly the same time with a different way of mixing image and task; Pix2Struct generalised the idea to web screenshots and variable resolution; Nougat specialised Donut's architecture to academic PDFs. General vision-language models have since absorbed the approach. These models have no pages of their own in these notes; the hub compares them at category level (<a href="document-ai-models.html#compare">the members compared</a>).</p>
+      <h4>Dessurt (arXiv 2203.16618)</h4>
+      <p>"End-to-end Document Recognition and Understanding with Dessurt" (Brigham Young University and Adobe Research) describes itself as sharing "an architecture similar in design" with Donut, differing "primarily in how the cross attention occurs and in pre-training". It takes a 1152 × 768 two-channel image (the grayscale page and a highlight mask used by some tasks) and a query string, and processes three token streams — visual, query and response — through eight cross-attention layers in which the Swin-style visual layers also attend to the query, the query attends to the whole visual array, and the response attends to both. It is trained from scratch (no pretrained weights fit its architecture) on IIT-CDIP plus three synthetic sets: Wikipedia text, 800,000 lines of synthetic handwriting, and synthetic forms whose label–value pairs were generated with GPT-2. With 127M parameters it reports 93.6% on RVL-CDIP and 63.2 ANLS on DocVQA, and it covers tasks Donut's paper does not, including full-page handwriting recognition and named-entity recognition on the IAM handwriting database.</p>
+      <h4>Pix2Struct (arXiv 2210.03347)</h4>
+      <p>"Pix2Struct: Screenshot Parsing as Pretraining for Visual Language Understanding" (Google Research and collaborators) keeps the pixels-in, text-out interface but changes the pretraining and the input. It is pretrained on 80M screenshots of web pages (URLs from the C4 corpus) to generate a simplified HTML parse of a partly masked screenshot, after a short "warm-up" reading curriculum. Its ViT encoder takes a <i>variable-resolution</i> input: the image is scaled, preserving aspect ratio, to the largest size whose 16 × 16 patches fit a sequence budget (2,048 in pretraining), with 2-D absolute position embeddings for each patch's row and column. Task text such as a question is rendered onto the image as a header. Base has 282M parameters (12 encoder and 12 decoder layers), Large 1.3B. On DocVQA it reports 72.1 (Base) and 76.6 (Large) ANLS against Donut's 67.5, and on InfographicVQA 38.2 and 40.0 against 11.6 for a Donut the authors fine-tuned; across nine benchmarks it reports gains over Donut of 9 to 53 points.</p>
+      <h4>Nougat (arXiv 2308.13418)</h4>
+      <p>"Nougat: Neural Optical Understanding for Academic Documents" (Meta AI) builds directly "on the Donut architecture" to convert rendered pages of scientific papers into Markdown with LaTeX mathematics and tables. Pages are rendered at 96 dpi onto an 896 × 672 canvas; the encoder is a Swin-B initialised from pretrained weights; the mBART-style decoder has 10 layers and a maximum length of 4,096 tokens (350M parameters), or 4 layers and 3,584 tokens in a 250M "small" variant. It is trained on 8,204,754 pages — 7,511,745 from arXiv, whose LaTeX source provides aligned targets, 536,319 from PubMed Central and 446,777 from the Industry Documents Library — and decodes greedily. On its arXiv test set it reports a normalised edit distance of 0.071 (base) against 0.255 for the text embedded in the PDF and 0.312 for GROBID. It also documents the design's weaknesses at length: repetition loops, handled with anti-repetition augmentation and a detector on the variance of top logits, and failure on non-Latin scripts, which "result in instant repetitions".</p>
+      <table class="cmp">
+        <tr><th></th><th>Donut</th><th>Dessurt</th><th>Pix2Struct</th><th>Nougat</th></tr>
+        <tr><td>Encoder</td><td>Swin-B variant {2,2,14,2}, window 10</td><td>small CNN + Swin-style layers that also attend to the query</td><td>ViT, variable resolution</td><td>Swin-B</td></tr>
+        <tr><td>Input</td><td>2560 × 1920 fixed canvas</td><td>1152 × 768, 2 channels</td><td>aspect-preserving, patch budget</td><td>896 × 672 fixed canvas</td></tr>
+        <tr><td>Decoder</td><td>4-layer mBART</td><td>response stream in joint layers</td><td>Transformer decoder</td><td>10-layer mBART, 4,096 tokens</td></tr>
+        <tr><td>Pretraining</td><td>reading: IIT-CDIP (OCR pseudo-labels) + SynthDoG</td><td>reading, MLM-style tasks, synthetic handwriting and forms</td><td>masked screenshot → simplified HTML</td><td>supervised page → Markdown/LaTeX</td></tr>
+        <tr><td>Size</td><td>143M (202M with vocabulary)</td><td>127M</td><td>282M / 1.3B</td><td>250M / 350M</td></tr>
+        <tr><td>Output</td><td>JSON via key tokens</td><td>free text, JSON for forms</td><td>free text</td><td>Markdown + LaTeX</td></tr>
+      </table>
+      <h4>Vision-language models as document readers</h4>
+      <p>From 2023 onward, general vision-language models — a vision encoder feeding a large language model — took over much of what Donut was built for: reading a page, answering questions about it, emitting JSON on request, usually at dynamic resolution rather than on a fixed canvas. They inherit Donut's interface and its trade-offs: no OCR dependency, generated rather than extracted answers, and a token budget that grows with page area. What they add is scale and instruction following, so a new schema can often be handled by a prompt instead of fine-tuning. The hub's <a href="document-ai-models.html#tokens">token-budget section</a> works the arithmetic for one such model, and <a href="../llm/vision-language-models.html">Vision-Language Models</a> covers the architecture family.</p>
+      <div class="callout"><b>Takeaway:</b> Donut's lineage kept its core — pixels in, tokens out, reading as pretraining — and fixed its constraints one at a time: Pix2Struct the fixed aspect ratio, Nougat the output length for long pages, general VLMs the model scale and task flexibility.</div>
+    </section>
+
+    <!-- 25 ───────────────────────────────────────────── -->
+    <section class="topic" id="vs-layoutlm" data-nav="Donut vs LayoutLM">
+      <h3><span class="idx">25</span> Donut versus LayoutLM</h3>
+      <p class="lede">LayoutLM and Donut are the reference designs of the two document-AI strands: an encoder over OCR words and their boxes, and an encoder–decoder over pixels. The <a href="layoutlm.html">LayoutLM page</a> covers that family in full, including its view of the same comparison (<a href="layoutlm.html#vs-ocrfree">LayoutLM versus Donut</a>); this table states the contrast from Donut's side.</p>
+      <table class="cmp">
+        <tr><th></th><th>Donut</th><th>LayoutLM family (v1 – v3)</th></tr>
+        <tr><td>Who reads the text</td><td>the model, from pixels</td><td>an external OCR engine (or a PDF's text layer)</td></tr>
+        <tr><td>Input</td><td>one image on a 2560 × 1920 canvas (fine-tunes use smaller)</td><td>OCR tokens with 0–1000 box coordinates; from v2, a 224 × 224 image</td></tr>
+        <tr><td>Network</td><td>Swin encoder + 4-layer decoder</td><td>BERT-style encoder (+ visual tokens in v2, v3)</td></tr>
+        <tr><td>Output</td><td>generated token sequence → JSON, class, answer</td><td>a label per token, a span, or a class from [CLS]</td></tr>
+        <tr><td>Structure (nested records)</td><td>native, via key tokens</td><td>needs group BIO tags or post-processing</td></tr>
+        <tr><td>Grounding</td><td>none built in; cross-attention hints</td><td>every output is a set of OCR words with boxes</td></tr>
+        <tr><td>Normalised or absent values</td><td>can generate them</td><td>can only label words present</td></tr>
+        <tr><td>Main failure</td><td>small text at the canvas resolution; fluent wrong values</td><td>OCR errors; reading-order errors</td></tr>
+        <tr><td>On the Donut paper's CORD protocol</td><td>84.1 F1, 90.9 TED acc., 1.2 s</td><td>LayoutLM 78.4 / 81.3, LayoutLMv2 78.9 / 82.4, 1.7 s</td></tr>
+        <tr><td>DocVQA (train set only)</td><td>67.5 ANLS</td><td>LayoutLM 69.8, LayoutLMv2 78.1</td></tr>
+      </table>
+      <h4>Reading the comparison fairly</h4>
+      <ul class="notes">
+        <li><b>Different protocols give different LayoutLM numbers.</b> Under the LayoutLM papers' own CORD protocol (ground-truth OCR, entity F1) LayoutLMv2 scores about 95; under Donut's end-to-end protocol, with a real OCR engine and field-level F1 over the full parse, it scores 78.9. Both are correct for their task.</li>
+        <li><b>Born-digital PDFs</b> remove OCR error entirely, which removes Donut's main advantage; scanned photos and handwriting do the opposite.</li>
+        <li><b>Cost comparisons depend on the OCR.</b> A fast local engine narrows Donut's end-to-end speed advantage; an expensive API widens it (see the <a href="#ablations">OCR-engine ablation</a>).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> pick LayoutLM when text is reliable and outputs must point at words on the page; pick Donut when reading is the hard part or the output is a structure to be generated. The hub's <a href="document-ai-models.html#choose">how-to-choose section</a> gives the full decision sequence.</div>
+    </section>
+
+    <!-- 26 ───────────────────────────────────────────── -->
+    <section class="topic" id="usage" data-nav="Practical usage">
+      <h3><span class="idx">26</span> Practical usage</h3>
+      <p class="lede">Donut is available in the Hugging Face Transformers library as a <code>VisionEncoderDecoderModel</code> with a <code>DonutProcessor</code> (image processor + tokenizer), and in the original <code>donut-python</code> package. The checkpoints under the naver-clova-ix organisation — donut-base, and fine-tunes for CORD, train tickets, RVL-CDIP and DocVQA — are MIT-licensed like the code. Using one correctly comes down to four things: the processor, the prompt, the generation settings, and the parsing.</p>
+      <h4>The steps</h4>
+      <ol class="notes">
+        <li><b>Preprocess with the checkpoint's own processor.</b> <code>processor(image, return_tensors="pt").pixel_values</code> applies that checkpoint's canvas size, long-axis setting and normalisation (<a href="#preprocess">preprocessing</a>). Changing the canvas from the fine-tuning size can hurt accuracy; measure it before relying on it.</li>
+        <li><b>Build the prompt exactly as in training</b> and tokenize it without extra special tokens: <code>&lt;s_cord-v2&gt;</code>, <code>&lt;s_rvlcdip&gt;</code>, or <code>&lt;s_docvqa&gt;&lt;s_question&gt;{question}&lt;/s_question&gt;&lt;s_answer&gt;</code>.</li>
+        <li><b>Generate</b> with <code>decoder_input_ids</code> = the prompt, <code>max_length</code> = the decoder's <code>max_position_embeddings</code> (or a task-appropriate bound), <code>eos_token_id</code> and <code>pad_token_id</code> from the tokenizer, <code>use_cache=True</code>, and <code>bad_words_ids=[[unk_token_id]]</code> to forbid the unknown token — the settings in the library's documented examples.</li>
+        <li><b>Parse:</b> decode, remove <code>&lt;/s&gt;</code> and padding, strip the first task token, and call <code>processor.token2json(sequence)</code>.</li>
+      </ol>
+      <h4>Decoding settings</h4>
+      <table class="cmp">
+        <tr><th>Setting</th><th>Original <code>inference()</code></th><th>Why</th></tr>
+        <tr><td>Search</td><td>greedy (<code>num_beams=1</code>)</td><td>fields are mostly deterministic reading; beam search multiplies decoder cost by the beam width</td></tr>
+        <tr><td>Unknown token</td><td>forbidden via <code>bad_words_ids</code></td><td>prevents <code>&lt;unk&gt;</code> in the output string</td></tr>
+        <tr><td>Stopping</td><td><code>&lt;/s&gt;</code> or <code>max_length</code></td><td>truncation at <code>max_length</code> loses the fields still open</td></tr>
+        <tr><td>Scores</td><td>optional (<code>return_dict_in_generate</code>, output scores)</td><td>per-token probabilities give a rough per-field confidence</td></tr>
+      </table>
+      <p>Beam search can help when a field's reading is genuinely ambiguous, but it does not fix misreads caused by insufficient resolution and it multiplies decoding time by roughly the beam width; the released inference code and Nougat both use greedy decoding. A practical confidence signal is the minimum or mean token probability inside each field's span, thresholded on validation data, with low-confidence fields routed to review.</p>
+      <h4>Fine-tuning on your own schema</h4>
+      <ul class="notes">
+        <li>Write each training target as JSON in one consistent key order and value format; add the key tokens and a task token to the tokenizer and resize the decoder's embedding.</li>
+        <li>Choose the canvas from your documents' size and smallest text; choose <code>max_length</code> from the longest serialised target.</li>
+        <li>Start from donut-base, use a learning rate around 1 × 10⁻⁵ – 1 × 10⁻⁴ with warm-up, and select checkpoints by validation edit distance or TED accuracy of generated outputs.</li>
+        <li>Quantisation is supported by the library (the documentation shows int4 weight-only quantisation with torchao); measure the accuracy change on your data.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> most failed Donut deployments fail on plumbing — wrong processor, wrong prompt, too small a <code>max_length</code> — rather than on the model. Match the training-time preprocessing and prompt exactly, decode greedily, and validate the parsed JSON.</div>
+    </section>
+
+    <!-- 27 ───────────────────────────────────────────── -->
+    <section class="topic" id="pitfalls" data-nav="Pitfalls">
+      <h3><span class="idx">27</span> Pitfalls</h3>
+      <p class="lede">The mistakes below each produce plausible-looking output, which is what makes them costly: a generative model rarely crashes on bad input, it writes something.</p>
+      <h4>Input and preprocessing</h4>
+      <ul class="notes">
+        <li><b>Wrong canvas orientation.</b> A landscape document on the 2560 × 1920 portrait canvas without long-axis alignment is shrunk to fit the 1920-pixel width, losing up to a quarter of its linear resolution relative to a matched canvas (a quarter for pages at least 4:3 wide).</li>
+        <li><b>Mixing normalisations.</b> The Hub processors (mean 0.5, std 0.5) and the original repository (ImageNet statistics) differ; pairing a checkpoint with the other preprocessing shifts every input pixel.</li>
+        <li><b>Size lists read in the wrong order.</b> <code>[1920, 2560]</code> in a processor file is width, height; <code>[2560, 1920]</code> in a model or training config is height, width.</li>
+        <li><b>Downscaled scans.</b> Feeding a 100-dpi thumbnail loses information before the model sees it; the canvas cannot restore resolution.</li>
+      </ul>
+      <h4>Targets and prompts</h4>
+      <ul class="notes">
+        <li><b>Prompt mismatch.</b> <code>&lt;s_cord&gt;</code> instead of <code>&lt;s_cord-v2&gt;</code>, or the paper's <code>&lt;parsing&gt;</code> instead of the code's names, starts generation from a prompt the model was never trained on.</li>
+        <li><b>Key order drift.</b> Training targets must use one key order; with <code>sort_json_key</code> on, keys are written reverse-alphabetically, so "total" precedes "menu".</li>
+        <li><b>Value formatting drift.</b> "9,000", "9000" and "9.000" are different targets and different token sequences (and number strings split irregularly: "14,000" is ▁1 · 4,000 but "28,000" is ▁28, · 000). Normalise values before training or after parsing, not inconsistently.</li>
+        <li><b>Truncated targets.</b> A training target longer than <code>max_length</code> is cut, teaching the model to stop mid-record.</li>
+      </ul>
+      <h4>Evaluation</h4>
+      <ul class="notes">
+        <li><b>Comparing F1 across protocols.</b> Donut's field-level F1 over parsed trees is not the entity F1 of OCR-based papers.</li>
+        <li><b>Reporting only one metric.</b> F1 hides structure errors and TED accuracy hides exact-field failures; report both.</li>
+        <li><b>Trusting silent drops.</b> The parser discards malformed fields without warning; count them.</li>
+        <li><b>Ignoring the OCR-free model's own "OCR" errors.</b> Donut can misread; measure character error rate on the fields that matter, not just record-level scores.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> most Donut pitfalls are inconsistencies between training and inference — in pixels, prompts, key order or value format. Write them down once as a data contract and test that inference follows it.</div>
+    </section>
+
+    <!-- 28 ───────────────────────────────────────────── -->
+    <section class="topic" id="cheatsheet" data-nav="Cheat sheet">
+      <h3><span class="idx">28</span> Cheat sheet</h3>
+      <p class="lede">The numbers and names to have at hand, all for donut-base unless stated. Everything here is derived or cited in the sections above.</p>
+      <h4>Model, training, interface and results</h4>
+      <table class="cmp">
+        <tr><th>Item</th><th>Value</th></tr>
+        <tr><td>Paper</td><td>"OCR-free Document Understanding Transformer", arXiv 2111.15664, ECCV 2022, NAVER CLOVA</td></tr>
+        <tr><td>Architecture</td><td>Swin encoder (patch 4, C = 128, depths {2, 2, 14, 2}, heads {4, 8, 16, 32}, window 10) → 4-layer mBART decoder (d = 1,024, 16 heads, FFN 4,096)</td></tr>
+        <tr><td>Canvas</td><td>2560 × 1920 (H × W) pretraining; 1280 × 960 CORD; 960 × 1280 tickets and business cards</td></tr>
+        <tr><td>Tokens</td><td>307,200 → 76,800 → 19,200 → 4,800 per stage; decoder attends to 4,800 × 1,024</td></tr>
+        <tr><td>Vocabulary</td><td>57,522 base entries + 3 = 57,525 (CORD fine-tune 57,580); max positions 1,536</td></tr>
+        <tr><td>Parameters</td><td>201,852,024 total; 142,946,424 (≈ 143M) without token embedding; encoder 74.2M, decoder 127.7M</td></tr>
+        <tr><td>Pretraining</td><td>read all text; IIT-CDIP 11M (CLOVA OCR pseudo-labels) + SynthDoG 0.5M × {en, zh, ja, ko}; 200K steps × 196 on 64 A100s</td></tr>
+        <tr><td>Loss</td><td>next-token cross-entropy, teacher forcing; prompt and padding masked (−100)</td></tr>
+        <tr><td>Serialisation</td><td>dict → &lt;s_k&gt;…&lt;/s_k&gt;; list → items joined by &lt;sep/&gt;; categorical values → &lt;value/&gt;</td></tr>
+        <tr><td>Prompts</td><td>&lt;s_cord-v2&gt;, &lt;s_rvlcdip&gt;, &lt;s_docvqa&gt;&lt;s_question&gt;…&lt;/s_question&gt;&lt;s_answer&gt;</td></tr>
+        <tr><td>Metrics</td><td>field F1 = TP / (TP + (FP + FN)/2); TED acc = max(0, 1 − TED(pr, gt) / TED(∅, gt)); ANLS for DocVQA</td></tr>
+        <tr><td>Headline results</td><td>RVL-CDIP 95.30% at 752 ms; CORD F1 84.1, TED 90.9 at 1.2 s (91.1 at 1280 × 960, 0.7 s); DocVQA 67.5 ANLS (72.1 handwritten)</td></tr>
+        <tr><td>Decoding</td><td>greedy, forbid &lt;unk&gt;, stop at &lt;/s&gt; or max_length; parse with token2json</td></tr>
+        <tr><td>DONUT-hole</td><td>magnitude pruning + distillation; 200M → 97M total (37M non-embedding); 54% density reduction reported; CKA 0.79 vs teacher</td></tr>
+        <tr><td>CKA (linear)</td><td>‖YᶜᵀXᶜ‖²_F / (‖XᶜᵀXᶜ‖_F · ‖YᶜᵀYᶜ‖_F); invariant to rotation and isotropic scale</td></tr>
+        <tr><td>Swin cost per block</td><td>Ω(W-MSA) = 4hwC² + 2M²hwC (linear in hw) vs Ω(MSA) = 4hwC² + 2(hw)²C</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> if you remember one line — a Swin encoder at 2560 × 1920 reads the page into 4,800 vectors, a four-layer decoder writes key-tagged tokens, and a regex turns them into JSON.</div>
+    </section>
+
+    <!-- 29 ───────────────────────────────────────────── -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">29</span> Takeaways</h3>
+      <p class="lede">Donut showed in 2021 that a plain encoder–decoder Transformer, pretrained only to read, could replace the OCR stage of document understanding for classification and structured extraction, with competitive accuracy and lower end-to-end latency. Its limits — resolution, grounding, single pages — defined the agenda for the models that followed.</p>
+      <h4>What to remember</h4>
+      <ul class="notes">
+        <li><b>Design:</b> a hierarchical, windowed vision encoder makes a 2560 × 1920 input affordable; a short, wide decoder with key tokens turns generation into records.</li>
+        <li><b>Training:</b> one next-token loss for every stage; reading as the pretraining task; synthetic pages (SynthDoG) to reach languages without labelled scans; real scans still matter for real-scan tasks.</li>
+        <li><b>Evaluation:</b> field F1 and TED accuracy measure different things; the Donut paper's protocol re-scores OCR-based baselines end to end, so its numbers are not comparable with those papers' own.</li>
+        <li><b>Strengths:</b> structure-heavy extraction (CORD TED 90.9 vs 82.4), handwriting (72.1 vs 67.3 ANLS), language flexibility, speed without an OCR call.</li>
+        <li><b>Weaknesses:</b> dense small print (DocVQA 67.5), fixed aspect ratio (InfographicVQA 11.6 in Pix2Struct's fine-tune), no grounding, silent parse failures.</li>
+        <li><b>Compression:</b> DONUT-hole's prune-then-distil recipe recovered a model destroyed by pruning; measure its speed rather than assume it, and read CKA as similarity, not quality.</li>
+        <li><b>Legacy:</b> Pix2Struct, Nougat and today's vision-language document readers keep Donut's interface — pixels in, tokens out.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> Donut is the reference design for OCR-free document understanding. Read the <a href="document-ai-models.html">Document AI Models</a> hub for where it sits among the alternatives, <a href="layoutlm.html">LayoutLM</a> for the OCR-based design it was measured against, and <a href="../nlp/document-intelligence.html">Document Intelligence</a> for how either fits into a working pipeline.</div>
+    </section>
+
+    <section class="topic" id="papers" data-nav="Research papers">
+      <h3><span class="idx">📄</span> Research papers</h3>
+      <p class="lede">Primary sources for Donut and its compressed variant, then the relatives, building blocks and datasets this page cites, by title and identifier.</p>
+      <h4>Donut and DONUT-hole</h4>
+      <ul class="notes">
+        <li><b>"OCR-free Document Understanding Transformer"</b> (2021, arXiv 2111.15664; ECCV 2022) — Donut, SynthDoG, the field-F1 / TED-accuracy evaluation.</li>
+        <li><b>"DONUT-hole: DONUT Sparsification by Harnessing Knowledge and Optimizing Learning Efficiency"</b> (2023, arXiv 2311.05778) — magnitude pruning plus distillation; CKA analysis.</li>
+      </ul>
+      <h4>Relatives</h4>
+      <ul class="notes">
+        <li><b>"End-to-end Document Recognition and Understanding with Dessurt"</b> (2022, arXiv 2203.16618).</li>
+        <li><b>"Pix2Struct: Screenshot Parsing as Pretraining for Visual Language Understanding"</b> (2022, arXiv 2210.03347; ICML 2023).</li>
+        <li><b>"Nougat: Neural Optical Understanding for Academic Documents"</b> (2023, arXiv 2308.13418).</li>
+        <li><b>"LayoutLMv2: Multi-modal Pre-training for Visually-rich Document Understanding"</b> (2020, arXiv 2012.14740) — the strongest OCR-based baseline in Donut's tables.</li>
+        <li><b>"Cost-effective End-to-end Information Extraction for Semi-structured Document Images"</b> (EMNLP 2021) — WYVERN; <b>"Spatial Dependency Parsing for Semi-structured Document Information Extraction"</b> (Findings of ACL 2021) — SPADE.</li>
+      </ul>
+      <h4>Building blocks</h4>
+      <ul class="notes">
+        <li><b>"Swin Transformer: Hierarchical Vision Transformer using Shifted Windows"</b> (2021, arXiv 2103.14030) — window and shifted-window attention, the complexity formulas.</li>
+        <li><b>"BART: Denoising Sequence-to-Sequence Pre-training for Natural Language Generation, Translation, and Comprehension"</b> (2019, arXiv 1910.13461).</li>
+        <li><b>"Multilingual Denoising Pre-training for Neural Machine Translation"</b> (2020, arXiv 2001.08210) — mBART, the source of the decoder's initialisation.</li>
+        <li><b>"SynthTIGER: Synthetic Text Image Generator Towards Better Text Recognition Models"</b> (ICDAR 2021) — the rendering pipeline SynthDoG follows.</li>
+        <li><b>"Simple Fast Algorithms for the Editing Distance between Trees and Related Problems"</b> (1989, SIAM Journal on Computing) — Zhang–Shasha tree edit distance.</li>
+        <li><b>"Similarity of Neural Network Representations Revisited"</b> (2019, arXiv 1905.00414) — CKA.</li>
+        <li><b>"Distilling the Knowledge in a Neural Network"</b> (2015, arXiv 1503.02531); <b>"Sequence-Level Knowledge Distillation"</b> (2016, arXiv 1606.07947).</li>
+        <li><b>"An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale"</b> (2020, arXiv 2010.11929) — ViT.</li>
+      </ul>
+      <h4>Datasets</h4>
+      <ul class="notes">
+        <li><b>"Building a Test Collection for Complex Document Information Processing"</b> (2006, SIGIR) — IIT-CDIP.</li>
+        <li><b>"Evaluation of Deep Convolutional Nets for Document Image Classification and Retrieval"</b> (2015, arXiv 1502.07058) — RVL-CDIP.</li>
+        <li><b>"CORD: A Consolidated Receipt Dataset for Post-OCR Parsing"</b> (2019, NeurIPS Document Intelligence Workshop).</li>
+        <li><b>"EATEN: Entity-aware Attention for Single Shot Visual Text Extraction"</b> (2019, arXiv 1909.09380; ICDAR 2019) — the Chinese train-ticket dataset.</li>
+        <li><b>"DocVQA: A Dataset for VQA on Document Images"</b> (2020, arXiv 2007.00398).</li>
       </ul>
     </section>
 
