@@ -177,7 +177,7 @@ def audit():
 
     # 10. in-body href/src links to .html that resolve to a missing file on disk
     broken_inbody = []
-    href_re = re.compile(r'(?:href|src)="([^"]+\.html[^"]*)"')
+    href_re = re.compile(r'(?<![\w-])(?:href|src)="([^"]+\.html[^"]*)"')   # not data-href (pending cards)
     for folder in DOMAIN_FOLDERS:
         for rel_page in html_files(folder):
             page = os.path.join(ROOT, rel_page)

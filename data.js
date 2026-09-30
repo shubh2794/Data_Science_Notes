@@ -57,7 +57,7 @@ const nodes = [
   {id:"Data Viz & Communication", group:"viz", level:1, desc:"Turning analysis into clear visuals and narratives that drive decisions."},
   {id:"LLMs & Generative AI", group:"llm", level:1, desc:"The modern generative stack built on large pretrained models: prompting and context, parameter-efficient adaptation, preference alignment, evaluation, and multimodal + diffusion variants."},
   {id:"Agentic AI", group:"agent", level:1, desc:"LLMs that plan, use tools, and act over multiple steps to accomplish goals — agents, the skills they wield, how they're trained, and the design patterns that structure them."},
-  {id:"Model Architectures", group:"models", level:1, desc:"Landmark models, each with notes, key research papers, and visuals — BERT, GPT, and the families that followed."},
+  {id:"Model Architectures", group:"models", level:1, desc:"Landmark models, grouped by modality — vision, NLP, LLM families, audio, multimodal and document AI — each with notes, key research papers, and visuals."},
 
   // Math & Statistics
   {id:"Linear Algebra", group:"math", level:2, link:"math/linear-algebra.html", desc:"Vectors, matrices, eigen-decompositions — the substrate of nearly every ML computation. Hub page: the map of the subject, split into six sub-topics below."},
@@ -174,7 +174,13 @@ const nodes = [
   {id:"Embeddings", group:"nlp", level:2, link:"nlp/embeddings.html", desc:"Dense vector representations where semantic similarity becomes geometric proximity."},
   {id:"Language Models", group:"nlp", level:2, link:"nlp/language-models.html", desc:"Models that predict the next token; scaled up, they become LLMs."},
   {id:"RAG", group:"nlp", level:2, link:"nlp/retrieval-augmented-generation.html", desc:"Retrieval-Augmented Generation — grounding LLM answers in retrieved documents."},
-  {id:"BERT", group:"models", level:2, link:"models/bert.html", desc:"Bidirectional encoder Transformer pretrained with masked language modeling — the pretrain-then-finetune workhorse for NLP understanding tasks."},
+  {id:"Vision Models", group:"models", level:2, link:"models/vision-models.html", desc:"Image and video backbones and task models — convolutional (EfficientNet) and transformer-based (ViT family, DETR, SAM, DINOv2): what each architecture changed and how the families compare."},
+  {id:"NLP Models", group:"models", level:2, link:"models/nlp-models.html", desc:"Encoder-only and encoder–decoder language models — BERT and its successors, T5, BART: pretraining objectives, input formats, and when an encoder or seq2seq model beats a decoder."},
+  {id:"LLM Families", group:"models", level:2, link:"models/llm-families.html", desc:"Decoder-only large language model families — GPT, Llama, Mistral/Mixtral, Qwen, Gemma, DeepSeek: configs, attention variants (GQA, MLA, sliding window), MoE, and training recipes compared."},
+  {id:"Audio Models", group:"models", level:2, link:"models/audio-models.html", desc:"Speech and audio models — Whisper and wav2vec 2.0: waveform/spectrogram front ends, self-supervised and weakly supervised pretraining, and CTC vs seq2seq decoding."},
+  {id:"Multimodal Models", group:"models", level:2, link:"models/multimodal-models.html", desc:"Vision–language models — CLIP-style dual encoders and generative VLMs (LLaVA, BLIP-2, PaliGemma): how images are turned into tokens and aligned with language."},
+  {id:"Document AI Models", group:"models", level:2, link:"models/document-ai-models.html", desc:"Models for visually rich documents — OCR-based LayoutLM and OCR-free Donut: layout as a modality, and pipeline vs end-to-end document understanding."},
+  {id:"BERT", group:"models", level:3, link:"models/bert.html", desc:"Bidirectional encoder Transformer pretrained with masked language modeling — the pretrain-then-finetune workhorse for NLP understanding tasks."},
 
   // Computer Vision
   {id:"Image Classification", group:"cv", level:2, desc:"Assigning a label to a whole image — the canonical vision task."},
@@ -253,11 +259,11 @@ const nodes = [
   {id:"Reasoning in LLMs", group:"llm", level:2, link:"llm/reasoning-in-llms.html", desc:"Eliciting multi-step thinking — chain-of-thought, self-consistency, tree/graph-of-thought, and reasoning-trained models."},
   {id:"Hallucination & Factuality", group:"llm", level:2, link:"llm/hallucination-factuality.html", desc:"Why LLMs fabricate and how to catch it — measuring factuality, detecting hallucinations, and grounding/abstention mitigations."},
   {id:"Context-Length Extension", group:"llm", level:2, link:"llm/context-length-extension.html", desc:"Pushing the context window longer — positional interpolation, RoPE scaling, and efficient long-context attention."},
-  {id:"GPT", group:"models", level:2, link:"models/gpt.html", desc:"Generative Pre-trained Transformer — the decoder-only autoregressive lineage (GPT-1→4) behind modern LLMs; the generative counterpart to BERT."},
-  {id:"CLIP", group:"models", level:2, link:"models/clip.html", desc:"Contrastive Language-Image Pre-training — dual image/text encoders aligned in a shared embedding space; zero-shot vision and the backbone of text-to-image models."},
-  {id:"LayoutLM", group:"models", level:2, link:"models/layoutlm.html", desc:"The Document-AI family (v1→v2→v3) that fuses text, 2D layout (OCR bounding boxes), and image in one Transformer for visually-rich document understanding — forms, receipts, invoices, doc classification, and document VQA."},
-  {id:"Donut", group:"models", level:2, link:"models/donut.html", desc:"OCR-free Document Understanding Transformer — a Swin vision encoder + BART-style decoder that reads document pixels and generates structured output (JSON) directly, no OCR. Pretrained with SynthDoG; DONUT-hole distills/prunes it for the edge."},
-  {id:"EfficientNet", group:"models", level:2, link:"models/efficientnet.html", desc:"Compound model scaling for ConvNets: grow depth, width and input resolution together (d = αᵠ, w = βᵠ, r = γᵠ, α·β²·γ² ≈ 2) from a NAS-found MBConv + squeeze-and-excitation baseline (B0), giving the B0–B7 family, plus its FLOPs-vs-latency critiques and the EfficientNetV2 follow-up."},
+  {id:"GPT", group:"models", level:3, link:"models/gpt.html", desc:"Generative Pre-trained Transformer — the decoder-only autoregressive lineage (GPT-1→4) behind modern LLMs; the generative counterpart to BERT."},
+  {id:"CLIP", group:"models", level:3, link:"models/clip.html", desc:"Contrastive Language-Image Pre-training — dual image/text encoders aligned in a shared embedding space; zero-shot vision and the backbone of text-to-image models."},
+  {id:"LayoutLM", group:"models", level:3, link:"models/layoutlm.html", desc:"The Document-AI family (v1→v2→v3) that fuses text, 2D layout (OCR bounding boxes), and image in one Transformer for visually-rich document understanding — forms, receipts, invoices, doc classification, and document VQA."},
+  {id:"Donut", group:"models", level:3, link:"models/donut.html", desc:"OCR-free Document Understanding Transformer — a Swin vision encoder + BART-style decoder that reads document pixels and generates structured output (JSON) directly, no OCR. Pretrained with SynthDoG; DONUT-hole distills/prunes it for the edge."},
+  {id:"EfficientNet", group:"models", level:3, link:"models/efficientnet.html", desc:"Compound model scaling for ConvNets: grow depth, width and input resolution together (d = αᵠ, w = βᵠ, r = γᵠ, α·β²·γ² ≈ 2) from a NAS-found MBConv + squeeze-and-excitation baseline (B0), giving the B0–B7 family, plus its FLOPs-vs-latency critiques and the EfficientNetV2 follow-up."},
 
   // ===== aman-coverage additions (curated gaps) =====
   {id:"Speech & Audio", group:"speech", level:1, desc:"Processing and generating audio and speech — features, recognition, and synthesis across the audio modality."},
@@ -293,13 +299,19 @@ const tree = {
   "LLMs & Generative AI":["Large Language Models","Context Engineering","Parameter-Efficient Fine-Tuning","Policy / Preference Optimization","LLM-as-a-Judge","Diffusion LLMs","Vision-Language Models","Reasoning in LLMs","Hallucination & Factuality","Context-Length Extension"],
   "Agentic AI":["Agents","Agentic RL","Agent Skills","Agentic Design Patterns","Computer Control"],
   "Speech & Audio":["Speech Processing"],
-  "Model Architectures":["BERT","GPT","CLIP","LayoutLM","Donut","EfficientNet"],
+  "Model Architectures":["Vision Models","NLP Models","LLM Families","Audio Models","Multimodal Models","Document AI Models"],
 };
 
 /* level-3 sub-topics: parent topic id → ordered child ids. The parent keeps its
    page as the hub; children are rendered as leaves hanging off the parent in the
    graph and as a "Sub-topics" / sibling list in the sidebars. */
 const subtree = {
+  "Vision Models":["EfficientNet"],
+  "NLP Models":["BERT"],
+  "LLM Families":["GPT"],
+  "Audio Models":[],
+  "Multimodal Models":["CLIP"],
+  "Document AI Models":["LayoutLM","Donut"],
   "Classical Neural Networks":["Perceptrons & Early Learning Rules","Hopfield Networks & Associative Memory","Boltzmann Machines & RBMs","Self-Organizing Maps & Competitive Learning","Radial Basis Function Networks","Neuro-Fuzzy Systems","Kalman Filter Training","Neural System Identification & Control","Neuroevolution & Growing Networks","Neural Network Hardware"],
   "Linear & Logistic Regression":["Linear Regression","Logistic Regression"],
   "Pandas & NumPy":["NumPy","Pandas"],
@@ -476,6 +488,22 @@ const cross = [
   // domain bridges (builds-on)
   ["LLMs & Generative AI","Deep Learning","isa"],["Agentic AI","LLMs & Generative AI","isa"],
   ["Speech & Audio","Deep Learning","isa"],
+  ["Vision Models","Attention"],["Vision Models","Residual / Skip Connections"],["Vision Models","Contrastive Learning"],["Vision Models","Knowledge Distillation"],["Vision Models","Fine-Tuning & Transfer Learning"],
+  ["Vision Models","Segmentation"],["Vision Models","Image Classification"],["Vision Models","Object Detection"],["Vision Models","DL Architectures Compared"],["Vision Models","Multimodal Models"],
+  ["NLP Models","Encoder vs Decoder Models"],["NLP Models","Attention"],["NLP Models","Tokenization"],["NLP Models","Embeddings"],["NLP Models","Language Models"],
+  ["NLP Models","Fine-Tuning & Transfer Learning"],["NLP Models","Text Classification"],["NLP Models","Named Entity Recognition"],["NLP Models","Question Answering"],["NLP Models","Text Summarization"],
+  ["NLP Models","Machine Translation"],["NLP Models","Knowledge Distillation"],["NLP Models","LLM Families"],["NLP Models","Large Language Models"],["LLM Families","Attention"],
+  ["LLM Families","Mixture of Experts"],["LLM Families","Transformers"],["LLM Families","Context-Length Extension"],["LLM Families","Tokenization"],["LLM Families","Knowledge Distillation"],
+  ["LLM Families","Distributed Training"],["LLM Families","Encoder vs Decoder Models"],["LLM Families","Parameter-Efficient Fine-Tuning"],["LLM Families","Policy / Preference Optimization"],["LLM Families","Multimodal Models"],
+  ["Audio Models","Contrastive Learning"],["Audio Models","Encoder vs Decoder Models"],["Audio Models","Transformers"],["Audio Models","Attention"],["Audio Models","CNNs"],
+  ["Audio Models","RNNs & LSTMs"],["Audio Models","Tokenization"],["Audio Models","NLP Evaluation Metrics"],["Audio Models","Fine-Tuning & Transfer Learning"],["Audio Models","Knowledge Distillation"],
+  ["Audio Models","Machine Translation"],["Multimodal Models","Contrastive Learning"],["Multimodal Models","Vision Transformers"],["Multimodal Models","Large Language Models"],["Multimodal Models","Attention"],
+  ["Multimodal Models","Transformers"],["Multimodal Models","Embeddings"],["Multimodal Models","Fine-Tuning & Transfer Learning"],["Multimodal Models","Parameter-Efficient Fine-Tuning"],["Multimodal Models","Hallucination & Factuality"],
+  ["Multimodal Models","Document AI Models"],["Document AI Models","Named Entity Recognition"],["Document AI Models","Question Answering"],["Document AI Models","Vision Transformers"],["Document AI Models","Encoder vs Decoder Models"],
+  ["Document AI Models","Vision-Language Models"],["Document AI Models","Transformers"],["Document AI Models","Tokenization"],["Donut","Vision Transformers"],["Model Architectures","Deep Learning","isa"],
+  ["Vision Models","Computer Vision","isa"],["NLP Models","NLP","isa"],["LLM Families","LLMs & Generative AI","isa"],["Audio Models","Speech & Audio","isa"],
+  ["Multimodal Models","Computer Vision","isa"],["Multimodal Models","NLP","isa"],["Multimodal Models","Vision-Language Models"],["Document AI Models","NLP","isa"],["Document AI Models","Document Intelligence"],
+  ["Vision Models","CNNs"],["Vision Models","Vision Transformers"],["LLM Families","Large Language Models"],["NLP Models","Transformers"],["Audio Models","Speech Processing"],
   // aman-coverage ties
   ["Hyperparameter Tuning","Model Evaluation"],["Hyperparameter Tuning","Neural Network Training"],["Hyperparameter Tuning","Bias-Variance Tradeoff"],
   ["Residual / Skip Connections","Neural Network Training"],["Residual / Skip Connections","CNNs"],["Residual / Skip Connections","Transformers"],
@@ -489,7 +517,7 @@ const cross = [
   ["BERT","Encoder vs Decoder Models"],["BERT","Transformers"],["BERT","Fine-Tuning & Transfer Learning"],["BERT","Language Models"],["BERT","Named Entity Recognition"],["BERT","Textual Entailment"],
   ["EfficientNet","CNNs"],["EfficientNet","Residual / Skip Connections"],["EfficientNet","Fine-Tuning & Transfer Learning"],["EfficientNet","Image Classification"],
   ["EfficientNet","Object Detection"],["EfficientNet","Vision Transformers"],["EfficientNet","Model Acceleration"],["EfficientNet","Hyperparameter Tuning"],
-  ["EfficientNet","Neural Network Training"],["EfficientNet","Knowledge Distillation"],["EfficientNet","DL Architectures Compared"],["EfficientNet","CLIP"],
+  ["EfficientNet","Neural Network Training"],["EfficientNet","Knowledge Distillation"],["EfficientNet","DL Architectures Compared"],
   ["GPT","Large Language Models"],["GPT","Transformers"],["GPT","Encoder vs Decoder Models"],["GPT","Policy / Preference Optimization"],["GPT","Attention"],
   ["GPT","Tokenization"],["GPT","Language Models"],["GPT","Context Engineering"],["GPT","Hallucination & Factuality"],["GPT","Context-Length Extension"],
   ["GPT","Speculative Decoding"],["GPT","Model Acceleration"],["GPT","Residual / Skip Connections"],["GPT","Reasoning in LLMs"],["GPT","LLMOps"],["GPT","RAG"],
