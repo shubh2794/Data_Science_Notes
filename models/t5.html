@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · T5</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+.tokrow{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0;font-family:"SF Mono",Menlo,monospace;font-size:11.5px}
+.tokrow span{padding:2px 5px;border-radius:4px;background:rgba(91,156,255,.16);color:#cfe0ff}
+.tokrow span.sp{background:rgba(192,132,252,.2);color:#e9d5ff}
+.tokrow span.bad{background:rgba(248,113,113,.25);color:#fecaca}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>T5 — the Text-to-Text Transfer Transformer</h1>
+      <p>T5 is an encoder–decoder Transformer from Google that casts every text task — translation, summarisation, classification, regression, question answering — as "read a string, write a string", and a 2019 study that used that single interface to compare, one factor at a time, the architectures, pretraining objectives, datasets, transfer strategies and scaling choices of the time. This note covers it in detail: the text-to-text format and its task prefixes, the architecture (pre-norm RMS-style layer norm, bias-free dense layers, the bucketed relative position bias, tied embeddings, ReLU feed-forward in the original and GEGLU in v1.1), every released configuration with parameter counts recomputed from the configurations, the SentencePiece vocabulary and its sentinels, how the C4 corpus was filtered, the span-corruption objective worked by hand with its length arithmetic, the systematic study table by table, the pretraining and fine-tuning schedule with Adafactor, the headline results, the successors T5 v1.1, mT5, ByT5, Flan-T5, UL2 and T5Gemma, the compute arithmetic of encoder–decoder against decoder-only models, and practical use with pitfalls.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Model Architectures</span>
+        <span class="pill">NLP Models</span>
+        <span class="pill">Encoder–decoder</span>
+        <span class="pill">Span corruption</span>
+        <span class="pill">Transfer learning</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="overview" data-nav="What T5 is">
+      <h3><span class="idx">01</span> What T5 is</h3>
+      <p class="lede">T5 ("Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer", arXiv 1910.10683, JMLR 2020) is two things at once: a family of encoder–decoder Transformers, released at five sizes from 60M to 11B parameters, and a large controlled study of transfer learning for NLP. Both rest on one decision — every task is text in, text out — so the same model, loss, optimiser and decoding procedure serve all of them.</p>
+      <div class="formula"><span class="lbl">every task, pretraining included: maximise the likelihood of the target string given the input string (teacher forcing)</span><span class="eq">L(θ) = − Σₜ₌₁ᵐ log p_θ(yₜ | y₁ … yₜ₋₁, Enc_θ(x))</span>
+<span class="lbl">where</span><span class="eq">x = task prefix + input text,     y = target text + &lt;/s&gt;</span>
+<span class="lbl">pretraining input and target come from unlabeled text by span corruption</span><span class="eq">x = "Thank you &lt;X&gt; me to your party &lt;Y&gt; week."     y = "&lt;X&gt; for inviting &lt;Y&gt; last &lt;Z&gt;"</span>
+<span class="lbl">inference: decode the target string, then read the answer out of it</span><span class="eq">"mnli hypothesis: … premise: …"  →  "entailment";   "stsb sentence1: … sentence2: …"  →  "3.8"</span></div>
+
+      <h4>What goes in and what comes out</h4>
+      <ul class="notes">
+        <li><b>Input:</b> a string that begins with a short task prefix — <code>translate English to German:</code>, <code>summarize:</code>, <code>cola sentence:</code> — tokenized with a 32,000-piece SentencePiece model; up to 512 tokens during pretraining.</li>
+        <li><b>Output:</b> a string generated token by token: a translation, a summary, a class name such as <code>entailment</code>, a number such as <code>3.8</code>, or an answer span.</li>
+        <li><b>Training:</b> pretraining with span corruption on C4 (about 750 GB of filtered English web text), then fine-tuning on each task with the same cross-entropy loss. The released v1.0 checkpoints were pretrained on a mixture of C4 and the supervised tasks (<a href="#final">final recipe</a>).</li>
+      </ul>
+
+      <h4>The pieces and their sizes</h4>
+      <table class="cmp">
+        <tr><th>Part</th><th>T5-Base setting (the study's baseline)</th><th>Where it is explained</th></tr>
+        <tr><td>Network</td><td>12-layer encoder + 12-layer decoder, d_model 768, 12 heads × d_kv 64, ReLU feed-forward 3,072; 222.9M parameters by recount (paper: "about 220 million")</td><td><a href="#architecture">architecture</a>, <a href="#params">parameters</a></td></tr>
+        <tr><td>Position signal</td><td>a learned scalar bias per head added to each attention logit, indexed by 32 log-spaced distance buckets up to 128, shared across the layers of a stack</td><td><a href="#relpos">relative position bias</a></td></tr>
+        <tr><td>Vocabulary</td><td>SentencePiece, 32,000 pieces + 100 sentinels = 32,100 ids; embedding padded to 32,128 rows; input and output embeddings tied</td><td><a href="#tokenizer">tokenizer</a></td></tr>
+        <tr><td>Data</td><td>C4: Common Crawl April 2019, heuristically cleaned, English only, about 750 GB</td><td><a href="#c4">C4</a></td></tr>
+        <tr><td>Objective</td><td>span corruption: 15% of tokens, mean span length 3, each span replaced by one sentinel; the target lists the dropped spans</td><td><a href="#span">span corruption</a>, <a href="#lengths">length arithmetic</a></td></tr>
+        <tr><td>Schedule (study)</td><td>2¹⁹ pretraining steps × 2¹⁶ tokens ≈ 34B tokens; inverse-square-root learning rate; Adafactor; 2¹⁸ fine-tuning steps at a constant 0.001</td><td><a href="#schedule">schedule</a></td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> T5 is a vanilla-looking encoder–decoder whose significance is the interface — one string-to-string format for everything — and the evidence the study produced with it: which pretraining choices matter (denoising over language modelling, clean and large data, scale) and which barely do (the exact denoising variant).</div>
+      <div class="callout"><b>What this page does NOT cover, and where it lives.</b> The NLP-model category as a whole — encoders against encoder–decoders, the lineage, a side-by-side configuration table — <a href="nlp-models.html">NLP Models</a>. The encoder-only branch — <a href="bert.html">BERT</a>; the decoder-only branch — <a href="gpt.html">GPT</a>. Encoder, decoder and encoder–decoder wirings and their masks in general — <a href="../deep-learning/encoder-decoder-models.html">Encoder vs Decoder Models</a>; the Transformer block and attention mathematics — <a href="../deep-learning/transformers.html">Transformers</a> and <a href="../deep-learning/attention.html">Attention</a>. Sub-word algorithms, SentencePiece included — <a href="../nlp/tokenization.html">Tokenization</a>. Adapters, LoRA and other parameter-efficient methods beyond the study's two — <a href="../llm/parameter-efficient-fine-tuning.html">Parameter-Efficient Fine-Tuning</a>. The tasks themselves — <a href="../nlp/machine-translation.html">Machine Translation</a>, <a href="../nlp/text-summarization.html">Text Summarization</a>, <a href="../nlp/question-answering.html">Question Answering</a>. This page owns T5 and its direct family.</div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="text-to-text" data-nav="Text-to-text and task prefixes">
+      <h3><span class="idx">02</span> Text-to-text: every task as a string, named by a prefix</h3>
+      <p class="lede">To tell the model which task to perform, T5 prepends a task-specific text prefix to the input. Classification labels become words, regression becomes a number written as text, and reference-resolution tasks become "name the noun". The paper found the exact wording of the prefix had limited impact and treated it as a hyperparameter.</p>
+      <div class="formula"><span class="lbl">the input is the task name plus each field as "name: value"</span><span class="eq">x = "mnli hypothesis: My feelings towards pigeons are filled with animosity.
+     premise: I hate pigeons."        y = "entailment"</span>
+<span class="lbl">STS-B: a 1–5 similarity score rounded to the nearest 0.2 and written as a string — a 21-way classification</span><span class="eq">y = str(round(5 · s) / 5):    3.25 → "3.2",    2.57 → "2.6"
+classes 1.0, 1.2, …, 5.0  ⇒  (5 − 1) / 0.2 + 1 = 21</span>
+<span class="lbl">an output that is not a valid label is scored as wrong</span><span class="eq">ŷ ∉ {entailment, neutral, contradiction}  ⇒  incorrect    (never observed, per the paper)</span></div>
+      <h4>How each benchmark was cast</h4>
+      <table class="cmp">
+        <tr><th>Task</th><th>Input (Appendix D format)</th><th>Target</th></tr>
+        <tr><td>WMT translation</td><td><code>translate English to German: That is good.</code></td><td><code>Das ist gut.</code></td></tr>
+        <tr><td>CNN/Daily Mail</td><td><code>summarize: state authorities dispatched …</code></td><td>the summary</td></tr>
+        <tr><td>CoLA, SST-2, RTE, MRPC, QQP</td><td><code>cola sentence: …</code>, <code>rte sentence1: … sentence2: …</code></td><td><code>acceptable</code>, <code>positive</code>, <code>not_entailment</code>, <code>equivalent</code>, <code>not_duplicate</code></td></tr>
+        <tr><td>MNLI, CB</td><td><code>mnli hypothesis: … premise: …</code></td><td><code>entailment</code> / <code>neutral</code> / <code>contradiction</code></td></tr>
+        <tr><td>STS-B</td><td><code>stsb sentence1: … sentence2: …</code></td><td><code>3.2</code></td></tr>
+        <tr><td>SQuAD</td><td><code>question: … context: …</code> (no task name)</td><td>the answer text, generated</td></tr>
+        <tr><td>WSC, WNLI, DPR</td><td>the passage with the pronoun marked: <code>… which made *it* pleasant and airy.</code></td><td>the referent noun: <code>stable</code></td></tr>
+      </table>
+      <h4>Details that differ between the paper's text and its code</h4>
+      <ul class="notes">
+        <li><b>Field order.</b> Section 2.4 writes MNLI as "mnli premise: … hypothesis: …", but Appendix D, which shows the actual preprocessed examples, has "mnli hypothesis: … premise: …" — the fields appear in alphabetical order of their names (likewise "cb hypothesis: … premise: …"). Use the Appendix D form with the released checkpoints.</li>
+        <li><b>Label words.</b> Figure 1 shows a CoLA target "not acceptable", but the label names in the dataset code are <code>unacceptable</code> and <code>acceptable</code>, and Appendix D's example target is "acceptable". Multi-word labels use underscores (<code>not_entailment</code>).</li>
+        <li><b>WSC.</b> Only examples labelled True can be trained on (the referent of a False candidate is unknown); at evaluation a prediction counts as True when its words are a subset of the candidate's or vice versa. WNLI overlaps the WSC training set, so the paper never trains on it and excludes it from validation GLUE averages.</li>
+      </ul>
+      <div class="viz" id="viz-task">
+        <div class="vhead">
+          <span class="vtitle">One model, many tasks: inputs and targets as tokens</span>
+          <span class="vhint">pick a task · drag the STS-B score to see the rounding</span>
+        </div>
+        <div class="controls">
+          <label>task <select id="task-pick">
+            <option value="ende">WMT English → German</option>
+            <option value="sum">CNN/DM summarisation</option>
+            <option value="cola">CoLA acceptability</option>
+            <option value="stsb">STS-B similarity</option>
+            <option value="mnli">MNLI inference</option>
+            <option value="rte">RTE inference</option>
+            <option value="wsc">WSC / DPR</option>
+            <option value="squad">SQuAD</option>
+          </select></label>
+          <label>STS-B gold score <input type="range" id="task-sts" min="100" max="500" step="1" value="325" /> <span id="task-stsv"></span></label>
+        </div>
+        <svg id="task-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="The chosen task's input and target strings split into the SentencePiece pieces the model sees, with token counts, and the STS-B rounding to a 0.2 grid"></svg>
+        <div class="readout" aria-live="polite" id="task-read"></div>
+        <p class="vcap">Strings are from the paper's Figure 1, Section 2.4 and Appendix D (the summarisation and SQuAD inputs are shortened). Pieces were produced with the released t5-small tokenizer; <code>▁</code> marks a preceding space, and the tokenizer appends <code>&lt;/s&gt;</code> (counted). The STS-B panel applies the paper's rule: round to the nearest 0.2 and print the number.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> text-to-text removes task-specific heads, so everything learned in pretraining — including the output vocabulary and the decoder — transfers. The cost is that the model must spell its labels, which is why a label must be tokenized and matched exactly, and why a regression target has to be quantised.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="architecture" data-nav="Architecture at a glance">
+      <h3><span class="idx">03</span> Architecture at a glance</h3>
+      <p class="lede">T5 follows the original Transformer encoder–decoder closely. The paper lists three departures: layer normalisation without a bias and without mean-centring, applied to the input of each sub-layer (pre-norm) with the residual path left un-normalised; a simplified relative position scheme in place of sinusoidal embeddings; and no additive biases. The output softmax shares its weights with the input embedding.</p>
+      <div class="formula"><span class="lbl">encoder block (N blocks), then a final norm and dropout</span><span class="eq">h ← h + Dropout(SelfAttn_full(LN(h), bias_enc))          h ← h + Dropout(FF(LN(h)))</span>
+<span class="lbl">decoder block (N blocks), then a final norm and dropout</span><span class="eq">h ← h + Dropout(SelfAttn_causal(LN(h), bias_dec))     h ← h + Dropout(CrossAttn(LN(h), z))
+h ← h + Dropout(FF(LN(h)))</span>
+<span class="lbl">output distribution: the tied embedding E; the Hugging Face code rescales by d_model^(−1/2) when tied</span><span class="eq">p(yₜ | y&lt;ₜ, x) = softmax( E · (d_model^(−1/2) · hₜ) ),     E ∈ ℝ^(32,128 × d_model)</span></div>
+      <h4>What is and is not in a block</h4>
+      <ul class="notes">
+        <li><b>Attention</b> has four bias-free projections: W_Q, W_K, W_V ∈ ℝ^(d_model × h·d_kv) and W_O ∈ ℝ^(h·d_kv × d_model). The inner width h·d_kv need not equal d_model — T5-3B and T5-11B make it 4× and 16× larger (<a href="#configs">configurations</a>).</li>
+        <li><b>Feed-forward</b> is dense–ReLU–dense with no biases (v1.0), or a GEGLU with three matrices (v1.1).</li>
+        <li><b>Position</b> enters only through the bias added to attention logits, computed in the first layer of each stack and reused by every layer of that stack. Cross-attention has no position bias.</li>
+        <li><b>Dropout</b> (0.1 in the study) is applied inside the feed-forward network, on each residual branch, on the attention weights, and at the input and output of each stack.</li>
+      </ul>
+      <div class="viz" id="viz-arch">
+        <div class="vhead">
+          <span class="vtitle">Encoder and decoder blocks with their shapes</span>
+          <span class="vhint">pick a configuration · hover a box for its weight shape</span>
+        </div>
+        <div class="controls">
+          <label>configuration <select id="arch-cfg"></select></label>
+        </div>
+        <svg id="arch-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Block diagram of a T5 encoder block and decoder block with norms, attention, cross-attention and feed-forward sub-layers, labelled with the chosen configuration's weight shapes"></svg>
+        <div class="readout" aria-live="polite" id="arch-read"></div>
+        <p class="vcap">Shapes come from each checkpoint's released config.json (d_model, d_ff, d_kv, num_heads, num_layers, num_decoder_layers, feed_forward_proj, tie_word_embeddings). Parameter counts per block are computed from those shapes; biases are absent everywhere, and each norm has d_model scale parameters.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> architecturally T5 is the 2017 encoder–decoder with modern hygiene: pre-norm residuals, scale-only norms, no biases, relative position biases, tied embeddings. The authors deliberately left these choices out of the study as "orthogonal to the experimental factors".</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="layernorm" data-nav="Scale-only layer norm">
+      <h3><span class="idx">04</span> The simplified layer norm (RMS-style) and pre-norm residuals</h3>
+      <p class="lede">T5's layer normalisation only rescales: it divides each vector by its root-mean-square and multiplies by a learned gain, with no mean subtraction and no additive bias. This is the operation later named RMSNorm; the Hugging Face implementation says so in its comments, and computes the mean square in 32-bit floats even for half-precision inputs.</p>
+      <div class="formula"><span class="lbl">standard LayerNorm, for comparison</span><span class="eq">LN(x) = g ⊙ (x − μ) / √(σ² + ε) + b,      μ = (1/d) Σᵢ xᵢ,   σ² = (1/d) Σᵢ (xᵢ − μ)²</span>
+<span class="lbl">T5 layer norm: no centring, no bias</span><span class="eq">T5LN(x) = g ⊙ x / √( (1/d) Σᵢ xᵢ² + ε ),      g ∈ ℝ^d initialised to 1,   ε = 10⁻⁶</span>
+<span class="lbl">pre-norm residual: the skip path is never normalised</span><span class="eq">h ← h + F(T5LN(h))           (post-norm would be h ← LN(h + F(h)))</span></div>
+      <h4>Worked example</h4>
+      <p>Take x = (2, 4, 6, 8). Its mean square is (4 + 16 + 36 + 64)/4 = 30, so T5LN(x) = x / √30 = (0.365, 0.730, 1.095, 1.461) with g = 1. Standard LayerNorm would first subtract the mean 5, giving (−3, −1, 1, 3) / √5 = (−1.342, −0.447, 0.447, 1.342). Adding a constant c to every coordinate changes T5LN's output (the mean is not removed) but leaves LayerNorm's unchanged; scaling x by any positive factor leaves both unchanged (up to ε).</p>
+      <ul class="notes">
+        <li><b>Parameters.</b> One gain vector of d_model per norm: two per encoder block, three per decoder block, plus one final norm per stack — 768 × (2·12 + 3·12 + 2) = 47,616 parameters in T5-Base, 0.02% of the model.</li>
+        <li><b>Why pre-norm.</b> With the norm inside the branch, the residual stream is a sum of branch outputs plus the embedding; gradients reach early layers through the identity path undisturbed, which is generally credited with making deep pre-norm stacks such as T5's 24 + 24 layers easier to train than post-norm ones.</li>
+        <li><b>A consequence for half precision.</b> Because nothing normalises the residual stream until the final norm, its magnitude can grow with depth — one ingredient of the fp16 overflow problem in <a href="#pitfalls">pitfalls</a>.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> T5's norm is RMSNorm before it had a name: cheaper than LayerNorm (no mean, no bias) and, in the pre-norm position, friendly to deep stacks. Loading T5 weights into a LayerNorm-based implementation silently changes the network.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="relpos" data-nav="Relative position bias">
+      <h3><span class="idx">05</span> Relative position bias: 32 log-spaced buckets</h3>
+      <p class="lede">T5 has no position embeddings on its tokens. Instead, each attention head adds a learned scalar to every query–key logit, chosen by the bucketed offset between the key's and the query's positions. There are 32 buckets per head; small offsets get their own bucket, larger ones share logarithmically wider buckets, and everything beyond the last boundary shares one. The table is learned once per stack — in the first layer — and reused by all layers of that stack; the encoder's and the decoder's tables are separate.</p>
+      <div class="formula"><span class="lbl">attention logits of head h: no 1/√d_kv scaling in T5 (see the next section)</span><span class="eq">sᵢⱼ = qᵢ · kⱼ + B_h[ bucket(j − i) ],       B ∈ ℝ^(32 × heads) per stack</span>
+<span class="lbl">bidirectional (encoder): half the buckets for keys after the query, half for keys at or before it</span><span class="eq">n = 32 / 2 = 16,   offset r = j − i,   base = 16 · [r &gt; 0],   a = |r|</span>
+<span class="lbl">causal (decoder): future offsets never occur; all 32 buckets measure the distance into the past</span><span class="eq">n = 32,   base = 0,   a = max(0, −r)</span>
+<span class="lbl">exact buckets for small distances, logarithmic above, capped at the last bucket (max_distance D = 128)</span><span class="eq">e = n / 2;     bucket = base + a                                    if a &lt; e
+       bucket = base + min( n − 1,  e + ⌊ ln(a / e) / ln(D / e) · (n − e) ⌋ )     otherwise</span></div>
+      <h4>Worked example: where each bucket starts</h4>
+      <table class="cmp">
+        <tr><th>Stack</th><th>Exact buckets</th><th>Logarithmic buckets (distance at which each starts)</th><th>Last bucket covers</th></tr>
+        <tr><td>Encoder, per direction (16 buckets)</td><td>0 – 7</td><td>8, 12, 16, 23, 32, 46, 64, 91</td><td>distance ≥ 91</td></tr>
+        <tr><td>Decoder (32 buckets, past only)</td><td>0 – 15</td><td>16, 19, 21, 24, 27, 31, 35, 40, 46, 52, 59, 67, 77, 87, 99, 113</td><td>distance ≥ 113</td></tr>
+      </table>
+      <p>For the encoder, a = 20 is not exact (20 ≥ 8), so bucket = 8 + ⌊ln(20/8)/ln(16) · 8⌋ = 8 + ⌊0.3305 · 8⌋ = 8 + 2 = 10, the bucket that starts at 16. The formula would reach 16 — one past the last bucket — at a = 128, which is where "max distance 128" comes from; but the cap at n − 1 means the last bucket already starts at 91 in the encoder and 113 in the decoder. The paper's sentence "ranges that increase in size logarithmically up to an offset of 128 beyond which we assign all relative positions to the same embedding" is therefore true but loose: offsets from 91 (encoder) or 113 (decoder) upward already share one value. One more quirk of the encoder: offset 0 goes to bucket 0 and a key after the query has distance at least 1, so bucket 16 ("after, distance 0") can never be selected — the encoder uses 31 of its 32 buckets.</p>
+      <h4>Consequences</h4>
+      <ul class="notes">
+        <li><b>Cheap and length-agnostic.</b> The whole position mechanism of T5-Base is 32 × 12 = 384 numbers per stack. Nothing ties the model to 512 positions; the <code>n_positions: 512</code> in the v1.0 configs is informational. Beyond the training length quality is not guaranteed, and attention cost still grows quadratically.</li>
+        <li><b>A single layer is blind beyond the last boundary</b> — it cannot tell a key 200 tokens away from one 2,000 away — but, as the paper notes, stacked layers can combine local information to build sensitivity to larger offsets.</li>
+        <li><b>Padding side does not matter</b> for the encoder, because nothing depends on absolute position (the library documentation says left or right padding both work).</li>
+      </ul>
+      <div class="viz" id="viz-rel">
+        <div class="vhead">
+          <span class="vtitle">From relative offset to bucket</span>
+          <span class="vhint">switch encoder/decoder · change the bucket count and maximum distance</span>
+        </div>
+        <div class="controls">
+          <label>stack <select id="rel-dir">
+            <option value="bi">encoder (bidirectional)</option>
+            <option value="uni">decoder (causal)</option>
+          </select></label>
+          <label>buckets <input type="range" id="rel-nb" min="8" max="64" step="8" value="32" /> <span id="rel-nbv"></span></label>
+          <label>max distance <input type="range" id="rel-md" min="32" max="512" step="32" value="128" /> <span id="rel-mdv"></span></label>
+        </div>
+        <svg id="rel-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Step plot of bucket index against relative offset from minus 160 to plus 160, with bucket start positions marked and a strip showing the query row of a bias matrix"></svg>
+        <div class="readout" aria-live="polite" id="rel-read"></div>
+        <p class="vcap">A port of the released <code>_relative_position_bucket</code> (Hugging Face, adapted from Mesh TensorFlow), evaluated for offsets r = j − i from −160 to +160. The strip below the plot colours one query's row of the bias matrix by bucket; in the decoder, offsets r &gt; 0 are masked by causality and map to bucket 0 only formally.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> T5's position signal is a per-head, per-bucket scalar — fine resolution nearby, coarse far away, nothing beyond the last bucket boundary within a layer. It costs almost no parameters and does not fix a maximum length, which is why T5 checkpoints accept inputs longer than 512 tokens (with no quality guarantee).</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="attention" data-nav="Attention without √d scaling">
+      <h3><span class="idx">06</span> Attention details: no √d_kv scaling, and the initialisation that replaces it</h3>
+      <p class="lede">T5's attention does not divide the logits by √d_kv. The released code (Mesh TensorFlow, and the Hugging Face port, whose comment reads "T5 folds the relative position bias into the attention scores and does not scale the query/key dot product") instead initialises W_Q with a smaller standard deviation so the logits start at the same scale. The paper does not mention this; it is a code-level detail that matters if you port weights.</p>
+      <div class="formula"><span class="lbl">standard scaled dot-product attention</span><span class="eq">A = softmax( Q Kᵀ / √d_kv + mask ) V</span>
+<span class="lbl">T5 attention: no scaling, position bias added</span><span class="eq">A = softmax( Q Kᵀ + B + mask ) V</span>
+<span class="lbl">initialisation in the released code (factor 1): W_Q absorbs the missing 1/√d_kv</span><span class="eq">W_Q ~ N(0, (d_model · d_kv)^(−1)),     W_K, W_V ~ N(0, d_model^(−1))
+W_O ~ N(0, (h · d_kv)^(−1)),     E ~ N(0, 1)</span>
+<span class="lbl">feed-forward initialisation</span><span class="eq">W_in ~ N(0, d_model^(−1)),    W_out ~ N(0, d_ff^(−1))</span></div>
+      <h4>Why the two are equivalent at initialisation</h4>
+      <p>With inputs of unit RMS, a query component qₐ = Σᵢ xᵢ W_Q,ᵢₐ has variance d_model · Var(W_Q) = 1/d_kv under T5's initialisation, versus 1 under the usual one. A logit q · k sums d_kv products, so its variance is d_kv · (1/d_kv) · 1 = 1 — the same as the standard √d_kv-scaled logit. The difference is what happens during training: T5's effective scale is a learned property of W_Q, not a fixed constant.</p>
+      <h4>The tied output projection</h4>
+      <p>Because the embedding E is initialised with unit variance and shared with the softmax layer, v1.0 multiplies the final decoder state by d_model^(−1/2) before the tied projection (768^(−1/2) = 0.0361 for T5-Base). T5 v1.1 unties the two matrices and drops this rescaling; the Hugging Face code decides which to do from the checkpoint's <code>tie_word_embeddings</code> flag. Mixing up the two is a silent error: logits come out √d_model = 27.7 times too large or too small.</p>
+      <div class="callout"><b>Takeaway:</b> when porting T5 to another codebase, three things have no counterpart in a textbook Transformer and each changes outputs silently: no 1/√d_kv in attention, the d_model^(−1/2) rescale before a tied output layer, and the scale-only norm.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="feedforward" data-nav="ReLU vs GEGLU feed-forward">
+      <h3><span class="idx">07</span> The feed-forward layer: ReLU in T5, GEGLU in v1.1</h3>
+      <p class="lede">The original T5 feed-forward network is two bias-free matrices with a ReLU between them. T5 v1.1 replaces it with GEGLU, from Shazeer's "GLU Variants Improve Transformer" (2020): the hidden layer is the elementwise product of a GELU-activated projection and a second, linear projection. The gate adds a third matrix, so v1.1 shrinks d_ff to keep sizes comparable.</p>
+      <div class="formula"><span class="lbl">T5 v1.0: W₁ is d × d_ff, W₂ is d_ff × d — 2 · d · d_ff parameters</span><span class="eq">FF_ReLU(x) = max(0, x W₁) W₂</span>
+<span class="lbl">T5 v1.1 (feed_forward_proj = "gated-gelu", tanh approximation of GELU): W₀, W₁ are d × d_ff′ — 3 · d · d_ff′ parameters</span><span class="eq">FF_GEGLU(x) = ( GELU(x W₀) ⊙ x W₁ ) W₂</span>
+<span class="lbl">same parameter count when</span><span class="eq">3 · d · d_ff′ = 2 · d · d_ff   ⇒   d_ff′ = (2/3) · d_ff</span>
+<span class="lbl">applied to the released shapes</span><span class="eq">Base: 3,072 → 2,048 (released 2,048);    Large: 4,096 → 2,730.7 (released 2,816)</span></div>
+      <h4>What the gate changes</h4>
+      <ul class="notes">
+        <li>A ReLU unit's output depends on one projection and is exactly zero for half its input range. A GEGLU unit multiplies a smooth, mostly-positive GELU of one projection by an unbounded linear value of another, so it can output either sign and its magnitude is modulated by a second direction of the input.</li>
+        <li>The GLU-variants paper reported lower pretraining perplexity for GEGLU and SwiGLU than for ReLU at matched parameters and compute on the T5 setup, and gains on downstream fine-tuning; SwiGLU is the variant most later decoder-only LLMs adopted.</li>
+        <li>The released v1.1 shapes are not all "2/3 of v1.0": Base matches (2,048), Large uses 2,816, and Small changes shape entirely (d_ff 1,024, 6 heads, 8 + 8 layers).</li>
+      </ul>
+      <div class="viz" id="viz-ff">
+        <div class="vhead">
+          <span class="vtitle">One hidden unit: ReLU, GELU and the GEGLU gate</span>
+          <span class="vhint">move the linear branch value · pick a size to compare parameter counts</span>
+        </div>
+        <div class="controls">
+          <label>linear branch x·W₁ <input type="range" id="ff-b" min="-20" max="20" step="1" value="10" /> <span id="ff-bv"></span></label>
+          <label>size <select id="ff-cfg">
+            <option value="base">Base</option>
+            <option value="large">Large</option>
+            <option value="small">Small</option>
+          </select></label>
+        </div>
+        <svg id="ff-svg" width="660" height="280" viewBox="0 0 660 280" role="img" aria-label="Curves of ReLU, GELU and GELU times the linear-branch value against the pre-activation, with a bar comparison of feed-forward parameters for v1.0 and v1.1"></svg>
+        <div class="readout" aria-live="polite" id="ff-read"></div>
+        <p class="vcap">GELU uses the tanh approximation (gelu_new) that the library applies for "gated-gelu". The bar panel computes one feed-forward block's parameters from the released configs: 2·d·d_ff for v1.0 and 3·d·d_ff′ for v1.1, and the d_ff′ that would exactly match v1.0.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> GEGLU is the one architectural change in v1.1 that later models kept; its gated product gives each unit two input directions for 1.5× the matrices, paid for by a narrower hidden layer.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="configs" data-nav="Every configuration">
+      <h3><span class="idx">08</span> Every configuration, and the odd shapes of 3B and 11B</h3>
+      <p class="lede">The paper defines five sizes. Small, Base and Large follow BERT's shape conventions (inner attention width equal to d_model, d_ff = 4 · d_model). The 3B and 11B models keep d_model = 1,024 and grow only the attention inner width and the feed-forward width, because, in the paper's words, TPUs "are most efficient for large dense matrix multiplications like those in the Transformer's feed-forward networks".</p>
+      <table class="cmp">
+        <tr><th>Model</th><th>Layers (enc + dec)</th><th>d_model</th><th>Heads × d_kv (inner)</th><th>d_ff</th><th>FF</th><th>Paper's size</th><th>Recount (HF num_parameters)</th></tr>
+        <tr><td>T5-Small</td><td>6 + 6</td><td>512</td><td>8 × 64 (512)</td><td>2,048</td><td>ReLU</td><td>about 60M</td><td>60,506,624</td></tr>
+        <tr><td>T5-Base</td><td>12 + 12</td><td>768</td><td>12 × 64 (768)</td><td>3,072</td><td>ReLU</td><td>about 220M</td><td>222,903,552</td></tr>
+        <tr><td>T5-Large</td><td>24 + 24</td><td>1,024</td><td>16 × 64 (1,024)</td><td>4,096</td><td>ReLU</td><td>around 770M</td><td>737,668,096</td></tr>
+        <tr><td>T5-3B</td><td>24 + 24</td><td>1,024</td><td>32 × 128 (4,096)</td><td>16,384</td><td>ReLU</td><td>around 2.8B</td><td>2,851,598,336</td></tr>
+        <tr><td>T5-11B</td><td>24 + 24</td><td>1,024</td><td>128 × 128 (16,384)</td><td>65,536</td><td>ReLU</td><td>about 11B</td><td>11,307,321,344</td></tr>
+        <tr><td>v1.1 Small</td><td>8 + 8</td><td>512</td><td>6 × 64 (384)</td><td>1,024</td><td>GEGLU</td><td>—</td><td>76,961,152</td></tr>
+        <tr><td>v1.1 Base</td><td>12 + 12</td><td>768</td><td>12 × 64 (768)</td><td>2,048</td><td>GEGLU</td><td>—</td><td>247,577,856</td></tr>
+        <tr><td>v1.1 Large</td><td>24 + 24</td><td>1,024</td><td>16 × 64 (1,024)</td><td>2,816</td><td>GEGLU</td><td>—</td><td>783,150,080</td></tr>
+        <tr><td>v1.1 XL</td><td>24 + 24</td><td>2,048</td><td>32 × 64 (2,048)</td><td>5,120</td><td>GEGLU</td><td>—</td><td>2,849,757,184</td></tr>
+        <tr><td>v1.1 XXL</td><td>24 + 24</td><td>4,096</td><td>64 × 64 (4,096)</td><td>10,240</td><td>GEGLU</td><td>—</td><td>11,135,332,352</td></tr>
+      </table>
+      <h4>Reading the odd shapes</h4>
+      <ul class="notes">
+        <li><b>T5-3B</b> projects 1,024-wide states to a 4,096-wide attention space (32 heads of 128) and back; each attention layer has 4 · 1,024 · 4,096 = 16.8M parameters, four times a d = 1,024 layer's. Its feed-forward layer is 16 · d_model wide.</li>
+        <li><b>T5-11B</b> goes further: 128 heads of 128 (inner width 16,384) and a 65,536-wide feed-forward layer, 64 · d_model. A single feed-forward matrix is 1,024 × 65,536 = 67.1M parameters; the two of them in one block hold more than all of T5-Small's non-embedding weights.</li>
+        <li><b>v1.1 reverses the trade.</b> XL and XXL widen d_model (2,048 and 4,096) and use ordinary 64-wide heads — "larger d_model and smaller num_heads and d_ff", as the release notes put it. The residual stream, and hence the embedding, gets wider: XXL's two 32,128 × 4,096 embedding tables (untied) are 263M parameters against 11B's single 32.9M.</li>
+        <li><b>Size labels are rounded loosely.</b> "Large ≈ 770M" overstates the configuration by 4.4%; "3B" is 2.85B. The paper's own Section 3.7 text says "around 2.8 billion".</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the five v1.0 sizes are not one shape scaled up — above Large, only the attention inner width and d_ff grow. Any calculation that assumes inner width = d_model or d_ff = 4·d_model is wrong for T5-3B, T5-11B and v1.1 Small.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="params" data-nav="Parameter counts, recomputed">
+      <h3><span class="idx">09</span> Parameter counts, recomputed from the configurations</h3>
+      <p class="lede">Every T5 parameter sits in a bias-free matrix, a norm gain, a relative-position table or the embedding, so the count is a short formula in the config's numbers. The recount reproduces what the Hugging Face library reports for each checkpoint; the checkpoint files hold one extra relative-bias table (in the first decoder layer's cross-attention) that the code never uses.</p>
+      <div class="formula"><span class="lbl">with inner = heads · d_kv and k = 2 for ReLU, 3 for GEGLU</span><span class="eq">P_attn = 4 · d · inner          P_ff = k · d · d_ff          P_norm = d</span>
+<span class="lbl">encoder block, decoder block</span><span class="eq">P_enc_block = P_attn + P_ff + 2d          P_dec_block = 2 · P_attn + P_ff + 3d</span>
+<span class="lbl">stacks: one 32 × heads bias table and one final norm each</span><span class="eq">P_encoder = N_enc · P_enc_block + 32·heads + d
+P_decoder = N_dec · P_dec_block + 32·heads + d</span>
+<span class="lbl">total: shared embedding, plus an output matrix only when untied (v1.1, mT5, ByT5, Flan-T5)</span><span class="eq">P = V·d + [untied] · V·d + P_encoder + P_decoder,          V = 32,128</span></div>
+      <h4>Worked example: T5-Base</h4>
+      <table class="cmp">
+        <tr><th>Component</th><th>Computation</th><th>Parameters</th></tr>
+        <tr><td>Shared embedding (tied to the output)</td><td>32,128 × 768</td><td>24,674,304</td></tr>
+        <tr><td>Encoder block</td><td>4 · 768 · 768 + 2 · 768 · 3,072 + 2 · 768</td><td>7,079,424</td></tr>
+        <tr><td>12 encoder blocks + bias table + final norm</td><td>12 × 7,079,424 + 32 · 12 + 768</td><td>84,954,240</td></tr>
+        <tr><td>Decoder block</td><td>8 · 768 · 768 + 2 · 768 · 3,072 + 3 · 768</td><td>9,439,488</td></tr>
+        <tr><td>12 decoder blocks + bias table + final norm</td><td>12 × 9,439,488 + 32 · 12 + 768</td><td>113,275,008</td></tr>
+        <tr><td><b>Total</b></td><td></td><td><b>222,903,552</b></td></tr>
+        <tr><td>Checkpoint file (+ unused cross-attention bias table)</td><td>+ 32 · 12</td><td>222,903,936</td></tr>
+      </table>
+      <p>Two checks against the paper. Its claim that encoder–decoder attention is "about 10% of the total parameter count" is 12 · 2,359,296 = 28.3M of 222.9M = 12.7% for Base by this count. And its Section 3.2 simplification — an L + L encoder–decoder has about the parameters of a 2L-layer decoder-only model — holds to within that cross-attention share: a 24-layer decoder-only stack of Base width would have 24 × 7,079,424 = 169.9M block parameters against 198.2M for 12 + 12.</p>
+      <div class="viz" id="viz-params">
+        <div class="vhead">
+          <span class="vtitle">Where the parameters are</span>
+          <span class="vhint">pick a checkpoint · compare its stacked breakdown with the family</span>
+        </div>
+        <div class="controls">
+          <label>checkpoint <select id="par-cfg"></select></label>
+          <label><input type="checkbox" id="par-log" checked /> log scale for the family</label>
+        </div>
+        <svg id="par-svg" width="660" height="320" viewBox="0 0 660 320" role="img" aria-label="A stacked bar splitting the chosen checkpoint's parameters into embeddings, encoder attention and feed-forward, decoder self-attention, cross-attention and feed-forward, and norms; below, bars for every checkpoint with the paper's size labels"></svg>
+        <div class="readout" aria-live="polite" id="par-read"></div>
+        <p class="vcap">Configs are the released config.json files (t5-small … t5-11b; t5-v1_1-*; mt5-small/base/xxl; byt5-small/xxl). Counts exclude the unused cross-attention bias table, so they equal what the library's <code>num_parameters()</code> reports; the paper's labels are shown where it gives one (60M, 220M, 770M, 2.8B, 11B; mT5 300M, 580M, 13B).</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> recount before you quote. Of the five v1.0 labels, Large's 770M is the loosest (737.7M); the multilingual models are dominated by vocabulary — mT5-Small is 300M parameters of which 256M are its two 250,112-row tables.</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="tokenizer" data-nav="SentencePiece vocabulary and sentinels">
+      <h3><span class="idx">10</span> The SentencePiece vocabulary: 32,000 pieces and 100 sentinels</h3>
+      <p class="lede">T5 uses one SentencePiece model of 32,000 pieces for inputs and outputs, trained on 10 parts English C4 to 1 part each of German, French and Romanian Common Crawl text so that the translation targets can be spelled. The released tokenizer adds 100 sentinel tokens for span corruption, for 32,100 ids; the checkpoints' embedding tables have 32,128 rows, the last 28 unused.</p>
+      <div class="formula"><span class="lbl">ids in the released tokenizer</span><span class="eq">&lt;pad&gt; = 0 (also the decoder start token),   &lt;/s&gt; = 1,   &lt;unk&gt; = 2,   pieces 3 … 31,999</span>
+<span class="lbl">sentinels count down from the top of the id range</span><span class="eq">&lt;extra_id_0&gt; = 32,099,   &lt;extra_id_1&gt; = 32,098,   …,   &lt;extra_id_99&gt; = 32,000
+id(&lt;extra_id_k&gt;) = 32,099 − k</span>
+<span class="lbl">embedding rows</span><span class="eq">32,128 = 251 · 128  ≥  32,100      (28 rows padding)</span></div>
+      <h4>What the vocabulary cannot represent</h4>
+      <p>The piece inventory was learned mostly from C4 (whose cleaning removed pages with a curly brace in their prose lines) plus some German, French and Romanian, so some common characters are not in it and become <code>&lt;unk&gt;</code> (id 2): <code>{</code>, <code>}</code>, <code>~</code>, <code>&lt;</code> (although <code>&gt;</code> is in the vocabulary), most CJK characters, and some accented letters such as <code>ï</code>. The normaliser also collapses runs of whitespace and turns newlines into spaces. A fine-tuned T5 therefore cannot copy code or JSON braces from its input to its output, and it cannot preserve line structure.</p>
+      <div class="viz" id="viz-tok">
+        <div class="vhead">
+          <span class="vtitle">What the tokenizer sees</span>
+          <span class="vhint">pick a string · red pieces became &lt;unk&gt;</span>
+        </div>
+        <div class="controls">
+          <label>string <select id="tok-pick"></select></label>
+        </div>
+        <svg id="tok-svg" width="660" height="150" viewBox="0 0 660 150" role="img" aria-label="The chosen string split into SentencePiece pieces with their ids; unknown pieces are highlighted and summary counts are shown"></svg>
+        <div class="readout" aria-live="polite" id="tok-read"></div>
+        <p class="vcap">Pieces and ids were produced once with the released google-t5/t5-small tokenizer.json (the same vocabulary serves every v1.0 and v1.1 English checkpoint) and are stored in the figure's data; <code>&lt;/s&gt;</code> is not shown. Counts, the unknown share and characters per piece are computed from those pieces.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> the vocabulary is English-centred with just enough German, French and Romanian for WMT. Anything else — code, braces, CJK, line breaks — loses information before the model sees it; mT5's 250k vocabulary and ByT5's bytes exist to fix exactly this.</div>
+    </section>
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="c4" data-nav="C4 and its filters">
+      <h3><span class="idx">11</span> C4: the Colossal Clean Crawled Corpus and its filters</h3>
+      <p class="lede">C4 is the April 2019 Common Crawl "web extracted text" after a set of line- and page-level heuristics, English-language detection and deduplication — about 750 GB of text (745 GB in the paper's Table 8), released through TensorFlow Datasets. The paper describes it as "reasonably clean and natural English text", large enough that the study's 34B-token pretraining never repeats data.</p>
+      <h4>The filters, as the paper lists them</h4>
+      <ol class="notes">
+        <li>Keep only lines that end in a terminal punctuation mark (period, exclamation mark, question mark, end quotation mark).</li>
+        <li>Discard pages with fewer than 3 sentences; keep only lines with at least 5 words.</li>
+        <li>Remove any page containing a word from the "List of Dirty, Naughty, Obscene or Otherwise Bad Words".</li>
+        <li>Remove any line containing the word "Javascript".</li>
+        <li>Remove any page containing "lorem ipsum".</li>
+        <li>Remove any page containing a curly bracket "{".</li>
+        <li>Remove citation markers such as [1] and [citation needed].</li>
+        <li>Remove lines containing "terms of use", "privacy policy", "cookie policy", "uses cookies", "use of cookies" or "use cookies".</li>
+        <li>Deduplicate: "discarded all but one of any three-sentence span occurring more than once".</li>
+        <li>Keep pages that langdetect classifies as English with probability at least 0.99.</li>
+      </ol>
+      <h4>What the released code does differently</h4>
+      <p>The TensorFlow Datasets implementation (<code>c4_utils.py</code>) applies the line rules in a fixed order, and three details differ from the paper's description:</p>
+      <ul class="notes">
+        <li><b>Page-killing tests only see surviving lines.</b> The "lorem ipsum" and "{" checks run inside the line loop after the terminal-punctuation and five-word checks, so a brace in a short or unpunctuated line (a code fragment, a menu) is dropped with that line and does not remove the page. The paper says any page containing a brace is removed.</li>
+        <li><b>Extra line rules.</b> The code also drops lines ending in an ellipsis "…" (three periods) and lines containing any "word" longer than 1,000 characters; neither is in the paper.</li>
+        <li><b>Deduplication is by line, not three-sentence span.</b> The code hashes each lower-cased line, keeps it in one page only, and then re-applies the 3-sentence minimum to the page that remains.</li>
+      </ul>
+      <div class="viz" id="viz-c4">
+        <div class="vhead">
+          <span class="vtitle">Cleaning one page, rule by rule</span>
+          <span class="vhint">pick a mock page · toggle rules · see which lines survive and whether the page does</span>
+        </div>
+        <div class="controls">
+          <label>page <select id="c4-page">
+            <option value="blog">recipe blog post</option>
+            <option value="code">tutorial with a code snippet</option>
+            <option value="shop">shop page with boilerplate</option>
+            <option value="wiki">encyclopedia extract</option>
+          </select></label>
+          <label><input type="checkbox" id="c4-end" checked /> terminal punctuation</label>
+          <label><input type="checkbox" id="c4-words" checked /> ≥ 5 words</label>
+          <label><input type="checkbox" id="c4-js" checked /> "javascript" lines</label>
+          <label><input type="checkbox" id="c4-brace" checked /> "{" kills page</label>
+          <label><input type="checkbox" id="c4-policy" checked /> policy lines</label>
+          <label><input type="checkbox" id="c4-cite" checked /> strip citations</label>
+          <label><input type="checkbox" id="c4-sent" checked /> ≥ 3 sentences</label>
+        </div>
+        <svg id="c4-svg" width="660" height="330" viewBox="0 0 660 330" role="img" aria-label="The mock page's lines listed with a kept or dropped mark and the rule responsible, and the page-level verdict"></svg>
+        <div class="readout" aria-live="polite" id="c4-read"></div>
+        <p class="vcap">The pages are invented for this note. The rules are a port of <code>clean_page</code> in TensorFlow Datasets' c4_utils.py in its order: too-long word, citation removal, terminal punctuation (and ellipsis), five words, lorem ipsum (page), javascript (line), "{" (page), policy substrings (line), then the sentence count. Sentences are counted with a simple end-mark splitter instead of the NLTK tokenizer the code uses; the bad-words list, language detection and cross-page deduplication are not simulated.</p>
+      </div>
+      <h4>What the study found about C4 itself</h4>
+      <p>Pretraining the baseline on "C4, unfiltered" (6.1 TB, language detection only) was worse on every task — GLUE 81.46 against 83.28, SuperGLUE 68.04 against 71.36 (<a href="#data-study">data study</a>). Later audits of C4 (not part of the T5 paper) found that the bad-words filter disproportionately removed text about and by some minority groups and that benchmark text leaked into the corpus, which is worth remembering when C4 is used as "clean" data.</p>
+      <div class="callout"><b>Takeaway:</b> C4 is a handful of cheap, transparent heuristics applied at web scale. They helped measurably, but the code is the specification — and the code's order of operations makes the "{" and "lorem ipsum" rules weaker than the paper's wording.</div>
+    </section>
+
+    <!-- 12 ───────────────────────────────────────────── -->
+    <section class="topic" id="span" data-nav="Span corruption by hand">
+      <h3><span class="idx">12</span> Span corruption, worked by hand</h3>
+      <p class="lede">T5's pretraining objective removes about 15% of the tokens of a text in contiguous spans averaging 3 tokens, replaces each span with a unique sentinel token, and trains the decoder to output only the removed spans, each introduced by its sentinel (plus a closing sentinel when the text ends with kept tokens, as in the paper's example). Only the corrupted tokens are predicted, which keeps targets short.</p>
+      <div class="formula"><span class="lbl">for a text of T tokens, noise density r = 0.15, mean span length m = 3 (the released random_spans_noise_mask)</span><span class="eq">noise = round(r · T),    spans S = round(noise / m),    non-noise = T − noise</span>
+<span class="lbl">span lengths: a random split of the noise tokens into S non-empty parts, and of the rest into S parts; the text alternates kept / dropped, starting with kept</span><span class="eq">T = k₁ + n₁ + k₂ + n₂ + … + k_S + n_S,     Σ nᵢ = noise,   kᵢ, nᵢ ≥ 1</span>
+<span class="lbl">sequence lengths, counting one sentinel per span and the end-of-sequence token</span><span class="eq">|input| = (T − noise) + S + 1,          |target| = noise + S + 1</span></div>
+      <h4>Worked example: the paper's sentence</h4>
+      <p>"Thank you for inviting me to your party last week." is 11 pieces for the T5 tokenizer (every word one piece, plus "."). Suppose "for inviting" and "last" are dropped (the paper's Figure 2):</p>
+      <table class="cmp">
+        <tr><th></th><th>Sequence</th><th>Length</th></tr>
+        <tr><td>original</td><td><code>Thank you for inviting me to your party last week .</code></td><td>11</td></tr>
+        <tr><td>input</td><td><code>Thank you &lt;extra_id_0&gt; me to your party &lt;extra_id_1&gt; week . &lt;/s&gt;</code></td><td>11 − 3 + 2 + 1 = 11</td></tr>
+        <tr><td>target</td><td><code>&lt;extra_id_0&gt; for inviting &lt;extra_id_1&gt; last &lt;extra_id_2&gt; &lt;/s&gt;</code></td><td>3 + 2 + 1 + 1 = 7</td></tr>
+      </table>
+      <p>The final sentinel <code>&lt;extra_id_2&gt;</code> marks the end of the last span (the paper's &lt;Z&gt;); it appears because the sentence ends with kept tokens ("week ."). In the released pipeline the mask always ends with a dropped span (spans alternate kept, dropped, starting with kept, and are not rolled), so real pretraining inputs end with a sentinel and real targets have none trailing — which is why the length formula above has exactly S sentinels on each side. The same sentence under the BERT-style objective would need an 11-token target — the whole text — and under "drop corrupted tokens" an input with no sentinels.</p>
+      <h4>Baseline objective versus final objective</h4>
+      <ul class="notes">
+        <li><b>The study's baseline (Section 3.1.4)</b> chooses tokens i.i.d. with probability 0.15 and merges consecutive dropped tokens into one sentinel. Spans are then usually length 1: with independent choices the expected run length is 1/(1 − 0.15) ≈ 1.18.</li>
+        <li><b>The released models (Section 3.7)</b> use explicit span corruption with mean span length 3, which Table 7 found "slightly (but significantly)" better than i.i.d. on most non-translation benchmarks, and slightly cheaper because there are fewer sentinels.</li>
+      </ul>
+      <div class="viz" id="viz-span">
+        <div class="vhead">
+          <span class="vtitle">Span-corruption sampler</span>
+          <span class="vhint">set the noise density and mean span · resample · read off input and target</span>
+        </div>
+        <div class="controls">
+          <label>text length T <input type="range" id="sp-len" min="20" max="60" step="1" value="40" /> <span id="sp-lenv"></span></label>
+          <label>noise density <input type="range" id="sp-rate" min="5" max="50" step="5" value="15" /> <span id="sp-ratev"></span></label>
+          <label>mean span <input type="range" id="sp-mu" min="1" max="10" step="1" value="3" /> <span id="sp-muv"></span></label>
+          <button id="sp-seed">resample</button>
+        </div>
+        <svg id="sp-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="The original token row with dropped spans highlighted, the encoder input with sentinels in place of spans, and the decoder target listing the spans"></svg>
+        <div class="readout" aria-live="polite" id="sp-read"></div>
+        <p class="vcap">A port of the released <code>random_spans_noise_mask</code> (t5/data/preprocessors.py, without random roll): noise and span counts are rounded as in the code, and span lengths are a uniformly random split into non-empty segments. Tokens are the words of the paper's abstract, one word per token for readability; sentinels are numbered in order as in the released <code>span_corruption</code> preprocessor. Because the mask ends with a dropped span, the input ends with a sentinel and the target has no trailing one.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> span corruption turns any text into an (input, target) pair whose target is about a fifth of the text's length. It teaches the decoder to generate multi-token fills conditioned on bidirectional context, at a fraction of the decoding cost of reconstructing the whole input.</div>
+    </section>
+
+    <!-- 13 ───────────────────────────────────────────── -->
+    <section class="topic" id="lengths" data-nav="Target-length arithmetic">
+      <h3><span class="idx">13</span> Target-length arithmetic: 568 tokens → 512 in, 114 out</h3>
+      <p class="lede">Because corruption shortens the input, the pipeline cuts raw text into chunks longer than the encoder's 512 positions so that, after corruption, inputs fill 512 exactly with no padding. The released helper <code>random_spans_helper</code> finds the largest raw length whose corrupted input fits, and the matching target length.</p>
+      <div class="formula"><span class="lbl">find the largest raw length T whose input fits in L = 512</span><span class="eq">T* = max { T :  T − round(0.15T) + round(round(0.15T) / 3) + 1  ≤  512 }</span>
+<span class="lbl">at T = 568</span><span class="eq">noise = round(85.2) = 85,    S = round(85 / 3) = 28</span>
+<span class="lbl">lengths at T = 568</span><span class="eq">input = 568 − 85 + 28 + 1 = 512,     target = 85 + 28 + 1 = 114</span>
+<span class="lbl">at T = 569 the input is one token too long</span><span class="eq">noise = round(85.35) = 85,  S = 28,  input = 569 − 85 + 28 + 1 = 513 &gt; 512</span>
+<span class="lbl">ratios</span><span class="eq">target / input = 114 / 512 = 22.3%,     target / raw = 114 / 568 = 20.1%</span>
+<span class="lbl">target tokens per dropped token (before the end token)</span><span class="eq">1 + 1/m = 1.33   at m = 3</span></div>
+      <h4>Compared with the alternatives</h4>
+      <table class="cmp">
+        <tr><th>Objective (all at 15%)</th><th>Encoder input</th><th>Decoder target</th><th>Decoder positions per 512 input positions</th></tr>
+        <tr><td>BERT-style / MASS-style (reconstruct everything)</td><td>512 (masks in place)</td><td>512</td><td>512</td></tr>
+        <tr><td>i.i.d. noise, replace spans (study baseline)</td><td>512 from ≈ 524 raw (expected)</td><td>≈ 146 (15% of the text + one sentinel per run of ≈ 1.18 tokens)</td><td>≈ 28.6%</td></tr>
+        <tr><td>span corruption, mean 2</td><td>512 from 552 raw</td><td>126</td><td>24.6%</td></tr>
+        <tr><td>span corruption, mean 3 (T5)</td><td>512 from 568 raw</td><td>114</td><td>22.3%</td></tr>
+        <tr><td>span corruption, mean 10</td><td>512 from 591 raw</td><td>99</td><td>19.3%</td></tr>
+      </table>
+      <p>The saving over full reconstruction is in the decoder: its self-attention and feed-forward work scale with the target length, and its cross-attention with target × input. The <a href="nlp-models.html#objectives">NLP Models hub</a>'s summary that "the target is about 20% of the input length" corresponds to the raw-text ratio (20.1%); measured against the 512-token corrupted input it is 22.3%.</p>
+      <div class="viz" id="viz-len">
+        <div class="vhead">
+          <span class="vtitle">The length helper</span>
+          <span class="vhint">change the encoder length, noise density and mean span · the curve shows target/input across densities</span>
+        </div>
+        <div class="controls">
+          <label>input length <input type="range" id="len-in" min="64" max="2048" step="64" value="512" /> <span id="len-inv"></span></label>
+          <label>noise density <input type="range" id="len-rate" min="5" max="50" step="5" value="15" /> <span id="len-ratev"></span></label>
+          <label>mean span <input type="range" id="len-mu" min="1" max="20" step="1" value="3" /> <span id="len-muv"></span></label>
+        </div>
+        <svg id="len-svg" width="660" height="290" viewBox="0 0 660 290" role="img" aria-label="Bars for raw text length, encoder input and decoder target, and a curve of target-to-input ratio against noise density for the chosen mean span"></svg>
+        <div class="readout" aria-live="polite" id="len-read"></div>
+        <p class="vcap">A port of <code>random_spans_helper</code> with one sentinel per span in inputs and targets and an end-of-sequence token on each; it includes the code's small adjustment at noise density 0.5 that keeps the target no longer than the input.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> T5's pretraining examples are 568 raw tokens that become a 512-token input and a 114-token target. If you pretrain or continue pretraining with span corruption, compute the lengths with the helper; mismatched lengths waste positions on padding or truncate targets.</div>
+    </section>
+
+    <!-- 14 ───────────────────────────────────────────── -->
+    <section class="topic" id="study" data-nav="How the study was run">
+      <h3><span class="idx">14</span> How the systematic study was run</h3>
+      <p class="lede">The study fixes a baseline — T5-Base-sized encoder–decoder, i.i.d. denoising, C4, 2¹⁹ pretraining steps, 2¹⁸ fine-tuning steps on each task — and changes one factor at a time ("coordinate ascent"). Every experiment is scored on the validation sets of GLUE, CNN/Daily Mail, SQuAD, SuperGLUE and three WMT pairs, and the paper's tables bold any score within two standard deviations of the best in that experiment.</p>
+      <div class="formula"><span class="lbl">noise estimate: the baseline was trained 10 times from scratch; the paper assumes this spread applies to every variant</span><span class="eq">σ: GLUE 0.235,  CNNDM 0.065,  SQuAD 0.343,  SGLUE 0.416
+   EnDe 0.112,  EnFr 0.090,  EnRo 0.108</span>
+<span class="lbl">"bold" rule used in every table</span><span class="eq">score is bold  ⇔  score ≥ max(scores in the experiment) − 2σ</span>
+<span class="lbl">metrics reported in the main tables</span><span class="eq">GLUE, SGLUE: benchmark averages;   CNNDM: ROUGE-2-F;   SQuAD: exact match;   WMT: SacreBLEU</span></div>
+      <h4>Baseline against no pretraining (Table 1)</h4>
+      <table class="cmp">
+        <tr><th></th><th>GLUE</th><th>CNNDM</th><th>SQuAD</th><th>SGLUE</th><th>EnDe</th><th>EnFr</th><th>EnRo</th></tr>
+        <tr><td>Baseline average (10 runs)</td><td>83.28</td><td>19.24</td><td>80.88</td><td>71.36</td><td>26.98</td><td>39.82</td><td>27.65</td></tr>
+        <tr><td>Standard deviation</td><td>0.235</td><td>0.065</td><td>0.343</td><td>0.416</td><td>0.112</td><td>0.090</td><td>0.108</td></tr>
+        <tr><td>No pretraining</td><td>66.22</td><td>17.60</td><td>50.31</td><td>53.04</td><td>25.86</td><td>39.77</td><td>24.04</td></tr>
+      </table>
+      <p>Pretraining helps everywhere except WMT English–French, whose training set is large enough that the gain is marginal (39.82 against 39.77). The high variance of small GLUE and SuperGLUE tasks — CB's validation set has 56 examples, and the baseline's CB F1 was 91.22 with a standard deviation of 3.237 — is why the averages carry σ of 0.2–0.4 points.</p>
+      <div class="viz" id="viz-study">
+        <div class="vhead">
+          <span class="vtitle">The study's tables, as differences from the baseline</span>
+          <span class="vhint">pick a table and a benchmark · amber bars are within 2σ of the best ("bold")</span>
+        </div>
+        <div class="controls">
+          <label>table <select id="st-table"></select></label>
+          <label>benchmark <select id="st-metric">
+            <option value="0">GLUE</option><option value="1">CNNDM</option><option value="2">SQuAD</option><option value="3">SuperGLUE</option>
+            <option value="4">WMT EnDe</option><option value="5">WMT EnFr</option><option value="6">WMT EnRo</option>
+          </select></label>
+        </div>
+        <svg id="st-svg" width="660" height="330" viewBox="0 0 660 330" role="img" aria-label="Horizontal bars of each row's score minus the baseline for the chosen table and benchmark, with a two-standard-deviation band and bold rows highlighted"></svg>
+        <div class="readout" aria-live="polite" id="st-read"></div>
+        <p class="vcap">Scores are transcribed from the paper's Tables 1, 2 and 4–13 and 15 (validation sets). Differences, the 2σ threshold and the "bold" set are computed here with σ from Table 1. Table 10's row for adapters with d = 2048 repeats the d = 128 row verbatim in the main text; this figure uses the appendix Table 16 values for that row (see <a href="#transfer-study">transfer study</a>).</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> read every comparison in the study against its noise: a 0.3-point GLUE difference is within 2σ. Coordinate ascent also means each finding holds around the baseline; interactions (an objective that only wins at scale) are outside what the study can see.</div>
+    </section>
+
+    <!-- 15 ───────────────────────────────────────────── -->
+    <section class="topic" id="arch-study" data-nav="Architectures compared">
+      <h3><span class="idx">15</span> Architectures: encoder–decoder, decoder-only LM and prefix LM</h3>
+      <p class="lede">The study compares three attention-mask patterns — fully visible, causal, and causal with a fully visible prefix — as five models of matched parameters or compute, each pretrained with the denoising objective and with a language-modelling objective. The encoder–decoder with denoising was best on every task.</p>
+      <div class="formula"><span class="lbl">P = parameters of one 12-layer BERT-Base-sized stack; M = FLOPs of the 12 + 12 encoder–decoder on an input–target pair</span><span class="eq">enc–dec (12 + 12): 2P, M        enc–dec shared: P, M        enc–dec (6 + 6): P, M/2</span>
+<span class="lbl">single-stack models of the same compute</span><span class="eq">LM (12 layers): P, M        prefix LM (12 layers): P, M</span>
+<span class="lbl">why an L + L encoder–decoder costs about what an L-layer decoder-only model costs</span><span class="eq">enc–dec: L × n_in + L × n_out  token-layers     ≈     LM: L × (n_in + n_out)  token-layers</span></div>
+      <table class="cmp">
+        <tr><th>Architecture</th><th>Objective</th><th>Params</th><th>Cost</th><th>GLUE</th><th>CNNDM</th><th>SQuAD</th><th>SGLUE</th><th>EnDe</th><th>EnFr</th><th>EnRo</th></tr>
+        <tr><td>Encoder–decoder</td><td>Denoising</td><td>2P</td><td>M</td><td>83.28</td><td>19.24</td><td>80.88</td><td>71.36</td><td>26.98</td><td>39.82</td><td>27.65</td></tr>
+        <tr><td>Enc–dec, shared</td><td>Denoising</td><td>P</td><td>M</td><td>82.81</td><td>18.78</td><td>80.63</td><td>70.73</td><td>26.72</td><td>39.03</td><td>27.46</td></tr>
+        <tr><td>Enc–dec, 6 layers</td><td>Denoising</td><td>P</td><td>M/2</td><td>80.88</td><td>18.97</td><td>77.59</td><td>68.42</td><td>26.38</td><td>38.40</td><td>26.95</td></tr>
+        <tr><td>Language model</td><td>Denoising</td><td>P</td><td>M</td><td>74.70</td><td>17.93</td><td>61.14</td><td>55.02</td><td>25.09</td><td>35.28</td><td>25.86</td></tr>
+        <tr><td>Prefix LM</td><td>Denoising</td><td>P</td><td>M</td><td>81.82</td><td>18.61</td><td>78.94</td><td>68.11</td><td>26.43</td><td>37.98</td><td>27.39</td></tr>
+        <tr><td>Encoder–decoder</td><td>LM</td><td>2P</td><td>M</td><td>79.56</td><td>18.59</td><td>76.02</td><td>64.29</td><td>26.27</td><td>39.17</td><td>26.86</td></tr>
+        <tr><td>Language model</td><td>LM</td><td>P</td><td>M</td><td>73.78</td><td>17.54</td><td>53.81</td><td>56.51</td><td>25.23</td><td>34.31</td><td>25.38</td></tr>
+        <tr><td>Prefix LM</td><td>LM</td><td>P</td><td>M</td><td>79.68</td><td>17.84</td><td>76.87</td><td>64.86</td><td>26.28</td><td>37.51</td><td>26.76</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Bidirectional context over the input matters most.</b> The causal LM, which sees its input only left to right, trails the prefix LM by 7.1 GLUE points with denoising; the prefix LM, which differs only in making the input fully visible, recovers most of the gap.</li>
+        <li><b>Sharing encoder and decoder weights costs little</b> (−0.47 GLUE, −0.63 SuperGLUE) while halving parameters; halving depth instead (6 + 6) costs 2.4 GLUE points.</li>
+        <li><b>Denoising beats language modelling</b> on GLUE for every architecture, e.g. encoder–decoder 83.28 against 79.56 (on SuperGLUE the causal LM is the exception, 56.51 with the LM objective against 55.02 with denoising).</li>
+        <li><b>Matched in what?</b> The winning model has twice the parameters of the decoder-only one at the same compute. But even with parameters and compute both matched — the shared encoder–decoder (P, M) — it beats the prefix LM on every task, so the advantage is not only the extra parameters; halving depth (6 + 6) to match parameters at half the compute loses to the prefix LM on GLUE and SQuAD.</li>
+      </ul>
+      <div class="viz" id="viz-mask">
+        <div class="vhead">
+          <span class="vtitle">Who can attend to whom</span>
+          <span class="vhint">pick a structure · change input and target lengths</span>
+        </div>
+        <div class="controls">
+          <label>structure <select id="mk-arch">
+            <option value="encdec">encoder–decoder</option>
+            <option value="lm">language model (causal)</option>
+            <option value="plm">prefix LM</option>
+          </select></label>
+          <label>input tokens <input type="range" id="mk-in" min="2" max="8" step="1" value="5" /> <span id="mk-inv"></span></label>
+          <label>target tokens <input type="range" id="mk-out" min="1" max="6" step="1" value="3" /> <span id="mk-outv"></span></label>
+        </div>
+        <svg id="mk-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Attention visibility matrices for the chosen structure: encoder self-attention, decoder self-attention and cross-attention, or one combined matrix for the single-stack models"></svg>
+        <div class="readout" aria-live="polite" id="mk-read"></div>
+        <p class="vcap">A dark cell at row i, column j means position i may attend to position j (the paper's Figure 3 convention). The readout counts visible pairs and the query–key products per layer that each structure computes, and how many input positions can see the whole input.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> at equal compute the encoder–decoder wins because it spends twice the parameters for the same FLOPs and sees its input bidirectionally. The finding is specific to fine-tuned transfer; the comparison says nothing about zero-shot prompting, where decoder-only models later dominated.</div>
+    </section>
+
+    <!-- 16 ───────────────────────────────────────────── -->
+    <section class="topic" id="objective-study" data-nav="Objectives compared">
+      <h3><span class="idx">16</span> Objectives: from families down to span lengths</h3>
+      <p class="lede">The objectives study narrows in four steps: pick a family (prefix LM, BERT-style denoising, deshuffling), simplify the BERT-style target, choose a corruption rate, choose a span length. The one large effect is the first — denoising beats language modelling and deshuffling — and the rest are within a point.</p>
+      <table class="cmp">
+        <tr><th>Step (table)</th><th>Variant</th><th>GLUE</th><th>CNNDM</th><th>SQuAD</th><th>SGLUE</th><th>EnDe</th><th>EnFr</th><th>EnRo</th></tr>
+        <tr><td rowspan="3">Families (4)</td><td>Prefix language modelling</td><td>80.69</td><td>18.94</td><td>77.99</td><td>65.27</td><td>26.86</td><td>39.73</td><td>27.49</td></tr>
+        <tr><td>BERT-style</td><td>82.96</td><td>19.17</td><td>80.65</td><td>69.85</td><td>26.78</td><td>40.03</td><td>27.41</td></tr>
+        <tr><td>Deshuffling</td><td>73.17</td><td>18.59</td><td>67.61</td><td>58.47</td><td>26.11</td><td>39.30</td><td>25.62</td></tr>
+        <tr><td rowspan="4">BERT variants (5)</td><td>BERT-style</td><td>82.96</td><td>19.17</td><td>80.65</td><td>69.85</td><td>26.78</td><td>40.03</td><td>27.41</td></tr>
+        <tr><td>MASS-style</td><td>82.32</td><td>19.16</td><td>80.10</td><td>69.28</td><td>26.79</td><td>39.89</td><td>27.55</td></tr>
+        <tr><td>Replace corrupted spans (baseline)</td><td>83.28</td><td>19.24</td><td>80.88</td><td>71.36</td><td>26.98</td><td>39.82</td><td>27.65</td></tr>
+        <tr><td>Drop corrupted tokens</td><td>84.44</td><td>19.31</td><td>80.52</td><td>68.67</td><td>27.07</td><td>39.76</td><td>27.82</td></tr>
+        <tr><td rowspan="4">Corruption rate (6)</td><td>10%</td><td>82.82</td><td>19.00</td><td>80.38</td><td>69.55</td><td>26.87</td><td>39.28</td><td>27.44</td></tr>
+        <tr><td>15% (baseline)</td><td>83.28</td><td>19.24</td><td>80.88</td><td>71.36</td><td>26.98</td><td>39.82</td><td>27.65</td></tr>
+        <tr><td>25%</td><td>83.00</td><td>19.54</td><td>80.96</td><td>70.48</td><td>27.04</td><td>39.83</td><td>27.47</td></tr>
+        <tr><td>50%</td><td>81.27</td><td>19.32</td><td>79.80</td><td>70.33</td><td>27.01</td><td>39.90</td><td>27.49</td></tr>
+        <tr><td rowspan="5">Mean span length (7)</td><td>i.i.d. (baseline)</td><td>83.28</td><td>19.24</td><td>80.88</td><td>71.36</td><td>26.98</td><td>39.82</td><td>27.65</td></tr>
+        <tr><td>2</td><td>83.54</td><td>19.39</td><td>82.09</td><td>72.20</td><td>26.76</td><td>39.99</td><td>27.63</td></tr>
+        <tr><td>3</td><td>83.49</td><td>19.62</td><td>81.84</td><td>72.53</td><td>26.86</td><td>39.65</td><td>27.62</td></tr>
+        <tr><td>5</td><td>83.40</td><td>19.24</td><td>82.05</td><td>72.23</td><td>26.88</td><td>39.40</td><td>27.53</td></tr>
+        <tr><td>10</td><td>82.85</td><td>19.33</td><td>81.84</td><td>70.44</td><td>26.79</td><td>39.49</td><td>27.69</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>"Drop corrupted tokens"</b> has the best GLUE (84.44) almost entirely through CoLA (60.04 against the baseline's 53.84) — plausibly because noticing missing words is close to judging grammaticality — but is worse on SuperGLUE, so the paper kept sentinels.</li>
+        <li><b>Corruption rate</b> barely matters between 10% and 25%; 50% hurts GLUE and SQuAD and makes targets longer. The paper kept 15% partly on BERT's precedent.</li>
+        <li><b>Span length 3</b> is not the best in every column — it wins CNNDM and SuperGLUE, span 2 wins GLUE and SQuAD — but it and 2 both beat i.i.d. on most non-translation tasks, and longer spans mean fewer sentinels and shorter sequences.</li>
+        <li><b>The paper's conclusion:</b> choose among denoising objectives mainly by computational cost; further tinkering with similar objectives "may not lead to significant gains".</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the objective search found a plateau, not a peak. Span corruption at 15% with mean length 3 is a cheap point on that plateau — which is also why UL2 later looked for gains by mixing very different denoisers rather than tuning this one.</div>
+    </section>
+
+    <!-- 17 ───────────────────────────────────────────── -->
+    <section class="topic" id="data-study" data-nav="Pretraining data compared">
+      <h3><span class="idx">17</span> Pretraining data: which corpus, and how much repetition</h3>
+      <p class="lede">Two experiments. The first swaps C4 for other corpora of 16 GB to 6.1 TB. The second truncates C4 so that the same 2³⁵ pretraining tokens repeat the data 64 to 4,096 times. In-domain data helps the matching tasks; heavy repetition hurts everything.</p>
+      <table class="cmp">
+        <tr><th>Data set</th><th>Size</th><th>GLUE</th><th>CNNDM</th><th>SQuAD</th><th>SGLUE</th><th>EnDe</th><th>EnFr</th><th>EnRo</th></tr>
+        <tr><td>C4</td><td>745 GB</td><td>83.28</td><td>19.24</td><td>80.88</td><td>71.36</td><td>26.98</td><td>39.82</td><td>27.65</td></tr>
+        <tr><td>C4, unfiltered</td><td>6.1 TB</td><td>81.46</td><td>19.14</td><td>78.78</td><td>68.04</td><td>26.55</td><td>39.34</td><td>27.21</td></tr>
+        <tr><td>RealNews-like</td><td>35 GB</td><td>83.83</td><td>19.23</td><td>80.39</td><td>72.38</td><td>26.75</td><td>39.90</td><td>27.48</td></tr>
+        <tr><td>WebText-like</td><td>17 GB</td><td>84.03</td><td>19.31</td><td>81.42</td><td>71.40</td><td>26.80</td><td>39.74</td><td>27.59</td></tr>
+        <tr><td>Wikipedia</td><td>16 GB</td><td>81.85</td><td>19.31</td><td>81.29</td><td>68.01</td><td>26.94</td><td>39.69</td><td>27.67</td></tr>
+        <tr><td>Wikipedia + TBC</td><td>20 GB</td><td>83.65</td><td>19.28</td><td>82.08</td><td>73.24</td><td>26.77</td><td>39.63</td><td>27.57</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Filtering helps across the board:</b> unfiltered C4 is the worst on every task.</li>
+        <li><b>Domain match explains the surprises.</b> Wikipedia + Toronto Books wins SuperGLUE (73.24) almost entirely through MultiRC exact match (25.78 → 50.93), whose largest source is fiction; RealNews-like data lifts ReCoRD (news) exact match from 68.16 to 73.72; Wikipedia helps SQuAD.</li>
+        <li><b>But small corpora repeat.</b> The WebText-like set (17 GB) was built from 12 months of Common Crawl and still came out about 40× smaller than C4.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Tokens in the truncated C4</th><th>Repeats over 2³⁵ tokens</th><th>GLUE</th><th>CNNDM</th><th>SQuAD</th><th>SGLUE</th><th>EnDe</th><th>EnFr</th><th>EnRo</th></tr>
+        <tr><td>Full data set</td><td>0</td><td>83.28</td><td>19.24</td><td>80.88</td><td>71.36</td><td>26.98</td><td>39.82</td><td>27.65</td></tr>
+        <tr><td>2²⁹</td><td>64</td><td>82.87</td><td>19.19</td><td>80.97</td><td>72.03</td><td>26.83</td><td>39.74</td><td>27.63</td></tr>
+        <tr><td>2²⁷</td><td>256</td><td>82.62</td><td>19.20</td><td>79.78</td><td>69.97</td><td>27.02</td><td>39.71</td><td>27.33</td></tr>
+        <tr><td>2²⁵</td><td>1,024</td><td>79.55</td><td>18.57</td><td>76.27</td><td>64.76</td><td>26.38</td><td>39.56</td><td>26.80</td></tr>
+        <tr><td>2²³</td><td>4,096</td><td>76.34</td><td>18.33</td><td>70.92</td><td>59.29</td><td>26.37</td><td>38.84</td><td>25.81</td></tr>
+      </table>
+      <p>The repeat counts are simply 2³⁵ / N: 2³⁵ / 2²⁹ = 64, … , 2³⁵ / 2²³ = 4,096. Up to 64 repeats the effect is small; the training loss falls as data shrinks, consistent with memorisation. The paper cautions that larger models may overfit a small corpus sooner, and recommends large pretraining sets whenever possible — the reason the 1T-token final models stayed on C4 rather than the better-scoring but small domain corpora, which would have repeated hundreds of times.</p>
+      <div class="callout"><b>Takeaway:</b> clean beats raw, in-domain beats generic on the matching task, and repetition is tolerable up to tens of epochs but not thousands. These are the empirical grounds for "large, filtered, diverse" as the default pretraining corpus.</div>
+    </section>
+
+    <!-- 18 ───────────────────────────────────────────── -->
+    <section class="topic" id="transfer-study" data-nav="Transfer strategies compared">
+      <h3><span class="idx">18</span> Transfer strategies: partial fine-tuning, multi-task mixing, and both</h3>
+      <p class="lede">Three questions. Can one update fewer parameters than all of them? (Adapters and gradual unfreezing: not without some loss.) Can one train on all tasks at once instead of pretrain-then-fine-tune? (Not quite as well, whatever the mixing rates.) Can multi-task pretraining followed by fine-tuning match the baseline? (Yes — which is what the released models do.)</p>
+      <div class="formula"><span class="lbl">examples-proportional mixing with an artificial size limit K (eₙ = examples in task n)</span><span class="eq">rₘ = min(eₘ, K) / Σₙ min(eₙ, K)</span>
+<span class="lbl">temperature-scaled mixing (K = 2²¹ before scaling)</span><span class="eq">rₘ ← rₘ^(1/T) / Σₙ rₙ^(1/T)          T = 1: examples-proportional;   T → ∞: equal</span>
+<span class="lbl">multi-task runs use the same total steps as pretrain + fine-tune</span><span class="eq">2¹⁹ + 2¹⁸ = 786,432 steps</span></div>
+      <table class="cmp">
+        <tr><th>Method (table)</th><th>GLUE</th><th>CNNDM</th><th>SQuAD</th><th>SGLUE</th><th>EnDe</th><th>EnFr</th><th>EnRo</th></tr>
+        <tr><td>All parameters (baseline)</td><td>83.28</td><td>19.24</td><td>80.88</td><td>71.36</td><td>26.98</td><td>39.82</td><td>27.65</td></tr>
+        <tr><td>Adapters, d = 32 (10)</td><td>80.52</td><td>15.08</td><td>79.32</td><td>60.40</td><td>13.84</td><td>17.88</td><td>15.54</td></tr>
+        <tr><td>Adapters, d = 512 (10)</td><td>81.54</td><td>17.78</td><td>79.18</td><td>64.30</td><td>23.45</td><td>33.98</td><td>25.81</td></tr>
+        <tr><td>Adapters, d = 2048 (16, appendix)</td><td>82.62</td><td>18.30</td><td>79.40</td><td>68.61</td><td>25.64</td><td>36.92</td><td>26.93</td></tr>
+        <tr><td>Gradual unfreezing (10)</td><td>82.50</td><td>18.95</td><td>79.17</td><td>70.79</td><td>26.71</td><td>39.02</td><td>26.93</td></tr>
+        <tr><td>Multi-task, examples-prop. K = 2¹⁹ (11, 12)</td><td>81.42</td><td>19.24</td><td>79.78</td><td>67.30</td><td>25.21</td><td>36.30</td><td>27.76</td></tr>
+        <tr><td>Multi-task, temperature T = 2 (11)</td><td>81.90</td><td>19.28</td><td>79.42</td><td>69.92</td><td>25.42</td><td>36.72</td><td>27.20</td></tr>
+        <tr><td>Multi-task, equal mixing (11)</td><td>76.13</td><td>19.02</td><td>76.51</td><td>63.37</td><td>23.89</td><td>34.31</td><td>26.78</td></tr>
+        <tr><td>Multi-task pretraining + fine-tuning (12)</td><td>83.11</td><td>19.12</td><td>80.26</td><td>71.03</td><td>27.08</td><td>39.80</td><td>28.07</td></tr>
+        <tr><td>Leave-one-out multi-task (12)</td><td>81.98</td><td>19.05</td><td>79.97</td><td>71.68</td><td>26.93</td><td>39.79</td><td>27.87</td></tr>
+        <tr><td>Supervised multi-task pretraining (12)</td><td>79.93</td><td>18.96</td><td>77.38</td><td>65.36</td><td>26.81</td><td>40.13</td><td>28.04</td></tr>
+      </table>
+      <h4>An apparent copy error in Table 10</h4>
+      <p>In the main text's Table 10 the row "Adapter layers, d = 2048" (81.51, 16.62, 79.47, 63.03, 19.83, 27.50, 22.63) is identical, digit for digit, to the d = 128 row. The appendix's full results (Table 16) give different values for d = 2048 — GLUE 82.62, CNNDM ROUGE-2 18.30, SQuAD 79.40, SuperGLUE 68.61, EnDe 25.64, EnFr 36.92, EnRo 26.93 — which also fit the paper's own reading that high-resource tasks need large adapters (translation climbs steadily with d). This page and its figure use the appendix values.</p>
+      <ul class="notes">
+        <li><b>Adapters</b> (dense–ReLU–dense blocks after each feed-forward layer; only adapters and norms train): small d suffices for small tasks (SQuAD), large d is needed for large ones (WMT); none matches full fine-tuning here. <b>Gradual unfreezing</b> — one more layer every 2¹⁸/12 steps, from the top — costs a little everywhere.</li>
+        <li><b>Mixing rates</b> have a sweet spot in K for most tasks (except WMT En–Fr, which always wants more), and T = 2 is the best temperature; equal mixing is worst.</li>
+        <li><b>Leave-one-out</b> is only slightly worse than full multi-task pretraining, suggesting little task interference; <b>supervised-only</b> pretraining is clearly worse except on translation.</li>
+      </ul>
+      <div class="viz" id="viz-mix">
+        <div class="vhead">
+          <span class="vtitle">Mixing rates for multi-task training</span>
+          <span class="vhint">choose a strategy · move the size limit K and temperature T</span>
+        </div>
+        <div class="controls">
+          <label>strategy <select id="mx-mode">
+            <option value="prop">examples-proportional</option>
+            <option value="temp">temperature-scaled (K = 2²¹)</option>
+            <option value="equal">equal</option>
+          </select></label>
+          <label>log₂ K <input type="range" id="mx-k" min="14" max="24" step="1" value="19" /> <span id="mx-kv"></span></label>
+          <label>T <input type="range" id="mx-t" min="1" max="8" step="1" value="2" /> <span id="mx-tv"></span></label>
+        </div>
+        <svg id="mx-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Bars of the sampling probability of each task under the chosen mixing strategy, with each task's raw size shown for reference"></svg>
+        <div class="readout" aria-live="polite" id="mx-read"></div>
+        <p class="vcap">Task sizes are approximate training-set sizes in examples for the TensorFlow Datasets versions (GLUE and SuperGLUE each concatenated, as in the paper); the unsupervised C4 task is effectively unlimited, so min(e, K) = K for it. Rates are computed from the paper's formulas.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> updating all parameters after unsupervised pretraining was the best recipe the study found, and multi-task pretraining followed by fine-tuning matched it — with the practical advantage of monitoring downstream tasks throughout pretraining. The released v1.0 checkpoints were trained that way.</div>
+    </section>
+
+    <!-- 19 ───────────────────────────────────────────── -->
+    <section class="topic" id="scaling-study" data-nav="Scaling: 4× the compute">
+      <h3><span class="idx">19</span> Scaling: what to do with 4× the compute</h3>
+      <p class="lede">Given four times the baseline's compute, the study compares training longer, using bigger batches, a 2× model for 2× steps, a 4× model, and ensembles. Bigger models trained somewhat longer did best; ensembling is an orthogonal gain.</p>
+      <table class="cmp">
+        <tr><th>Scaling strategy</th><th>GLUE</th><th>CNNDM</th><th>SQuAD</th><th>SGLUE</th><th>EnDe</th><th>EnFr</th><th>EnRo</th></tr>
+        <tr><td>Baseline</td><td>83.28</td><td>19.24</td><td>80.88</td><td>71.36</td><td>26.98</td><td>39.82</td><td>27.65</td></tr>
+        <tr><td>1× size, 4× training steps</td><td>85.33</td><td>19.33</td><td>82.45</td><td>74.72</td><td>27.08</td><td>40.66</td><td>27.93</td></tr>
+        <tr><td>1× size, 4× batch size</td><td>84.60</td><td>19.42</td><td>82.52</td><td>74.64</td><td>27.07</td><td>40.60</td><td>27.84</td></tr>
+        <tr><td>2× size, 2× training steps</td><td>86.18</td><td>19.66</td><td>84.18</td><td>77.18</td><td>27.52</td><td>41.03</td><td>28.19</td></tr>
+        <tr><td>4× size, 1× training steps</td><td>85.91</td><td>19.73</td><td>83.86</td><td>78.04</td><td>27.47</td><td>40.71</td><td>28.10</td></tr>
+        <tr><td>4× ensembled</td><td>84.77</td><td>20.10</td><td>83.09</td><td>71.74</td><td>28.05</td><td>40.53</td><td>28.57</td></tr>
+        <tr><td>4× ensembled, fine-tune only</td><td>84.05</td><td>19.57</td><td>82.36</td><td>71.55</td><td>27.55</td><td>40.22</td><td>28.09</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>The bigger models</b> use BERT-Large-shaped layers (d_model 1,024, d_ff 4,096, 16 heads) with 16 + 16 layers (2×) or 32 + 32 layers (4×).</li>
+        <li><b>More steps versus bigger batches:</b> no clear winner; both help. <b>Size helps beyond steps</b>: 2× size for 2× steps beats 4× steps on every task, and matches 4× size.</li>
+        <li><b>Ensembling</b> four independently pretrained models wins CNN/DM, EnDe and EnRo outright; four fine-tunes of one pretrained model still help, more cheaply. Neither helps SuperGLUE.</li>
+        <li><b>Costs differ after training:</b> a larger model costs more at every inference; a smaller model pretrained longer amortises its pretraining across tasks.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> within the study's 4× budget, parameters and steps were complementary and parameters edged ahead — the basis for scaling T5 to 11B with 1T tokens. It is a snapshot at small scale; later compute-optimal scaling studies of decoder-only models revisited the trade-off with far larger sweeps.</div>
+    </section>
+
+    <!-- 20 ───────────────────────────────────────────── -->
+    <section class="topic" id="schedule" data-nav="Schedule and Adafactor">
+      <h3><span class="idx">20</span> The schedule: steps, tokens, the inverse-square-root rate and Adafactor</h3>
+      <p class="lede">Pretraining in the study runs 2¹⁹ steps of 128 sequences of 512 tokens, packed so each batch holds about 2¹⁶ tokens — 2³⁵ ≈ 34B tokens in all, a small fraction of C4, so nothing repeats. The learning rate is 1/√max(n, k) with k = 10⁴ warm-up steps; the optimiser is Adafactor; decoding during the study is greedy.</p>
+      <div class="formula"><span class="lbl">tokens</span><span class="eq">2¹⁹ steps × 2⁷ sequences × 2⁹ tokens = 2³⁵ = 34,359,738,368 ≈ 34B</span>
+<span class="lbl">tokens, final models</span><span class="eq">10⁶ steps × 2¹¹ sequences × 2⁹ tokens ≈ 1.07 × 10¹² ≈ 1T</span>
+<span class="lbl">pretraining learning rate at step n</span><span class="eq">lr(n) = 1 / √max(n, k),   k = 10⁴</span>
+<span class="lbl">values</span><span class="eq">lr = 0.01 for n ≤ 10⁴,     lr(2¹⁹) = 1/√524,288 = 0.00138,     lr(10⁶) = 0.001</span>
+<span class="lbl">fine-tuning</span><span class="eq">2¹⁸ = 262,144 steps,  batch 128 × 512,  constant lr = 0.001
+checkpoint every 5,000 steps,  best validation checkpoint per task</span>
+<span class="lbl">Adafactor's factored second moment for an n × m weight matrix (row sums R, column sums C of the squared gradients)</span><span class="eq">V̂ = R Cᵀ / (1ᵀ R),      state: n + m numbers instead of n · m</span></div>
+      <h4>Notes on the schedule</h4>
+      <ul class="notes">
+        <li><b>"Exponentially decays".</b> The paper describes the post-warm-up phase as exponential decay; 1/√n is a power law — from step 10⁴ to 2¹⁹ the rate falls by √52.4 = 7.24×, not by an exponential factor. The formula, not the adjective, is what the code implements.</li>
+        <li><b>Why not a triangular schedule?</b> It scored slightly better but needs the total step count in advance; the study varied step counts, so it used the schedule that does not.</li>
+        <li><b>BERT comparison.</b> 34B tokens is about 1/4 of BERT's roughly 137B and 1/64 of RoBERTa's 2.2T; the final models' 1T is about 32× the baseline.</li>
+        <li><b>Adafactor</b> (Shazeer and Stern 2018) keeps, for each weight matrix, row and column statistics of the squared gradients instead of a full second-moment matrix, and in its memory-saving configuration no momentum. The paper names only the optimiser and does not say which configuration it used; the memory saving matters most at 11B parameters (see the figure).</li>
+      </ul>
+      <div class="viz" id="viz-lr">
+        <div class="vhead">
+          <span class="vtitle">Learning rate over pretraining and fine-tuning, and optimiser memory</span>
+          <span class="vhint">change the warm-up length · pick a model for the memory comparison</span>
+        </div>
+        <div class="controls">
+          <label>log₁₀ warm-up k <input type="range" id="lr-k" min="2" max="5" step="0.5" value="4" /> <span id="lr-kv"></span></label>
+          <label>model <select id="lr-cfg"></select></label>
+          <label><input type="checkbox" id="lr-log" /> log step axis</label>
+        </div>
+        <svg id="lr-svg" width="660" height="290" viewBox="0 0 660 290" role="img" aria-label="Learning rate against step for the inverse-square-root pretraining schedule followed by constant fine-tuning, and bars comparing Adam and Adafactor optimiser state for the chosen model"></svg>
+        <div class="readout" aria-live="polite" id="lr-read"></div>
+        <p class="vcap">The schedule is the paper's formula over 2¹⁹ pretraining steps, followed by 2¹⁸ fine-tuning steps at 0.001. Optimiser state counts are computed from the chosen config's weight shapes: Adam keeps two numbers per parameter; factored Adafactor without momentum keeps rows + columns per matrix and a full vector for each norm gain.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> T5's recipe is simple and scale-free — a warm-up constant, then 1/√n, no knowledge of the total length needed — with an optimiser whose state for T5-11B is millions of numbers rather than tens of billions.</div>
+    </section>
+
+    <!-- 21 ───────────────────────────────────────────── -->
+    <section class="topic" id="final" data-nav="The final recipe">
+      <h3><span class="idx">21</span> Putting it together: the recipe behind the released models</h3>
+      <p class="lede">For the released T5 models the authors changed the baseline in six ways: span corruption (mean length 3) instead of i.i.d. noise; 1 million steps at 2¹¹ sequences of 512 (about 1T tokens); five sizes; multi-task pretraining; fine-tuning on individual GLUE and SuperGLUE tasks with small batches; and beam search for long outputs.</p>
+      <ul class="notes">
+        <li><b>Multi-task pretraining.</b> The unsupervised task was mixed with the supervised ones by examples-proportional mixing, with artificial sizes for the unlabeled data of 710,000 (Small), 2,620,000 (Base), 8,660,000 (Large), 33,500,000 (3B) and 133,000,000 (11B), and WMT En–Fr and En–De capped at 1M examples. This is why the released v1.0 checkpoints respond to <code>translate English to German:</code> before any fine-tuning.</li>
+        <li><b>Per-task GLUE / SuperGLUE fine-tuning</b> with a batch of 8 sequences instead of 2¹¹ (so small tasks are not repeated within a batch) and checkpoints every 1,000 steps.</li>
+        <li><b>Decoding.</b> Beam width 4 with length penalty 0.6 for WMT and CNN/DM; greedy elsewhere.</li>
+        <li><b>Test sets</b> through the GLUE and SuperGLUE servers, standard CNN/DM test, newstest2014 / 2015 / 2016 for En–De / En–Fr / En–Ro; SQuAD on the validation set because the server could not run the largest models.</li>
+      </ul>
+      <h4>How much of the gain is not scale? (Table 15)</h4>
+      <table class="cmp">
+        <tr><th>Model (validation)</th><th>GLUE</th><th>CNNDM</th><th>SQuAD</th><th>SGLUE</th><th>EnDe</th><th>EnFr</th><th>EnRo</th></tr>
+        <tr><td>Baseline (34B tokens)</td><td>83.28</td><td>19.24</td><td>80.88</td><td>71.36</td><td>26.98</td><td>39.82</td><td>27.65</td></tr>
+        <tr><td>Baseline-1T (same recipe, 1T tokens)</td><td>84.80</td><td>19.62</td><td>83.01</td><td>73.90</td><td>27.46</td><td>40.30</td><td>28.34</td></tr>
+        <tr><td>T5-Base (final recipe, 1T tokens)</td><td>85.97</td><td>20.90</td><td>85.44</td><td>75.64</td><td>28.37</td><td>41.37</td><td>28.98</td></tr>
+      </table>
+      <p>Baseline-1T isolates the effect of more pretraining (+1.52 GLUE); T5-Base adds the study's "non-scaling" changes (+1.17 GLUE more, +1.28 ROUGE-2, +2.43 SQuAD EM). Both effects are clear on every task, so the study's findings contributed beyond the extra tokens.</p>
+      <div class="callout"><b>Takeaway:</b> the released v1.0 checkpoints are not "C4-only span-corruption models": their pretraining included the supervised tasks with prefixes. That is convenient for zero-shot use of those exact prefixes and a confound when comparing against models pretrained on raw text only. T5 v1.1 went back to C4 alone.</div>
+    </section>
+
+    <!-- 22 ───────────────────────────────────────────── -->
+    <section class="topic" id="results" data-nav="Results">
+      <h3><span class="idx">22</span> Results: the five sizes on the test sets (Table 14)</h3>
+      <p class="lede">T5-11B set the state of the art on 18 of the 24 tasks the paper reports, including GLUE average 90.3, SuperGLUE 88.9 (human 89.8), SQuAD exact match 91.26 and CNN/DM ROUGE-2 21.55. It did not reach the state of the art on any WMT pair, which the authors attribute to English-only pretraining and the absence of back-translation.</p>
+      <table class="cmp">
+        <tr><th>Model</th><th>GLUE</th><th>SuperGLUE</th><th>SQuAD EM / F1</th><th>CNN/DM R-1 / R-2 / R-L</th><th>EnDe</th><th>EnFr</th><th>EnRo</th></tr>
+        <tr><td>Previous best (as of Oct 24, 2019)</td><td>89.4</td><td>84.6</td><td>90.1 / 95.5</td><td>43.47 / 20.30 / 40.63</td><td>33.8</td><td>43.8</td><td>38.5</td></tr>
+        <tr><td>T5-Small</td><td>77.4</td><td>63.3</td><td>79.10 / 87.24</td><td>41.12 / 19.56 / 38.35</td><td>26.7</td><td>36.0</td><td>26.8</td></tr>
+        <tr><td>T5-Base</td><td>82.7</td><td>76.2</td><td>85.44 / 92.08</td><td>42.05 / 20.34 / 39.40</td><td>30.9</td><td>41.2</td><td>28.0</td></tr>
+        <tr><td>T5-Large</td><td>86.4</td><td>82.3</td><td>86.66 / 93.79</td><td>42.50 / 20.68 / 39.75</td><td>32.0</td><td>41.5</td><td>28.1</td></tr>
+        <tr><td>T5-3B</td><td>88.5</td><td>86.4</td><td>88.53 / 94.95</td><td>42.72 / 21.02 / 39.94</td><td>31.8</td><td>42.6</td><td>28.2</td></tr>
+        <tr><td>T5-11B</td><td>90.3</td><td>88.9</td><td>91.26 / 96.22</td><td>43.52 / 21.55 / 40.69</td><td>32.1</td><td>43.4</td><td>28.1</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Where it beat humans, and where not.</b> T5-11B exceeds the human baselines on MultiRC and ReCoRD, which the paper reads as a sign the metrics favour machine predictions; humans reach 100% on COPA and WSC, where T5-11B scores 94.8 and 93.8.</li>
+        <li><b>Translation barely scales.</b> En–Ro stays at 26.8–28.2 BLEU from 60M to 11B parameters, while GLUE climbs 12.9 points; the vocabulary and English-only pretraining cap what size can do there.</li>
+        <li><b>Ensembles for comparison.</b> Several previous-best GLUE entries were large ensembles (ALBERT used 6 to 17 models per task); T5-11B's entries are single models.</li>
+      </ul>
+      <div class="viz" id="viz-res">
+        <div class="vhead">
+          <span class="vtitle">Score against model size</span>
+          <span class="vhint">pick a benchmark · the dashed line is the previous state of the art</span>
+        </div>
+        <div class="controls">
+          <label>benchmark <select id="res-metric"></select></label>
+          <label><input type="checkbox" id="res-prev" checked /> show previous best</label>
+        </div>
+        <svg id="res-svg" width="660" height="290" viewBox="0 0 660 290" role="img" aria-label="Line of the chosen benchmark score for T5-Small through T5-11B on a log parameter axis, with the previous best as a dashed line"></svg>
+        <div class="readout" aria-live="polite" id="res-read"></div>
+        <p class="vcap">Scores are transcribed from Table 14 (test sets, SQuAD validation). The x-axis uses the recomputed parameter counts from <a href="#params">parameters</a>; gains per doubling of parameters and the first size to pass the previous best are computed here.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> most of T5-11B's records came from classification and QA benchmarks, where size kept paying; generation benchmarks gained less per parameter, and translation almost nothing beyond Base.</div>
+    </section>
+
+    <!-- 23 ───────────────────────────────────────────── -->
+    <section class="topic" id="v11" data-nav="T5 v1.1">
+      <h3><span class="idx">23</span> T5 v1.1: the cleaned-up checkpoints</h3>
+      <p class="lede">T5 v1.1, released in the T5 repository after the paper, changes five things: GEGLU instead of ReLU in the feed-forward layer; dropout turned off during pretraining (a "quality win"; it should be re-enabled for fine-tuning); pretraining on C4 only, with no supervised tasks mixed in; no parameter sharing between the input embedding and the output layer; and new XL and XXL shapes that replace 3B and 11B.</p>
+      <table class="cmp">
+        <tr><th>Change</th><th>v1.0</th><th>v1.1</th><th>What it means in practice</th></tr>
+        <tr><td>Feed-forward</td><td>ReLU, 2 matrices</td><td>GEGLU, 3 matrices</td><td>different module names (wi_0, wi_1, wo); d_ff narrower</td></tr>
+        <tr><td>Pretraining dropout</td><td>0.1</td><td>0</td><td>set dropout (0.1 in the configs) deliberately when fine-tuning</td></tr>
+        <tr><td>Pretraining data</td><td>C4 + supervised mixture</td><td>C4 only</td><td>must be fine-tuned; task prefixes have no special meaning for single-task fine-tuning</td></tr>
+        <tr><td>Output layer</td><td>tied to E, rescaled by d_model^(−1/2)</td><td>separate matrix, no rescale</td><td>+V·d parameters (65.8M for XL, 131.6M for XXL)</td></tr>
+        <tr><td>Large shapes</td><td>3B: d 1,024, 32 × 128, d_ff 16,384; 11B: 128 × 128, d_ff 65,536</td><td>XL: d 2,048, 32 × 64, d_ff 5,120; XXL: d 4,096, 64 × 64, d_ff 10,240</td><td>inner width = d_model again</td></tr>
+      </table>
+      <p>The LM-adapted variants (from the prompt-tuning work of Lester et al. 2021) continue v1.1 on a plain language-modelling objective for 100B additional C4 tokens so that the model can continue a prefix; the Flan paper uses them as its un-instruction-tuned T5 baselines.</p>
+      <div class="callout"><b>Takeaway:</b> v1.1 is the checkpoint to start from when you want a pretrained-only T5 for your own fine-tuning (and the architecture Flan-T5 and mT5 share); v1.0 is the checkpoint that already "knows" the paper's task prefixes.</div>
+    </section>
+
+    <!-- 24 ───────────────────────────────────────────── -->
+    <section class="topic" id="mt5" data-nav="mT5">
+      <h3><span class="idx">24</span> mT5: 101 languages</h3>
+      <p class="lede">mT5 ("mT5: A Massively Multilingual Pre-trained Text-to-Text Transformer", arXiv 2010.11934) applies the T5 v1.1 recipe to mC4, a Common Crawl corpus covering 101 languages, with a 250,000-piece SentencePiece vocabulary. Sizes run from Small (≈ 300M) through Base (580M), Large (1.2B) and XL (3.7B) to XXL (13B), each pretrained for 1M steps on batches of 1,024 length-1,024 inputs — about 1T input tokens, the same amount as T5.</p>
+      <div class="formula"><span class="lbl">language sampling during pretraining (|L| = examples in language L)</span><span class="eq">p(L) ∝ |L|^a,     a = 0.3   (tried 0.2, 0.3, 0.7; 0.3 balanced high- and low-resource languages)</span>
+<span class="lbl">vocabulary cost: two untied tables of 250,112 × d_model</span><span class="eq">mT5-Small: 2 · 250,112 · 512 = 256.1M of 300.2M
+mT5-Base:  2 · 250,112 · 768 = 384.2M of 582.4M (66%)</span></div>
+      <ul class="notes">
+        <li><b>The parameter jump over T5 is vocabulary.</b> mT5-Small's non-embedding weights are the same 44.1M as T5 v1.1 Small; the extra 223M are the larger input and output tables.</li>
+        <li><b>A slip in the ByT5 paper.</b> ByT5 describes mT5-Base's "vocabulary and softmax output matrices" as "256 million parameters, or about 66% of the total". Recounting from the released config gives 384.2M, and 384.2M / 582.4M = 66% — so the percentage is right and the 256M appears to be mT5-Small's figure.</li>
+        <li><b>Classification cost.</b> The mT5 paper points out that an encoder–decoder classifies at about the cost of T + 2 tokens (input, label, end) against T + 1 for an encoder-only model with a [CLS] token, despite twice the parameters.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> mT5 is T5 v1.1 with a multilingual corpus and a vocabulary eight times larger; at small sizes most of its parameters are embeddings.</div>
+    </section>
+
+    <!-- 25 ───────────────────────────────────────────── -->
+    <section class="topic" id="byt5" data-nav="ByT5">
+      <h3><span class="idx">25</span> ByT5: bytes instead of pieces</h3>
+      <p class="lede">ByT5 ("ByT5: Towards a Token-Free Future with Pre-trained Byte-to-Byte Models", arXiv 2105.13626) removes the tokenizer: text is fed as UTF-8 bytes, with 256 byte ids plus 3 special ids (padding, end-of-sequence, and an unused unknown). Sentinels reuse the final 100 byte ids, the mean masked span grows to 20 bytes, and the encoder is three times as deep as the decoder.</p>
+      <table class="cmp">
+        <tr><th></th><th>mT5-Small</th><th>ByT5-Small</th><th>mT5-XXL</th><th>ByT5-XXL</th></tr>
+        <tr><td>Layers (enc + dec)</td><td>8 + 8</td><td>12 + 4</td><td>24 + 24</td><td>36 + 12</td></tr>
+        <tr><td>d_model / d_ff</td><td>512 / 1,024</td><td>1,472 / 3,584</td><td>4,096 / 10,240</td><td>4,672 / 12,352</td></tr>
+        <tr><td>Vocabulary rows (config)</td><td>250,112</td><td>384</td><td>250,112</td><td>384</td></tr>
+        <tr><td>Parameters (recount)</td><td>300.2M</td><td>299.6M</td><td>12.92B</td><td>12.91B</td></tr>
+        <tr><td>Embedding share (input + output tables)</td><td>85.3%</td><td>0.38%</td><td>15.9%</td><td>0.03%</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Matched sizes, different allocations.</b> ByT5 spends the parameters mT5 put into vocabulary on wider and deeper layers, so the two families line up in total size while ByT5-Small's transformer blocks are almost seven times larger.</li>
+        <li><b>The price is sequence length:</b> a byte sequence is several times longer than a SentencePiece sequence for the same text, so compute per example rises even at equal parameters; the heavy-encoder, light-decoder split keeps decoding cheaper.</li>
+        <li><b>The payoff</b> is robustness to noise and spelling, and no out-of-vocabulary characters — the <code>{</code> and CJK problems of the <a href="#tokenizer">T5 tokenizer</a> disappear.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> ByT5 shows the T5 recipe works without a tokenizer if you rebalance the network toward the encoder and lengthen the masked spans to byte scale.</div>
+    </section>
+
+    <!-- 26 ───────────────────────────────────────────── -->
+    <section class="topic" id="flan" data-nav="Flan-T5">
+      <h3><span class="idx">26</span> Flan-T5: instruction-tuned T5</h3>
+      <p class="lede">Flan-T5 ("Scaling Instruction-Finetuned Language Models", arXiv 2210.11416) fine-tunes T5 models on 1,836 tasks (473 datasets, 146 task categories) phrased as instructions, with and without chain-of-thought exemplars, so that one checkpoint follows unseen instructions zero-shot. The released checkpoints share T5 v1.1's architecture (GEGLU, untied output layer) at five sizes: 80M, 250M, 780M, 3B and 11B.</p>
+      <table class="cmp">
+        <tr><th>Size</th><th>MMLU direct, T5 (LM-adapted)</th><th>MMLU direct, Flan-T5</th><th>Instruction-tuning compute (% of pretraining)</th></tr>
+        <tr><td>Large (780M)</td><td>25.1</td><td>45.1</td><td>1.1%</td></tr>
+        <tr><td>XL (3B)</td><td>25.7</td><td>52.4</td><td>0.6%</td></tr>
+        <tr><td>XXL (11B)</td><td>25.9</td><td>55.1</td><td>0.2%</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>From chance to useful.</b> The un-tuned T5 models are near MMLU's 25% chance level; instruction tuning lifts Flan-T5-XL to 52.4%, which the paper notes surpasses GPT-3 175B's 43.9%.</li>
+        <li><b>Cheap relative to pretraining:</b> 0.2% of the pretraining compute for XXL.</li>
+        <li><b>Training details:</b> constant learning rate, Adafactor, packing with masking across example boundaries, one checkpoint for all evaluations.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> Flan-T5 is the usual answer when someone wants "a T5 that works without fine-tuning": the architecture of v1.1 with instruction-following added for a fraction of a percent of the pretraining compute.</div>
+    </section>
+
+    <!-- 27 ───────────────────────────────────────────── -->
+    <section class="topic" id="ul2" data-nav="UL2: mixture of denoisers">
+      <h3><span class="idx">27</span> UL2: a mixture of denoisers</h3>
+      <p class="lede">UL2 ("UL2: Unifying Language Learning Paradigms", arXiv 2205.05131) keeps the T5 framework but pretrains on a mixture of seven denoising tasks in three families, each announced to the model by a mode token, [R], [S] or [X]. Its 20B encoder–decoder (19.5B parameters, 32 + 32 layers, d_model 4,096, d_ff 16,384, 16 heads of 256, the T5 32k vocabulary) was trained on 1T C4 tokens and later instruction-tuned as Flan-UL2.</p>
+      <table class="cmp">
+        <tr><th>Denoiser</th><th>Settings (mean span, corruption rate, spans)</th><th>What it trains</th></tr>
+        <tr><td>R — regular</td><td>(3, 0.15, n) ∪ (8, 0.15, n)</td><td>T5 span corruption: short spans, knowledge</td></tr>
+        <tr><td>S — sequential</td><td>(L/4, 0.25, 1): one span running to the end of the text</td><td>prefix language modelling: fluent continuation</td></tr>
+        <tr><td>X — extreme</td><td>(3, 0.5, n) ∪ (8, 0.5, n) ∪ (64, 0.15, n) ∪ (64, 0.5, n)</td><td>long spans or heavy corruption: long generation from little context</td></tr>
+      </table>
+      <p>The paper counts a task as extreme if its spans are at least 12 tokens long or its corruption rate at least 30%. Note that one of the X settings — mean span 3 at 50% — is close to the 50% corruption rate that performed poorly alone in T5's Table 6; UL2's claim is that such objectives help in a mixture, not by themselves. At fine-tuning time the mode token is chosen to match the task (for example [S] for generation).</p>
+      <div class="callout"><b>Takeaway:</b> UL2 is the T5 study's objective axis revisited: instead of picking one point on the denoising plateau, mix distant points — short spans, long spans, and prefix-LM — and let a mode token select the behaviour.</div>
+    </section>
+
+    <!-- 28 ───────────────────────────────────────────── -->
+    <section class="topic" id="t5gemma" data-nav="T5Gemma">
+      <h3><span class="idx">28</span> T5Gemma: encoder–decoders adapted from decoder-only models</h3>
+      <p class="lede">T5Gemma ("Encoder-Decoder Gemma: Improving the Quality-Efficiency Trade-Off via Adaptation", arXiv 2504.06225) builds encoder–decoder models by initialising both stacks from a pretrained decoder-only Gemma 2 model and continuing pretraining with prefix-LM (with distillation) or UL2 objectives, on up to 2T tokens. Despite the name, the blocks are Gemma 2's (rotary position embeddings and its other components), not T5's.</p>
+      <ul class="notes">
+        <li><b>Balanced and unbalanced pairs.</b> 2B-2B and 9B-9B pair an encoder and decoder of the same size; 9B-2B pairs a large encoder with a small decoder to keep generation cheap.</li>
+        <li><b>Reported results.</b> After instruction tuning, Gemma 2B-2B outperforms the decoder-only Gemma 2B by about 7%, and 9B-2B surpasses 2B-2B by more than 3%; adaptation reaches its decoder-only counterpart's quality after only tens of billions of tokens.</li>
+        <li><b>Why it connects to T5.</b> It revisits the T5 study's architecture finding under modern conditions: at similar inference cost, an encoder–decoder with a bidirectional encoder fine-tunes better.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the encoder–decoder idea survives into the decoder-only era by adaptation: reuse a strong decoder-only model's weights, then pay for bidirectional reading only where it helps.</div>
+    </section>
+
+    <!-- 29 ───────────────────────────────────────────── -->
+    <section class="topic" id="compute" data-nav="Encoder–decoder vs decoder-only compute">
+      <h3><span class="idx">29</span> Encoder–decoder versus decoder-only: the compute arithmetic</h3>
+      <p class="lede">An L + L encoder–decoder has roughly the parameters of a 2L-layer decoder-only model but the per-example compute of an L-layer one, because each token passes through only one stack. That is the equivalence the study used; it also has consequences at inference, where the encoder runs once and the decoder's cache holds only target tokens plus a fixed cross-attention cache.</p>
+      <div class="formula"><span class="lbl">forward multiply–accumulates per layer (inner = heads · d_kv, k = 2 or 3 feed-forward matrices)</span><span class="eq">encoder layer on n tokens:        n · (4 · d · inner + k · d · d_ff)  +  2 · n² · inner</span>
+<span class="lbl">decoder layer on m target tokens attending to n encoder states</span><span class="eq">m · (6 · d · inner + k · d · d_ff) + n · 2 · d · inner  +  2 · m² · inner + 2 · m · n · inner</span>
+<span class="lbl">decoder-only layer on the concatenated n + m tokens</span><span class="eq">(n + m) · (4 · d · inner + k · d · d_ff)  +  2 · (n + m)² · inner</span>
+<span class="lbl">key–value cache while generating the t-th target token</span><span class="eq">enc–dec: N_dec · 2 · (t + n) · inner   (the n part computed once)
+decoder-only: N · 2 · (n + t) · inner</span></div>
+      <h4>Worked example: T5-Base shapes, a 512-token input and a 128-token target</h4>
+      <p>One encoder layer processes 512 tokens: 512 · (4 · 768 · 768 + 2 · 768 · 3,072) = 3.62 × 10⁹ multiply–accumulates in its matrices plus 2 · 512² · 768 = 0.40 × 10⁹ in attention. One decoder-only layer of the same width on 640 tokens needs 640 · 7.08 × 10⁶ = 4.53 × 10⁹ plus 2 · 640² · 768 = 0.63 × 10⁹. The figure sums these over all layers for the three models of the paper's comparison.</p>
+      <div class="viz" id="viz-cc">
+        <div class="vhead">
+          <span class="vtitle">Compute and cache: L + L encoder–decoder against decoder-only</span>
+          <span class="vhint">set input and target lengths · pick a width</span>
+        </div>
+        <div class="controls">
+          <label>input tokens <input type="range" id="cc-in" min="16" max="2048" step="16" value="512" /> <span id="cc-inv"></span></label>
+          <label>target tokens <input type="range" id="cc-out" min="1" max="1024" step="1" value="128" /> <span id="cc-outv"></span></label>
+          <label>width <select id="cc-cfg"></select></label>
+        </div>
+        <svg id="cc-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Bars of forward compute and parameter count for the encoder–decoder, a decoder-only model with the same compute and one with the same parameters, and the key–value cache at the last generated token"></svg>
+        <div class="readout" aria-live="polite" id="cc-read"></div>
+        <p class="vcap">Compute counts the matrix multiplications and attention products of one forward pass over an (input, target) pair, as in training, and excludes the embedding and softmax layers, norms and the causal-mask saving (full n² products are counted, as a plain implementation computes them). The decoder-only models take the chosen config's block shape: N layers (same compute) or 2N layers (same parameters). The cache assumes 16-bit values.</p>
+      </div>
+      <ul class="notes">
+        <li><b>When the input is long and the output short</b> (classification, extraction, summarisation), the encoder–decoder does the bulk of its work once, bidirectionally, and decodes against a fixed cross-attention cache.</li>
+        <li><b>When outputs are long and inputs short</b> (open-ended generation, chat with growing context), the split buys less, and a single stack reuses one cache for the whole conversation — one reason decoder-only models took over general-purpose LLMs.</li>
+        <li><b>Parameters are not compute.</b> Matching an encoder–decoder by parameters (2N decoder layers) doubles the decoder-only model's compute; matching by compute halves its parameters. The study's Table 2 reports both.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> an encoder–decoder buys twice the parameters per FLOP and a bidirectional reading of the input; a decoder-only model buys one uniform stack and cache. Which is cheaper depends on the ratio of input to output length.</div>
+    </section>
+
+    <!-- 30 ───────────────────────────────────────────── -->
+    <section class="topic" id="usage" data-nav="Using T5 in Transformers">
+      <h3><span class="idx">30</span> Using T5 with the Hugging Face Transformers library</h3>
+      <p class="lede">All T5-family checkpoints load as <code>T5ForConditionalGeneration</code> (or through <code>AutoModelForSeq2SeqLM</code>) with a SentencePiece-based T5 tokenizer: google-t5/t5-small … t5-11b (v1.0), google/t5-v1_1-*, google/flan-t5-*, google/mt5-* and google/byt5-* (the last with a byte tokenizer). Correct use comes down to prefixes, the decoder start token, label masking, learning rate and precision.</p>
+      <h4>The steps</h4>
+      <ol class="notes">
+        <li><b>Inputs.</b> <code>tokenizer("translate English to French: The weather is nice today.", return_tensors="pt")</code>. For v1.0 checkpoints use the paper's prefixes; for v1.1 the documentation notes there is "no real advantage" to a prefix in single-task fine-tuning, but prefixes should be used for multi-task fine-tuning. Flan-T5 takes natural-language instructions.</li>
+        <li><b>Targets.</b> Tokenize the target text as <code>labels</code>; replace padding ids in the labels by −100 so the loss ignores them. The model builds <code>decoder_input_ids</code> by shifting the labels right and inserting the decoder start token, which for T5 is the pad token (id 0).</li>
+        <li><b>Loss.</b> <code>model(input_ids=…, attention_mask=…, labels=…).loss</code> is the mean token cross-entropy over non-ignored positions — the paper's objective.</li>
+        <li><b>Generation.</b> <code>model.generate(**inputs, max_new_tokens=…)</code>; greedy by default, beam 4 with length penalty 0.6 reproduces the paper's WMT and CNN/DM decoding.</li>
+        <li><b>Span-corruption inputs</b> use the sentinel strings directly: input <code>"The &lt;extra_id_0&gt; walks in &lt;extra_id_1&gt; park"</code>, labels <code>"&lt;extra_id_0&gt; cute dog &lt;extra_id_1&gt; the &lt;extra_id_2&gt;"</code> (the library's own example).</li>
+      </ol>
+      <h4>Settings that matter</h4>
+      <table class="cmp">
+        <tr><th>Setting</th><th>Recommendation</th><th>Why</th></tr>
+        <tr><td>Learning rate</td><td>about 1 × 10⁻⁴ to 3 × 10⁻⁴ with AdamW (library docs); or Adafactor at a constant 10⁻³ (the paper)</td><td>T5 needs a higher rate than the library's default</td></tr>
+        <tr><td>Precision</td><td>bf16 or fp32 — not fp16 — for v1.1, mT5 and Flan-T5 especially</td><td>activations can exceed fp16's maximum of 65,504 (see pitfalls)</td></tr>
+        <tr><td>Dropout (v1.1)</td><td>set dropout_rate for fine-tuning (configs ship 0.1)</td><td>pretraining used none</td></tr>
+        <tr><td>Padding side</td><td>either</td><td>relative position bias only</td></tr>
+        <tr><td>Input length</td><td>512 is the pretraining length; longer inputs run but cost O(n²) memory and are unvalidated</td><td>no absolute positions, but no length training beyond 512</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> T5 fine-tuning is plain sequence-to-sequence training with two T5-specific habits — labels padded with −100 and a pad token as decoder start — plus a higher learning rate than BERT and bf16 instead of fp16.</div>
+    </section>
+
+    <!-- 31 ───────────────────────────────────────────── -->
+    <section class="topic" id="pitfalls" data-nav="Pitfalls">
+      <h3><span class="idx">31</span> Pitfalls</h3>
+      <p class="lede">T5's failures are mostly silent: a wrong prefix, a label that tokenizes differently, an fp16 overflow that produces NaN only on some inputs, a brace that became &lt;unk&gt;. The list below is grouped by where they occur.</p>
+      <h4>Numerics and precision</h4>
+      <ul class="notes">
+        <li><b>fp16 overflow.</b> T5 was trained on TPUs, where the reduced-precision format is bfloat16, which has fp32's exponent range. In fp16 (maximum 65,504) the un-normalised residual stream and feed-forward activations of some checkpoints — v1.1, mT5 and Flan-T5 in particular — can overflow to inf and then NaN. The library's own code shows the workaround: it clamps hidden states to just below the fp16 maximum inside each block when running in fp16, and keeps the feed-forward output projection <code>wo</code> in fp32 (<code>_keep_in_fp32_modules = ["wo"]</code>). Use bf16 or fp32 when you can.</li>
+        <li><b>Porting to another implementation</b> without the three T5 specifics — no 1/√d_kv, d_model^(−1/2) rescale before a tied output, scale-only norm — gives wrong logits with no error.</li>
+      </ul>
+      <h4>Inputs and targets</h4>
+      <ul class="notes">
+        <li><b>Prefix and field order.</b> v1.0 checkpoints expect the Appendix D forms (<code>mnli hypothesis: … premise: …</code>, <code>stsb sentence1: … sentence2: …</code>); a different order or wording is a different input.</li>
+        <li><b>Label strings.</b> "entailment" is 4 pieces (▁ · en · tail · ment) and "not_entailment" 5; compare decoded strings, and restrict or validate outputs for classification.</li>
+        <li><b>Unrepresentable characters.</b> <code>{ } ~ &lt;</code>, most CJK characters and newlines do not survive the T5 tokenizer; use mT5 or ByT5, or escape them, for code, JSON or line-structured text.</li>
+        <li><b>STS-B-style regression</b> needs the 0.2-grid quantisation and a parser for the generated number.</li>
+      </ul>
+      <h4>Training</h4>
+      <ul class="notes">
+        <li><b>Forgetting −100.</b> Padding ids left as 0 in the labels teaches the model to predict padding.</li>
+        <li><b>v1.1 without dropout</b> overfits small data sets; enable it.</li>
+        <li><b>Assuming v1.1 works zero-shot.</b> It was never trained on supervised tasks; it must be fine-tuned (or use Flan-T5).</li>
+        <li><b>Span-corruption lengths.</b> Continuing pretraining with inputs and targets not sized by the helper (568 → 512 / 114 at the defaults) pads or truncates every example.</li>
+      </ul>
+      <h4>Reading the paper's numbers</h4>
+      <ul class="notes">
+        <li><b>Validation versus test.</b> Tables 1–13 and 15 are validation scores of the 34B-token baseline family; Table 14 is test scores of the 1T-token models. Do not mix them.</li>
+        <li><b>Noise.</b> Differences under 2σ (0.47 GLUE, 0.83 SuperGLUE) are within the paper's own noise estimate.</li>
+        <li><b>Table 10's d = 2048 adapter row</b> is a copy of the d = 128 row; use Table 16.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the checklist is short — right checkpoint for the job, right prefix and label strings, −100 in labels, bf16 not fp16, a tokenizer that can spell your data.</div>
+    </section>
+
+    <!-- 32 ───────────────────────────────────────────── -->
+    <section class="topic" id="cheatsheet" data-nav="Cheat sheet">
+      <h3><span class="idx">32</span> Cheat sheet</h3>
+      <p class="lede">The numbers and names to have at hand. Everything here is derived or cited in the sections above.</p>
+      <table class="cmp">
+        <tr><th>Item</th><th>Value</th></tr>
+        <tr><td>Paper</td><td>"Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer", arXiv 1910.10683, JMLR 21 (2020)</td></tr>
+        <tr><td>Interface</td><td>task prefix + input text → target text; labels as words, STS-B rounded to 0.2</td></tr>
+        <tr><td>Block</td><td>pre-norm, scale-only (RMS) norm, no biases, no 1/√d_kv; ReLU FF (v1.0) or GEGLU (v1.1)</td></tr>
+        <tr><td>Position</td><td>scalar bias per head per bucket; 32 buckets, max distance 128; last bucket from 91 (encoder, each direction) / 113 (decoder); one table per stack</td></tr>
+        <tr><td>Sizes (v1.0)</td><td>Small 60.5M · Base 222.9M · Large 737.7M · 3B 2.85B · 11B 11.31B (recount)</td></tr>
+        <tr><td>Odd shapes</td><td>3B: d 1,024, 32 × 128 heads, d_ff 16,384; 11B: 128 × 128 heads, d_ff 65,536</td></tr>
+        <tr><td>Vocabulary</td><td>SentencePiece 32,000 + 100 sentinels = 32,100; embedding 32,128 rows; &lt;extra_id_k&gt; = 32,099 − k; pad 0 = decoder start</td></tr>
+        <tr><td>C4</td><td>Common Crawl April 2019; terminal punctuation, ≥ 5 words, ≥ 3 sentences, bad words, javascript, lorem ipsum, "{", citations, policy lines, dedup, English ≥ 0.99; ~750 GB</td></tr>
+        <tr><td>Span corruption</td><td>15% noise, mean span 3; 568 raw → 512 input, 114 target; one sentinel per span on each side, then &lt;/s&gt;</td></tr>
+        <tr><td>Study schedule</td><td>2¹⁹ steps × 2¹⁶ tokens = 2³⁵ ≈ 34B; lr = 1/√max(n, 10⁴); Adafactor; fine-tune 2¹⁸ steps at 10⁻³</td></tr>
+        <tr><td>Final schedule</td><td>10⁶ steps × 2¹¹ × 512 ≈ 1T tokens; multi-task pretraining; beam 4, length penalty 0.6 for WMT and CNN/DM</td></tr>
+        <tr><td>Study findings</td><td>enc–dec + denoising best; sharing enc/dec weights costs little; denoising variants similar; clean data helps; repetition hurts clearly from 1,024×; full fine-tuning best; multi-task pretrain + fine-tune ≈ baseline; bigger models beat longer training</td></tr>
+        <tr><td>Headline (T5-11B, test)</td><td>GLUE 90.3, SuperGLUE 88.9, SQuAD 91.26 / 96.22, CNN/DM R-2 21.55, WMT 32.1 / 43.4 / 28.1</td></tr>
+        <tr><td>Successors</td><td>v1.1 (GEGLU, C4-only, untied, no pretraining dropout); mT5 (101 languages, 250k vocab); ByT5 (bytes, 3:1 encoder); Flan-T5 (1,836 tasks); UL2 (7 denoisers, 20B); T5Gemma (adapted from Gemma 2)</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> if you remember one line — T5 is an encoder–decoder that reads a prefixed string and writes the answer as a string, pretrained to fill in sentinel-marked gaps in clean web text.</div>
+    </section>
+
+    <!-- 33 ───────────────────────────────────────────── -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">33</span> Takeaways</h3>
+      <p class="lede">T5 made "every task is text-to-text" the default framing for transfer learning and produced a large controlled comparison of pretraining choices. Its largest model set the state of the art on GLUE and SuperGLUE in 2019, and its successors — v1.1, mT5, ByT5, Flan-T5, UL2 — remained standard encoder–decoder checkpoints for years.</p>
+      <h4>What to remember</h4>
+      <ul class="notes">
+        <li><b>Design:</b> the 2017 encoder–decoder with scale-only pre-norm, no biases, bucketed relative position biases and a tied (v1.0) or untied (v1.1) output layer.</li>
+        <li><b>Objective:</b> span corruption — short targets, sentinels, 15% at mean length 3 — chosen from a plateau of similar denoising objectives on cost grounds.</li>
+        <li><b>Data:</b> C4, cleaned by simple heuristics whose code differs in detail from their description; large enough, per the paper, to train on 1T tokens without repeating data.</li>
+        <li><b>Evidence:</b> one-factor-at-a-time comparisons with a measured noise floor; read them with the 2σ rule and remember they were run at Base size.</li>
+        <li><b>Practice:</b> use v1.0 for its built-in prefixes, v1.1 to fine-tune from scratch, Flan-T5 for instructions, mT5 or ByT5 beyond English; bf16, labels with −100, a tokenizer that can spell your data.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> read the <a href="nlp-models.html">NLP Models</a> hub for where T5 sits among encoders and encoder–decoders, <a href="bert.html">BERT</a> for the encoder-only recipe it compared against, and <a href="gpt.html">GPT</a> for the decoder-only branch that its architecture study found weaker for fine-tuned transfer and that later dominated prompting.</div>
+    </section>
+
+    <section class="topic" id="papers" data-nav="Research papers">
+      <h3><span class="idx">📄</span> Research papers</h3>
+      <p class="lede">The primary source, then the successors, building blocks and datasets this page cites, by title and identifier.</p>
+      <h4>T5 and its family</h4>
+      <ul class="notes">
+        <li><b>"Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer"</b> (2019, arXiv 1910.10683; JMLR 2020) — T5, C4 and the systematic study.</li>
+        <li><b>"mT5: A Massively Multilingual Pre-trained Text-to-Text Transformer"</b> (2020, arXiv 2010.11934; NAACL 2021).</li>
+        <li><b>"ByT5: Towards a Token-Free Future with Pre-trained Byte-to-Byte Models"</b> (2021, arXiv 2105.13626; TACL 2022).</li>
+        <li><b>"Scaling Instruction-Finetuned Language Models"</b> (2022, arXiv 2210.11416) — Flan-T5.</li>
+        <li><b>"UL2: Unifying Language Learning Paradigms"</b> (2022, arXiv 2205.05131; ICLR 2023).</li>
+        <li><b>"Encoder-Decoder Gemma: Improving the Quality-Efficiency Trade-Off via Adaptation"</b> (2025, arXiv 2504.06225) — T5Gemma.</li>
+        <li><b>"The Power of Scale for Parameter-Efficient Prompt Tuning"</b> (2021, arXiv 2104.08691) — the LM-adapted T5 v1.1 checkpoints.</li>
+      </ul>
+      <h4>Building blocks</h4>
+      <ul class="notes">
+        <li><b>"Attention Is All You Need"</b> (2017, arXiv 1706.03762) — the encoder–decoder Transformer.</li>
+        <li><b>"Self-Attention with Relative Position Representations"</b> (2018, arXiv 1803.02155) — relative position embeddings, simplified by T5 to scalar biases.</li>
+        <li><b>"Adafactor: Adaptive Learning Rates with Sublinear Memory Cost"</b> (2018, arXiv 1804.04235).</li>
+        <li><b>"GLU Variants Improve Transformer"</b> (2020, arXiv 2002.05202) — GEGLU.</li>
+        <li><b>"Root Mean Square Layer Normalization"</b> (2019, arXiv 1910.07467) — RMSNorm, the name for T5's scale-only norm.</li>
+        <li><b>"SentencePiece: A simple and language independent subword tokenizer and detokenizer for Neural Text Processing"</b> (2018, arXiv 1808.06226).</li>
+        <li><b>"Mesh-TensorFlow: Deep Learning for Supercomputers"</b> (2018, arXiv 1811.02084) — the training library.</li>
+        <li><b>"BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding"</b> (2018, arXiv 1810.04805); <b>"MASS: Masked Sequence to Sequence Pre-training for Language Generation"</b> (2019, arXiv 1905.02450); <b>"SpanBERT: Improving Pre-training by Representing and Predicting Spans"</b> (2019, arXiv 1907.10529) — objectives compared in the study.</li>
+        <li><b>"Parameter-Efficient Transfer Learning for NLP"</b> (2019, arXiv 1902.00751) — adapter layers; <b>"Universal Language Model Fine-tuning for Text Classification"</b> (2018, arXiv 1801.06146) — gradual unfreezing.</li>
+      </ul>
+      <h4>Data and benchmarks</h4>
+      <ul class="notes">
+        <li><b>"GLUE: A Multi-Task Benchmark and Analysis Platform for Natural Language Understanding"</b> (2018, arXiv 1804.07461); <b>"SuperGLUE: A Stickier Benchmark for General-Purpose Language Understanding Systems"</b> (2019, arXiv 1905.00537).</li>
+        <li><b>"SQuAD: 100,000+ Questions for Machine Comprehension of Text"</b> (2016, arXiv 1606.05250); <b>"Get To The Point: Summarization with Pointer-Generator Networks"</b> (2017, arXiv 1704.04368) — the non-anonymised CNN/Daily Mail.</li>
+        <li><b>"Documenting Large Webtext Corpora: A Case Study on the Colossal Clean Crawled Corpus"</b> (2021, arXiv 2104.08758) — the later audit of C4's filters and contents.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="t5.viz.js"></script>
+</body>
+</html>
