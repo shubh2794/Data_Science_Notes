@@ -77,6 +77,7 @@ const nodes = [
   {id:"Joint Distributions & Dependence", group:"math", level:3, link:"math/probability/joint-distributions.html", desc:"Several random variables at once: joint, marginal and conditional distributions, independence, covariance and correlation, sums and convolution, the bivariate and multivariate normal, change of variables with Jacobians, order statistics and mixtures."},
   {id:"Limit Theorems & Convergence", group:"math", level:3, link:"math/probability/limit-theorems.html", desc:"What happens as n grows: the modes of convergence and how they relate, the weak and strong laws of large numbers, the central limit theorem and a proof sketch, the delta method, Slutsky's theorem and the continuous mapping theorem."},
   {id:"Simulation & Stochastic Processes", group:"math", level:3, link:"math/probability/stochastic-processes.html", desc:"Making randomness computable, then letting it evolve in time: pseudo-random numbers, inverse-transform and rejection sampling, Monte Carlo estimation and its 1/√n error, Markov chains and stationary distributions, and the Bernoulli and Poisson processes."},
+  {id:"Fourier Analysis", group:"math", level:2, link:"math/fourier-analysis.html", desc:"Decomposing functions into sinusoids: Fourier series and their convergence, the function-space view where coefficients are projections, Parseval, the transform and convolution, and the statistical side — periodograms, spectral density, and the characteristic function as the Fourier transform of a distribution."},
   {id:"Statistics", group:"math", level:2, link:"math/statistics/index.html", desc:"Reasoning from a sample to the population it came from. Hub page: the map of the subject, split into nine sub-topics below — description, design, sampling distributions, estimation, testing, regression, resampling, categorical data, and ANOVA."},
   // Statistics sub-topics (level 3) — one page each, in course order
   {id:"Descriptive Statistics", group:"math", level:3, link:"math/statistics/descriptive.html", desc:"Summarising a batch of numbers before modelling it: histograms and shape, the mean/median/mode trio and when each lies, spread by SD, IQR and MAD, quartiles and boxplots, z-scores and standardisation, outliers, and the plots that reveal what a summary statistic hides."},
@@ -295,7 +296,7 @@ const nodes = [
 ];
 
 const tree = {
-  "Math & Statistics":["Linear Algebra","Probability","Statistics","Calculus","Optimization"],
+  "Math & Statistics":["Linear Algebra","Probability","Statistics","Calculus","Fourier Analysis","Optimization"],
   // Foundations — folded into the main tree so they render like any other domain
   "Programming & Tools":["Python","SQL","Pandas & NumPy","Git & Version Control","R","Apache Spark"],
   "Data Structures & Algorithms":["Data Structures","Algorithm Design & Analysis"],
@@ -404,6 +405,9 @@ const cross = [
   ["Joint Distributions & Dependence","Quadratic Forms, Covariance & PCA"],["Joint Distributions & Dependence","Regression & Correlation"],["Joint Distributions & Dependence","Naive Bayes"],["Joint Distributions & Dependence","Clustering (k-Means)"],["Joint Distributions & Dependence","Linear Regression"],
   ["Limit Theorems & Convergence","Sampling Distributions & CLT"],["Limit Theorems & Convergence","Estimation & Confidence Intervals"],["Limit Theorems & Convergence","Hypothesis Testing"],["Limit Theorems & Convergence","Resampling (Bootstrap & Permutation)"],["Limit Theorems & Convergence","Model Evaluation"],
   ["Simulation & Stochastic Processes","Reinforcement Learning"],["Simulation & Stochastic Processes","Hidden Markov Models & CRFs"],["Simulation & Stochastic Processes","Diffusion Models"],["Simulation & Stochastic Processes","Resampling (Bootstrap & Permutation)"],["Simulation & Stochastic Processes","Language Models"],
+
+  /* Fourier Analysis ↔ the rest of the graph */
+  ["Fourier Analysis","Frequency Domain"],["Fourier Analysis","Projections & Least-Squares"],["Fourier Analysis","Limit Theorems & Convergence"],["Fourier Analysis","Joint Distributions & Dependence"],["Fourier Analysis","Transformers"],["Fourier Analysis","Support Vector Machines"],["Fourier Analysis","Speech Processing"],["Fourier Analysis","Calculus"],
 
   /* Statistics sub-topics ↔ the rest of the graph */
   ["Descriptive Statistics","Data Preprocessing"],
