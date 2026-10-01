@@ -70,7 +70,7 @@ const nodes = [
   {id:"Quadratic Forms, Covariance & PCA", group:"math", level:3, link:"math/linear-algebra-quadratic-pca.html", desc:"The quadratic form xᵀAx and matrix definiteness, covariance and correlation matrices as Gram matrices of centered data, and PCA as the eigendecomposition of the covariance matrix."},
   {id:"Probability", group:"math", level:2, link:"math/probability/index.html", desc:"The calculus of uncertainty: given a model of a chance experiment, what will the data look like? Hub page: the map of the subject, split into seven sub-topics below — foundations, discrete and continuous distributions, expectation, joint distributions, limit theorems, and simulation & stochastic processes."},
   // Probability sub-topics (level 3) — one page each, in dependency order
-  {id:"Probability Foundations", group:"math", level:3, desc:"Sample spaces, events and the axioms; counting and combinatorics; conditional probability, the multiplication rule, the law of total probability and Bayes' rule; independence — the grammar every later probability statement is written in."},
+  {id:"Probability Foundations", group:"math", level:3, link:"math/probability/foundations.html", desc:"Sample spaces, events and the axioms; counting and combinatorics; conditional probability, the multiplication rule, the law of total probability and Bayes' rule; independence — the grammar every later probability statement is written in."},
   {id:"Random Variables & Discrete Distributions", group:"math", level:3, desc:"A random variable as a number attached to an outcome: PMF and CDF, and the discrete zoo — Bernoulli, binomial, geometric, negative binomial, hypergeometric and Poisson — with the stories that generate them and the Poisson approximation to the binomial."},
   {id:"Continuous Distributions", group:"math", level:3, desc:"Densities and why P(X = x) = 0: pdf, cdf and quantiles; uniform, exponential and memorylessness, normal, gamma, beta, Pareto and lognormal; transforming a single random variable, and the family tree that relates the distributions."},
   {id:"Expectation, Variance & Inequalities", group:"math", level:3, desc:"What a random quantity does on average and how far it strays: expectation and LOTUS, variance and moments, moment generating functions, the tail bounds (Markov, Chebyshev, Jensen, Chernoff-Hoeffding), and conditional expectation with the tower rule."},
@@ -396,6 +396,9 @@ const cross = [
   ["Linear Algebra","Optimization"],["Probability","Naive Bayes"],
   ["Statistics","Model Evaluation"],["Probability","Statistics"],
   ["BERT","GPT"],["BERT","LayoutLM"],["LayoutLM","Donut"],
+  /* Probability sub-topics ↔ the rest of the graph */
+  ["Probability Foundations","Naive Bayes"],["Probability Foundations","Model Evaluation"],["Probability Foundations","Hypothesis Testing"],["Probability Foundations","Sampling Distributions & CLT"],["Probability Foundations","Logistic Regression"],
+
   /* Statistics sub-topics ↔ the rest of the graph */
   ["Descriptive Statistics","Data Preprocessing"],
   ["Producing Data & Sampling","Data Sampling & Imbalance"],["Producing Data & Sampling","A/B Testing"],
