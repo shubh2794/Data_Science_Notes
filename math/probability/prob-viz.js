@@ -409,3 +409,130 @@ Object.assign(PV, (function () {
   }
   return { cauchyPdf, cauchyCdf, cauchyQuant, cauchyDraw, gumbelPdf, gumbelCdf, gumbelQuant, frechetPdf, frechetCdf, ksDist };
 })());
+
+/* ── appended for Simulation & Stochastic Processes (part 7) ──────────────────────────────────────
+   Adds ONLY what neither ST nor PV had: a Poisson-process generator, Walker's alias table for O(1)
+   categorical draws, the stationary distribution of a finite Markov chain, and the three dependent-
+   sample diagnostics every MCMC run reports (autocorrelation, effective sample size, R̂).
+
+     · Poisson process   PV.poisProcess(lam, T, r) → sorted arrival times in (0, T], built from
+                         exponential gaps (PV.expDraw)
+     · alias method      PV.aliasTable(p) → {prob, alias}  (O(K) set-up, Vose's stable variant)
+                         PV.aliasDraw(tab, r) → index      (one uniform: column, then coin)
+                                                       ~2³²/K distinct coin levels with 32-bit uniforms
+                                                       (≈86,000 at K = 50,000): fine in practice; two
+                                                       independent uniforms give the exact version
+     · Markov chains     PV.stationary(P) → π with πP = π, Σπ = 1, by Gaussian elimination on the
+                         transposed system; null when the solution is not unique (several closed classes)
+     · dependence        PV.acf(x, maxLag) → [ρ₀ = 1, ρ₁, …]  (biased, divisor n, the standard estimator)
+                         PV.ess(x) → {tau, ess, lags}  integrated autocorrelation time τ = 1 + 2Σρₖ by
+                         the initial-positive-sequence rule (sum adjacent pairs Γₘ = ρ₂ₘ + ρ₂ₘ₊₁ while they
+                         stay positive, capped at 4,000 lags), ess = n/τ
+                         PV.rhat(chains) → potential scale reduction √(((n − 1)/n·W + B/n)/W) across ≥ 2
+                         equal-length chains (W = mean within-chain variance, B = n × variance of the
+                         chain means)
+
+   VERIFICATION: see the check log appended directly below this block.                              */
+Object.assign(PV, (function () {
+  function poisProcess(lam, T, r) {
+    const out = [];
+    if (!(lam > 0)) return out;
+    let t = PV.expDraw(lam, r);
+    while (t <= T) { out.push(t); t += PV.expDraw(lam, r); }
+    return out;
+  }
+  function aliasTable(p) {
+    const K = p.length, tot = p.reduce((a, b) => a + b, 0);
+    const s = p.map(x => x * K / tot), prob = new Array(K).fill(1), alias = d3range(K);
+    const small = [], large = [];
+    s.forEach((x, i) => (x < 1 ? small : large).push(i));
+    while (small.length && large.length) {
+      const l = small.pop(), g = large.pop();
+      prob[l] = s[l]; alias[l] = g;
+      s[g] = s[g] + s[l] - 1;
+      (s[g] < 1 ? small : large).push(g);
+    }
+    large.concat(small).forEach(i => { prob[i] = 1; alias[i] = i; });   // rounding leftovers
+    return { prob, alias };
+  }
+  function d3range(K) { const a = []; for (let i = 0; i < K; i++) a.push(i); return a; }
+  function aliasDraw(tab, r) {
+    const K = tab.prob.length, v = r() * K, i = Math.min(K - 1, Math.floor(v));
+    return (v - i) < tab.prob[i] ? i : tab.alias[i];
+  }
+  function stationary(P) {                       // solve (Pᵀ − I)π = 0 with the last row replaced by Σπ = 1
+    const n = P.length, A = [];
+    for (let i = 0; i < n; i++) { const row = []; for (let j = 0; j < n; j++) row.push(P[j][i] - (i === j ? 1 : 0)); row.push(0); A.push(row); }
+    for (let j = 0; j <= n; j++) A[n - 1][j] = 1;
+    for (let c = 0; c < n; c++) {
+      let piv = c; for (let i = c + 1; i < n; i++) if (Math.abs(A[i][c]) > Math.abs(A[piv][c])) piv = i;
+      if (Math.abs(A[piv][c]) < 1e-12) return null;
+      const t = A[c]; A[c] = A[piv]; A[piv] = t;
+      for (let i = 0; i < n; i++) if (i !== c) { const f = A[i][c] / A[c][c]; for (let j = c; j <= n; j++) A[i][j] -= f * A[c][j]; }
+    }
+    const pi = A.map((row, i) => row[n] / row[i]);
+    return pi.some(v => v < -1e-10) ? null : pi.map(v => Math.max(0, v));
+  }
+  function acf(x, maxLag) {
+    const n = x.length; let m = 0;
+    for (let i = 0; i < n; i++) m += x[i];
+    m /= n;
+    let c0 = 0; for (let i = 0; i < n; i++) c0 += (x[i] - m) * (x[i] - m);
+    const out = [1], L = Math.min(maxLag, n - 1);
+    for (let k = 1; k <= L; k++) {
+      let c = 0; for (let i = 0; i + k < n; i++) c += (x[i] - m) * (x[i + k] - m);
+      out.push(c0 > 0 ? c / c0 : 0);
+    }
+    return out;
+  }
+  function ess(x) {                              // autocorrelations computed lazily, only as far as needed
+    const n = x.length; let mean = 0;
+    for (let i = 0; i < n; i++) mean += x[i];
+    mean /= n;
+    let c0 = 0; for (let i = 0; i < n; i++) c0 += (x[i] - mean) * (x[i] - mean);
+    const rho = k => { if (k === 0) return 1; let c = 0; for (let i = 0; i + k < n; i++) c += (x[i] - mean) * (x[i + k] - mean); return c0 > 0 ? c / c0 : 0; };
+    let tau = -1, m = 0;                         // τ = −1 + 2 Σ_{m} Γₘ, Γₘ = ρ₂ₘ + ρ₂ₘ₊₁ (so Γ₀ = 1 + ρ₁)
+    for (; 2 * m + 1 <= Math.min(n - 2, 4000); m++) {   // capped at 4,000 lags
+      const G = rho(2 * m) + rho(2 * m + 1);
+      if (G <= 0) break;
+      tau += 2 * G;
+    }
+    tau = Math.max(tau, 1 / n);
+    return { tau, ess: n / tau, lags: 2 * m + 1 };
+  }
+  function rhat(chains) {
+    const k = chains.length, n = Math.min(...chains.map(c => c.length));
+    const means = chains.map(c => { let s = 0; for (let i = 0; i < n; i++) s += c[i]; return s / n; });
+    const grand = means.reduce((a, b) => a + b, 0) / k;
+    const B = n * means.reduce((s, m) => s + (m - grand) * (m - grand), 0) / (k - 1);
+    const W = chains.map((c, j) => { let s = 0; for (let i = 0; i < n; i++) s += (c[i] - means[j]) * (c[i] - means[j]); return s / (n - 1); })
+      .reduce((a, b) => a + b, 0) / k;
+    return W > 0 ? Math.sqrt(((n - 1) / n * W + B / n) / W) : NaN;
+  }
+  return { poisProcess, aliasTable, aliasDraw, stationary, acf, ess, rhat };
+})());
+/* Check log for the part-7 block (run 2026-10-01 under node with stats-viz.js + this file loaded;
+   scripts vpv.js and vpv2.js kept in the build scratchpad). Each line is "check — result":
+     poisProcess
+       · λ = 2, T = 10, 20,000 runs (seed 20261001): mean count 20.027, variance 20.09 (both exactly 20 for
+         Poisson(20)); total-variation distance of the count histogram to Poisson(20) — 0.0109
+       · λ = 1, T = 10⁵ (seeds 77–81): gap means 0.9960–1.0039; Kolmogorov distance of the gaps to Exp(1)
+         0.0017–0.0048 (95% critical value 0.0043; one seed of five above it, as chance allows)
+     aliasTable / aliasDraw
+       · p = (0.1, 0.2, 0.4, 0.3): prob = (0.4, 0.8, 1, 0.4), alias = (3, 3, 2, 2); the exact column mixture
+         recovers p to 1e-16; 400,000 draws (seed 11) give 0.1001 0.2008 0.3995 0.2997
+       · 50 random weights (seed 5): max |recovered − p| — 1.4e-17
+     stationary
+       · three-state shared-device chain [[.64 .32 .04] [.40 .50 .10] [.25 .50 .25]] → 25/49, 20/49, 4/49
+         to 8 d.p.; two-state weather chain [[.7 .3] [.4 .6]] → 4/7, 3/7; the Hardy–Weinberg genotype chain
+         with allele frequency 0.3 → (0.09, 0.42, 0.49) exactly; a random 6 × 6 stochastic matrix (seed 9)
+         — max |πP − π| 1.9e-16
+       · periodic 3-cycle → uniform (the stationary distribution exists though Pⁿ does not converge);
+         two absorbing states → null (not unique), as documented
+     acf / ess
+       · AR(1), φ ∈ {0.9, 0.5, −0.5}, n = 200,000 (seed 31): ρ₁, ρ₂, ρ₃ within 0.004 of φ, φ², φ³; τ̂ = 18.21,
+         2.944, 0.319 against (1 + φ)/(1 − φ) = 19, 3, 0.333; four seeds at φ = 0.9 give τ̂ = 18.2–19.3
+       · 50,000 iid uniforms: τ̂ = 0.991
+     rhat
+       · four chains of 2,000 iid N(0, 1) draws: 0.9999; the same chains with two shifted by +2: 1.5206
+         (population value √((1999/2000) + 4/3) = 1.5274)                                               */
