@@ -598,7 +598,7 @@ const cross = [
   // embeddings-primer ties
   ["Tokenization","Embeddings"],["BERT","Embeddings"],["Embeddings","Dimensionality Reduction (PCA)"],
   ["Contrastive Learning","Embeddings"],["Contrastive Learning","CLIP"],["Contrastive Learning","Vision-Language Models"],
-  ["Contrastive Learning","Fine-Tuning & Transfer Learning"],["Contrastive Learning","Learning Paradigms"],
+  ["Contrastive Learning","Learning Paradigms"],
   ["Contrastive Learning","CNNs"],["Contrastive Learning","Neural Network Training"],
 
   // NLP core-batch ties (text classification, summarization, QA, evaluation hub)
