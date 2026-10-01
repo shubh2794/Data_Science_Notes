@@ -295,3 +295,62 @@ Object.assign(PV, (function () {
     lognormPdf, lognormCdf, lognormQuant, lognormDraw
   };
 })());
+
+/* ═══ Joint distributions — appended for Joint Distributions & Dependence (part 5) ═══════════════
+   Adds to PV only what neither ST nor the blocks above have:
+
+     · bivariate normal   PV.bvnPdf(x, y, mx, my, sx, sy, rho)   joint density
+                          PV.bvnDraw(mx, my, sx, sy, rho, r) → [x, y]
+                          by the Cholesky construction X = mx + sx·Z₁, Y = my + sy·(ρZ₁ + √(1 − ρ²)Z₂)
+     · Dirichlet          PV.dirichletDraw(alpha, r) → p   normalised gammas (PV.gammaDraw, rate 1)
+                          PV.dirichletLogPdf(p, alpha)      log density on the simplex
+     · convolution        PV.convolve(p, q) → array          discrete convolution of two pmf arrays
+                                                             indexed from 0 (result length |p| + |q| − 1)
+
+   VERIFICATION (run 2026-10-01 under node with stats-viz.js + this file; script verify-jd.js kept in the
+   build scratchpad). Each line is "check — result":
+     bvnPdf
+       · midpoint-grid integral over ±8 sd for (sx, sy, ρ) ∈ {(1, 1, 0), (1, 1, 0.6), (2, 0.5, −0.9),
+         (10.2, 11.8, 0.67)} — 1.00000000 each; grid ∫∫ xy·f = ρ·sx·sy to 6 d.p. (e.g. 80.641200)
+       · ρ = 0 factorises: bvnPdf(0.3, −1.2) − φ(0.3)φ(−1.2) — 1.4e-17
+     bvnDraw
+       · 200,000 draws, (mx, my, sx, sy, ρ) = (1, −2, 2, 3, 0.6), seed 20261001 — means 1.0008, −1.9925;
+         variances 4.013, 9.018; correlation 0.6034 (sampling sd of the correlation ≈ 0.0014)
+     dirichletDraw / dirichletLogPdf
+       · 200,000 draws of Dir(2, 3, 5), seed 77 — means 0.1999, 0.2998, 0.5003; Var p₁ 0.01454
+         (exact 0.014545); Cov(p₁, p₂) −0.00551 (exact −0.005455)
+       · midpoint integral of exp(dirichletLogPdf) over the 3-simplex, 600² cells — 1.0000083
+       · K = 2 equals PV.betaPdf: Dir([0.3, 0.7]; 2.5, 4) vs Beta(2.5, 4) at 0.3 — 1.8e-15
+     convolve
+       · two fair dice: 36·P(S = s) = 1 2 3 4 5 6 5 4 3 2 1 — exact
+       · Poisson(2) * Poisson(3) vs Poisson(5), k < 50 — max |diff| 3.9e-16
+       · Bin(10, 0.3) * Bin(7, 0.3) vs Bin(17, 0.3) — max |diff| 1.4e-15                         */
+Object.assign(PV, (function () {
+  function bvnPdf(x, y, mx, my, sx, sy, rho) {
+    const zx = (x - mx) / sx, zy = (y - my) / sy, om = 1 - rho * rho;
+    return Math.exp(-(zx * zx - 2 * rho * zx * zy + zy * zy) / (2 * om)) / (2 * Math.PI * sx * sy * Math.sqrt(om));
+  }
+  function bvnDraw(mx, my, sx, sy, rho, r) {
+    const z1 = ST.randn(r), z2 = ST.randn(r);
+    return [mx + sx * z1, my + sy * (rho * z1 + Math.sqrt(1 - rho * rho) * z2)];
+  }
+  function dirichletDraw(alpha, r) {
+    const g = alpha.map(a => PV.gammaDraw(a, 1, r));
+    const s = g.reduce((a, b) => a + b, 0);
+    return g.map(v => v / s);
+  }
+  function dirichletLogPdf(p, alpha) {
+    let l = ST.lnGamma(alpha.reduce((a, b) => a + b, 0));
+    for (let i = 0; i < alpha.length; i++) {
+      if (!(p[i] > 0)) return -Infinity;
+      l += (alpha[i] - 1) * Math.log(p[i]) - ST.lnGamma(alpha[i]);
+    }
+    return l;
+  }
+  function convolve(p, q) {
+    const out = new Array(p.length + q.length - 1).fill(0);
+    for (let i = 0; i < p.length; i++) if (p[i]) for (let j = 0; j < q.length; j++) out[i + j] += p[i] * q[j];
+    return out;
+  }
+  return { bvnPdf, bvnDraw, dirichletDraw, dirichletLogPdf, convolve };
+})());
