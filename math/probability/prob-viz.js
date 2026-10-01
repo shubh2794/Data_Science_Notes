@@ -354,3 +354,58 @@ Object.assign(PV, (function () {
   }
   return { bvnPdf, bvnDraw, dirichletDraw, dirichletLogPdf, convolve };
 })());
+
+/* ── appended for Limit Theorems & Convergence (part 6) ─────────────────────────────────────────
+   Adds ONLY what neither ST nor PV had: the Cauchy, the two heavy/light-tailed extreme-value laws
+   used as limits of maxima, and a Kolmogorov distance between a sample and a cdf.
+
+     · Cauchy        PV.cauchyPdf(x, x0, s), PV.cauchyCdf(x, x0, s), PV.cauchyQuant(p, x0, s),
+                     PV.cauchyDraw(x0, s, r)  (inverse transform x0 + s·tan(π(U − ½)))
+     · Gumbel        PV.gumbelPdf(x), PV.gumbelCdf(x) = exp(−e^(−x)), PV.gumbelQuant(p)  (standard)
+     · Fréchet       PV.frechetPdf(x, α), PV.frechetCdf(x, α) = exp(−x^(−α)) for x > 0  (standard)
+     · comparison    PV.ksDist(sortedAsc, cdf) = sup_x |F̂ₙ(x) − F(x)|, checked on both sides of
+                     every jump of the empirical cdf
+
+   VERIFICATION (run 2026-10-01 under node with stats-viz.js + this file loaded; script
+   lt-pv-check.js kept in the build scratchpad). Each line is "check — result":
+     cauchyPdf / cauchyCdf / cauchyQuant / cauchyDraw
+       · Simpson ∫ of cauchyPdf over ±10⁴ — 0.99993634, equal to (2/π)·atan(10⁴) to 8 d.p.
+       · cdf(x0 = 2, s = 3) vs ½ + ∫ of the pdf from the centre, x ∈ {−10, −1, 2, 3.5, 20} — max |diff| 3.3e-15
+       · cauchyCdf(cauchyQuant(p)) − p for p from 0.001 to 0.999 — max 2.8e-17
+       · P(|X| > 3) = 1 − (2/π)·atan 3 = 0.204833 — matches
+       · 200,000 draws (x0 = 0, s = 1, seed 20261001): median 0.0037, quartiles −0.9905 and 1.0129
+         (exact ∓1), Kolmogorov distance to cauchyCdf 0.0023 (DKW 95% band 0.0030)
+     gumbelPdf / gumbelCdf / gumbelQuant
+       · ∫ pdf = 1.0000000000, mean 0.57721566 (Euler's γ), variance 1.64493407 (π²/6) — to 8 d.p.
+       · ∫ pdf vs cdf on x ∈ [−3, 8] — max |diff| 7.7e-15;  cdf(quant(p)) − p — max 1.4e-17
+       · exponential maxima: sup over [−2, 10] of |(1 − e^(−x)/1000)^1000 − Λ(x)| — 2.71e-4
+     frechetPdf / frechetCdf (α = 3)
+       · ∫ pdf = 1.000000; ∫ pdf vs cdf on [0.3, 6] — max |diff| 9.4e-15
+       · median (ln 2)^(−1/3) = 1.12995 has cdf 0.500000; mean Γ(1 − 1/3) = 1.354118, numeric 1.3541
+     ksDist
+       · 500 N(0, 1) draws (seed 5) vs ST.normCdf: 0.031825, identical to a brute-force sup over both
+         sides of every jump of the empirical cdf                                                    */
+Object.assign(PV, (function () {
+  const cauchyPdf = (x, x0, s) => { const a = x0 || 0, b = s || 1, z = (x - a) / b; return 1 / (Math.PI * b * (1 + z * z)); };
+  const cauchyCdf = (x, x0, s) => 0.5 + Math.atan((x - (x0 || 0)) / (s || 1)) / Math.PI;
+  const cauchyQuant = (p, x0, s) => (x0 || 0) + (s || 1) * Math.tan(Math.PI * (p - 0.5));
+  function cauchyDraw(x0, s, r) {
+    let u = r(); while (u === 0) u = r();
+    return cauchyQuant(u, x0, s);
+  }
+  const gumbelCdf = x => Math.exp(-Math.exp(-x));
+  const gumbelPdf = x => { const e = Math.exp(-x); return e * Math.exp(-e); };
+  const gumbelQuant = p => -Math.log(-Math.log(p));
+  const frechetCdf = (x, a) => (x > 0 ? Math.exp(-Math.pow(x, -a)) : 0);
+  const frechetPdf = (x, a) => (x > 0 ? a * Math.pow(x, -a - 1) * Math.exp(-Math.pow(x, -a)) : 0);
+  function ksDist(sorted, cdf) {
+    const n = sorted.length;
+    let d = 0;
+    for (let i = 0; i < n; i++) {
+      const F = cdf(sorted[i]);
+      d = Math.max(d, Math.abs((i + 1) / n - F), Math.abs(F - i / n));
+    }
+    return d;
+  }
+  return { cauchyPdf, cauchyCdf, cauchyQuant, cauchyDraw, gumbelPdf, gumbelCdf, gumbelQuant, frechetPdf, frechetCdf, ksDist };
+})());
