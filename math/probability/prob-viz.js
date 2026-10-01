@@ -166,3 +166,132 @@ const PV = (function () {
     tv, support
   };
 })();
+
+/* ═══ Continuous families — appended for Continuous Distributions (part 3) ═══════════════════
+   Adds to PV only what neither ST nor the block above has. The normal pdf/cdf/quantile, lnGamma,
+   the regularised incomplete gamma (ST.gammaP), the regularised incomplete beta (ST.betaI) and the
+   χ², t, F functions all stay in ST; the cdfs below are thin calls into those two special functions.
+   Parametrisation: exponential and gamma use the RATE λ (mean 1/λ and α/λ); Pareto uses shape α and
+   minimum xm; lognormal uses the mean μ and sd σ of log X.
+
+     · exponential   PV.expPdf(x, λ), PV.expCdf(x, λ), PV.expQuant(p, λ), PV.expDraw(λ, r)
+     · gamma         PV.gammaPdf(x, α, λ), PV.gammaCdf(x, α, λ) = ST.gammaP(α, λx),
+                     PV.gammaQuant(p, α, λ), PV.gammaDraw(α, λ, r)   (Marsaglia–Tsang, α < 1 boosted)
+     · beta          PV.betaPdf(x, a, b), PV.betaCdf(x, a, b) = ST.betaI(a, b, x),
+                     PV.betaQuant(p, a, b), PV.betaDraw(a, b, r) = G₁/(G₁ + G₂)
+     · Pareto        PV.paretoPdf(x, α, xm), PV.paretoCdf, PV.paretoQuant, PV.paretoDraw(α, xm, r)
+     · lognormal     PV.lognormPdf(x, μ, σ), PV.lognormCdf, PV.lognormQuant, PV.lognormDraw(μ, σ, r)
+     · numerics      PV.invert(cdf, p, lo, hi) — bracketed bisection for any continuous cdf
+                     PV.simpson(f, a, b, n)    — composite Simpson rule, n even
+
+   VERIFICATION (run 2026-10-01 under node with stats-viz.js + this file; script verify-cd.js kept in
+   the build scratchpad). Each line is "check — result":
+     normalisation  ∫ pdf = 1 by Simpson (n = 200,000) for Exp(0.25), Gamma(3, 0.2), Gamma(9, 0.75),
+                    Beta(2, 5), Beta(23.18, 20.35), Lognormal(0, 1) — |1 − ∫| < 1e-6. The singular
+                    densities need a substitution first (Simpson evaluates the endpoint): Gamma(0.5, 1)
+                    with x = u², Beta(0.5, 0.5) with x = sin²t, Pareto with x = xm/u — |1 − ∫| < 6e-12
+     moments        Simpson mean and variance against α/λ, α/λ²; a/(a+b), ab/((a+b)²(a+b+1));
+                    αxm/(α−1) (Pareto(1.5): 2.999995 with x = 1/v², the mean integrand being singular),
+                    αxm²/((α−1)²(α−2)); e^(μ+σ²/2), (e^(σ²)−1)e^(2μ+σ²) — rel. err < 2e-6
+     identities     gammaCdf(x, 1, λ) = expCdf(x, λ) — |diff| < 1e-15 on 200 points
+                    gammaCdf(x, k/2, ½) = ST.chi2Cdf(x, k), k = 1…10 — identical
+                    Gamma–Poisson: gammaCdf(t, r, 1) = 1 − PV.poisCdf(r − 1, t), r = 1…12, t to 40
+                    — |diff| < 7e-15
+                    betaCdf(x, 1, 1) = x; betaCdf(x, 2.5, 1) = x^2.5; betaCdf(x, a, b) = 1 − betaCdf(1−x, b, a)
+                    — |diff| < 9e-16
+                    lognormCdf(e^(μ+σz), μ, σ) = Φ(z); paretoCdf(xm·e^t, α, xm) = expCdf(t, α) — |diff|
+                    < 3e-16 (the log of a Pareto variable is exponential)
+     quantiles      round trip cdf(quant(p)) = p for p ∈ {0.001, 0.025, 0.1, 0.5, 0.9, 0.975, 0.999}
+                    for exp, gamma (0.5 and 9), beta (0.5,0.5 and 23.18,20.35), Pareto, lognormal
+                    — |err| < 1.2e-12
+     published      Gamma(3, 1/5): P(T < 12) = 0.430291 (1 − e^(−2.4)(1 + 2.4 + 2.88) = 0.430291)
+                    Gamma(9, 0.75): P(8 < T < 10) = 0.18527 (Poisson-table route: 0.338 − 0.153 = 0.185)
+                    χ²₁: P(≤ 3.841459) = 0.950000; Beta(23.18, 20.35) mean 0.53251
+                    Exp(0.25): P(X > 5) = e^(−1.25) = 0.286505; Exp mean 4: q₀.₁ = 0.421442
+     Monte Carlo    200,000 draws each (one stream, seed 20261001): expDraw, gammaDraw (α = 0.5, 3, 9),
+                    betaDraw (0.5, 0.5), (2, 5), paretoDraw (α = 3), lognormDraw (0, 1) — sample mean
+                    and the empirical cdf at the 10/50/90% quantiles within 3 standard errors of the
+                    exact values (largest |z| = 2.79); Kolmogorov distance 0.0011–0.0035 (1% critical
+                    value 0.0036). The 0.0035 was Gamma(3); five further seeds gave 0.0019–0.0026.  */
+Object.assign(PV, (function () {
+  const lnG = x => ST.lnGamma(x);
+
+  /* ── generic numerics ─────────────────────────────────────────────────── */
+  function invert(cdf, p, lo, hi) {        // smallest x with cdf(x) ≥ p, by bracketed bisection
+    let a = lo, b = hi, guard = 0;
+    while (cdf(b) < p && guard++ < 400) { const w = b - a; a = b; b = b + 2 * w; }
+    for (let i = 0; i < 300; i++) {
+      const m = 0.5 * (a + b);
+      if (cdf(m) < p) a = m; else b = m;
+      if (b - a < 1e-14 * Math.max(1, Math.abs(b))) break;
+    }
+    return 0.5 * (a + b);
+  }
+  function simpson(f, a, b, n) {
+    const N = (n || 2000) + ((n || 2000) % 2), h = (b - a) / N;
+    let s = f(a) + f(b);
+    for (let i = 1; i < N; i++) s += (i % 2 ? 4 : 2) * f(a + i * h);
+    return s * h / 3;
+  }
+  const unit = r => { let u = r(); while (u === 0) u = r(); return u; };   // u ∈ (0, 1)
+
+  /* ── exponential(λ): f = λe^(−λx), F = 1 − e^(−λx) ─────────────────────── */
+  const expPdf = (x, lam) => (x < 0 ? 0 : lam * Math.exp(-lam * x));
+  const expCdf = (x, lam) => (x <= 0 ? 0 : -Math.expm1(-lam * x));
+  const expQuant = (p, lam) => -Math.log1p(-p) / lam;
+  const expDraw = (lam, r) => -Math.log(unit(r)) / lam;          // −ln U ~ Exp(1), U ~ U(0, 1)
+
+  /* ── gamma(α, λ), rate form: f = λ^α x^(α−1) e^(−λx) / Γ(α) ────────────── */
+  function gammaPdf(x, a, lam) {
+    if (x < 0) return 0;
+    if (x === 0) return a < 1 ? Infinity : (a === 1 ? lam : 0);
+    return Math.exp(a * Math.log(lam) + (a - 1) * Math.log(x) - lam * x - lnG(a));
+  }
+  const gammaCdf = (x, a, lam) => (x <= 0 ? 0 : ST.gammaP(a, lam * x));
+  const gammaQuant = (p, a, lam) => invert(x => gammaCdf(x, a, lam), p, 0, Math.max(1, 2 * a / lam));
+  function gammaStd(a, r) {                // Gamma(a, 1) — Marsaglia–Tsang
+    if (a < 1) return gammaStd(a + 1, r) * Math.pow(unit(r), 1 / a);
+    const d = a - 1 / 3, c = 1 / Math.sqrt(9 * d);
+    for (;;) {
+      let x, v;
+      do { x = ST.randn(r); v = 1 + c * x; } while (v <= 0);
+      v = v * v * v;
+      const u = unit(r);
+      if (u < 1 - 0.0331 * x * x * x * x) return d * v;
+      if (Math.log(u) < 0.5 * x * x + d * (1 - v + Math.log(v))) return d * v;
+    }
+  }
+  const gammaDraw = (a, lam, r) => gammaStd(a, r) / lam;
+
+  /* ── beta(a, b): f = x^(a−1)(1 − x)^(b−1) / B(a, b) on (0, 1) ──────────── */
+  function betaPdf(x, a, b) {
+    if (x < 0 || x > 1) return 0;
+    if (x === 0) return a < 1 ? Infinity : (a === 1 ? b : 0);
+    if (x === 1) return b < 1 ? Infinity : (b === 1 ? a : 0);
+    return Math.exp(lnG(a + b) - lnG(a) - lnG(b) + (a - 1) * Math.log(x) + (b - 1) * Math.log1p(-x));
+  }
+  const betaCdf = (x, a, b) => ST.betaI(a, b, x);
+  const betaQuant = (p, a, b) => invert(x => betaCdf(x, a, b), p, 0, 1);
+  const betaDraw = (a, b, r) => { const g1 = gammaStd(a, r), g2 = gammaStd(b, r); return g1 / (g1 + g2); };
+
+  /* ── Pareto(α, xm): P(X > x) = (xm/x)^α for x ≥ xm ─────────────────────── */
+  const paretoPdf = (x, al, xm) => (x < xm ? 0 : al * Math.pow(xm, al) / Math.pow(x, al + 1));
+  const paretoCdf = (x, al, xm) => (x <= xm ? 0 : 1 - Math.pow(xm / x, al));
+  const paretoQuant = (p, al, xm) => xm * Math.pow(1 - p, -1 / al);
+  const paretoDraw = (al, xm, r) => xm * Math.pow(unit(r), -1 / al);   // inverse transform, U ↔ 1 − U
+
+  /* ── lognormal(μ, σ): ln X ~ N(μ, σ²) ──────────────────────────────────── */
+  const lognormPdf = (x, mu, s) => (x <= 0 ? 0 : ST.normPdf((Math.log(x) - mu) / s) / (x * s));
+  const lognormCdf = (x, mu, s) => (x <= 0 ? 0 : ST.normCdf((Math.log(x) - mu) / s));
+  const lognormQuant = (p, mu, s) => Math.exp(mu + s * ST.normQuant(p));
+  const lognormDraw = (mu, s, r) => Math.exp(mu + s * ST.randn(r));
+
+  return {
+    invert, simpson,
+    expPdf, expCdf, expQuant, expDraw,
+    gammaPdf, gammaCdf, gammaQuant, gammaDraw,
+    betaPdf, betaCdf, betaQuant, betaDraw,
+    paretoPdf, paretoCdf, paretoQuant, paretoDraw,
+    lognormPdf, lognormCdf, lognormQuant, lognormDraw
+  };
+})());
