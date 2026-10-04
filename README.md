@@ -142,6 +142,14 @@ recursively for the same reason.
   before the page's own inline viz script.
 - In the graph, a node lights up (glowing ring) automatically once it has a `link:`
   in `data.js`; otherwise it shows "Notes coming soon".
+- **Equation decoder blocks** (`.eqdec`, styled in `notes.css`): a page's *headline*
+  formula may carry a decoder block right after its `.formula` — six fixed rows:
+  **Say it** (pronunciation), **Shapes** (tensor shapes through every term),
+  **Scope** (what each ∑ / softmax / 𝔼 actually ranges over), **Plain words**,
+  **Tiny example** (small recomputed numbers, in `dd.mono`), **Why it's here**
+  (role in the page / field, with §-references). One per page, on the equation the
+  page exists for — not on every formula. Numbers in the tiny example must be
+  recomputed before being printed. First instance: `deep-learning/attention.html` §01.
 
 ## Adding a new topic
 
