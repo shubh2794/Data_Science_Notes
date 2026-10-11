@@ -90,18 +90,48 @@ const C = { A:"#5b9cff", B:"#ffb454", good:"#4ade80", bad:"#f87171", ink:"#e6e9e
       sk.className = "skiplink"; sk.href = "#main"; sk.textContent = "Skip to content";
       document.body.insertBefore(sk, document.body.firstChild);
     }
-    // mobile hamburger + scrim → off-canvas sidebar
+    // desktop: collapse/expand the whole sidebar, persisted across pages
+    const mq = window.matchMedia("(max-width:820px)");
+    const COLKEY = "mlnotes-sidebar-collapsed";
+    const setCollapsed = (c) => {
+      document.body.classList.toggle("navcollapsed", c);
+      try { localStorage.setItem(COLKEY, c ? "1" : "0"); } catch(e){}
+    };
+    try { if (localStorage.getItem(COLKEY) === "1") {
+      // restore collapsed state without playing the slide-out animation on load
+      nav.style.transition = "none";
+      document.body.classList.add("navcollapsed");
+      requestAnimationFrame(() => requestAnimationFrame(() => { nav.style.transition = ""; }));
+    } } catch(e){}
+    const col = document.createElement("button");
+    col.className = "navcollapse"; col.type = "button";
+    col.title = "Collapse sidebar  ( [ )"; col.setAttribute("aria-label","Collapse sidebar");
+    col.innerHTML = "«";
+    nav.appendChild(col);
+    // mobile hamburger + scrim → off-canvas sidebar; on desktop the same button reopens a collapsed sidebar
     if (document.querySelector(".navtoggle")) return;
     const btn = document.createElement("button");
-    btn.className = "navtoggle"; btn.type = "button";
+    btn.className = "navtoggle"; btn.type = "button"; btn.title = "Show sidebar  ( [ )";
     btn.setAttribute("aria-label","Toggle navigation"); btn.setAttribute("aria-expanded","false");
     btn.innerHTML = "☰";
+    col.addEventListener("click", () => { setCollapsed(true); btn.focus(); });
     const scrim = document.createElement("div"); scrim.className = "navscrim";
     const close = () => { document.body.classList.remove("navopen"); btn.setAttribute("aria-expanded","false"); };
     const open  = () => { document.body.classList.add("navopen"); btn.setAttribute("aria-expanded","true"); };
-    btn.addEventListener("click", () => document.body.classList.contains("navopen") ? close() : open());
+    btn.addEventListener("click", () => {
+      if (!mq.matches) { setCollapsed(false); return; }
+      document.body.classList.contains("navopen") ? close() : open();
+    });
     scrim.addEventListener("click", close);
     document.addEventListener("keydown", e => { if (e.key === "Escape") close(); });
+    // "[" toggles the whole sidebar (desktop collapse / mobile drawer); ignored while typing
+    document.addEventListener("keydown", e => {
+      if (e.key !== "[" || e.metaKey || e.ctrlKey || e.altKey) return;
+      const t = e.target;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+      if (mq.matches) { document.body.classList.contains("navopen") ? close() : open(); }
+      else setCollapsed(!document.body.classList.contains("navcollapsed"));
+    });
     document.querySelectorAll("nav.sidebar a").forEach(a => a.addEventListener("click", close));
     document.body.appendChild(btn); document.body.appendChild(scrim);
   }
