@@ -134,6 +134,21 @@ const C = { A:"#5b9cff", B:"#ffb454", good:"#4ade80", bad:"#f87171", ink:"#e6e9e
     });
     document.querySelectorAll("nav.sidebar a").forEach(a => a.addEventListener("click", close));
     document.body.appendChild(btn); document.body.appendChild(scrim);
+    // back to top — fixed bottom-right on every page, visible once scrolled past ~half a screen
+    const top = document.createElement("button");
+    top.className = "backtotop"; top.type = "button";
+    top.title = "Back to top"; top.setAttribute("aria-label","Back to top");
+    top.innerHTML = "↑";
+    top.addEventListener("click", () => {
+      window.scrollTo({ top: 0 }); // smoothness comes from the CSS scroll-behavior (reduced-motion aware)
+      const h1 = document.querySelector("main h1");
+      if (h1) { h1.setAttribute("tabindex","-1"); h1.focus({ preventScroll: true }); }
+    });
+    document.body.appendChild(top);
+    let topTick = false;
+    const topSpy = () => { topTick = false; top.classList.toggle("show", window.scrollY > window.innerHeight * 0.5); };
+    window.addEventListener("scroll", () => { if (!topTick){ topTick = true; requestAnimationFrame(topSpy); } }, { passive: true });
+    topSpy();
   }
 
   function renderLocalGraph(cur){
