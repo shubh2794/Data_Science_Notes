@@ -4,7 +4,8 @@
 
 /* ───────────────────────── Ch6 · 2×2 transformation ───────────────────────── */
 (function(){
-  const svg=d3.select("#xf-svg"),W=640,H=360,ox=W/2,oy=H/2,U=46;
+  const svg=d3.select("#xf-svg"); if(svg.empty()) return;
+  const W=640,H=360,ox=W/2,oy=H/2,U=46;
   axes(svg,W,H,ox,oy,U); arrowDefs(svg,[["xi",PC.accent],["xj",PC.a2]]);
   const px=(x,y)=>ox+x*U, py=(x,y)=>oy-y*U;
   const square=svg.append("polygon").attr("fill",PC.accent).attr("fill-opacity",.10).attr("stroke",PC.accent).attr("stroke-opacity",.4).attr("stroke-dasharray","4 3");
@@ -31,7 +32,8 @@
 })();
 /* ───────────────────────── similarity · one map, many matrices ───────────────────────── */
 (function(){
-  const svg=d3.select("#sim-svg"),W=640,H=400,ox=W/2,oy=H/2,U=38;
+  const svg=d3.select("#sim-svg"); if(svg.empty()) return;
+  const W=640,H=400,ox=W/2,oy=H/2,U=38;
   axes(svg,W,H,ox,oy,U); arrowDefs(svg,[["sb1",PC.accent],["sb2",PC.a2],["si1",PC.good],["si2",PC.bad]]);
   const px=v=>ox+v.x*U, py=v=>oy-v.y*U;
   let b1={x:2,y:0}, b2={x:0,y:2}, A={p:2,q:1,r:2};

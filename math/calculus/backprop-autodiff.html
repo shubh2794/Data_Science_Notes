@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Backprop &amp; Automatic Differentiation</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../calculus.html">Calculus</a> · part 3 of 3</p>
+      <h1>Backprop &amp; Automatic Differentiation</h1>
+      <p>How machines compute derivatives: backpropagation as the chain rule applied to a composition, the vector–Jacobian product each layer must implement and what it explains, then finite differences, symbolic differentiation and automatic differentiation stepped through in forward and reverse mode on one graph.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Calculus</span>
+        <span class="pill">Composition · vector–Jacobian products · finite differences · symbolic · forward & reverse mode</span>
+      </div>
+    </header>
+
+    <!-- ── 12 Backprop ────────────────────────────────────── -->
+    <section class="topic" id="backprop" data-nav="Chain rule = backprop">
+      <h3><span class="idx">12</span> The chain rule <i>is</i> backpropagation</h3>
+      <p class="lede">Backprop has a reputation as a deep-learning invention. It is the multivariable chain rule, evaluated right-to-left because the output is a scalar. That is the entire idea; the rest is engineering.</p>
+
+      <h4>The composition</h4>
+      <p>A feed-forward network is a composition <code>L = ℓ ∘ f_T ∘ f_{T−1} ∘ … ∘ f_1</code>. The chain rule says the Jacobian of the composition is the product of the Jacobians:</p>
+      <div class="formula">
+        <span class="lbl">Backprop, stated once</span>
+        <span class="eq">DL(x) = Dℓ · Df_T · Df_{T−1} · … · Df_1</span>   <span class="eq">shapes: (1×n_T)(n_T×n_{T−1})···(n_1×n_0)</span>
+        <span class="eq">associativity is a CHOICE:</span>
+        <span class="eq">  left-to-right  ( ( (Dℓ·Df_T) ·Df_{T−1}) ··· )</span>   <span class="eq">every partial product is a ROW VECTOR  → reverse mode</span>
+        <span class="eq">  right-to-left  ( ··· (Df_2·Df_1) )</span>              <span class="eq">every partial product is a full MATRIX → forward mode</span>
+      </div>
+      <p>Both orders give the same answer; they differ enormously in cost. With one scalar output and <code>n</code> inputs, grouping from the left keeps every intermediate a <code>1 × nₖ</code> row — you never materialise an <code>nₖ × nⱼ</code> Jacobian at all. <b>Backprop is nothing more than choosing the cheap parenthesisation.</b></p>
+
+      <h4>Vector–Jacobian products: what a layer must implement</h4>
+      <p>Concretely, a framework never asks a layer for its Jacobian. It hands the layer an <b>adjoint</b> <code>ḡ = ∂L/∂(output)</code> and asks for <code>ḡᵀ · Df</code> — a <b>vector–Jacobian product</b> (VJP). For a dense layer <code>h = Wx + b</code>, use the identification method:</p>
+      <div class="formula">
+        <span class="lbl">Derivation of the dense-layer gradients</span>
+        <span class="eq">h = Wx + b,</span>   <span class="eq">ḡ = ∂L/∂h  (column, size m)</span>
+        <span class="eq">dL = ḡᵀ dh = ḡᵀ[ (dW)x + W dx + db ]</span>
+        <span class="eq">term in dW:</span>  <span class="eq">ḡᵀ(dW)x = tr( x ḡᵀ dW ) = tr( (ḡxᵀ)ᵀ dW )</span>   <span class="eq">⟹  ∂L/∂W = ḡ xᵀ</span>
+        <span class="eq">term in dx:</span>  <span class="eq">ḡᵀW dx</span>                                        <span class="eq">⟹  ∂L/∂x = Wᵀ ḡ</span>
+        <span class="eq">term in db:</span>  <span class="eq">ḡᵀ db</span>                                          <span class="eq">⟹  ∂L/∂b = ḡ</span>
+      </div>
+      <p>Three results, each one line, each with the right shape guaranteed by construction: <code>ḡxᵀ</code> is <code>m × n</code> like <code>W</code>; <code>Wᵀḡ</code> is <code>n × 1</code> like <code>x</code>. The weight gradient being an <b>outer product</b> of the incoming adjoint and the stored input is exactly why the forward activations must be cached for the backward pass — and therefore why activation memory, not parameter memory, dominates training footprints.</p>
+      <table class="cmp">
+        <tr><th>Layer</th><th>Forward</th><th>VJP (given <code>ḡ = ∂L/∂out</code>)</th></tr>
+        <tr><td>Dense</td><td><code>h = Wx + b</code></td><td><code>∂L/∂W = ḡxᵀ</code>, <code>∂L/∂x = Wᵀḡ</code>, <code>∂L/∂b = ḡ</code></td></tr>
+        <tr><td>Elementwise <code>σ</code></td><td><code>h = σ(z)</code></td><td><code>∂L/∂z = ḡ ⊙ σ′(z)</code> — Jacobian is diagonal, never formed</td></tr>
+        <tr><td>ReLU</td><td><code>h = max(0,z)</code></td><td><code>∂L/∂z = ḡ ⊙ 1[z &gt; 0]</code></td></tr>
+        <tr><td>Softmax + CE</td><td><code>L = −log p_y</code></td><td><code>∂L/∂z = p − e_y</code> (§11)</td></tr>
+        <tr><td>Sum over batch</td><td><code>L = Σ_b L_b</code></td><td>gradients add — linearity of <code>d</code></td></tr>
+      </table>
+
+      <h4>What the Jacobian product explains</h4>
+      <ul class="notes">
+        <li><b>Vanishing / exploding gradients.</b> <code>‖DL‖ ≤ Π_k ‖Df_k‖</code>. If each layer's Jacobian has spectral norm consistently below 1, the product decays geometrically; above 1, it explodes. Same geometric series as §06.</li>
+        <li><b>Why residual connections help.</b> <code>f(x) = x + g(x)</code> has Jacobian <code>I + Dg</code>. The identity term keeps the product from collapsing — the gradient always has a clean path back. See <a href="../../deep-learning/residual-skip-connections.html">Residual / Skip Connections</a>.</li>
+        <li><b>Why normalisation helps.</b> It keeps layer inputs in a range where <code>σ′</code> is not saturated, so the diagonal Jacobians stay away from zero.</li>
+        <li><b>Gradient clipping</b> is a blunt instrument against the exploding case: rescale <code>ḡ</code> when <code>‖ḡ‖</code> exceeds a threshold, preserving direction and bounding the step.</li>
+      </ul>
+      <div class="callout"><b>Second-order caution.</b> The first differential is invariant under substitution (Cauchy's rule, §08), which is what lets you chain layers naively. The <b>second</b> differential is not: <code>d²h = d²g(df) + dg(d²f)</code>, with an extra term unless the inner map is affine. Forgetting the second term is precisely the Gauss–Newton approximation — usually a good one, never an identity.</div>
+    </section>
+
+    <!-- ── 13 Autodiff ────────────────────────────────────── -->
+    <section class="topic" id="autodiff" data-nav="Numeric · symbolic · auto">
+      <h3><span class="idx">13</span> Numerical vs symbolic vs automatic differentiation</h3>
+      <p class="lede">There are exactly three ways a computer can get a derivative, and they are not variations on a theme — they have different accuracy, different cost, and different failure modes. Automatic differentiation is neither of the other two, despite being routinely confused with both.</p>
+
+      <h4>Numerical differentiation (finite differences)</h4>
+      <div class="formula">
+        <span class="lbl">Finite differences and their error budgets</span>
+        <span class="eq">forward:</span>  <span class="eq">[ f(x+h) − f(x) ] / h  = f′(x) + (h/2)f″(x) + …</span>   <span class="eq">truncation O(h)</span>
+        <span class="eq">central:</span>  <span class="eq">[ f(x+h) − f(x−h) ] / 2h = f′(x) + (h²/6)f‴(x) + …</span>  <span class="eq">truncation O(h²)</span>
+        <span class="eq">round-off:</span> <span class="eq">≈ ε_mach·|f| / h</span>   <span class="eq">— grows as h shrinks. The two errors fight.</span>
+      </div>
+      <p>Balancing <code>(h/2)|f″|</code> against <code>ε|f|/h</code> gives an optimal <code>h ≈ 2√(ε|f|/|f″|) ~ √ε ≈ 1.5×10⁻⁸</code> in double precision, with best achievable accuracy only <code>~√ε</code>. For central differences the optimum is <code>h ~ ε^{1/3} ≈ 6×10⁻⁶</code> with accuracy <code>~ε^{2/3}</code>. So you can never get more than roughly half (or two-thirds) of your digits back. Cost: <code>n + 1</code> function evaluations for a full gradient (or <code>2n</code> central) — hopeless for a million parameters. Verdict: <b>a testing tool, not a training tool</b> (§14).</p>
+      <div class="callout"><b>The complex-step trick.</b> If <code>f</code> is analytic and you can evaluate it in complex arithmetic, <code>f′(x) ≈ Im[f(x + ih)]/h</code> has <code>O(h²)</code> truncation error and <b>no subtractive cancellation at all</b> — there is no difference of nearly equal numbers. You can take <code>h = 10⁻²⁰</code> and get essentially machine-precision derivatives. A beautiful workaround, limited to analytic functions of one variable at a time.</div>
+
+      <h4>Symbolic differentiation</h4>
+      <p>Apply the rules of §03 to an expression tree and return a new expression tree. Exact, and it gives you a closed form you can inspect and simplify. The failure mode is <b>expression swell</b>: differentiating a product of <code>k</code> factors produces <code>k</code> terms, and nesting causes exponential blow-up, with common sub-expressions recomputed everywhere. Symbolic differentiation of a 50-layer network's loss is not a thing anyone does.</p>
+
+      <h4>Automatic differentiation</h4>
+      <p>AD sits between the two: it works on the <b>program</b>, not on a formula, and applies the chain rule numerically at each elementary operation. Results are exact to machine precision (no truncation error), and cost is a small constant times the cost of the original program. Two modes, corresponding exactly to the two parenthesisations of §12.</p>
+      <table class="cmp">
+        <tr><th></th><th>Forward mode (tangent)</th><th>Reverse mode (adjoint)</th></tr>
+        <tr><td>Propagates</td><td><code>v̇ = ∂v/∂xⱼ</code> — sensitivity of everything to <b>one input</b></td><td><code>v̄ = ∂y/∂v</code> — sensitivity of <b>one output</b> to everything</td></tr>
+        <tr><td>Direction</td><td>inputs → outputs, alongside the primal</td><td>a forward pass, then outputs → inputs</td></tr>
+        <tr><td>Computes per sweep</td><td>one column of the Jacobian (a JVP, <code>Df·v</code>)</td><td>one row of the Jacobian (a VJP, <code>uᵀ·Df</code>)</td></tr>
+        <tr><td>Sweeps for a full <code>m × n</code> Jacobian</td><td><code>n</code></td><td><code>m</code></td></tr>
+        <tr><td>Memory</td><td><code>O(1)</code> extra — nothing to store</td><td><code>O(#operations)</code> — the tape of intermediates</td></tr>
+        <tr><td>Implementation</td><td>dual numbers <code>a + bε</code>, <code>ε² = 0</code></td><td>tape / graph recording + reverse replay</td></tr>
+        <tr><td>Best when</td><td><code>n</code> small (few inputs, many outputs)</td><td><code>m</code> small — <b>especially m = 1</b></td></tr>
+      </table>
+      <div class="formula">
+        <span class="lbl">Why deep learning is reverse mode, in one line</span>
+        <span class="eq">a loss is  L: ℝⁿ → ℝ  with  n ≈ 10⁹  and  m = 1</span>
+        <span class="eq">forward mode:  n sweeps  ≈ 10⁹ × cost(L)</span>
+        <span class="eq">reverse mode:  1 sweep   ≈ 2–4 × cost(L)</span>   <span class="eq">for the ENTIRE gradient</span>
+      </div>
+      <p>The reverse-mode result — a full gradient for a small constant multiple of one function evaluation, independent of the number of parameters — is the "cheap gradient principle". It is the single computational fact that makes training billion-parameter models possible at all.</p>
+
+      <h4>Step through both modes on one graph</h4>
+      <p>The example is <code>y = ln(x₁) + x₁x₂ − sin(x₂)</code>. Step forward mode (seeded on one input at a time) and then reverse mode, and count the sweeps each needs to produce the full gradient <code>(∂y/∂x₁, ∂y/∂x₂)</code>.</p>
+      <div class="viz" id="viz-ad">
+        <div class="vhead">
+          <span class="vtitle">Forward vs reverse mode on a computational graph</span>
+          <span class="vhint">pick a mode · step through</span>
+        </div>
+        <div class="controls">
+          <label>mode
+            <select id="ad-mode">
+              <option value="fwd1">forward · seed ẋ₁ = 1</option>
+              <option value="fwd2">forward · seed ẋ₂ = 1</option>
+              <option value="rev">reverse · seed ȳ = 1</option>
+            </select>
+          </label>
+          <label>x₁ <input type="range" id="ad-x1" min="30" max="300" value="200" /></label>
+          <label>x₂ <input type="range" id="ad-x2" min="30" max="300" value="500" /></label>
+          <button class="btn" type="button" id="ad-step">step ▸</button>
+          <button class="btn ghost" type="button" id="ad-run">run all</button>
+          <button class="btn ghost" type="button" id="ad-reset">reset</button>
+        </div>
+        <svg id="ad-svg" width="680" height="430" viewBox="0 0 680 430" role="img" aria-label="A computational graph for y equals log of x1 plus x1 times x2 minus sine of x2. Stepping highlights each node in turn and shows either forward-mode tangents propagating from inputs to output, or reverse-mode adjoints propagating from output back to inputs."></svg>
+        <div class="readout" aria-live="polite" id="ad-readout"></div>
+      </div>
+      <p><b>Read the count.</b> Forward mode needs one sweep per input — two here, a billion in a real network. Reverse mode needs one sweep per output — always one for a scalar loss. That asymmetry, and nothing else, is why every deep-learning framework is built around a reverse-mode tape.</p>
+      <ul class="notes">
+        <li><b>The memory price.</b> Reverse mode must keep every intermediate value from the forward pass. <b>Gradient checkpointing</b> trades it back: store only a few checkpoints and recompute the rest during the backward pass — roughly <code>O(√T)</code> memory for <code>O(1)</code> extra forward passes.</li>
+        <li><b>Mixing modes.</b> Hessian-vector products are best computed as forward-over-reverse: <code>Hv = ∂/∂ε [ ∇φ(x + εv) ]|_{ε=0}</code>, i.e. push a forward-mode tangent through the reverse-mode gradient. Cost: one extra backward pass, no <code>n × n</code> matrix.</li>
+        <li><b>Control flow is fine.</b> AD differentiates the trace of operations that <i>actually executed</i>, so loops and branches are handled — but the derivative is that of the taken branch, which is why a piecewise definition can silently give you a one-sided derivative.</li>
+        <li><b>Where AD lies.</b> At non-differentiable points (ReLU at 0, <code>abs</code>, <code>max</code>, sorting/ranking, <code>round</code>) AD returns a convention. And for iterative solvers it is often far better to use the implicit function theorem (§08) than to differentiate through every iteration.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Calculus series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="multivariable-matrix.html">← Gradients, Jacobians &amp; Matrix Differentials</a>
+      <a href="../calculus.html" style="color:var(--muted)">Calculus · overview</a>
+      <a href="../calculus.html">Calculus · overview →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../calculus.viz.js"></script>
+</body>
+</html>

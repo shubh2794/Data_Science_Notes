@@ -4,7 +4,8 @@
 
 /* ───────────────────────── Ch15 · eigenvector hunt ───────────────────────── */
 (function(){
-  const svg=d3.select("#eig-svg"),W=640,H=360,ox=W/2,oy=H/2,U=46;
+  const svg=d3.select("#eig-svg"); if(svg.empty()) return;
+  const W=640,H=360,ox=W/2,oy=H/2,U=46;
   axes(svg,W,H,ox,oy,U); arrowDefs(svg,[["ev",PC.accent],["eav",PC.a2]]);
   const A=[[2,0.8],[0.8,1.3]];               // symmetric → real, orthogonal eigvecs
   const E=eigSym2(A[0][0],A[0][1],A[1][1]);
@@ -33,7 +34,8 @@
 })();
 /* ───────────────────────── Ch16 · SVD circle → ellipse ───────────────────────── */
 (function(){
-  const svg=d3.select("#svd-svg"),W=640,H=360,ox=W/2,oy=H/2,U=70;
+  const svg=d3.select("#svd-svg"); if(svg.empty()) return;
+  const W=640,H=360,ox=W/2,oy=H/2,U=70;
   axes(svg,W,H,ox,oy,U); arrowDefs(svg,[["s1","#4ade80"],["s2","#4ade80"]]);
   const circle=svg.append("path").attr("fill","none").attr("stroke",PC.accent).attr("stroke-opacity",.5).attr("stroke-dasharray","4 3");
   const ellipse=svg.append("path").attr("fill",PC.good).attr("fill-opacity",.12).attr("stroke",PC.good).attr("stroke-width",1.5);

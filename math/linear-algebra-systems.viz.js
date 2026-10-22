@@ -4,7 +4,8 @@
 
 /* ───────────────────────── Ch10 · two-line system ───────────────────────── */
 (function(){
-  const svg=d3.select("#sys-svg"),W=640,H=360,ox=W/2,oy=H/2,U=40;
+  const svg=d3.select("#sys-svg"); if(svg.empty()) return;
+  const W=640,H=360,ox=W/2,oy=H/2,U=40;
   axes(svg,W,H,ox,oy,U);
   const px=x=>ox+x*U, py=y=>oy-y*U, X=(W/2)/U;   // x ranges roughly [-X, X]
   const l1=svg.append("line").attr("stroke",PC.accent).attr("stroke-width",2.5);
@@ -33,7 +34,8 @@
 })();
 /* ──────────────── conditioning · two nearly-parallel lines ──────────────── */
 (function(){
-  const svg=d3.select("#cond-svg"),W=640,H=380,ox=W/2,oy=H/2+18,U=52;
+  const svg=d3.select("#cond-svg"); if(svg.empty()) return;
+  const W=640,H=380,ox=W/2,oy=H/2+18,U=52;
   axes(svg,W,H,ox,oy,U);
   const px=x=>ox+x*U, py=y=>oy-y*U;
   const l1=svg.append("line").attr("stroke",PC.accent).attr("stroke-width",2.2).attr("stroke-opacity",.9);
