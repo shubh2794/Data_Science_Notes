@@ -40,14 +40,16 @@ const C = { A:"#5b9cff", B:"#ffb454", good:"#4ade80", bad:"#f87171", ink:"#e6e9e
     const secs = [...document.querySelectorAll("section.topic[id]")];
     const onpage = secs.length > 1
       ? secs.map(s => `<a class="onpage" href="#${s.id}">${sectionLabel(s)}</a>`).join("") : "";
-    // sibling topics: same domain for a topic page; same parent (plus the parent hub) for a level-3 sub-topic page
+    // sibling topics: same domain for a topic page; same parent (plus the parent hub)
+    // for a sub-topic page at any depth (level 3 under a topic, level 4 under a level-3 hub)
     const parent = (typeof PARENT !== "undefined") ? PARENT[cur.id] : null;
-    const sibIds = (cur.level === 3 && typeof subtree !== "undefined" && subtree[parent]) ? subtree[parent] : (tree[g.label] || []);
+    const isSub = cur.level >= 3 && parent && typeof subtree !== "undefined" && !!subtree[parent];
+    const sibIds = isSub ? subtree[parent] : (tree[g.label] || []);
     const item = id => `<a class="tocitem${id===cur.id?" active":""}" href="${rel(meta[id].link)}">${id}</a>`;
-    const sibs = (cur.level === 3 && meta[parent] && meta[parent].link ? `<a class="tocitem" href="${rel(meta[parent].link)}">↑ ${parent} · overview</a>` : "")
+    const sibs = (isSub && meta[parent] && meta[parent].link ? `<a class="tocitem" href="${rel(meta[parent].link)}">↑ ${parent} · overview</a>` : "")
       + sibIds.filter(id => meta[id] && meta[id].link).map(item).join("");
-    const sibCount = sibIds.filter(id => meta[id] && meta[id].link).length + (cur.level === 3 ? 1 : 0);
-    // sub-topics (level 3) of a hub page
+    const sibCount = sibIds.filter(id => meta[id] && meta[id].link).length + (isSub ? 1 : 0);
+    // sub-topics of a hub page (any depth)
     const kids = (typeof subtree !== "undefined" && subtree[cur.id]) ? subtree[cur.id].filter(id => meta[id] && meta[id].link) : [];
     const subs = kids.map(item).join("");
     // connections (bidirectional links from data.js)
@@ -59,7 +61,7 @@ const C = { A:"#5b9cff", B:"#ffb454", good:"#4ade80", bad:"#f87171", ink:"#e6e9e
     const groups = [];
     if (onpage) groups.push(grp("On this page", onpage, true, secs.length));
     if (subs)   groups.push(grp("Sub-topics", subs, true, kids.length));
-    if (sibs)   groups.push(grp(cur.level === 3 ? parent : "Topics", sibs, cur.level === 3, sibCount));
+    if (sibs)   groups.push(grp(isSub ? parent : "Topics", sibs, isSub, sibCount));
     if (conns)  groups.push(grp("Connections", conns, false, nbrs.length));
     groups.push(grp("Local graph", `<svg id="local-graph" width="244" height="188" viewBox="0 0 244 188"></svg>`, false));
 

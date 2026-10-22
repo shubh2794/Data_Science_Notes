@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · LayoutLM: v3 Patches, Parameters &amp; Benchmarks</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../layoutlm.html">LayoutLM</a> · part 3 of 4</p>
+      <h1>LayoutLM: v3 Patches, Parameters &amp; Benchmarks</h1>
+      <p>LayoutLMv3 and the family's numbers: the CNN replaced by linearly embedded 16 × 16 patches, masked language and masked image modelling made symmetric with word–patch alignment, v3 configurations, recipes and results, parameter counts recomputed from every released configuration, and one benchmark chart across all four members with its settings.</p>
+      <div style="margin-top:10px">
+        <span class="pill">LayoutLM</span>
+        <span class="pill">16 × 16 linear patches · MLM + MIM + word–patch alignment · v3 recipes · parameter counts recomputed · family benchmarks</span>
+      </div>
+    </header>
+
+    <!-- 18 ───────────────────────────────────────────── -->
+    <section class="topic" id="v3-arch" data-nav="v3: patches instead of a CNN">
+      <h3><span class="idx">18</span> v3: linear patches instead of a CNN</h3>
+      <p class="lede">LayoutLMv3 removes the convolutional backbone. The page image is resized to 224 × 224, cut into 16 × 16-pixel patches, and each patch is flattened and linearly projected to the model width — the ViT recipe. The v3 paper describes itself as the first multimodal document AI model that does not rely on a pre-trained CNN or Faster R-CNN for image features.</p>
+      <div class="formula"><span class="lbl">patch count for an H × W image and patch size P</span><span class="eq">M = H·W / P² = 224·224 / 16² = 14 · 14 = 196</span>
+<span class="lbl">image embedding: linear projection plus learnable 1-D position embedding per patch</span><span class="eq">xₘ = W_patch · flatten(patchₘ) + Pos1D_img(m)        W_patch ∈ ℝ^(D × 3·16·16)</span>
+<span class="lbl">text embedding: RoBERTa word embedding plus 1-D and segment-level 2-D positions</span><span class="eq">yₗ = Tok(wₗ) + Pos1D(l) + Layout(x̂₀, ŷ₀, x̂₁, ŷ₁, ŵ, ĥ of wₗ's segment)</span>
+<span class="lbl">the encoder sees text then image; 1-D and 2-D relative biases as in v2</span><span class="eq">input = [ y₁ … y_L ; x₁ … x_M ]</span></div>
+      <h4>Worked example: what the patches cost</h4>
+      <p>The projection is a 16 × 16 convolution with stride 16 from 3 to 768 channels: 3 · 16 · 16 · 768 weights + 768 biases = 590,592 parameters, the "0.6M" the v3 paper reports for adding image embedding. The v3 paper calls this negligible next to CNN backbones, citing 44M for a ResNet-101; v2's ResNeXt-101-FPN is about 90M. The Transformers implementation also prepends a visual [CLS] token and learns a 197-row position embedding (196 patches + [CLS]), so the image contributes 197 tokens to the sequence.</p>
+      <p>A word's corresponding patches follow from its box: "Total:" at (665, 826, 745, 843) maps to 224-pixel coordinates x 148.96–166.88 and y 185.02–188.83, i.e. patch columns floor(148.96/16) = 9 to floor(166.88/16) = 10 in patch row floor(185.02/16) = 11. Those two patches are what <a href="#v3-pretrain">word–patch alignment</a> checks.</p>
+      <div class="viz" id="viz-patch">
+        <div class="vhead">
+          <span class="vtitle">Patchify, mask, and label word–patch alignment</span>
+          <span class="vhint">resample the masks · change the image mask ratio · click a word</span>
+        </div>
+        <div class="controls">
+          <label>image mask ratio <input type="range" id="patch-ratio" min="0" max="80" step="5" value="40" /><span id="patch-rv" style="min-width:40px;display:inline-block"></span></label>
+          <label>text mask ratio <input type="range" id="patch-tratio" min="0" max="60" step="5" value="30" /><span id="patch-tv" style="min-width:40px;display:inline-block"></span></label>
+          <button class="btn ghost" id="patch-new">Resample</button>
+        </div>
+        <svg id="patch-svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="Page resized to 224 pixels with a 14 by 14 patch grid, blockwise-masked patches, and words labelled aligned, unaligned or masked"></svg>
+        <div class="readout" aria-live="polite" id="patch-read"></div>
+        <p class="vcap">The mock invoice is resized to 224 × 224 (aspect ratio is not preserved, as in the reference processor) and split into 14 × 14 patches. Image masking follows BEiT's blockwise scheme: rectangles of at least 16 patches with aspect ratio between 0.3 and 1/0.3 are added until the ratio is reached. Words are masked independently at the text ratio. A non-masked word is labelled aligned if none of the patches its box overlaps is masked, unaligned otherwise; masked words are excluded, as in the paper. The paper does not spell out the overlap rule; "any overlap" is this figure's assumption.</p>
+      </div>
+      <h4>Other v3 architecture choices</h4>
+      <ul class="notes">
+        <li><b>Segment-level layout</b> for text tokens (<a href="inputs-v1.html#subwords">sub-words</a>); image patches get their grid cell as a box, and special tokens get zeros.</li>
+        <li><b>RoBERTa initialisation</b> and its byte-level BPE vocabulary (50,265 entries) replace BERT/UniLMv2 WordPiece; the maximum text length stays 512 (the configuration lists 514 positions because RoBERTa's position ids start after the padding index).</li>
+        <li><b>1-D position embeddings for patches:</b> the authors "have not observed improvements from using 2-D position embeddings in [their] preliminary experiments".</li>
+        <li><b>Training stability:</b> attention computed in the CogView form, softmax(QᵀK/√d) = softmax( (QᵀK/(a√d) − max(QᵀK/(a√d))) · a ) with a = 32, which rescales before subtracting the maximum.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> v3 spends 0.6M parameters on image input where v2 spent about 90M, and gets the image into the sequence at 196 patch tokens — more visual tokens than v2's 49, each looking at a quarter of the area.</div>
+    </section>
+
+    <!-- 19 ───────────────────────────────────────────── -->
+    <section class="topic" id="v3-pretrain" data-nav="v3 pretraining: MLM, MIM, WPA">
+      <h3><span class="idx">19</span> v3 pretraining: MLM, MIM and word–patch alignment</h3>
+      <p class="lede">v3's argument is that text and image objectives should look alike. Text uses masked language modelling over discrete word tokens; image uses masked image modelling over discrete visual tokens produced by an image tokenizer; and word–patch alignment ties the two by asking whether a word's image patches were masked. The total loss is the plain sum.</p>
+      <div class="formula"><span class="lbl">MLM: mask 30% of text tokens in spans, lengths from Poisson(<span class="keep">λ</span> = 3); layout kept</span><span class="eq">ℒ_MLM = − ∑_(l ∈ L′) log p( yₗ | X_masked , Y_masked )</span>
+<span class="lbl">MIM: blockwise-mask about 40% of patches; predict each masked patch's visual token id (8,192-way)</span><span class="eq">ℒ_MIM = − ∑_(m ∈ M′) log p( zₘ | X_masked , Y_masked )</span>
+<span class="lbl">WPA: for each unmasked text token, aligned / unaligned (two-layer MLP head)</span><span class="eq">ℒ_WPA = − ∑_(l ∉ L′) log p( aₗ | X_masked , Y_masked )        ℒ = ℒ_MLM + ℒ_MIM + ℒ_WPA</span></div>
+      <h4>The image tokenizer</h4>
+      <p>MIM's targets come from a discrete VAE image tokenizer, the approach of DALL·E and BEiT. The v3 paper initialises its tokenizer from the one in DiT (arXiv 2203.02378), a self-supervised document image Transformer; the DiT paper trained that dVAE on the 42 million page images of IIT-CDIP because the DALL·E tokenizer, trained on natural images, reconstructed documents poorly. It has an 8,192-entry codebook and downsamples by 8, so a 112 × 112 input — the released configuration's <code>second_input_size</code> — would yield a 14 × 14 grid of codes, one target per 16 × 16 patch of the 224 × 224 image (the v3 paper itself does not state the tokenizer's input size). The tokenizer is used only to make labels and is not counted in the model's parameters.</p>
+      <h4>Worked example: one sequence</h4>
+      <p>With 512 text tokens, 30% masking hides about 154 tokens in spans averaging 3 tokens — roughly 51 spans. With 196 patches, 40% masking hides about 78 patches in rectangular blocks. WPA is then computed on the roughly 358 unmasked text tokens. If "Total:" is unmasked but patch (11, 10) is masked, its WPA label is unaligned; if both (11, 9) and (11, 10) are visible, aligned.</p>
+      <div class="viz" id="viz-span">
+        <div class="vhead">
+          <span class="vtitle">Span masking with Poisson lengths</span>
+          <span class="vhint">change the mean span length and the ratio · resample</span>
+        </div>
+        <div class="controls">
+          <label>mean span <span class="keep">λ</span> <input type="range" id="span-lam" min="1" max="6" step="0.5" value="3" /><span id="span-lv" style="min-width:36px;display:inline-block"></span></label>
+          <label>mask ratio <input type="range" id="span-ratio" min="10" max="50" step="5" value="30" /><span id="span-rv" style="min-width:40px;display:inline-block"></span></label>
+          <button class="btn ghost" id="span-new">Resample</button>
+        </div>
+        <svg id="span-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="A strip of 512 token cells with masked spans highlighted and a histogram of sampled span lengths against the Poisson distribution"></svg>
+        <div class="readout" aria-live="polite" id="span-read"></div>
+        <p class="vcap">A 512-token sequence; span lengths are drawn from Poisson(λ) with a seeded generator, zero-length draws are redrawn (an assumption — implementations differ), and spans are placed at random non-overlapping starts until the ratio is reached (the last span is clipped). Bars are the sampled length histogram; dots are the Poisson probabilities renormalised over lengths ≥ 1.</p>
+      </div>
+      <h4>What each objective is worth (v3 paper, Table 3: base, 1M pages, 150k steps)</h4>
+      <table class="cmp">
+        <tr><th>#</th><th>Image input</th><th>Objectives</th><th>Params</th><th>FUNSD</th><th>CORD</th><th>RVL-CDIP</th><th>PubLayNet mAP</th></tr>
+        <tr><td>1</td><td>none</td><td>MLM</td><td>125M</td><td>88.64</td><td>96.27</td><td>95.33</td><td>not applicable</td></tr>
+        <tr><td>2</td><td>linear</td><td>MLM</td><td>126M</td><td>89.39</td><td>96.11</td><td>95.00</td><td>loss diverges</td></tr>
+        <tr><td>3</td><td>linear</td><td>MLM + MIM</td><td>132M</td><td>89.19</td><td>96.30</td><td>95.42</td><td>94.38</td></tr>
+        <tr><td>4</td><td>linear</td><td>MLM + MIM + WPA</td><td>133M</td><td>89.78</td><td>96.49</td><td>95.53</td><td>94.43</td></tr>
+      </table>
+      <p>Adding patches without an image objective (#2) helps FUNSD (+0.75) but hurts CORD and RVL-CDIP and makes layout-detection fine-tuning diverge; MIM restores CORD and RVL-CDIP and makes PubLayNet trainable (while FUNSD dips by 0.20), and WPA improves every column. The parameter column counts pretraining heads: the paper puts the MIM head at 6.9M and the WPA head at 0.6M, which roughly accounts for #3 and #4 reading 132M and 133M.</p>
+      <div class="callout"><b>Takeaway:</b> v3's objectives are symmetric — discrete tokens reconstructed on both sides — plus an alignment label that falls out of the masking for free. Without MIM, the cheap linear patches help FUNSD slightly but hurt the other tasks and cannot be fine-tuned for layout detection.</div>
+    </section>
+
+    <!-- 20 ───────────────────────────────────────────── -->
+    <section class="topic" id="v3-results" data-nav="v3: configurations and results">
+      <h3><span class="idx">20</span> v3: configurations, recipes and results</h3>
+      <p class="lede">Base: 12 layers, 12 heads, width 768, feed-forward 3,072. Large: 24 layers, 16 heads, width 1,024, feed-forward 4,096. Both pretrained on 11 million IIT-CDIP pages — of the roughly 42 million pages the collection splits into — with no image augmentation. The paper reports 133M and 368M parameters.</p>
+      <h4>Recipes (v3 paper, Section 3)</h4>
+      <table class="cmp">
+        <tr><th>Stage</th><th>Settings</th></tr>
+        <tr><td>Pretraining</td><td>Adam, batch 2,048, 500,000 steps, weight decay 0.01, (β₁, β₂) = (0.9, 0.98); base lr 1 × 10⁻⁴ with 4.8% warm-up; large lr 5 × 10⁻⁵ with 10% warm-up; RoBERTa init; tokenizer init from DiT</td></tr>
+        <tr><td>FUNSD</td><td>1,000 steps, lr 1 × 10⁻⁵, batch 16; linear head per token</td></tr>
+        <tr><td>CORD</td><td>lr 5 × 10⁻⁵, batch 64; MLP head per token</td></tr>
+        <tr><td>RVL-CDIP</td><td>20,000 steps, batch 64, lr 2 × 10⁻⁵; MLP on [CLS]; OCR from Microsoft Read API</td></tr>
+        <tr><td>DocVQA</td><td>extractive start/end classifier; base 100,000 steps, batch 128, lr 3 × 10⁻⁵, warm-up 0.048; large 200,000 steps, batch 32, lr 1 × 10⁻⁵, warm-up 0.1; train split only</td></tr>
+        <tr><td>PubLayNet</td><td>Cascade R-CNN with FPN (Detectron2), features from layers 4, 6, 8, 12 of base; AdamW, 60,000 steps, 1,000 warm-up, weight decay 0.05, batch 32, lr 2 × 10⁻⁴; no flips or crops; no relative positions; image only</td></tr>
+      </table>
+      <h4>Results (v3 paper, Tables 1 and 2)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Params (paper)</th><th>FUNSD F1</th><th>CORD F1</th><th>RVL-CDIP acc.</th><th>DocVQA ANLS</th></tr>
+        <tr><td>LayoutLM-base (+ image)</td><td>160M</td><td>79.27</td><td>—</td><td>94.42</td><td>—</td></tr>
+        <tr><td>LayoutLMv2-base</td><td>200M</td><td>82.76</td><td>94.95</td><td>95.25</td><td>78.08</td></tr>
+        <tr><td>LayoutLMv3-base</td><td>133M</td><td>90.29</td><td>96.56</td><td>95.44</td><td>78.76</td></tr>
+        <tr><td>LayoutLM-large</td><td>343M</td><td>77.89</td><td>—</td><td>91.90</td><td>—</td></tr>
+        <tr><td>LayoutLMv2-large</td><td>426M</td><td>84.20</td><td>96.01</td><td>95.64</td><td>83.48</td></tr>
+        <tr><td>LayoutLMv3-large</td><td>368M</td><td>92.08</td><td>97.46</td><td>95.93</td><td>83.37</td></tr>
+      </table>
+      <p>On PubLayNet (validation mAP @ IoU 0.50:0.95, image only) LayoutLMv3-base with Cascade R-CNN scores 95.1 overall — text 94.5, title 90.6, list 95.5, table 97.9, figure 97.0 — against 94.5 for DiT-base in the same framework; the largest gain is on titles, which the authors attribute to language pretraining since titles are small and identifiable by content.</p>
+      <h4>Reading the table fairly</h4>
+      <ul class="notes">
+        <li><b>FUNSD:</b> v3 and StructuralLM use segment-level boxes, the rest word-level; the v3 paper itself says the two "are not directly comparable". Part of the jump from 82.76 to 90.29 may be the box granularity rather than the architecture.</li>
+        <li><b>DocVQA:</b> v3-large (83.37) is slightly below v2-large (83.48) at equal train-only data; the paper marks the models that score higher (TILT, StructuralLM) as using more DocVQA training data and "expected to score higher".</li>
+        <li><b>Parameters:</b> the 133M includes pretraining heads (<a href="#params">parameter counts</a>); the deployable encoder is about 125M.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> v3 beats v2 on every task in the table except large-size DocVQA (83.37 vs 83.48), with fewer parameters and no detector, and is the first family member that doubles as a layout-detection backbone. Its FUNSD lead is real but partly protocol.</div>
+    </section>
+
+    <!-- 21 ───────────────────────────────────────────── -->
+    <section class="topic" id="params" data-nav="Parameter counts, recomputed">
+      <h3><span class="idx">21</span> Parameter counts, recomputed from the configurations</h3>
+      <p class="lede">The papers give rounded parameter counts, and several of them differ from what the released configurations add up to — some explained by pretraining heads, two (LayoutLM-large and LayoutXLM-base) not explained by the papers. Recomputing from the configuration files — vocabulary, width, depth, table sizes, backbone — shows where each count comes from and what the reported numbers include.</p>
+      <div class="formula"><span class="lbl">a BERT-style encoder with a pooler (vocab V, positions P, segment types T, width d, depth L)</span><span class="eq">N_enc = V·d + P·d + T·d + 2d  +  L·(12d² + 13d)  +  (d² + d)</span>
+<span class="lbl">v1 layout tables (R = 1024 rows): the paper's two, or the implementation's four</span><span class="eq">paper: 2·R·d        implementation: 4·R·d   (X, Y, H, W)</span>
+<span class="lbl">v2 / v3 layout slices and relative-bias tables (h heads)</span><span class="eq">R·(2c + 2s)   with 4c + 2s = d        biases: 32·h + 2·64·h</span></div>
+      <h4>Worked example: LayoutLM-base</h4>
+      <p>V = 30,522, P = 512, T = 2, d = 768, L = 12. Word embeddings 30,522 · 768 = 23,440,896; 1-D positions 393,216; segments 1,536; embedding LayerNorm 1,536; twelve layers at 12·768² + 13·768 = 7,087,872 each, 85,054,464 in all; pooler 590,592. That is BERT-base's 109,482,240. The paper's two 1024 × 768 layout tables add 1,572,864 for 111,055,104; the implementation's four add 3,145,728 for <b>112,627,968</b> — the "113M" the paper reports sits closer to the latter, and closer still (113.25M) if the masked-LM head is counted.</p>
+      <div class="viz" id="viz-params">
+        <div class="vhead">
+          <span class="vtitle">Where the parameters live, per family member</span>
+          <span class="vhint">pick a model · compare the recomputed total with the paper's figure</span>
+        </div>
+        <div class="controls">
+          <label>model <select id="par-model"></select></label>
+          <label><input type="checkbox" id="par-heads" /> include pretraining heads (v1: MLM transform; v3: MIM + WPA)</label>
+        </div>
+        <svg id="par-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Stacked horizontal bar of parameter groups for the selected LayoutLM model with the paper-reported total marked"></svg>
+        <div class="readout" aria-live="polite" id="par-read"></div>
+        <p class="vcap">Every group is computed in the script from the released configuration values (Hugging Face Hub <code>config.json</code> for each checkpoint) with the formulas above. The ResNeXt-101 32×8d FPN backbone is counted as its convolution weights (86,539,456) plus the four lateral and four output FPN convolutions (3,344,384), with batch-norm affine terms treated as frozen buffers as in Detectron2's default; counting them as trainable adds 202,880. The v3 head sizes are inferred: a dense + LayerNorm + 8,192-way linear MIM head and a two-layer MLP WPA head reproduce the paper's 6.9M and 0.6M at base size to the precision stated (6,891,776 and 592,130), and the same shapes are assumed at large size.</p>
+      </div>
+      <h4>Reconciling the reported numbers</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Paper</th><th>Recomputed</th><th>Why they differ</th></tr>
+        <tr><td>LayoutLM-base</td><td>113M</td><td>111.1M (paper's 2 tables) · 112.6M (implementation's 4)</td><td>rounding; the paper's figure matches the implementation's layout tables</td></tr>
+        <tr><td>LayoutLM-large</td><td>343M</td><td>337.2M (2 tables) · 339.3M (4 tables) · 340.4M with the MLM head</td><td>not explained in the paper; the same paper lists BERT-large as 340M, whose exact count with pooler is 335.1M, so its large-size figures appear to be loose</td></tr>
+        <tr><td>LayoutLMv2-base</td><td>≈200M</td><td>200.1M</td><td>agrees (≈110M encoder + ≈90M visual backbone)</td></tr>
+        <tr><td>LayoutLMv2-large</td><td>≈426M</td><td>426.0M</td><td>agrees</td></tr>
+        <tr><td>LayoutXLM-base</td><td>≈345M</td><td>368.7M</td><td>the 250,002 × 768 vocabulary alone is 192.0M; the paper does not break its figure down. Only the base checkpoint is public, so the large figure (625M) cannot be recomputed from a released configuration</td></tr>
+        <tr><td>LayoutLMv3-base</td><td>133M</td><td>125.3M encoder · 132.8M with MIM (6.9M) and WPA (0.6M) heads</td><td>the paper's count includes the pretraining heads (its Table 3: 126M → 132M → 133M as heads are added)</td></tr>
+        <tr><td>LayoutLMv3-large</td><td>368M</td><td>356.0M encoder · ≈366.5M with heads of the assumed shapes</td><td>heads, as for base; the remaining ≈1.5M is not explained by the paper</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> quote LayoutLMv3-base as ≈125M if you mean the model you deploy and 133M if you mean the paper's figure; quote LayoutLM-large as ≈339M by configuration arithmetic. The layout tables themselves are small — 0.5M to 3.1M parameters at base size, up to 4.2M in the implementation of LayoutLM-large — so layout is almost free in parameters.</div>
+    </section>
+
+    <!-- 22 ───────────────────────────────────────────── -->
+    <section class="topic" id="benchmarks" data-nav="The family on the benchmarks">
+      <h3><span class="idx">22</span> The family on the benchmarks, with settings</h3>
+      <p class="lede">One chart for all four members across the tasks they share, each bar labelled with the setting that produced it. The source is the paper that first reported each number; where a later paper reran a model, both are shown.</p>
+      <div class="viz" id="viz-bench">
+        <div class="vhead">
+          <span class="vtitle">Scores by task, model and setting</span>
+          <span class="vhint">choose a task · hover or read the setting under each bar</span>
+        </div>
+        <div class="controls">
+          <label>task <select id="bench-task"><option value="funsd">FUNSD F1</option><option value="cord">CORD F1</option><option value="sroie">SROIE F1</option><option value="rvl">RVL-CDIP accuracy</option><option value="docvqa">DocVQA ANLS</option><option value="xfund">XFUND SER F1 (8-column average)</option></select></label>
+        </div>
+        <svg id="bench-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="Horizontal bar chart of benchmark scores for LayoutLM family members, labelled with their settings"></svg>
+        <div class="readout" aria-live="polite" id="bench-read"></div>
+        <p class="vcap">Values are copied into a source-labelled array in the script from the v1 paper (Tables 1, 4, 5), the v2 paper (Tables 2–4, appendix), the LayoutXLM paper (Table 2) and the v3 paper (Table 1). Bars are coloured by generation; the axis starts at the lowest value shown minus five points, so bar lengths exaggerate differences — read the numbers.</p>
+      </div>
+      <h4>Two numbers that are often misquoted</h4>
+      <ul class="notes">
+        <li><b>LayoutLM-large on FUNSD</b> is 0.7789 in its own paper (11M pages, 1 epoch) and 0.7895 in the v2 paper's rerun. The v3 table uses 77.89.</li>
+        <li><b>DocVQA "0.73 → 0.87"</b> mixes settings: 0.7295 in the v2 abstract matches no number in the paper's tables and is most plausibly a transposition of LayoutLM-large's 0.7259 (every other starting value in that abstract is a LayoutLM-large figure), 0.7259 is LayoutLM-large fine-tuned on train only, and 0.8672 is LayoutLMv2-large fine-tuned on train + dev after question-generation pre-fine-tuning. The like-for-like large comparison is 0.7259 → 0.8348.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> within the family, each generation improves on the last on almost every task at equal settings; v3's margins are largest on FUNSD (with the segment-box caveat) and smallest on RVL-CDIP and DocVQA.</div>
+    </section>
+
+    <nav class="pager" aria-label="LayoutLM series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="v2-layoutxlm.html">← LayoutLM: v2 Spatial Attention &amp; LayoutXLM</a>
+      <a href="../layoutlm.html" style="color:var(--muted)">LayoutLM · overview</a>
+      <a href="fine-tuning-practice.html">LayoutLM: Fine-Tuning, Relatives &amp; Practice →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../layoutlm.viz.js"></script>
+</body>
+</html>

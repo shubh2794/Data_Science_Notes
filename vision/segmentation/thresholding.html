@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Thresholding &amp; Connected Components</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses, carried over from part 1 */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  table.grid2 tr.hit td{background:rgba(74,222,128,.09)}
+  .steps{counter-reset:st;margin:12px 0;padding:0;list-style:none}
+  .steps li{counter-increment:st;position:relative;padding-left:34px;margin-bottom:9px;font-size:13.5px}
+  .steps li:before{content:counter(st);position:absolute;left:0;top:0;width:22px;height:22px;border-radius:50%;
+    border:1px solid var(--accent);color:var(--accent);font-size:11.5px;display:flex;align-items:center;justify-content:center}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../segmentation.html">Segmentation</a> · part 1 of 5</p>
+      <h1>Thresholding &amp; Connected Components</h1>
+      <p>Segmentation through the one-dimensional keyhole of the histogram: global thresholds, Otsu's method derived with its within-class and between-class criteria shown to be the same, when a histogram is bimodal enough, adaptive local thresholds, and labelling the binary map into connected components.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Segmentation</span>
+        <span class="pill">Global threshold · Otsu · bimodality · adaptive · 4/8-connectivity</span>
+      </div>
+    </header>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="threshold" data-nav="Global thresholding">
+      <h3><span class="idx">04</span> Global thresholding: the whole image, through a one-dimensional keyhole</h3>
+      <p class="lede">The simplest possible segmenter compares each pixel against one number. It has no idea where the pixel is, what is next to it, or what shape anything has. Everything it knows about the image is the <b>histogram</b> — and the histogram is invariant to shuffling the pixels.</p>
+
+      <div class="formula"><span class="lbl">global threshold</span><span class="eq">B(x, y) = 1  if I(x, y) > t,   0  otherwise</span>      <span class="eq">t ∈ {0, 1, …, L − 1}</span></div>
+
+      <p>That single line is doing a lot of assuming, and it is worth making the assumptions explicit before choosing <code>t</code>, because when thresholding fails it is always one of these that broke.</p>
+
+      <table class="grid2">
+        <tr><th style="width:26%">Assumption</th><th style="width:37%">What it means in the image</th><th>What breaks it, and what to do</th></tr>
+        <tr><td><b>Two classes</b></td><td>Every pixel is either object or background — no third material, no "partly".</td><td>Three materials need two thresholds (multi-level Otsu, §05). Anti-aliased and blurred edges genuinely are "partly", and no threshold handles them; that is what soft segmentation and matting are for.</td></tr>
+        <tr><td><b>Separable in value</b></td><td>The two classes occupy different, barely overlapping ranges of intensity.</td><td>If the ranges overlap, <i>no</i> threshold is good — the best one still misclassifies, and §06 quantifies exactly how much. Change the feature, not the threshold: texture energy, colour distance, gradient magnitude.</td></tr>
+        <tr><td><b>Uniform illumination</b></td><td>The same material has the same value everywhere in the frame.</td><td>The most common failure by far. A shading gradient shifts one class's range across the image until it crosses the other's. §07 is the fix.</td></tr>
+        <tr><td><b>Spatial structure is irrelevant</b></td><td>A pixel's own value is sufficient evidence.</td><td>Noise breaks this instantly: an isolated bright speck in the background is indistinguishable from an object pixel. The repair is not a better threshold but a post-pass — smooth before, or filter components by size after (§08).</td></tr>
+      </table>
+
+      <h4>Choosing <code>t</code>: five families, in rough order of how much they assume</h4>
+      <ul class="notes">
+        <li><b>Fixed / manual.</b> Somebody typed a number. Perfectly respectable when the imaging is controlled — a backlit part on a conveyor, a document scanner — and indefensible otherwise.</li>
+        <li><b>Percentile.</b> "The object is 12% of the frame", so put <code>t</code> at the 88th percentile of the histogram. Uses prior knowledge of <i>size</i> rather than of <i>brightness</i>, which is sometimes the thing you actually know.</li>
+        <li><b>Valley seeking.</b> Smooth the histogram and put <code>t</code> at the minimum between the two largest peaks. Intuitive, and fragile: the answer depends entirely on how much you smoothed, and a histogram with no valley returns nonsense without complaining.</li>
+        <li><b>Variance / discriminant criteria.</b> Score every candidate <code>t</code> by how well it separates the two induced classes, and take the best. This is <b>Otsu's method</b>, §05, and it is the default for good reasons.</li>
+        <li><b>Entropy and model-fitting criteria.</b> Maximise the sum of the entropies of the two classes, or fit a two-Gaussian mixture and put <code>t</code> where the posteriors cross. The mixture route is the only one that is <i>Bayes-optimal</i> when its model is right — and §06 shows Otsu landing very close to it anyway.</li>
+      </ul>
+
+      <div class="callout"><b>Thresholding is one-dimensional clustering, and it is worth saying so out loud.</b> The histogram is a weighted set of points on a line; a threshold is a partition of that line into two intervals. Everything <a href="../../machine-learning/clustering.html#kmeans">Clustering &amp; k-Means</a> says about choosing <code>k</code>, about clusters of unequal size, and about criteria that reward compactness applies verbatim — with the enormous simplification that in one dimension with two clusters you can afford to <b>enumerate every candidate</b> and take the exact optimum. §05 shows that Otsu is precisely that exhaustive enumeration, and that what it finds is the exact global optimum of 2-means on the grey levels.</div>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="otsu" data-nav="Otsu's method, derived">
+      <h3><span class="idx">05</span> Otsu's method, derived — and why two opposite-sounding criteria are the same criterion</h3>
+      <p class="lede">Otsu's method is usually quoted as "maximise the between-class variance" and sometimes as "minimise the within-class variance". Both are correct, they are not two methods, and the reason is a one-line identity worth deriving rather than believing.</p>
+
+      <h4>Setup and notation</h4>
+      <p>Let the image have <code>L</code> grey levels and let <code>p(l) = n_l / N</code> be the normalised histogram, so <code>∑ p(l) = 1</code>. A threshold <code>t</code> splits the levels into class <code>C₁ = {0, …, t}</code> and class <code>C₂ = {t+1, …, L−1}</code>. Everything below is a function of <code>t</code> and of the histogram alone — <b>no pixel positions are ever consulted</b>.</p>
+
+      <div class="formula"><span class="lbl">class weights, means and variances</span><span class="eq">P₁(t) = ∑_{l=0}^{t} p(l)                    P₂(t) = ∑_{l=t+1}^{L−1} p(l) = 1 − P₁(t)</span>
+<span class="eq">μ₁(t) = (1/P₁) ∑_{l=0}^{t} l·p(l)           μ₂(t) = (1/P₂) ∑_{l=t+1}^{L−1} l·p(l)</span>
+<span class="eq">σ₁²(t) = (1/P₁) ∑_{l=0}^{t} (l − μ₁)² p(l)   σ₂²(t) = (1/P₂) ∑_{l=t+1}^{L−1} (l − μ₂)² p(l)</span>
+<span class="eq">μ_G = ∑_{l} l·p(l)                          σ_T² = ∑_{l} (l − μ_G)² p(l)</span></div>
+
+      <p><code>μ_G</code> and <code>σ_T²</code> are the global mean and variance of the whole histogram. <b>Neither depends on <code>t</code>.</b> Hold on to that; it is the entire argument.</p>
+
+      <h4>The two candidate criteria</h4>
+      <div class="formula"><span class="lbl">within-class (intra-class) variance — the weighted average of the two spreads</span><span class="eq">σ_W²(t) = P₁(t)·σ₁²(t) + P₂(t)·σ₂²(t)</span>
+<span class="lbl">between-class (inter-class) variance — the spread of the two means about the global mean</span><span class="eq">σ_B²(t) = P₁(t)·(μ₁(t) − μ_G)² + P₂(t)·(μ₂(t) − μ_G)²</span></div>
+
+      <p>A good threshold should make each class <i>tight</i> — small <code>σ_W²</code> — and the two classes <i>far apart</i> — large <code>σ_B²</code>. Those sound like two different demands. They are one demand.</p>
+
+      <h4>The decomposition, in full</h4>
+      <p>Start from the total variance and split the sum at <code>t</code>, adding and subtracting the relevant class mean inside each piece.</p>
+
+      <div class="formula"><span class="lbl">step 1 — split and insert the class means</span><span class="eq">σ_T² = ∑_{l≤t} (l − μ₁ + μ₁ − μ_G)² p(l)  +  ∑_{l>t} (l − μ₂ + μ₂ − μ_G)² p(l)</span>
+<span class="lbl">step 2 — expand each square into three terms</span><span class="eq">     = ∑_{l≤t} [ (l−μ₁)² + 2(l−μ₁)(μ₁−μ_G) + (μ₁−μ_G)² ] p(l)  +  ∑_{l>t} [ … same with μ₂ … ]</span>
+<span class="lbl">step 3 — the cross terms are exactly zero, because <span class="keep">μ₁</span> is the mean of class 1</span><span class="eq">∑_{l≤t} (l − μ₁) p(l) = P₁μ₁ − μ₁P₁ = 0      and likewise for class 2</span>
+<span class="lbl">step 4 — what is left</span><span class="eq">σ_T² = [ P₁σ₁² + P₂σ₂² ]  +  [ P₁(μ₁−μ_G)² + P₂(μ₂−μ_G)² ]  =  σ_W²(t) + σ_B²(t)</span></div>
+
+      <div class="callout"><b>The identity, and the conclusion.</b> <code>σ_W²(t) + σ_B²(t) = σ_T²</code> for <b>every</b> <code>t</code>, and <code>σ_T²</code> does not depend on <code>t</code>. So as <code>t</code> sweeps the grey levels, whatever <code>σ_B²</code> gains, <code>σ_W²</code> loses, exactly. <b>Maximising the between-class variance and minimising the within-class variance are the same optimisation</b>, and so is maximising the ratio <code>σ_B²/σ_W² = σ_B²/(σ_T² − σ_B²)</code>, which is monotone increasing in <code>σ_B²</code>. Three criteria, one argmax. This is the analysis-of-variance decomposition, and it is the same identity that underlies Fisher's discriminant.</div>
+
+      <p>Otsu maximises <code>σ_B²</code> rather than minimising <code>σ_W²</code> for a purely computational reason: <code>σ_B²</code> can be evaluated in constant time per candidate from two running sums, whereas <code>σ_W²</code> naively needs the class variances. Simplify <code>σ_B²</code> using <code>μ_G = P₁μ₁ + P₂μ₂</code> and <code>P₂ = 1 − P₁</code>:</p>
+
+      <div class="formula"><span class="lbl">the two useful closed forms</span><span class="eq">μ₁ − μ_G = P₂(μ₁ − μ₂)      μ₂ − μ_G = P₁(μ₂ − μ₁)</span>
+<span class="eq">⇒  σ_B²(t) = P₁P₂²(μ₁−μ₂)² + P₂P₁²(μ₁−μ₂)² = P₁P₂(P₁+P₂)(μ₁−μ₂)²</span>
+<span class="eq">⇒  σ_B²(t) = P₁(t)·P₂(t)·(μ₁(t) − μ₂(t))²                       ← the interpretable form</span>
+<span class="eq">   σ_B²(t) = (μ_G·ω(t) − m(t))² / (ω(t)·(1 − ω(t)))              ← the computable form</span>
+<span class="eq">   where  ω(t) = ∑_{l≤t} p(l)   and   m(t) = ∑_{l≤t} l·p(l)      (the unnormalised first moment)</span></div>
+
+      <p>The second form is what an implementation runs: sweep <code>t</code> from 0 upward, keep the running sums <code>ω</code> and <code>m</code>, evaluate one expression, remember the best. <b>Cost: one pass to build the histogram, one pass of length <code>L</code> over it.</b> For 8-bit images that is 256 evaluations regardless of image size, which is why Otsu is essentially free.</p>
+
+      <p>The interpretable form <code>σ_B² = P₁P₂(μ₁−μ₂)²</code> says something the "between-class variance" name hides: the criterion is <b>the squared gap between the class means, weighted by how balanced the split is</b>. The factor <code>P₁P₂</code> is maximised at a 50/50 split, so Otsu quietly prefers balanced classes — which is exactly the assumption that breaks when the object occupies 2% of the frame. §06 has the counterexample.</p>
+
+      <h4>A worked example small enough to check by hand</h4>
+      <p>Sixteen grey levels, 140 pixels, two humps with a shallow valley between them. The histogram is <code>n = (2, 5, 12, 20, 14, 6, 3, 2, 2, 4, 9, 18, 22, 13, 5, 3)</code> for levels 0…15.</p>
+      <div class="formula"><span class="lbl">the constants</span><span class="eq">N = 140      μ_G = 7.821429      σ_T² = 19.989541</span></div>
+
+      <table class="grid2">
+        <tr><th style="width:7%"><code>t</code></th><th style="width:14%"><code>P₁</code></th><th style="width:14%"><code>μ₁</code></th><th style="width:14%"><code>μ₂</code></th><th style="width:17%"><code>σ_W²</code></th><th style="width:17%"><code>σ_B²</code></th><th><code>σ_W² + σ_B²</code></th></tr>
+        <tr><td class="num">3</td><td class="num">0.2786</td><td class="num">2.2821</td><td class="num">9.9604</td><td class="num">8.1410</td><td class="num">11.8485</td><td class="num">19.9895</td></tr>
+        <tr><td class="num">4</td><td class="num">0.3786</td><td class="num">2.7358</td><td class="num">10.9195</td><td class="num">4.2338</td><td class="num">15.7557</td><td class="num">19.9895</td></tr>
+        <tr><td class="num">5</td><td class="num">0.4214</td><td class="num">2.9661</td><td class="num">11.3580</td><td class="num">2.8182</td><td class="num">17.1713</td><td class="num">19.9895</td></tr>
+        <tr><td class="num">6</td><td class="num">0.4429</td><td class="num">3.1129</td><td class="num">11.5641</td><td class="num">2.3671</td><td class="num">17.6225</td><td class="num">19.9895</td></tr>
+        <tr class="hit"><td class="num"><b>7</b></td><td class="num">0.4571</td><td class="num">3.2344</td><td class="num">11.6842</td><td class="num"><b>2.2708</b> ← min</td><td class="num"><b>17.7188</b> ← max</td><td class="num">19.9895</td></tr>
+        <tr><td class="num">8</td><td class="num">0.4714</td><td class="num">3.3788</td><td class="num">11.7838</td><td class="num">2.3862</td><td class="num">17.6033</td><td class="num">19.9895</td></tr>
+        <tr><td class="num">9</td><td class="num">0.5000</td><td class="num">3.7000</td><td class="num">11.9429</td><td class="num">3.0034</td><td class="num">16.9862</td><td class="num">19.9895</td></tr>
+        <tr><td class="num">10</td><td class="num">0.5643</td><td class="num">4.4177</td><td class="num">12.2295</td><td class="num">4.9857</td><td class="num">15.0038</td><td class="num">19.9895</td></tr>
+        <tr><td class="num">11</td><td class="num">0.6929</td><td class="num">5.6392</td><td class="num">12.7442</td><td class="num">9.2468</td><td class="num">10.7427</td><td class="num">19.9895</td></tr>
+        <tr><td class="num">12</td><td class="num">0.8500</td><td class="num">6.8151</td><td class="num">13.5238</td><td class="num">14.2512</td><td class="num">5.7383</td><td class="num">19.9895</td></tr>
+      </table>
+
+      <p>The last column is constant to every digit shown, for every row — that is the identity, measured rather than asserted. The minimum of <code>σ_W²</code> and the maximum of <code>σ_B²</code> occur at <b>the same <code>t</code> = 7</b>, which is also what a standard library implementation returns on this histogram.</p>
+
+      <div class="callout"><b>Otsu is exact 2-means on the grey levels — not an approximation to it.</b> The quantity <code>σ_W² = P₁σ₁² + P₂σ₂²</code> is, up to the factor <code>N</code>, the k-means objective: the total within-cluster sum of squares. Minimising it over thresholds only ever considers partitions into two <i>intervals</i>. That loses nothing, because in one dimension a nearest-centroid assignment always <b>is</b> an interval partition — the boundary is the midpoint of the two centroids. Enumerating the <code>L−1</code> thresholds therefore enumerates every partition k-means could possibly converge to. On the worked histogram, brute force over all 65 534 non-trivial two-way partitions of the sixteen levels gives a minimum within-cluster sum of squares of <b>2.270753</b>, attained by the mask <code>11111111 00000000</code> — precisely the interval split at <code>t = 7</code>, and precisely <code>σ_W²(7)</code>. So on a one-dimensional histogram, unlike everywhere else, k-means has no local-minimum problem and no initialisation to get wrong. See <a href="../../machine-learning/clustering.html#kmeans">Clustering &amp; k-Means</a> for what happens the moment you add a second dimension.</div>
+
+      <h4>Multi-level Otsu</h4>
+      <p>Nothing in the derivation is specific to two classes. With <code>K</code> classes cut by thresholds <code>t₁ &lt; … &lt; t_{K−1}</code>, the between-class variance generalises to <code>σ_B² = ∑_k P_k(μ_k − μ_G)²</code>, the identity <code>σ_T² = σ_W² + σ_B²</code> still holds, and the optimum is still the argmax. What does not generalise is the cost: exhaustive search is <code>O(L^{K−1})</code>, so 8-bit three-class Otsu is 32 640 evaluations — fine — and five-class is 8.6 billion, which is not. Dynamic programming over the cumulative moments reduces this to <code>O(KL²)</code>, which is the standard implementation. A cheaper and more common hack is <b>recursive</b> Otsu: threshold, then re-threshold the larger class. It is not the same answer as joint multi-level Otsu, and it is not optimal, but it is one line.</p>
+
+      <div class="viz" id="viz-otsu">
+        <div class="vhead">
+          <span class="vtitle">Drag the threshold; the criterion curves below say what you are giving up</span>
+          <span class="vhint">the two curves are mirror images about <code>σ_T²</code> — that is the identity, drawn</span>
+        </div>
+        <div class="controls">
+          <label>threshold <span class="keep">t</span> <input type="range" id="ot-t" min="1" max="254" step="1" value="90" /><span id="ot-tv" style="min-width:34px;display:inline-block">90</span></label>
+          <label><input type="checkbox" id="ot-opt" /> jump to the Otsu optimum</label>
+          <label><input type="checkbox" id="ot-sw" checked /> plot <span class="keep">σ_W²</span> as well as <span class="keep">σ_B²</span></label>
+          <label><input type="checkbox" id="ot-truth" checked /> show the true object mask for comparison</label>
+        </div>
+        <svg id="otsu-svg" width="760" height="470" viewBox="0 0 760 470" role="img" aria-label="Left: a small synthetic greyscale image of two bright ellipses on a darker background with additive noise, and beneath it the binary map produced by the current threshold, with pixels that disagree with the true object mask picked out in red. Right top: the 256-bin histogram of that image, drawn as two humps, with a draggable vertical line at the current threshold and the two class means marked as ticks. Right bottom: the between-class variance and the within-class variance plotted against every candidate threshold from 1 to 254; the two curves are reflections of one another about the constant total variance, they cross nowhere by accident, and the exhaustive-search maximum of the between-class curve is marked with a dot at grey level 123. A readout gives the class weights, means, both variances, their sum against the total variance, and the intersection over union of the thresholded map against the true mask."></svg>
+        <div class="readout" aria-live="polite" id="otsu-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>The two criterion curves are one curve.</b> Drag anywhere and read the sum in the panel: it is <code>σ_T²</code> to every digit, at every threshold. The <code>σ_W²</code> curve is the <code>σ_B²</code> curve flipped about the horizontal line <code>σ_T²/2</code> and shifted — so the maximum of one is the minimum of the other, necessarily and everywhere.</li>
+        <li><b>The optimum is a broad plateau, not a spike.</b> Near <code>t*</code> the criterion is flat: moving several grey levels either way costs almost nothing. That is good news — Otsu is robust to small histogram changes — and bad news, because it means the criterion is nearly indifferent between thresholds that produce visibly different masks.</li>
+        <li><b>The criterion is not the task.</b> Turn on the true-mask overlay. Otsu's optimum on this image is <code>t = 123</code>, and the threshold that actually maximises intersection over union against the true object is <code>t = 126</code>, with IoU <code>0.9968</code> against Otsu's <code>0.9957</code>. The gap is tiny here because the classes are well separated; the point is that it is not zero, and it never is. Otsu optimises a proxy that nobody actually wants, and it does so exactly.</li>
+        <li><b>Drag <code>t</code> to an extreme.</b> As <code>t → 0</code> or <code>t → L−1</code> one class empties, <code>P₁P₂ → 0</code> and <code>σ_B² → 0</code>. The criterion is zero at both ends and positive in between, so a maximum always exists — even for a perfectly unimodal histogram with nothing to separate. <b>Otsu always returns an answer.</b> Whether it means anything is §06.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="bimodal" data-nav="When is a histogram bimodal?">
+      <h3><span class="idx">06</span> When is a histogram bimodal enough to bother — and what Otsu does when it is not</h3>
+      <p class="lede">Otsu's method always returns a threshold. It returns one for a picture of a blank wall. The criterion has a maximum for any histogram whatsoever, because it is zero at both ends and positive in between, so "it found a threshold" carries no information at all about whether a threshold was the right idea.</p>
+
+      <h4>The exact condition, for the model everyone has in mind</h4>
+      <p>Take the standard mental picture: object and background are both Gaussian in intensity, with the same spread <code>σ</code>, means separated by <code>d</code>, and equal areas. Is the resulting histogram bimodal? There is a clean answer.</p>
+
+      <p>Put the two means at <code>±a</code> with <code>a = d/2</code>, and set <code>σ = 1</code> without loss of generality. The mixture, up to a constant, is <code>f(x) = e^{−(x−a)²/2} + e^{−(x+a)²/2}</code>. By symmetry <code>x = 0</code> is always a critical point; the whole question is whether it is a peak or a valley.</p>
+
+      <div class="formula"><span class="lbl">second derivative of the symmetric two-Gaussian mixture</span><span class="eq">f″(x) = [(x−a)² − 1]·e^{−(x−a)²/2}  +  [(x+a)² − 1]·e^{−(x+a)²/2}</span>
+<span class="eq">f″(0) = (a² − 1)e^{−a²/2} + (a² − 1)e^{−a²/2} = 2(a² − 1)·e^{−a²/2}</span>
+<span class="lbl">so the sign of f″(0) is the sign of a² − 1</span><span class="eq">a &lt; 1  ⇒  f″(0) &lt; 0  ⇒  x = 0 is a maximum  ⇒  unimodal</span>
+<span class="eq">a &gt; 1  ⇒  f″(0) &gt; 0  ⇒  x = 0 is a minimum  ⇒  bimodal, with two peaks either side</span>
+<span class="lbl">in the original units, with <span class="keep">a = d/2σ</span></span><span class="eq">the histogram is bimodal  ⟺  d &gt; 2σ</span></div>
+
+      <div class="callout"><b>Two standard deviations, exactly.</b> Equal-weight, equal-variance Gaussian classes produce a visibly two-humped histogram if and only if their means are more than <code>2σ</code> apart. Below that the two humps have already fused into one, <i>even though the classes are perfectly well defined and a threshold still separates them tolerably</i>. So "the histogram has no valley" is not the same statement as "thresholding will not work" — the valley disappears long before the threshold becomes useless. At <code>d = 2σ</code> exactly, the best achievable error is already down to about 16%, and at <code>d = 1.5σ</code>, where the histogram is a single smooth hump with no hint of structure, the best possible threshold still gets 77% of pixels right.</div>
+
+      <p>Unequal class sizes make it much worse. The minority class has to be pushed considerably further out before it raises a bump of its own on the flank of the majority hump. Measured on the figure's own grid:</p>
+
+      <table class="grid2">
+        <tr><th style="width:30%">Object occupies</th><th style="width:34%">Bimodal from a separation of</th><th>Reading</th></tr>
+        <tr><td class="num">50%</td><td class="num">2.00 σ</td><td>The textbook case, and the only one the <code>2σ</code> derivation covers.</td></tr>
+        <tr><td class="num">30%</td><td class="num">2.72 σ</td><td>Already 36% more separation needed than the balanced case.</td></tr>
+        <tr><td class="num">15%</td><td class="num">3.13 σ</td><td>A small object is nearly invisible in a histogram even when it is obvious in the image.</td></tr>
+        <tr><td class="num">5%</td><td class="num">3.58 σ</td><td>At <code>3σ</code> separation — a beautifully clean image — the histogram still shows one hump.</td></tr>
+        <tr><td class="num">2%</td><td class="num">3.88 σ</td><td>Text on a page, a defect on a part, a lesion on a scan. Histogram methods are the wrong tool here and the histogram will not tell you so.</td></tr>
+      </table>
+
+      <h4>The failure mode that matters: <code>P₁P₂</code> wants a balanced split</h4>
+      <p>Recall §05's interpretable form, <code>σ_B² = P₁P₂(μ₁ − μ₂)²</code>. The factor <code>P₁P₂</code> peaks at <code>P₁ = P₂ = ½</code>, so among thresholds with similar mean separation, <b>Otsu prefers the one that halves the image</b>. When the object really is about half the frame this bias costs nothing. When the object is 5% of the frame it is catastrophic: Otsu drags the threshold deep into the background hump to fabricate a more balanced split.</p>
+
+      <div class="wrong"><span class="say">The claim to be careful about.</span> "Otsu is optimal." It is optimal <i>for its own criterion</i>, and its criterion is not the error rate. With a 5% object separated by a generous <code>4σ</code> — a histogram that is genuinely bimodal — Otsu picks a threshold with a <b>26.8%</b> misclassification rate where the Bayes-optimal threshold achieves <b>0.8%</b>. <span class="fix">That is a factor of 33, on an easy image, with the histogram doing exactly what the textbook says it should.</span> The fix is not a better search; the search was already exact. The fix is a different criterion — fit a two-component mixture and threshold where the posteriors cross, or use a method that knows the class prior.</div>
+
+      <h4>What to do when the histogram is unimodal</h4>
+      <ul class="notes">
+        <li><b>Check whether it should be.</b> A unimodal histogram from a scene that visibly contains two things means the <i>feature</i> is wrong, not the threshold. Intensity is often the wrong feature: try local gradient magnitude, a texture energy, a colour-opponent channel, or the distance from a fitted background model.</li>
+        <li><b>Use a unimodal-specific rule.</b> The best known takes the line from the histogram's peak to its far tail end and puts the threshold at the point of the histogram furthest from that line — a corner-finding rule rather than a valley-finding one. It has no valley to depend on and degrades gracefully.</li>
+        <li><b>Use the prior.</b> If you know the object covers roughly <code>π</code> of the frame, a percentile threshold at <code>1 − π</code> is often dramatically better than Otsu, precisely because it supplies the information <code>P₁P₂</code> is guessing at.</li>
+        <li><b>Do not trust the separability number as a bimodality test.</b> The normalised criterion <code>η = σ_B²(t*)/σ_T² ∈ [0, 1]</code> is often quoted as a quality score. It measures how much of the variance the split explains, which is <i>not</i> the same thing. The disastrous 5%-object case above scores <code>η = 0.548</code>; a balanced pair separated by only <code>1.5σ</code>, where Otsu is exactly Bayes-optimal and cannot be improved, scores a <i>higher</i> <code>0.656</code>. <code>η</code> ranks them backwards on the question you care about.</li>
+      </ul>
+
+      <div class="viz" id="viz-bimodal">
+        <div class="vhead">
+          <span class="vtitle">Two Gaussians, a slider for how far apart and a slider for how big the object is</span>
+          <span class="vhint">the default histogram has <b>one</b> hump — and Otsu answers anyway, 3× worse than Bayes</span>
+        </div>
+        <div class="controls">
+          <label>separation <span class="keep">d / σ</span> <input type="range" id="bm-d" min="0.6" max="6" step="0.02" value="3" /><span id="bm-dv" style="min-width:44px;display:inline-block">3.00</span></label>
+          <label>object fraction <span class="keep">π</span> <input type="range" id="bm-p" min="0.02" max="0.5" step="0.005" value="0.15" /><span id="bm-pv" style="min-width:44px;display:inline-block">0.150</span></label>
+          <label><input type="checkbox" id="bm-comp" checked /> draw the two components separately</label>
+          <label><input type="checkbox" id="bm-err" checked /> plot the error curve</label>
+        </div>
+        <svg id="bimodal-svg" width="760" height="440" viewBox="0 0 760 440" role="img" aria-label="Top left: the intensity histogram of a two-class Gaussian model, drawn as a filled curve, with the background and object components shown separately underneath it in blue and orange scaled by their class priors. A solid vertical line marks the threshold Otsu's criterion selects and a dashed one marks the Bayes-optimal threshold where the two weighted components cross; at the default settings these are fourteen grey levels apart. Small triangles mark every local maximum of the histogram, and at the default there is only one. Top right: a map over separation on the horizontal axis and object fraction on the vertical, shaded to show where the mixture has one mode and where it has two, with the current setting marked by a cross; the boundary curves upward and to the right, showing that a smaller object needs far more separation before a second hump appears. Bottom left: the misclassification rate plotted against every candidate threshold, with the Otsu and Bayes choices marked on it, so the vertical gap between them is the price of Otsu's balance preference. Bottom right: a numeric panel giving the number of modes, both thresholds, both error rates, the fraction of the frame each threshold labels as object against the true fraction, and Otsu's normalised separability measure."></svg>
+        <div class="readout" aria-live="polite" id="bimodal-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Start at the default and push the separation slider right.</b> The single hump splits into two at <code>d/σ = 3.13</code> for a 15% object, not at <code>2</code>. Now drag the object fraction up to <code>0.5</code> and the split happens at <code>2.00</code> — the derivation above, confirmed on the picture.</li>
+        <li><b>Set the object fraction to 0.05 and the separation to 4.</b> The histogram is bimodal, the little object hump is clearly visible, and Otsu's line sits nowhere near it. This is the case worth remembering: <b>a visibly bimodal histogram is not a guarantee that Otsu will find the valley</b>, because Otsu is not looking for the valley.</li>
+        <li><b>Watch the "fraction labelled object" row.</b> Otsu's answer stays stubbornly near a half of the frame long after the true fraction has dropped to a few percent. That row is the <code>P₁P₂</code> factor made visible, and it is the single best diagnostic for "Otsu is the wrong tool here".</li>
+        <li><b>Slide the separation below 2 with balanced classes.</b> Otsu and Bayes coincide exactly, and both still have a large error. That is the honest picture of a hard problem: the method is optimal and the answer is still bad, because the classes genuinely overlap. No threshold on this feature will do better, and looking for one is wasted effort.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="adaptive" data-nav="Adaptive thresholding">
+      <h3><span class="idx">07</span> Adaptive thresholding: when one number cannot cover the frame</h3>
+      <p class="lede">The most common reason a global threshold fails has nothing to do with the algorithm that chose it. It is that the same material is not the same brightness in different parts of the picture, so no single number can separate the classes anywhere except locally.</p>
+
+      <h4>Why illumination is fatal, in one equation</h4>
+      <p>A pixel's value is, to a first approximation, the product of what the surface <i>is</i> and how much light fell on it:</p>
+      <div class="formula"><span class="lbl">the multiplicative image model</span><span class="eq">I(x, y) = R(x, y) · S(x, y)</span>      <span class="eq">R = reflectance (the thing you want)     S = shading (the thing you do not)</span>
+<span class="lbl">taking logs turns the product into a sum, which is why this is called the homomorphic view</span><span class="eq">log I = log R + log S</span>      <span class="eq">and log S is low-frequency — it varies slowly across the frame</span></div>
+
+      <p>Segmenting means recovering a property of <code>R</code>. A global threshold on <code>I</code> asks whether <code>R·S &gt; t</code>, which is <code>R &gt; t/S(x, y)</code> — a threshold on reflectance that <b>silently moves as you cross the image</b>. If <code>S</code> varies by more than the contrast ratio between the two materials, the dark material in the bright corner becomes brighter than the light material in the dark corner, and the two classes are no longer separable by <i>any</i> constant.</p>
+
+      <div class="callout"><b>The exact condition for a global threshold to survive.</b> Let the two materials have reflectances <code>R_o &lt; R_b</code> and let shading range over <code>[S_min, S_max]</code>. A constant threshold exists if and only if the two value ranges do not overlap: <code>R_o·S_max &lt; R_b·S_min</code>, that is <code>S_max/S_min &lt; R_b/R_o</code>. <b>The permissible illumination variation is exactly the material contrast ratio.</b> Ink at 90 on paper at 210 gives a ratio of 2.33, so a shading field that swings by more than 2.33× has already destroyed global thresholding, whatever criterion picked the threshold. Printed text under a desk lamp routinely swings by more than that across one page.</div>
+
+      <h4>Three local rules, and what each is trying to fix</h4>
+      <p>All of them replace the constant <code>t</code> with a field <code>t(x, y)</code> estimated from a window <code>W</code> of side <code>2w+1</code> centred on the pixel. Write <code>μ_W</code> and <code>σ_W</code> for the local mean and standard deviation.</p>
+
+      <div class="formula"><span class="lbl">mean minus offset — the simplest, and often enough</span><span class="eq">t(x, y) = μ_W(x, y) − C</span>
+<span class="lbl">Niblack — scale the offset by the local contrast</span><span class="eq">t(x, y) = μ_W(x, y) + k·σ_W(x, y),     k ≈ −0.2 for dark objects</span>
+<span class="lbl">Sauvola — shrink the offset to nothing where the window is flat</span><span class="eq">t(x, y) = μ_W(x, y) · [ 1 + k·( σ_W(x, y)/R − 1 ) ],     k ≈ 0.2,  R ≈ 128</span></div>
+
+      <p>Read the third one carefully, because the algebra is the whole idea. When the window has strong contrast, <code>σ_W → R</code>, the bracket <code>→ 1</code>, and <code>t → μ_W</code>: it behaves like the plain mean rule. When the window is <b>flat</b> — nothing in it but background and noise — <code>σ_W → 0</code>, the bracket <code>→ 1 − k</code>, and <code>t → 0.8·μ_W</code>, a threshold well below everything present, so <b>nothing fires</b>. Niblack does the opposite: with <code>σ_W → 0</code> its threshold collapses onto <code>μ_W</code> itself, and half the noise in an empty region falls below it.</p>
+
+      <div class="wrong"><span class="say">The failure everyone hits first.</span> Running a local rule and getting a snowstorm of speckle in every blank area. <span class="fix">It is not a bug and no amount of tuning <code>C</code> removes it.</span> A local rule <b>has</b> to invent a boundary inside every window, because it has no way to know the window contains only one class. Measured on the figure's own blank band with an <code>8</code>-pixel half-window: the mean-minus-offset rule fires on <b>13.67%</b> of blank pixels and Niblack on <b>25.69%</b>, while Sauvola fires on <b>0.00%</b> — because Sauvola is the one rule of the three that was designed to notice that the window is flat.</div>
+
+      <h4>Choosing the window size: a two-sided constraint, and both sides bite</h4>
+      <ul class="notes">
+        <li><b>Too small</b> and the window fits inside an object. Then <code>μ_W</code> is the object's own mean, the threshold tracks the object, and the interior of every thick stroke is labelled background — objects come out hollow. The window must be <b>larger than the widest object feature</b>.</li>
+        <li><b>Too large</b> and the window spans the illumination change it was supposed to be immune to. In the limit <code>w → ∞</code> the local rule <i>is</i> the global rule and inherits all its failures. The window must be <b>smaller than the scale on which the shading varies</b>.</li>
+        <li><b>If those two constraints do not leave a gap, no window size works</b>, and that is a real possibility — a thick object under fast-varying light. The answer then is not a better window but the next paragraph.</li>
+      </ul>
+
+      <h4>The alternative that is often better: estimate the shading and divide it out</h4>
+      <p>Rather than making the threshold vary, make the <i>image</i> stop varying. Estimate <code>S</code> — by a morphological opening with a structuring element larger than every object (the "rolling ball" background), by a heavy low-pass filter, or by fitting a low-order polynomial or plane to the image — then form <code>I/Ŝ</code>, or equivalently <code>log I − log Ŝ</code>, and threshold that <b>globally</b>. The advantage is that after correction you get a single, interpretable, image-wide threshold back, and every diagnostic from §05 and §06 becomes usable again. The morphology this needs belongs to <a href="../index.html">Part 2</a>.</p>
+
+      <div class="viz" id="viz-adapt">
+        <div class="vhead">
+          <span class="vtitle">A page under a desk lamp: one threshold cannot cover it, and three local rules disagree about how to cope</span>
+          <span class="vhint">the default shading swing already exceeds the ink-to-paper contrast ratio, so no constant works</span>
+        </div>
+        <div class="controls">
+          <label>illumination swing <input type="range" id="ad-r" min="0" max="1.2" step="0.02" value="0.7" /><span id="ad-rv" style="min-width:40px;display:inline-block">0.70</span></label>
+          <label>window half-width <span class="keep">w</span> <input type="range" id="ad-w" min="2" max="34" step="1" value="8" /><span id="ad-wv" style="min-width:52px;display:inline-block">8 (17px)</span></label>
+          <label>offset <span class="keep">C</span> <input type="range" id="ad-c" min="0" max="30" step="1" value="8" /><span id="ad-cv" style="min-width:26px;display:inline-block">8</span></label>
+          <label>Sauvola <span class="keep">k</span> <input type="range" id="ad-k" min="0.02" max="0.6" step="0.01" value="0.2" /><span id="ad-kv" style="min-width:34px;display:inline-block">0.20</span></label>
+          <label><input type="checkbox" id="ad-nib" /> show Niblack instead of mean − C</label>
+        </div>
+        <svg id="adapt-svg" width="760" height="452" viewBox="0 0 760 452" role="img" aria-label="Top row of four small images. First, a synthetic page of dark text and blocks on light paper, multiplied by a shading field that is dark at the top left and bright at the bottom right, with additive noise. Second, the result of a single global Otsu threshold, which reads correctly in the brightly lit bottom right but floods the dimly lit top left solid, because paper there is darker than ink is in the bright corner. Third, the result of the local mean-minus-offset rule, which recovers the text everywhere but fills the blank band at the bottom with speckle. Fourth, the Sauvola rule, which recovers the text and leaves the blank band clean because its offset collapses where the local standard deviation is small. Bottom left: the local threshold surface itself, drawn as a grey image, which is visibly a copy of the illumination field. Bottom middle: a bar chart of intersection over union against the true ink mask for the four results, and a second bar chart of the false-positive rate inside a region that contains no ink at all. Bottom right: numbers, including the illumination swing, the ink-to-paper contrast ratio, and whether the swing has exceeded it."></svg>
+        <div class="readout" aria-live="polite" id="adapt-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Pull the illumination swing to zero.</b> Global Otsu becomes near-perfect and every local rule is at best equal to it. Adaptive thresholding buys nothing on a uniformly lit image and costs a window's worth of blur at every boundary — it is a fix for a specific disease, not a general improvement.</li>
+        <li><b>Push the swing up and watch where global breaks.</b> The readout prints the shading ratio and the ink-to-paper contrast ratio side by side, and flips a verdict when the first exceeds the second — at a swing slider value of about <code>0.62</code>. The collapse begins a little <i>before</i> that line, because the ratios above are computed for noiseless values and the noise widens each class by a few levels either side. What the crossing marks exactly is the point beyond which no constant threshold could work even on a noiseless image.</li>
+        <li><b>Drag the window down to <code>w = 3</code>.</b> Every local rule falls apart, and it falls apart <i>inside</i> the thick block rather than at its edges — the window fits inside the object, so the object becomes its own background. This is the failure that gets misdiagnosed as "the threshold is too high".</li>
+        <li><b>Drag the window up to <code>w = 34</code> with the swing at maximum.</b> The local rules converge back toward the global answer and start failing in the same corner. There is a sweet spot, it is bounded on both sides, and its width is the ratio between the shading scale and the object scale.</li>
+        <li><b>Watch the blank-band bar.</b> Niblack's false-positive rate there is roughly double the mean-minus-offset rule's, and Sauvola's is essentially zero at every window size. That single column is the entire argument for the Sauvola form.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="components" data-nav="Connected components">
+      <h3><span class="idx">08</span> From a binary map to regions: connected components, and the paradox in the grid</h3>
+      <p class="lede">A threshold produces a <b>binary image</b>, not a segmentation. Nothing so far has grouped anything. The step that turns "these pixels are bright" into "these are three objects" is connected-component labelling, and it is where spatial information finally enters a thresholding pipeline.</p>
+
+      <h4>The definition, and the choice hiding inside it</h4>
+      <p>Two foreground pixels are in the same component when a path of foreground pixels joins them, each consecutive pair being <b>neighbours</b>. Everything turns on what "neighbour" means, and there are two conventions on a square grid.</p>
+      <div class="formula"><span class="lbl">4-connectivity — the von Neumann neighbourhood</span><span class="eq">N₄(x, y) = { (x±1, y), (x, y±1) }                            distance ‖·‖₁ = 1</span>
+<span class="lbl">8-connectivity — the Moore neighbourhood</span><span class="eq">N₈(x, y) = N₄(x, y) ∪ { (x±1, y±1) }                        distance ‖·‖_∞ = 1</span></div>
+
+      <p>This looks like a taste question. It is not: <b>the two conventions give different numbers of objects, different numbers of holes, and — if you choose the same one for foreground and background — a topological contradiction.</b></p>
+
+      <h4>The Jordan curve paradox, on eleven by eleven pixels</h4>
+      <p>The Jordan curve theorem says a simple closed curve in the plane divides it into exactly two pieces, an inside and an outside, and the curve itself is connected. Draw a diagonal diamond ring of 16 pixels on an 11 × 11 grid and count.</p>
+
+      <table class="grid2">
+        <tr><th style="width:28%">Convention</th><th style="width:22%">Foreground pieces</th><th style="width:22%">Background pieces</th><th>Verdict</th></tr>
+        <tr><td><b>4 for both</b></td><td class="num">16</td><td class="num">2</td><td>The "curve" is 16 isolated dots and is not connected at all — yet it still separates inside from outside. Not a curve, but it does divide the plane.</td></tr>
+        <tr><td><b>8 for both</b></td><td class="num">1</td><td class="num">1</td><td><b>The contradiction.</b> The ring is a single connected closed curve, and the inside and the outside are <i>also</i> connected — to each other, through the diagonal gaps. Jordan fails.</td></tr>
+        <tr class="hit"><td><b>8 foreground, 4 background</b></td><td class="num">1</td><td class="num">2</td><td>Connected curve, two background pieces. Jordan holds. <b>This is the standard choice</b>, and the reason libraries default to 8-connectivity for objects.</td></tr>
+        <tr><td><b>4 foreground, 8 background</b></td><td class="num">16</td><td class="num">1</td><td>Also consistent, and appropriate when the objects are the light regions rather than the dark ones. The rule is simply that the two must differ.</td></tr>
+      </table>
+
+      <div class="callout"><b>The rule to remember.</b> <b>Foreground and background must use opposite connectivities.</b> Using 8 for both makes thin diagonal structures both connect and fail to separate; using 4 for both shatters every diagonal line into dust. Which of the two mixed conventions you pick decides whether diagonal contact counts as touching, and that is a modelling decision about your objects, not a mathematical one. The alternative fix, used in some morphology systems, is to work on a hexagonal grid, where every neighbour is at the same distance and the question never arises.</div>
+
+      <h4>The algorithm</h4>
+      <p>Labelling is one pass with a <a href="../../dsa/data-structures/trees-bst.html">union–find</a> structure, and it is worth knowing because the same structure reappears in the graph-based merging of §11 and in the watershed of §12.</p>
+      <ol class="steps">
+        <li><b>Raster scan.</b> For each foreground pixel, look at the already-visited neighbours — for 8-connectivity that is the pixel to the left and the three above. If none is labelled, mint a new label. If one is, copy it.</li>
+        <li><b>Record collisions.</b> If two visited neighbours carry <i>different</i> labels, both are correct and the labels are equivalent: <code>union(a, b)</code>. This is a U-shaped object being met from both arms before the join is seen.</li>
+        <li><b>Second pass.</b> Replace every label by <code>find(label)</code>, and renumber consecutively.</li>
+      </ol>
+      <p>Cost is <code>O(N·α(N))</code> where <code>α</code> is the inverse Ackermann function — constant for any conceivable image. The flood-fill alternative (one depth- or breadth-first search per component) is <code>O(N)</code> and simpler to write, but touches the image in scattered order and is slower in practice on large images for cache reasons.</p>
+
+      <h4>What you get once you have components</h4>
+      <ul class="notes">
+        <li><b>Area</b> — the pixel count. The single most useful filter there is: drop everything below a minimum area and most threshold noise disappears.</li>
+        <li><b>Perimeter</b> — the count of boundary edges, or a chain-code length. Beware: the naive count over-estimates diagonal boundaries by up to <code>√2</code>, so a "circularity" computed from it is biased.</li>
+        <li><b>Bounding box, centroid, second moments</b> — the centroid <code>(x̄, ȳ)</code> and the covariance of the pixel coordinates give an equivalent ellipse, its orientation and its elongation, all in one pass.</li>
+        <li><b>Euler number</b> <code>E = C − H</code>, components minus holes. Cheap, and a genuinely topological descriptor — but it depends on the connectivity convention exactly as the counts above do, so it must be quoted together with the convention.</li>
+        <li><b>Compactness</b> <code>4πA/P²</code>, which is 1 for a circle and small for a ragged shape. Useful for rejecting noise clusters, and sensitive to the perimeter bias just mentioned.</li>
+      </ul>
+
+      <div class="viz" id="viz-cc">
+        <div class="vhead">
+          <span class="vtitle">Two connectivities, one diamond, and a topological contradiction you can count</span>
+          <span class="vhint">set both menus to 8 and read the background count — the inside and the outside are the same region</span>
+        </div>
+        <div class="controls">
+          <label>foreground
+            <select id="cc-fg"><option value="4">4-connected</option><option value="8" selected>8-connected</option></select>
+          </label>
+          <label>background
+            <select id="cc-bg"><option value="4" selected>4-connected</option><option value="8">8-connected</option></select>
+          </label>
+          <label>drop components smaller than <input type="range" id="cc-min" min="1" max="40" step="1" value="1" /><span id="cc-minv" style="min-width:44px;display:inline-block">1 px</span></label>
+        </div>
+        <svg id="cc-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Left: an eleven by eleven grid carrying a diagonal ring of sixteen pixels. Foreground pixels are coloured by connected component under the chosen foreground rule and background pixels are coloured by component under the chosen background rule, so the counts are directly visible: under four-connectivity every ring pixel is its own island, under eight-connectivity the ring is one piece, and when both rules are eight the inside and the outside of the ring receive the same colour, which is the Jordan curve theorem failing. Right: a thresholded blob image contaminated with salt noise, with its components coloured and a slider that discards components below a minimum area; a curve beneath plots the surviving component count against that minimum area and falls off a cliff between the noise speckles and the real blobs. A table gives foreground and background component counts, the number of holes, the Euler number, and whether the chosen pair of conventions is topologically consistent."></svg>
+        <div class="readout" aria-live="polite" id="cc-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Set both menus to 4.</b> Sixteen foreground components — the ring is dust — but still two background components. A set can separate the plane without being connected.</li>
+        <li><b>Set both menus to 8.</b> One foreground component and <b>one</b> background component. The interior and the exterior have merged through the diagonal gaps between ring pixels. There is now no meaningful notion of "inside this object", and any hole-filling or Euler-number code built on this convention pair returns nonsense.</li>
+        <li><b>Set foreground 8, background 4.</b> One curve, two background pieces, one hole, Euler number <code>1 − 1 = 0</code> — an annulus, which is what a ring is. This is the only pair of the four that gets the topology of a ring right while keeping the ring connected.</li>
+        <li><b>On the right, push the minimum-area slider.</b> The component count falls off a cliff: the salt noise is nearly all components of one to three pixels, and the blobs are hundreds. That gap is why area filtering works, and the width of the gap is a decent measure of how well the threshold did.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Segmentation series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../segmentation.html">← Segmentation · overview</a>
+      <a href="../segmentation.html" style="color:var(--muted)">Segmentation · overview</a>
+      <a href="regions-watershed.html">Region Growing &amp; Watershed →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../vision-viz.js"></script>
+<script src="../segmentation.viz.js"></script>
+</body>
+</html>

@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Transformer Training &amp; Decoding</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to the other pages of the series */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../transformers.html">Transformers</a> · part 4 of 7</p>
+      <h1>Transformer Training &amp; Decoding</h1>
+      <p>The recipe that trains a transformer and the rules that read it out: teacher forcing under the causal mask, label smoothing and its loss floor, warmup then decay, AdamW with clipping and dropout, bf16 against fp16, then temperature, top-k, top-p, greedy and beam decoding run live.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Transformers</span>
+        <span class="pill">Teacher forcing · label smoothing · warmup · AdamW · bf16 · top-k/top-p · beam</span>
+      </div>
+    </header>
+
+    <!-- ═══ 24 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="teacher" data-nav="Teacher forcing with the causal mask">
+      <h3><span class="idx">24</span> The training recipe (1): teacher forcing with the causal mask — one forward pass, every position's loss</h3>
+      <p class="lede">A decoder is trained to predict the next token, and the mask is what lets it be trained on <i>all</i> next tokens of a sequence in one pass. The recipe is the shift by one, the mask, and the mean over positions; the cost is the exposure bias <a href="../rnns-lstms/architectures-seq2seq.html#teacher">the RNN page's teacher-forcing section</a> named, which a decoder inherits unchanged.</p>
+
+      <div class="formula"><span class="lbl">the shift, the mask, the loss</span><span class="eq">sequence      t₀ t₁ t₂ … t_{n−1}                       one document, or a chunk of one
+input rows    X = [t₀, t₁, …, t_{n−2}]                     positions 0 … n−2
+targets       y = [t₁, t₂, …, t_{n−1}]                     the SAME tokens, shifted by one
+mask          causal: position i reads 0 … i, so its prediction of yᵢ = tᵢ₊₁ cannot see tᵢ₊₁
+loss          L = (1/n′) ∑ᵢ −log p(yᵢ | t₀ … tᵢ)           n′ = the positions that carry a target
+
+ONE forward pass produces every p(yᵢ | ·) at once — n′ supervised predictions from n tokens —
+because the mask makes each row's computation exactly what it would have been had the
+model been run on the prefix alone.  DL.tfLoss(m, idx, tgt) is this line, with tgt[i] = −1
+for the positions that carry no target (a prompt, padding).</span>
+<span class="lbl">the equivalence that makes it legitimate, and the bias it leaves</span><span class="eq">causal masking ⇒  logitsᵢ( t₀ … t_{n−1} ) = logitsᵢ( t₀ … tᵢ )     exactly, at every layer (§18)
+so training on the full sequence with the mask IS training on every prefix separately,
+at about 2/n of the cost (n tokens pushed through once, instead of 1 + 2 + … + n).
+
+but every prefix is the TRUE prefix. At inference the prefix is the model's own output,
+and a model that has only ever conditioned on correct prefixes has never learned to
+recover from an incorrect one — exposure bias. The figure measures it on the trained
+model: accuracy when teacher-forced against accuracy when fed its own predictions — no gap
+once a task is solved (the model's own outputs ARE the true tokens); a gap on a partly
+trained model (at 60 steps: 40% teacher-forced against 35% free-running).</span></div>
+
+      <p>Two details in the recipe are transformer-specific. <b>Documents are packed</b>: to keep every row of the batch at the trained context, several documents are concatenated with a separator, and the causal mask is either left as it is (a token may read the previous document — cheap, and at scale found to cost little) or blocked at document boundaries (a block-diagonal causal mask, built from the same additive machinery). <b>The loss is a mean over positions, not over sequences</b>, so a long document contributes more than a short one, and the per-position losses are not equal: the first positions of a document have little context and high loss, later positions less. The figure plots the per-position loss of the trained copy model, and it is the shape every language-model loss curve has along the sequence — high where there is nothing to condition on, low where the answer is determined.</p>
+
+      <div class="formula"><span class="lbl">packing, and the two masks it can use — three short documents in one row of n = 10</span><span class="eq">row     A₁ A₂ A₃ ‹eos› B₁ B₂ ‹eos› C₁ C₂ C₃          targets: the same row shifted left
+plain causal mask:  position 5 (B₂) may read A₁ … A₃ and ‹eos›: the previous document leaks in.
+                    cheap; at scale the model learns that ‹eos› resets the context.
+document mask:      block-diagonal causal —  M[i][j] = 0 iff j ≤ i AND doc(j) = doc(i), else −∞
+                    (each ‹eos› counted with the document it ends;  · = −∞)
+
+                         A₁ A₂ A₃ ‹e›  B₁ B₂ ‹e›  C₁ C₂ C₃
+                    A₁    0  ·  ·  ·    ·  ·  ·    ·  ·  ·
+                    A₂    0  0  ·  ·    ·  ·  ·    ·  ·  ·
+                    A₃    0  0  0  ·    ·  ·  ·    ·  ·  ·
+                    ‹e›   0  0  0  0    ·  ·  ·    ·  ·  ·
+                    B₁    ·  ·  ·  ·    0  ·  ·    ·  ·  ·
+                    B₂    ·  ·  ·  ·    0  0  ·    ·  ·  ·
+                    ‹e›   ·  ·  ·  ·    0  0  0    ·  ·  ·
+                    C₁    ·  ·  ·  ·    ·  ·  ·    0  ·  ·
+                    C₂    ·  ·  ·  ·    ·  ·  ·    0  0  ·
+                    C₃    ·  ·  ·  ·    ·  ·  ·    0  0  0
+
+                    three triangles on the diagonal, −∞ everywhere else; built from the same
+                    additive machinery as the causal mask, and every row still has at least
+                    one 0 (itself) — no NaN.
+either way: ONE forward pass, 9 supervised positions, three documents' worth of loss.
+with a document mask the loss at B₁ is the loss of a document's first token: no context, high.</span></div>
+
+      <div class="viz" id="viz-tf">
+        <div class="vhead">
+          <span class="vtitle">One sequence through the trained model: inputs, shifted targets, the mask, the per-position loss — and free-running against teacher-forced</span>
+          <span class="vhint">the grey positions carry no target; every coloured bar is one term of the mean, all computed in one pass; the bottom panel re-runs the answer half feeding the model its own predictions — at 300 steps the copy model is perfect both ways, so switch to 60 steps to see the gap open</span>
+        </div>
+        <div class="controls">
+          <label>task <select id="tf-t"><option value="copy" selected>copy</option><option value="reverse">reverse</option><option value="sort">sort</option></select></label>
+          <label>example <input type="range" id="tf-e" min="0" max="19" step="1" value="3" /><span id="tf-ev" style="min-width:16px;display:inline-block">3</span></label>
+          <label>steps trained <select id="tf-s"><option value="60">60</option><option value="300" selected>300</option></select></label>
+        </div>
+        <svg id="tf-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Top: the input sequence as a row of labelled cells and beneath it the target sequence shifted one place left, with cells that carry no loss greyed out. Left middle: the causal mask as a small triangular grid. Right middle: the per-position cross-entropy of the trained model as bars, one per supervised position, with the mean printed; on the copy task after three hundred steps every bar is near zero. Bottom: the answer half generated two ways from the same prefix — teacher-forced, where every input is the true token, and free-running, where each input is the model's previous argmax — with the two output rows shown and mismatches highlighted, and the accuracy of each over twenty held-out examples printed. The readout prints the number of supervised positions, the mean loss, and the two accuracies."></svg>
+        <div class="readout" aria-live="polite" id="tf-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 25 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="smoothing" data-nav="Label smoothing: the floor">
+      <h3><span class="idx">25</span> The training recipe (2): label smoothing — the target it really trains on, and the loss floor it creates</h3>
+      <p class="lede">The 2017 recipe trained against a target that put <code>0.9</code> on the correct token and spread <code>0.1</code> over the rest. That changes what "perfect" means: the loss can no longer reach zero, the optimal logit gap is finite, and the reported training loss must be read against a floor that this section derives.</p>
+
+      <div class="formula"><span class="lbl">the smoothed target and the loss against it</span><span class="eq">one-hot     q = e_k                                    L = −log p_k
+smoothed    q_ε = (1 − ε)·e_k + ε/V · 1                  L_ε = −∑ⱼ q_ε[j] log pⱼ
+                                                         = (1 − ε)(−log p_k) + (ε/V) ∑ⱼ (−log pⱼ)
+i.e. the usual loss, damped by (1 − ε), PLUS a penalty on making ANY token improbable</span>
+<span class="lbl">the floor — the loss when p = q<span class="keep">_ε</span> exactly</span><span class="eq">L_ε(p = q_ε) = H(q_ε) = −(1 − ε + ε/V)·log(1 − ε + ε/V) − (V − 1)·(ε/V)·log(ε/V)
+
+ε = 0.1, V = 50 257:   H = 0.0948 + 1.3127 = 1.408 nats           ← the loss cannot go below this
+ε = 0.1, V = 32 000:   1.363 nats          ε = 0.1, V = 8: 0.467 nats          ε = 0: 0
+and the optimal logit gap between the correct token and any other is FINITE:
+   z_k − z_j = log( (1 − ε + ε/V) / (ε/V) ) = log(1 + (1 − ε)·V/ε)  =  13.02 at ε = 0.1, V = 50 257
+against +∞ for a one-hot target — the smoothing is a cap on confidence, and that is the point.</span>
+<span class="lbl">by hand — V = 4, <span class="keep">ε</span> = 0.1, correct token k = 2 (0-based)</span><span class="eq">q_ε = 0.9·e₂ + 0.1/4 · 1  =  [ 0.025   0.025   0.925   0.025 ]          sums to 1
+
+floor  H(q_ε) = −0.925·ln 0.925 − 3·0.025·ln 0.025 = 0.0721 + 0.2767 = 0.349 nats
+optimal gap    ln( 0.925 / 0.025 ) = ln 37 = 3.61  (against ∞ for a one-hot target)
+
+a model that puts p = [ 0.05  0.05  0.85  0.05 ]:
+   one-hot loss    −ln 0.85                                            = 0.163
+   smoothed loss   −∑ⱼ q_ε[j]·ln pⱼ = 0.925·0.163 + 3·0.025·(−ln 0.05) = 0.150 + 0.225 = 0.375
+   gradient on the logits  p − q_ε = [ 0.025  0.025  −0.075  0.025 ]  — still pushing 2 up, the rest down;
+   the same model with p₂ = 0.99 would have a gap of ln(0.99/0.0033) = 5.7 > 3.61, and the sign of ∂L/∂z₂ flips.</span></div>
+
+      <p>Two consequences for reading a training run. First, <b>a loss of 1.4 on a smoothed 50k-vocabulary objective is a perfect model</b>, and the comparable one-hot cross-entropy has to be computed separately (the work that introduced the recipe noted that smoothing "hurts perplexity" while improving accuracy — the two numbers are not the same objective). Second, the gradient with respect to the logits is <code>p − q_ε</code> rather than <code>p − e_k</code>, so it does not vanish at a confident correct prediction — once the model is more confident than the target, it pushes the correct logit <i>down</i> and the others <i>up</i> until the gap is back at <code>13.02</code>, which is a mild, permanent regulariser on the head. Encoder–decoder translation models keep it; most decoder-only language models drop it (<code>ε = 0</code>), because on a next-token objective at scale the calibration it buys is not needed and the floor obscures the number everyone compares. The figure evaluates the floor and the gap for any <code>(ε, V)</code> and shows the gradient at the optimum.</p>
+
+      <div class="viz" id="viz-ls">
+        <div class="vhead">
+          <span class="vtitle">Label smoothing: the target distribution, the loss floor against ε and V, and the finite optimal logit gap</span>
+          <span class="vhint">the floor is the entropy of the smoothed target — set ε to zero and it vanishes; the gap is where the gradient p − q_ε is zero, and it is finite for every ε above zero</span>
+        </div>
+        <div class="controls">
+          <label>ε <input type="range" id="ls-e" min="0" max="0.3" step="0.01" value="0.1" /><span id="ls-ev" style="min-width:34px;display:inline-block">0.10</span></label>
+          <label>vocabulary V <select id="ls-V"><option value="8">8</option><option value="1000">1 000</option><option value="32000">32 000</option><option value="50257" selected>50 257</option><option value="128256">128 256</option></select></label>
+          <label>logit gap to show <input type="range" id="ls-g" min="0" max="20" step="0.5" value="8" /><span id="ls-gv" style="min-width:30px;display:inline-block">8.0</span></label>
+        </div>
+        <svg id="ls-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Left: the smoothed target for a vocabulary of the chosen size drawn as a bar for the correct token and a much shorter bar for a typical other token, with the two probabilities printed. Middle: the loss floor, the entropy of the smoothed target, plotted against epsilon from zero to 0.3 for the chosen vocabulary, zero at epsilon zero and rising, with the current epsilon marked and its floor printed. Right: the smoothed loss as a function of the logit gap between the correct token and all others, with every other logit equal, a curve that decreases to a minimum at the finite optimal gap and rises again beyond it; the current gap is marked and the gradient of the loss with respect to the correct logit at that gap is printed. The readout prints the floor, the optimal gap, and the gradient at the chosen gap."></svg>
+        <div class="readout" aria-live="polite" id="ls-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 26 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="schedule" data-nav="Warmup, then decay">
+      <h3><span class="idx">26</span> The training recipe (3): the warmup-then-decay schedule, derived from the 2017 rule and plotted from the library</h3>
+      <p class="lede">The original recipe tied the learning rate to the width and the step count in one formula. Written out, it is a linear warmup to a peak that depends on <code>d</code> and the warmup length, followed by an inverse-square-root decay; the modern recipe keeps the warmup and swaps the tail for a cosine. Both come out of <code>DL.lrAt</code> with the right arguments, and §12 said why the warmup is there.</p>
+
+      <div class="formula"><span class="lbl">the 2017 rule, and what each piece is</span><span class="eq">η(step) = d^(−½) · min( step^(−½) ,  step · warmup^(−3/2) )          step = 1, 2, …
+
+for step ≤ warmup:   the second term wins:  η = d^(−½) · warmup^(−3/2) · step       LINEAR in step
+for step ≥ warmup:   the first wins:        η = d^(−½) · step^(−½)                   ∝ 1/√step
+at step = warmup:    both equal              η_peak = (d · warmup)^(−½)
+
+d = 512, warmup = 4000:   η_peak = (512 · 4000)^(−½) = 6.99e−4
+d = 512, warmup = 8000:   4.94e−4        d = 1024, warmup = 4000:  4.94e−4
+so the peak FALLS with both width and warmup length, and the decay after the peak is slow:
+at step = 100 000 with warmup 4000 the rate is √(4000/100000) = 0.2 of the peak.
+
+by hand, d = 512, warmup = 4 000  (d^(−½) = 0.04419,  warmup^(−3/2) = 3.953e−6):
+   step  1 000:   0.04419 · min( 1000^(−½) = 0.0316 ,  1000 · 3.953e−6 = 0.00395 )  =  0.04419 · 0.00395  =  1.75e−4
+   step  4 000:   0.04419 · min( 0.0158 , 0.0158 )                                   =  6.99e−4   ← the peak
+   step 16 000:   0.04419 · min( 16000^(−½) = 0.00791 ,  0.0632 )                    =  3.49e−4   = peak / 2
+   step 100 000:  0.04419 · 100000^(−½)                                              =  1.40e−4   = 0.2 · peak
+   (DL.noamLR returns 1.747e−4, 6.988e−4, 3.494e−4, 1.398e−4 for the same four steps)</span>
+<span class="lbl">the same object in the library, and the modern replacement</span><span class="eq">DL.noamLR(step, d, warmup)  ≡  DL.lrAt("invsqrt", step, {peak: (d·warmup)^(−½), warm: warmup})   to round-off
+modern:   DL.lrAt("cosine", step, {peak: η_max, warm: W, total: T, floor: η_min})
+          linear warmup over W steps — a fraction of a percent of the run in the two recipes of
+          §27: 375M of 300B tokens, and 2 000 of roughly 500 000 steps — then cosine from η_max
+          to η_min ≈ η_max/10 over the remaining steps. η_max is set by hand — 6e−4 for a 125M-class model,
+          3e−4 at 350M, 2e−4 at 1.3B, 1.2e−4 at 6.7B, 6e−5 at 175B in the published 2020 family;
+          3e−4 at 7B and 1.5e−4 at 70B in the 2023 family — smaller with width, as the 2017
+          rule's d^(−½) already said (the 2020 family's peaks fall as d^(−0.77) over that range).</span></div>
+
+      <p>Three things the plot makes visible. The <b>warmup</b> is a straight line from zero and is the part of the schedule §12 explained: the gradient scales at initialisation are not the scales the optimiser will see later, and a post-norm stack in particular cannot take a full-size step at step one. The <b>inverse-square-root tail</b> never reaches a floor and decays slowly — it was designed for training runs whose length was not fixed in advance. The <b>cosine tail</b> reaches a chosen floor at a chosen step, which is what a run with a fixed token budget wants, and it spends more of the run near the peak; the two tails differ by a factor of about two over most of a long run, which is one reason the modern recipe's peak rates can sit at or below what the 2017 rule would give at the same width — at <code>d = 4096</code> with a 2 000-step warmup the rule gives <code>(4096·2000)^(−½) = 3.5e−4</code>, and the 2023 recipe's 7B peak is <code>3.0e−4</code>. The figure also draws the constant-then-drop schedule some recent recipes prefer (a "warmup–stable–decay" shape), because it makes the same point from the other side: what the decay buys is the last few percent of loss, and when it is taken is a choice.</p>
+
+      <div class="viz" id="viz-sc">
+        <div class="vhead">
+          <span class="vtitle">The 2017 rule against warmup + cosine and warmup–stable–decay, from DL.lrAt and DL.noamLR</span>
+          <span class="vhint">change d and the warmup and watch the 2017 peak move exactly as (d·warmup)^(−½) says; the cosine curve's peak is a free choice, so it is set to match at the defaults</span>
+        </div>
+        <div class="controls">
+          <label>d_model <select id="sc-d"><option value="256">256</option><option value="512" selected>512</option><option value="1024">1024</option><option value="4096">4096</option></select></label>
+          <label>warmup steps <select id="sc-w"><option value="1000">1000</option><option value="4000" selected>4000</option><option value="8000">8000</option></select></label>
+          <label>total steps <select id="sc-T"><option value="50000">50 000</option><option value="100000" selected>100 000</option><option value="300000">300 000</option></select></label>
+          <label>cosine floor <select id="sc-f"><option value="0">0</option><option value="0.1" selected>peak / 10</option></select></label>
+          <label><input type="checkbox" id="sc-log" /> log axis for the rate</label>
+        </div>
+        <svg id="sc-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Left: learning rate against step for three schedules over the full run — the 2017 inverse-square-root rule rising linearly to its peak at the warmup step and then decaying slowly without a floor, a warmup-plus-cosine schedule with the same peak decaying to a tenth of the peak at the last step, and a warmup-stable-decay schedule that holds the peak for most of the run and drops linearly at the end. Right: a zoom on the first few thousand steps showing the three linear warmups coinciding, with a printed check that the library's inverse-square-root schedule and the closed-form rule agree to round-off. The readout prints the peak of the 2017 rule for the chosen width and warmup, the rate each schedule reaches at the end of the run, and the mean rate over the run for each, which is the number that decides how far the model travels."></svg>
+        <div class="readout" aria-live="polite" id="sc-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 27 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="adamw" data-nav="AdamW, clipping, dropout — as set">
+      <h3><span class="idx">27</span> The training recipe (4): AdamW as it is actually set — <code>β₂</code>, decoupled decay, clipping, and where the dropout goes</h3>
+      <p class="lede"><a href="../neural-network-training/optimizers.html#adamw">The training page owns AdamW</a> as an algorithm. This section owns the four numbers a transformer recipe sets differently from the textbook defaults, and measures the one that matters most: the second-moment constant.</p>
+
+      <div class="formula"><span class="lbl">the recipe's numbers, and the textbook's</span><span class="eq">                    textbook default     transformer recipe      why
+β₁                  0.9                  0.9                     unchanged
+β₂                  0.999                0.95                    the figure: a gradient spike under 0.999
+                                                                 both overshoots and then starves the step
+                                                                 for ~1/(1−β₂) = 1000 steps
+ε                   1e−8                 1e−8 … 1e−5             1e−8 in the 2020 family, 1e−5 in the 2023 one
+weight decay        0 or 1e−4 (L2)       0.1, DECOUPLED          applied to the matrices — not to norms or
+                                                                 biases; embeddings vary by recipe
+gradient clipping   none                 global norm 1.0         DL.clipNorm: rescales, never re-directs
+batch (tokens)      —                    0.5M … 4M               set by the budget; in some recipes ramped
+                                                                 up over the first few billion tokens
+(the 2017 recipe sat in between: β₂ = 0.98, ε = 1e−9, no weight decay, dropout instead — §26's schedule)</span>
+<span class="lbl">why <span class="keep">β₂</span> = 0.95: the update under a spike, from the update rule itself</span><span class="eq">Adam's step is  m̂ / (√v̂ + ε)   with   m ← β₁m + (1−β₁)g,   v ← β₂v + (1−β₂)g²
+a spike g_s = 50·g_typical at one step, from a steady state m ≈ g, v ≈ g² (so m̂/√v̂ ≈ 1), in units of g:
+   β₂ = 0.999:  m ← 0.9·1 + 0.1·50 = 5.9      v ← 0.999·1 + 0.001·2500 = 3.50
+                ⇒  the step that turn is 5.9/√3.50 = 3.2× the usual (3.2× measured) — then v stays
+                inflated for ~1/(1−β₂) = 1000 steps and every subsequent step is SMALLER than it
+                should be, in every direction
+   β₂ = 0.95:   m ← 5.9 (the same)              v ← 0.95·1 + 0.05·2500 = 126
+                ⇒  step = 5.9/√126 = 0.53× the usual (0.50× measured): the spike is ABSORBED, and v's
+                time constant is 1/(1−β₂) = 20 steps (the figure's step is back within 15% of normal
+                after about 135 steps, against about 2 000 for β₂ = 0.999)
+the figure runs DL.OPT.adam on exactly this gradient stream, with the spike at step 3000 so that
+the bias corrections have expired and the steady-state arithmetic above applies.</span></div>
+
+      <h4>Two published recipes, as tables</h4>
+      <table class="grid2">
+        <tr><th>family</th><th>size</th><th>peak η</th><th>batch (tokens)</th><th>warmup</th><th>decay</th><th>β₁, β₂, ε</th><th>weight decay</th><th>clip</th><th>tokens</th></tr>
+        <tr><td rowspan="5"><b>2020 decoder family</b> (learned positions, pre-norm, GELU)</td><td>125M</td><td class="num">6.0e−4</td><td class="num">0.5M</td><td rowspan="5">linear over 375M tokens; batch ramped from 32k tokens over the first 4–12B</td><td rowspan="5">cosine to 10% over 260B tokens, then flat</td><td rowspan="5" class="mono">0.9, 0.95, 1e−8</td><td rowspan="5" class="num">0.1</td><td rowspan="5" class="num">1.0</td><td rowspan="5" class="num">300B</td></tr>
+        <tr><td>350M</td><td class="num">3.0e−4</td><td class="num">0.5M</td></tr>
+        <tr><td>1.3B</td><td class="num">2.0e−4</td><td class="num">1M</td></tr>
+        <tr><td>6.7B</td><td class="num">1.2e−4</td><td class="num">2M</td></tr>
+        <tr><td>175B</td><td class="num">0.6e−4</td><td class="num">3.2M</td></tr>
+        <tr><td rowspan="2"><b>2023 decoder family</b> (RoPE, pre-RMSNorm, SwiGLU)</td><td>7B</td><td class="num">3.0e−4</td><td class="num">4M</td><td rowspan="2">2 000 steps</td><td rowspan="2">cosine to 10%</td><td rowspan="2" class="mono">0.9, 0.95, 1e−5</td><td rowspan="2" class="num">0.1</td><td rowspan="2" class="num">1.0</td><td rowspan="2" class="num">2T</td></tr>
+        <tr><td>70B</td><td class="num">1.5e−4</td><td class="num">4M</td></tr>
+      </table>
+      <p>Read across the columns and the recipe's constants are the same in both families three years apart: <code>β₂ = 0.95</code>, decay 0.1, clipping at 1.0, warmup then cosine to a tenth. What moved is the peak rate (down with width, as §26's rule says) and the batch (up with size and up over the course of a run — the batch ramp is a second warmup, on the noise scale rather than the step size). The <code>ε</code> difference is plausibly a bf16 accommodation — the 2023 recipe does not say — since with coarser gradients a larger <code>ε</code> keeps the denominator from being dominated by rounding; it is also a floor on how large a step a near-zero second moment can produce.</p>
+
+      <h4>Dropout: where, and how much</h4>
+      <p>The 2017 recipe applied dropout of <code>0.1</code> in three places: to the output of every sub-layer <i>before</i> it is added to the residual stream (so the stream itself is never dropped), to the attention weights after the softmax (which zeros individual entries of <code>A</code>, so a row no longer sums to one; the survivors are rescaled by <code>1/(1 − p)</code> like any dropout and nothing renormalises the row — the paper's text names the first and third placements, its reference implementation had the second as well), and to the sum of embedding and position before the first block. Encoders of the 2018 generation kept all three at <code>0.1</code>. Most large decoders since 2020 use <b>none</b> (a few 2022 families kept <code>0.1</code>): at their data scale each token is seen about once and there is little to overfit to, and the regularisation costs real capacity. The rule is therefore a function of the data-to-parameter ratio rather than of the architecture, and <a href="../neural-network-training/normalization-regularization.html#dropout">the training page</a> owns the mechanism. What the architecture fixes is only the <i>placement</i>: on the sub-layer output, never on the residual path, and never after the final norm.</p>
+
+      <div class="viz" id="viz-ad">
+        <div class="vhead">
+          <span class="vtitle">Adam's step size through a gradient spike at two values of β₂, and global-norm clipping on the same stream</span>
+          <span class="vhint">the gradient stream is steady noise with one spike at step 3000; with β₂ = 0.999 the step overshoots at the spike and then stays too small for hundreds of steps, with 0.95 it is absorbed — clipping the gradient norm caps the spike before Adam sees it</span>
+        </div>
+        <div class="controls">
+          <label>spike size × <input type="range" id="ad-s" min="5" max="100" step="5" value="50" /><span id="ad-sv" style="min-width:24px;display:inline-block">50</span></label>
+          <label>β₂ to compare with 0.95 <select id="ad-b"><option value="0.999" selected>0.999</option><option value="0.99">0.99</option><option value="0.98">0.98</option></select></label>
+          <label>clip at ‖g‖ ≤ <select id="ad-c"><option value="0" selected>no clipping</option><option value="2">2× typical</option><option value="1">1× typical</option></select></label>
+          <label>seed <input type="range" id="ad-seed" min="1" max="5" step="1" value="1" /><span id="ad-seedv" style="min-width:16px;display:inline-block">1</span></label>
+        </div>
+        <svg id="ad-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Upper panel: the gradient stream against step — small noisy values with one large spike at step three thousand — and, if clipping is on, the clipped stream overlaid. Lower panel: the magnitude of Adam's update in units of the learning rate against step for the two second-moment constants; before the spike both hover near one; at the spike the 0.999 curve jumps to several times its usual size while the 0.95 curve dips below one; after the spike the 0.999 curve stays well below one for hundreds of steps as the inflated second moment decays, while the 0.95 curve recovers within a few dozen steps and is back within fifteen percent of normal after about a hundred and thirty. The readout prints the step size at the spike and the number of steps each takes to settle back within fifteen percent of its pre-spike level."></svg>
+        <div class="readout" aria-live="polite" id="ad-readout"></div>
+      </div>
+
+      <div class="wrong"><span class="say">The decay applied everywhere.</span> Weight decay of <code>0.1</code> applied to the LayerNorm gains and to the biases. <span class="fix">Nothing crashes; the norms' <code>γ</code> are pulled toward zero every step, and the model fights its own regulariser.</span> The recipe decays the matrices (the things with a scale to control) and excludes the one-dimensional parameters; most frameworks require the two groups to be listed explicitly, and the default of decaying everything is the bug.</div>
+    </section>
+
+    <!-- ═══ 28 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="precision" data-nav="bf16 against fp16">
+      <h3><span class="idx">28</span> The training recipe (5): mixed precision — bf16 against fp16, and what the loss scale was for</h3>
+      <p class="lede"><a href="../neural-network-training/schedules-precision-memory.html#precision">The training page</a> owns mixed precision as a topic. What this section owns is the transformer-specific fact that decided the format: a 16-bit float with fp32's exponent range and a coarse mantissa (bf16) trains a transformer without the loss-scaling machinery that a 16-bit float with a fine mantissa and a small range (fp16) needs, and the reason is where the small numbers are.</p>
+
+      <div class="formula"><span class="lbl">the two 16-bit formats, exactly</span><span class="eq">                 sign   exponent   mantissa   largest        smallest normal   smallest subnormal   unit round-off (½ step)
+fp16               1        5         10       65 504         6.10e−5           5.96e−8              2^(−11) = 4.9e−4
+bf16               1        8          7       3.39e38        1.18e−38          9.18e−41             2^(−8)  = 3.9e−3
+fp32               1        8         23       3.40e38        1.18e−38          1.40e−45             2^(−24) = 6.0e−8
+bf16 is fp32 with the low 16 mantissa bits cut off: SAME range, 8× coarser steps than fp16.</span>
+<span class="lbl">where the trouble is — activations and gradients in a transformer</span><span class="eq">activations in a large model can exceed 65 504 — a few outlier coordinates of the residual
+stream, and in some models the attention logits before the softmax               → fp16 overflow → inf, then NaN
+gradients of early layers and of embeddings are routinely 1e−8 … 1e−5                          → fp16 UNDERFLOW → zero
+the loss-scale fix:   multiply the loss by S (say 2¹⁶), so every gradient is S× larger and lands in
+                      fp16's range; divide by S in fp32 before the update; if a gradient overflows,
+                      skip the step and halve S; grow S every N clean steps (dynamic loss scaling)
+bf16 needs none of it: a 1e−8 gradient is representable, a 1e5 score is representable.
+what bf16 costs: 3.9e−3 relative rounding on every stored value — which is why the MASTER copy
+of the weights and the optimiser state stay in fp32 and only the matmuls run in 16 bits.</span></div>
+
+      <p>The figure makes the two failure modes literal. It draws a histogram of gradient magnitudes of the shape a transformer produces — log-normal across many decades — and rounds every value to each format: the fraction that becomes exactly zero in fp16 is printed, and it is not small; in bf16 it is zero. Then it applies a loss scale and shows the fp16 fraction fall to zero, and it applies too large a scale and shows the top of the distribution overflow instead. The other panel rounds a single number to both formats and prints the relative error, which for bf16 is up to eight times larger than fp16's (the steps are eight times coarser; on a single value the ratio depends on where it falls between steps): that is the price, and it is paid in the forward pass, where a matmul of thousands of terms averages it away, rather than in the weights, which are never stored in 16 bits. <a href="../distributed-training.html">Distributed Training</a> owns what happens to these choices at multi-device scale.</p>
+
+      <div class="viz" id="viz-mp">
+        <div class="vhead">
+          <span class="vtitle">A gradient histogram rounded to fp16 and to bf16: the underflow fraction, the overflow fraction, and the loss scale that moves them</span>
+          <span class="vhint">the histogram is log-normal on purpose — that is the shape gradients have; the loss scale slides it right, out of fp16's underflow and, if pushed, into its overflow; bf16 has neither problem and a coarser mantissa</span>
+        </div>
+        <div class="controls">
+          <label>gradient median <select id="mp-m"><option value="1e-4">10⁻⁴</option><option value="1e-6" selected>10⁻⁶</option><option value="1e-7">10⁻⁷</option></select></label>
+          <label>spread (decades) <input type="range" id="mp-s" min="1" max="4" step="0.5" value="2.5" /><span id="mp-sv" style="min-width:24px;display:inline-block">2.5</span></label>
+          <label>loss scale 2^k, k = <input type="range" id="mp-k" min="0" max="30" step="1" value="0" /><span id="mp-kv" style="min-width:20px;display:inline-block">0</span></label>
+          <label>value to round <select id="mp-v"><option value="0.3333333">1/3</option><option value="1024.7">1024.7</option><option value="3.14159e-5" selected>3.14159e−5</option></select></label>
+        </div>
+        <svg id="mp-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left: a histogram of gradient magnitudes on a logarithmic axis spanning from ten to the minus twelve to ten to the sixth, with fp16's representable range shaded and its subnormal region shaded more lightly, and bf16's range extending across the whole axis. Bars that fall below fp16's smallest subnormal are coloured as underflow and bars above its largest value as overflow, and the percentage in each is printed for both formats. Moving the loss-scale slider shifts the whole histogram right by the chosen power of two. Right: one chosen value rounded to fp16, to bf16 and to fp32, with the rounded values and the relative errors printed, showing bf16's error larger than fp16's — its representable steps are eight times coarser, though the ratio on any single value varies. The readout prints the four percentages and the three relative errors."></svg>
+        <div class="readout" aria-live="polite" id="mp-readout"></div>
+      </div>
+
+      <h4>The same choice again at load time</h4>
+      <p>Training settles the format; inference has to respect it. A checkpoint trained and saved in bf16 carries nothing in an fp32 copy — the extra mantissa bits are zeros — so loading it in fp32 doubles the memory and, because decode time is weight bytes divided by bandwidth (§47), roughly halves the decode speed, for essentially the same predictions — the weights are identical, and only the precision of the arithmetic on the activations changes. Loading it in fp16 on hardware without bf16 support brings back this section's other failure: the few activation coordinates that exceed 65 504 overflow to <code>∞</code> and then to <code>NaN</code>. The default in current implementations is to load in the dtype the configuration records; §38 walks through it, and the mask constant <code>−1e9</code> that is finite in fp32 and <code>−∞</code> in fp16 is §36's example of a single number whose meaning depends on this choice.</p>
+    </section>
+
+    <!-- ═══ 29 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="sampling" data-nav="Temperature, top-k, top-p">
+      <h3><span class="idx">29</span> Decoding (1): what temperature, top-k and top-p do to one distribution</h3>
+      <p class="lede">The model produces a distribution over the vocabulary at every step; decoding is the rule that turns it into a token. Greedy takes the mode, sampling draws from it, and the three knobs in every generation API are three ways of reshaping the distribution before drawing. Each has a closed form, and each does something the others cannot.</p>
+
+      <div class="formula"><span class="lbl">the four rules, on one logit vector z</span><span class="eq">greedy         t = argmaxⱼ zⱼ                                     deterministic; the mode, every step
+temperature    p_T = softmax(z / T)       T → 0: greedy;  T = 1: the model;  T → ∞: uniform
+               changes every probability; log-odds between two tokens scale by 1/T
+top-k          keep the k largest pⱼ, renormalise                  a HARD cap on the candidate set,
+                                                                     blind to how peaked p is
+top-p          keep the smallest set whose mass ≥ p, renormalise   ADAPTIVE: one token when the model
+(nucleus)                                                            is sure, many when it is not
+the order that frameworks apply them:  temperature → top-k → top-p → sample</span>
+<span class="lbl">two numbers that summarise the reshaped distribution</span><span class="eq">entropy   H(p) = −∑ pⱼ log pⱼ         (nats)   and   perplexity e^H = the effective number of candidates
+temperature moves H continuously; top-k and top-p move it by removing mass from the tail, and the
+figure prints H and e^H for every setting so that "T = 0.7" and "top-p = 0.9" can be compared
+on one scale.</span></div>
+
+      <p>Two facts that the closed forms make clear. First, <b>temperature is not truncation</b>: at <code>T = 0.7</code> the tail is still there, only lighter, and a long generation will eventually draw from it; top-<code>p</code> removes it. Second, <b>top-<code>k</code> is the wrong shape for a language model</b>: the number of plausible next tokens varies by orders of magnitude between positions (one after "the United States of", hundreds after "I think"), and a fixed <code>k</code> is too many in the first case and too few in the second. Nucleus sampling was proposed for exactly this reason. In practice the two are combined — a top-<code>k</code> of 50 as a safety cap and a top-<code>p</code> of 0.9 to 0.95 doing the work — with a temperature slightly below one. Repetition penalties, length normalisation and the beam search of §30 are further rules on top; the KV cache that makes any of this affordable is <a href="../attention/kv-cache-gqa-mla.html#kvcache">the attention page's KV-cache section</a>'s.</p>
+
+      <table class="grid2">
+        <tr><th>use</th><th>rule</th><th>typical setting</th><th>why</th></tr>
+        <tr><td>a single correct answer (extraction, classification framed as generation, code completion)</td><td>greedy or beam</td><td>T = 0, or B = 4 with length normalisation</td><td>the mode is what is wanted; any tail mass is error</td></tr>
+        <tr><td>translation, summarisation</td><td>beam</td><td>B = 4 … 8, α ≈ 0.6</td><td>whole-sequence probability matters; the length penalty stops short outputs winning by default</td></tr>
+        <tr><td>open-ended text</td><td>sampling</td><td>T = 0.7 … 1.0, top-p 0.9 … 0.95, top-k 40 … 50 as a cap</td><td>the mode of a language model is repetitive; the tail is where variety is, and top-p removes only the implausible part of it</td></tr>
+        <tr><td>self-consistency, best-of-n</td><td>sampling, many times</td><td>T ≈ 0.7 … 1.0, n = 5 … 64</td><td>disagreement between samples is the signal; needs the KV cache shared across the samples</td></tr>
+        <tr><td>evaluation of a model's own likelihoods</td><td>none</td><td>—</td><td>score the reference sequence under teacher forcing (§24); no decoding rule is involved</td></tr>
+      </table>
+
+      <div class="viz" id="viz-sp">
+        <div class="vhead">
+          <span class="vtitle">One distribution, reshaped: the model's p, then after temperature, top-k and top-p, with entropy and effective candidates</span>
+          <span class="vhint">the source distribution is Zipf-like on purpose — a long tail is what a language model produces; watch which rule removes the tail and which only lightens it</span>
+        </div>
+        <div class="controls">
+          <label>temperature T <input type="range" id="sp-T" min="0.1" max="2" step="0.1" value="0.8" /><span id="sp-Tv" style="min-width:30px;display:inline-block">0.8</span></label>
+          <label>top-k <input type="range" id="sp-k" min="0" max="50" step="1" value="0" /><span id="sp-kv" style="min-width:24px;display:inline-block">off</span></label>
+          <label>top-p <input type="range" id="sp-p" min="0.1" max="1" step="0.05" value="0.9" /><span id="sp-pv" style="min-width:30px;display:inline-block">0.90</span></label>
+          <label>peakedness <select id="sp-z"><option value="0.8">flat (Zipf 0.8)</option><option value="1.2" selected>typical (Zipf 1.2)</option><option value="2">peaked (Zipf 2)</option></select></label>
+        </div>
+        <svg id="sp-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Four panels of bar charts over fifty ranked vocabulary entries: the source distribution, the same after temperature, after top-k, and after the full chain including top-p, each with its entropy in nats and its effective number of candidates printed. At the defaults of temperature 0.8, no top-k and top-p 0.9, the temperature panel is a lightened version of the source with the tail still present, and the final panel has the tail removed entirely with a small number of surviving bars renormalised. The readout prints the four entropies, the number of tokens that survive each rule, and the probability the final distribution assigns to the mode."></svg>
+        <div class="readout" aria-live="polite" id="sp-readout"></div>
+      </div>
+
+      <h4>Where these knobs sit in a real generate loop</h4>
+      <p>In an implementation, temperature, top-k and top-p are the last stages of a <b>pipeline of logits processors</b> that runs at every step (followed only by rarer warpers and, when one is configured, a watermark), and the stages before them — repetition penalties, n-gram bans, a minimum length that suppresses end-of-sequence, banned words — have already changed the distribution these three see. The order is fixed (penalties and constraints first, then temperature → top-k → top-p), and it matters: a repetition penalty applied after a temperature of 0.7 would act on logits already divided by 0.7. §46 steps through the whole pipeline on a six-word vocabulary with every intermediate number, and shows a property of the repetition penalty that the closed forms above do not have — it is not invariant to adding a constant to the logits.</p>
+    </section>
+
+    <!-- ═══ 30 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="decode" data-nav="Decoding live: greedy, beam, sampling">
+      <h3><span class="idx">30</span> Decoding (2): greedy, beam search and sampling, run live on the trained model</h3>
+      <p class="lede">§29 reshaped one distribution. Decoding a sequence applies a rule at every step and feeds the result back, and the rules differ in what they optimise: greedy the next token, beam search the whole sequence's probability, sampling nothing at all. Run all three on the page's trained model and watch them agree where the model is sure and diverge where it is not.</p>
+
+      <div class="formula"><span class="lbl">the three rules, and what each one is looking for</span><span class="eq">greedy       tₖ = argmax p(· | prefix, t₁ … tₖ₋₁)                         one forward per step
+             maximises each step's probability; NOT the sequence's — a locally best first
+             token can lead to a poor continuation
+
+beam (B)     keep the B highest-scoring partial sequences, score = ∑ log p(tₖ | …)
+             at each step extend every one of the B by every token, keep the best B of the B·V
+             B forward passes per step (batched); B = 1 is greedy; B = V^n is exhaustive
+             finds a sequence with HIGHER total log-probability than greedy, not the highest
+             length bias: longer sequences accumulate more negative log-probability, so the
+             score is often divided by length^α, α ≈ 0.6 … 1
+
+sampling     tₖ ~ p_T,k,p(· | …)  from §29's reshaped distribution     one forward per step
+             stochastic; the only rule that produces DIFFERENT outputs from the same prefix</span>
+<span class="lbl">the cost, with the KV cache of <a href="../attention/kv-cache-gqa-mla.html#kvcache">the attention page</a></span><span class="eq">per generated token, per layer:  one new row of Q, K, V (3·d² MACs) and its output projection (d²),
+scores against the cached n keys (n·d), the blend (n·d), the FFN (8d²): O(d² + n·d) — no re-encoding
+of the prefix.
+beam search multiplies every term by B and keeps B caches; sampling and greedy keep one.</span></div>
+
+      <p>On the copy task the three rules produce the same answer once the model is trained: the distributions are one-hot to three decimals, the beam's alternatives have vanishing scores and sampling with any sane temperature never leaves the mode. That is the honest picture for a solved deterministic task and it is worth seeing. On a partly trained model — 60 steps instead of 300 — the three separate: greedy commits to a wrong token and carries it forward, the beam recovers a higher-scoring sequence, and repeated samples disagree with each other. The figure shows the per-step distribution as a heat strip, the chosen token under each rule, and, for the beam, the <code>B</code> live hypotheses with their running scores at every step.</p>
+
+      <h4>Beam search by hand, three tokens, two steps</h4>
+      <div class="formula"><span class="lbl">a vocabulary {a, b, c}, beam width 2, two tokens to produce — every probability is the model's, every score a sum of logs</span><span class="eq">step 1   p(· | prefix) = {a: 0.50, b: 0.30, c: 0.20}
+         greedy takes a.   beam keeps the best 2:   [a] −0.693     [b] −1.204
+
+step 2   p(· | prefix, a) = {a: 0.10, b: 0.10, c: 0.80}        p(· | prefix, b) = {a: 0.05, b: 0.90, c: 0.05}
+         candidates (all 2 × 3 = 6):
+            [a c] −0.693 + (−0.223) = −0.916          [b b] −1.204 + (−0.105) = −1.309
+            [a a] −0.693 + (−2.303) = −2.996          [b a] −1.204 + (−2.996) = −4.200
+            [a b] −0.693 + (−2.303) = −2.996          [b c] −1.204 + (−2.996) = −4.200
+         beam keeps [a c] and [b b].   greedy produced [a c] as well: here they agree.
+
+now change step 1 to {a: 0.40, b: 0.38, c: 0.22} and step 2 after b to {b: 0.99}:
+            greedy: [a c]   log 0.40 + log 0.80 = −0.916 − 0.223 = −1.139
+            beam:   [b b]   log 0.38 + log 0.99 = −0.968 − 0.010 = −0.978    ← higher total probability than greedy's
+the beam found what greedy missed: a slightly worse first token with a much better continuation.
+that is the whole content of beam search, and the reason it needs B forward passes per step.</span></div>
+
+      <div class="viz" id="viz-dc">
+        <div class="vhead">
+          <span class="vtitle">Decode the answer half three ways: per-step distributions, the chosen tokens, and the beam's live hypotheses</span>
+          <span class="vhint">at 300 steps all three agree — drop to 60 steps to see them diverge; the beam panel lists every hypothesis with its cumulative log-probability, and the sampling row re-draws with the seed</span>
+        </div>
+        <div class="controls">
+          <label>task <select id="dc-t"><option value="copy" selected>copy</option><option value="reverse">reverse</option><option value="sort">sort</option></select></label>
+          <label>steps trained <select id="dc-s"><option value="60">60</option><option value="300" selected>300</option></select></label>
+          <label>example <input type="range" id="dc-e" min="0" max="19" step="1" value="5" /><span id="dc-ev" style="min-width:16px;display:inline-block">5</span></label>
+          <label>beam width <select id="dc-B"><option value="2">2</option><option value="3" selected>3</option><option value="5">5</option></select></label>
+          <label>sampling T <input type="range" id="dc-T" min="0.2" max="2" step="0.1" value="1" /><span id="dc-Tv" style="min-width:24px;display:inline-block">1.0</span></label>
+          <label>sample seed <input type="range" id="dc-seed" min="1" max="9" step="1" value="1" /><span id="dc-seedv" style="min-width:16px;display:inline-block">1</span></label>
+        </div>
+        <svg id="dc-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Top: the prompt half of one held-out example as labelled cells, followed by the true answer. Below it three rows of cells — greedy, beam search and a sample — each showing the tokens decoded step by step for the answer half, cells coloured by whether they match the true answer, with the sequence log-probability under the model printed at the end of each row. Middle: for the greedy decode, a heat strip per step showing the full distribution over the vocabulary, with the chosen token marked. Bottom: the beam's hypotheses after every step, listed with cumulative log-probabilities, the surviving ones highlighted. At three hundred training steps on the copy task all three rows match the true answer and every distribution is one-hot; at sixty steps they differ. The readout prints the three decoded sequences, their log-probabilities, and how many of the answer tokens each got right."></svg>
+        <div class="readout" aria-live="polite" id="dc-readout"></div>
+      </div>
+
+      <h4>What beam search costs in a real cache, and the rules that go beyond these three</h4>
+      <p>With a KV cache, beam search is more than <code>B</code> forward rows per step. After each step the <code>B</code> surviving hypotheses may descend from different parents — two children of one beam, none of another — so every layer's cache must be <b>reordered</b> along the batch axis to follow them: a gather of <code>B</code> caches per step, and <code>B</code> times the cache memory of greedy decoding for the whole generation. On §36's model with a 2 000-token context and <code>B = 4</code> that is 4 × 250 MiB = 1 000 MiB of cache instead of 250 MiB (§45). The rules that change which candidates survive rather than how many — contrastive search, contrasting layers, diverse and constrained beams — are §48, each worked by hand; the processor pipeline that feeds every rule is §46.</p>
+    </section>
+
+    <nav class="pager" aria-label="Transformers series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="stacks-accounting.html">← Transformer Stacks &amp; Accounting</a>
+      <a href="../transformers.html" style="color:var(--muted)">Transformers · overview</a>
+      <a href="shape-live-lens.html">Depth, Width &amp; the Logit Lens →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../transformers.viz.js"></script>
+</body>
+</html>

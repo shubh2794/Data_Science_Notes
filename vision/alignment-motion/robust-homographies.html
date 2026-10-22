@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Robust Alignment &amp; When Homographies Hold</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses, carried over from parts 1, 2, 4 and 5 */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../alignment-motion.html">Alignment &amp; Motion</a> · part 2 of 4</p>
+      <h1>Robust Alignment &amp; When Homographies Hold</h1>
+      <p>Alignment with bad matches and the wrong model: RANSAC with a homography inside it, its minimal sample, degeneracies and threshold, bounded-influence M-estimators as the alternative, and the only two cases in which a homography is exact, a plane or a purely rotating camera, with the plane-plus-parallax residual everywhere else.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Alignment &amp; Motion</span>
+        <span class="pill">RANSAC for homographies · M-estimators · planar scene · pure rotation · plane-plus-parallax</span>
+      </div>
+    </header>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="robust" data-nav="RANSAC for a homography">
+      <h3><span class="idx">09</span> Robust fitting: RANSAC, with a homography inside it</h3>
+      <p class="lede">The estimator is <a href="../features/descriptors-matching.html#ransac">Part 4 §27</a>'s and is not re-derived. What this section owns is what goes <i>inside</i> it for the models on this page: the minimal sample, the degeneracies that sample can hit, the threshold, and the refit.</p>
+
+      <div class="formula"><span class="lbl">the loop, with the homography-specific parts marked</span><span class="eq">best ← ∅
+repeat N times:
+    S ← 4 correspondences drawn uniformly at random        ← s = 4 for a homography
+    if S is degenerate (any 3 collinear): continue         ← §03; CHEAP and essential
+    H ← DLT(S), normalised                                 ← §06–§07, exact from 4
+    I ← { i : ‖H xᵢ − x̃ᵢ‖ &lt; t }                            ← the consensus set
+    if |I| &gt; |best|: best ← I;  N ← adaptive update from |I|/n
+H* ← refit on `best`, all of it, by §07 then §08           ← NEVER return the minimal-sample H</span></div>
+
+      <h4>The four decisions that actually matter</h4>
+      <table class="grid2">
+        <tr><th style="width:150px">Decision</th><th>What to do</th><th>What goes wrong if you do not</th></tr>
+        <tr><td><b>The threshold <code>t</code></b></td><td>Set it from the expected inlier noise, not by taste: for isotropic Gaussian error of standard deviation <span class="keep">σ</span> per coordinate, the squared distance is <span class="keep">σ</span>²<span class="keep">χ</span>²₂, so <code>t = <span class="keep">σ</span>√5.99 ≈ 2.45<span class="keep">σ</span></code> admits 95% of true inliers. With <span class="keep">σ</span> = 1 px that is about <b>2.4 px</b>.</td><td>Too small and the consensus sets are tiny and noisy, so <code>N</code> explodes and the winner is chosen by luck. Too large and a wrong homography that happens to be close over part of the image collects enough support to win.</td></tr>
+        <tr><td><b>Degenerate samples</b></td><td>Reject any minimal sample with three near-collinear points before fitting. Test all four triangle areas against the square of the sample's own largest pairwise distance; it costs four cross products. A threshold of 0.002 rejects <b>5.15%</b> of uniformly random quadruples (measured over 20 000 draws) and essentially all the harmful ones.</td><td>The DLT returns an arbitrary member of a family (§03, <span class="keep">σ</span>₈ ≈ 10⁻¹³). That arbitrary matrix occasionally scores a large consensus by accident and is then returned as the answer.</td></tr>
+        <tr><td><b>Adaptive <code>N</code></b></td><td>Recompute <code>N</code> from the best inlier ratio seen so far after every improvement. Start from a pessimistic <code>w</code> and let the data raise it.</td><td>A fixed <code>N</code> chosen for <code>w</code> = 0.3 wastes 500 samples on data that is 80% inliers; one chosen for <code>w</code> = 0.7 silently fails on data that is 30%.</td></tr>
+        <tr><td><b>The final refit</b></td><td>Refit on the whole consensus set, then re-classify inliers with the refitted model and repeat once or twice. The minimal-sample homography is fitted to exactly 4 points and has no noise averaging whatsoever.</td><td>You keep an estimate whose accuracy is that of 4 noisy points instead of 200 — typically 3–5× worse, for no reason.</td></tr>
+      </table>
+
+      <h4>Why RANSAC and not least squares with a big residual threshold</h4>
+      <p>Because least squares has a <b>breakdown point of zero</b>: a single correspondence, moved far enough, drags the fit arbitrarily far. §04's figure shows it happening on six points. Iterating "fit, discard the worst, refit" does not repair this — the first fit is already so corrupted that the worst residual may belong to a good point. RANSAC inverts the logic: it never lets the outliers into a fit in the first place, because it only ever fits <i>minimal</i> subsets and judges them by counting.</p>
+
+      <div class="viz" id="viz-ransac">
+        <div class="vhead">
+          <span class="vtitle">RANSAC fitting a homography, one sample at a time</span>
+          <span class="vhint">step through samples, or run to completion — the outlier slider is the thing to play with</span>
+        </div>
+        <div class="controls">
+          <label>outliers <input type="range" id="rs-o" min="0" max="80" step="5" value="45" /><span id="rs-ov" style="min-width:34px;display:inline-block">45%</span></label>
+          <label>threshold t <input type="range" id="rs-t" min="1" max="12" step="0.5" value="3" /><span id="rs-tv" style="min-width:44px;display:inline-block">3.0 px</span></label>
+          <label>inlier noise <span class="keep">σ</span> <input type="range" id="rs-s" min="0" max="3" step="0.25" value="1" /><span id="rs-sv" style="min-width:44px;display:inline-block">1.00 px</span></label>
+          <label><input type="checkbox" id="rs-deg" checked /> reject degenerate samples</label>
+          <label><input type="checkbox" id="rs-ad" checked /> adaptive N</label>
+          <button id="rs-step">draw one sample</button>
+          <button id="rs-run">run to completion</button>
+          <button id="rs-new">new data</button>
+        </div>
+        <svg id="ransac-svg" width="760" height="470" viewBox="0 0 760 470" role="img" aria-label="Left: image one with the source points of every putative correspondence. Middle: image two, showing each putative match as a line from where the current best homography predicts the point to where it was measured; matches whose residual is below the threshold are drawn in green as inliers and the rest in red as outliers, and the four points of the sample currently being tested are ringed. Below the two panels, a running plot of the best consensus size against sample number, which rises in visible steps and then flattens, with the true inlier count drawn as a horizontal reference. Right: a count of how many samples have been drawn, how many were rejected as degenerate before being fitted, the current best inlier ratio, and the number of samples the adaptive rule now thinks are needed. And the two homographies compared: the one fitted to the winning minimal sample of four points, and the one refitted to the whole consensus set, with their transfer errors against the transformation that generated the data — the refit is consistently several times more accurate, which is why the last line of the algorithm is not optional — and finally the consensus size re-scored against the refitted homography, which is typically larger than the one the winning minimal sample found and usually recovers every true inlier."></svg>
+        <div class="readout" aria-live="polite" id="ransac-readout"></div>
+      </div>
+
+      <div class="wrong"><span class="say">A misreading of the iteration count.</span> "I ran <code>N</code> = 72 samples, so I have a 99% chance of the right homography." <span class="fix">You have a 99% chance of having <i>drawn</i> at least one all-inlier sample.</span> That is a strictly weaker statement, as <a href="../features/descriptors-matching.html#ransac">Part 4 §27</a> measures: even given a clean sample, four inliers that happen to be nearly collinear or clustered define a badly conditioned homography that will lose the consensus vote to a luckier sample. The formula bounds one failure mode out of three; the other two are degeneracy and bad conditioning within a clean sample, and only the degeneracy check and the final refit address them.</div>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="mest" data-nav="M-estimators &amp; IRLS">
+      <h3><span class="idx">10</span> The other robust route: bounded influence</h3>
+      <p class="lede">RANSAC decides which points to <i>use</i>. An M-estimator decides how much each point is allowed to <i>say</i>. They solve the same problem from opposite ends, and in practice a pipeline uses both — RANSAC first to get a starting point, an M-estimator afterwards to polish without a hard inlier/outlier cut.</p>
+
+      <div class="formula"><span class="lbl">replace the square with something that grows more slowly</span><span class="eq">E(p) = ∑ᵢ <span class="keep">ρ</span>(rᵢ)          instead of      E(p) = ∑ᵢ rᵢ²
+
+∂E/∂p = ∑ᵢ <span class="keep">ψ</span>(rᵢ) · ∂rᵢ/∂p = 0    with   <span class="keep">ψ</span> = <span class="keep">ρ</span>′  — the INFLUENCE function.
+                                        <span class="keep">ψ</span>(r) is how hard a residual of size r
+                                        pushes on the answer.</span>
+<span class="lbl">the reweighting identity that makes it practical</span><span class="eq">write  w(r) = <span class="keep">ψ</span>(r)/r , and the stationarity condition becomes
+
+    ∑ᵢ w(rᵢ) · rᵢ · ∂rᵢ/∂p = 0     ⟺   the normal equations of a WEIGHTED
+                                        least-squares problem.
+
+Iteratively reweighted least squares (IRLS): compute residuals, compute weights,
+solve a weighted linear system, repeat. Three or four passes is usual. Every
+solver you already have is reused unchanged — only a diagonal weight appears.</span></div>
+
+      <table class="grid2">
+        <tr><th style="width:150px"><span class="keep">ρ</span>(r)</th><th>Influence <span class="keep">ψ</span>(r)</th><th>Weight w(r)</th><th>Behaviour · breakdown</th></tr>
+        <tr><td><b>L2</b> &nbsp; r²</td><td class="mono">2r</td><td class="mono">2</td><td>Influence grows without bound. <b>Breakdown point 0</b>: one point at infinity moves the fit to infinity. Optimal only under exactly Gaussian noise.</td></tr>
+        <tr><td><b>L1</b> &nbsp; |r|</td><td class="mono">sgn(r)</td><td class="mono">1/|r|</td><td>Bounded influence, so a far outlier does not dominate — but it still votes with full strength. Not differentiable at 0, which upsets gradient methods. Median-like; breakdown 0.5 in location.</td></tr>
+        <tr><td><b>Huber</b><br />r²/2 for |r| ≤ a<br />a|r| − a²/2 else</td><td class="mono">r if |r| ≤ a<br />a·sgn(r) else</td><td class="mono">1 if |r| ≤ a<br />a/|r| else</td><td>Quadratic near zero — so it is efficient on the inliers — and linear outside, so influence is capped. Convex, hence a unique minimum. The safe default; <code>a ≈ 1.345<span class="keep">σ</span></code> gives 95% of the Gaussian efficiency.</td></tr>
+        <tr><td><b>Geman–McClure</b><br />r²/(1 + r²/a²)</td><td class="mono">2r/(1 + r²/a²)²</td><td class="mono">2/(1 + r²/a²)²</td><td>Influence rises, peaks, then <i>falls to zero</i>: a sufficiently wrong point is ignored entirely. Redescending. <b>Not convex</b>, so it needs a good starting point — exactly what RANSAC provides.</td></tr>
+        <tr><td><b>Tukey biweight</b><br />(a²/6)[1 − (1 − r²/a²)³] for |r| ≤ a,<br />a²/6 otherwise</td><td class="mono">r(1 − r²/a²)² for |r| ≤ a<br />0 otherwise</td><td class="mono">(1 − r²/a²)² <br />0 for |r| &gt; a</td><td>Influence is exactly zero beyond <code>a</code> — a hard reject with a smooth approach. <code>a ≈ 4.685<span class="keep">σ</span></code> for 95% efficiency. Also non-convex.</td></tr>
+        <tr><td colspan="4"><i>Scale.</i> Every <code>a</code> above is in units of the inlier noise, which you do not know. The standard robust estimate is <code><span class="keep">σ</span>̂ = 1.4826 · median|rᵢ|</code> — the median absolute deviation, scaled so that it is consistent for Gaussian noise. Re-estimate it at each IRLS pass, from the current residuals.</td></tr>
+      </table>
+
+      <div class="viz" id="viz-mest">
+        <div class="vhead">
+          <span class="vtitle">Influence, weight, and what they do to a fit</span>
+          <span class="vhint">drag the outlier and watch the least-squares line chase it while the robust ones do not</span>
+        </div>
+        <div class="controls">
+          <label>loss <select id="me-l">
+            <option value="l2">L2 · least squares</option>
+            <option value="l1">L1</option>
+            <option value="huber" selected>Huber</option>
+            <option value="gm">Geman–McClure</option>
+            <option value="tukey">Tukey biweight</option>
+          </select></label>
+          <label>tuning a <input type="range" id="me-a" min="0.5" max="8" step="0.25" value="2" /><span id="me-av" style="min-width:44px;display:inline-block">2.00 <span class="keep">σ</span></span></label>
+          <label>IRLS passes <input type="range" id="me-i" min="1" max="20" step="1" value="8" /><span id="me-iv" style="min-width:26px;display:inline-block">8</span></label>
+          <label>extra outliers <input type="range" id="me-o" min="0" max="8" step="1" value="2" /><span id="me-ov" style="min-width:22px;display:inline-block">2</span></label>
+        </div>
+        <svg id="mest-svg" width="760" height="430" viewBox="0 0 760 430" role="img" aria-label="Left: the three functions of the selected loss plotted against the residual on a shared horizontal axis — the loss itself, its derivative which is the influence, and the derivative divided by the residual which is the iteratively reweighted least squares weight. For least squares the influence is a straight line through the origin with no bound; for Huber it flattens at the tuning constant; for Geman McClure and Tukey it rises, turns over and returns to zero, so a far enough point is ignored altogether. Right: twenty points on a line, one draggable outlier and however many further outliers the last control adds, showing the plain least squares fit and the fit produced by the selected loss after the chosen number of reweighting passes, with each point drawn at a size proportional to the weight it currently carries so that the down weighting is directly visible. Dragging the outlier upward swings the least squares line steadily away while the redescending fits stay put once the outlier has left their support; the readout gives both slopes, the robust scale estimate from the median absolute deviation, and the weight the outlier ended up with."></svg>
+        <div class="readout" aria-live="polite" id="mest-readout"></div>
+      </div>
+
+      <div class="callout"><b>When to use which.</b> If you can enumerate a minimal sample cheaply and the outlier fraction may exceed ~30%, use <b>RANSAC</b> — its breakdown point is essentially 1, limited only by patience. If the outliers are mild (mis-localisation rather than mismatch), the model is expensive to fit from a minimal sample, or you need a differentiable objective to embed in a larger optimisation such as §17's bundle adjustment, use an <b>M-estimator</b>. Dense motion (§21 onwards) has no minimal-sample structure at all — every pixel contributes one equation — so it uses M-estimators exclusively, which is why robust norms reappear in §24's smoothness term.</div>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="plane" data-nav="A homography IS: a plane">
+      <h3><span class="idx">11</span> Case one: two views of a plane</h3>
+      <p class="lede">This is the first of exactly two situations in which a homography is not an approximation but an identity. It is worth deriving in four lines, because the derivation shows precisely which assumption is doing the work.</p>
+
+      <div class="formula"><span class="lbl">setup — the camera model is <a href="../image-formation/pinhole-camera.html#camera-matrix">Part 1 §16</a>'s, unchanged</span><span class="eq">camera 0:  x̃₀ ~ K₀ X            world frame = camera 0's frame
+camera 1:  x̃₁ ~ K₁ (R X + t)
+the plane:  n̂ᵀX = d              n̂ a unit normal, d &gt; 0 the distance to camera 0</span>
+<span class="lbl">the derivation</span><span class="eq">1 · A pixel back-projects to a ray:  X = Z · K₀⁻¹x̃₀   for some unknown depth Z.
+2 · Impose the plane:  n̂ᵀX = d  ⇒  Z · (n̂ᵀK₀⁻¹x̃₀) = d  ⇒  1 = (n̂ᵀX)/d.
+    That single scalar equation is what makes the depth recoverable, and it is
+    the ONLY place the plane is used.
+3 · Substitute the harmless-looking identity  t = t · 1 = t · (n̂ᵀX)/d :
+
+    x̃₁ ~ K₁(R X + t·(n̂ᵀX)/d) = K₁( R + t n̂ᵀ/d ) X
+4 · And X ~ K₀⁻¹x̃₀ , so
+
+    x̃₁ ~ K₁ ( R + t n̂ᵀ/d ) K₀⁻¹ x̃₀  =  H₁₀ x̃₀        ∎</span>
+<span class="lbl">verified numerically</span><span class="eq">f = 600, R = 8° about y then 3° about z, t = (−0.60, 0, 0.18) m, plane at Z = 10 m,
+300 points scattered ON the plane:
+
+    max ‖ dehom(H x̃₀) − x̃₁ ‖  =  2.05 × 10⁻¹³ px
+
+Exact. Not "accurate to a fraction of a pixel" — exact, to double precision.</span></div>
+
+      <h4>What the derivation tells you</h4>
+      <ul class="notes">
+        <li><b>The rank-one update <code>t n̂ᵀ/d</code> is the whole content.</b> Without translation it vanishes and you get §12's case. With translation it depends on the plane through the single combination <code>n̂/d</code>, which is why you cannot recover the normal and the distance separately from <code>H</code> alone — only their ratio, and even then only up to a well-known two-fold ambiguity.</li>
+        <li><b>Any camera motion is allowed.</b> The plane assumption does all the work; <code>R</code> and <code>t</code> are arbitrary. This is why a whiteboard, a document, a building facade, a floor and a football pitch are all homography problems no matter how the camera moves.</li>
+        <li><b>Different planes give different homographies.</b> A scene with two planes at different depths needs two homographies, and the set of all plane-induced homographies for a fixed camera pair forms a 3-parameter family — which is exactly what <a href="../index.html">Part 7</a>'s plane-plus-parallax decomposition exploits.</li>
+        <li><b>The intrinsics need not match.</b> <code>K₀</code> and <code>K₁</code> appear separately, so a zoom, a different sensor or a different focal length between the two shots changes nothing structural. That is not true of the essential matrix.</li>
+      </ul>
+
+      <div class="viz" id="viz-plane">
+        <div class="vhead">
+          <span class="vtitle">The plane-induced homography, built from the geometry</span>
+          <span class="vhint">move the second camera and tilt the plane — the transfer error stays at machine zero for every point on the plane</span>
+        </div>
+        <div class="controls">
+          <label>baseline <input type="range" id="pl-b" min="0" max="200" step="5" value="60" /><span id="pl-bv" style="min-width:52px;display:inline-block">0.60 m</span></label>
+          <label>rotation <input type="range" id="pl-r" min="-30" max="30" step="1" value="8" /><span id="pl-rv" style="min-width:34px;display:inline-block">8°</span></label>
+          <label>plane tilt <input type="range" id="pl-t" min="-50" max="50" step="2" value="0" /><span id="pl-tv" style="min-width:34px;display:inline-block">0°</span></label>
+          <label>plane distance <input type="range" id="pl-d" min="3" max="30" step="0.5" value="10" /><span id="pl-dv" style="min-width:48px;display:inline-block">10.0 m</span></label>
+        </div>
+        <svg id="plane-svg" width="760" height="430" viewBox="0 0 760 430" role="img" aria-label="Left: a three dimensional view of the scene — the tilted plane as a shaded quadrilateral, the two camera centres each with a stub of its optical axis, a few back-projected rays from the first camera, and a grid of scene points lying on the plane. Middle: the image the first camera forms, with the grid of points projected into it. Right: the image the second camera forms, showing the same points projected directly through its own projection matrix as hollow circles, and the positions obtained instead by pushing the first image through the estimated homography as filled dots. The two coincide to machine precision for every setting of every control, and the readout prints the maximum discrepancy in pixels, which stays at the order of ten to the minus thirteen however far the second camera is moved or the plane is tilted. Below the images the rotation, the rank one term t n transpose over d, and the resulting homography are printed as three separate matrices, so that the term which carries the plane is visible on its own and can be watched vanishing as the baseline goes to zero."></svg>
+        <div class="readout" aria-live="polite" id="plane-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="rotation" data-nav="A homography IS: pure rotation">
+      <h3><span class="idx">12</span> Case two: a camera that rotates about its own centre</h3>
+      <p class="lede">The second exact case, and the one panoramas are built on. Here the scene is arbitrary — any shape, any depth, any clutter — and the constraint is on the <i>camera</i> instead.</p>
+
+      <div class="formula"><span class="lbl">set t = 0 in §11's derivation and the plane disappears</span><span class="eq">x̃₁ ~ K₁ R X  ~ K₁ R K₀⁻¹ x̃₀  =  H₁₀ x̃₀
+
+No plane. No depth. No d, no n̂. The depth Z cancelled in step 1 because it is a
+scalar multiplying a homogeneous vector, and with t = 0 nothing ever reintroduces
+it. THAT is why a rotating camera can photograph anything at all.</span>
+<span class="lbl">verified numerically</span><span class="eq">f = 600, R = 8° about y then 3° about z, t = 0, 300 points at depths from 2 m to 80 m:
+
+    max ‖ dehom(H x̃₀) − x̃₁ ‖  =  2.34 × 10⁻¹³ px
+
+A fortyfold range of depth, and it does not matter at all.</span>
+<span class="lbl">the useful special form (principal point at the origin, square pixels)</span><span class="eq">⎡ x₁ ⎤        ⎡ x₀ ⎤            K = diag(f, f, 1)
+⎢ y₁ ⎥  ~  R₁₀⎢ y₀ ⎥            so a pixel is literally a 3D RAY (x, y, f), the
+⎣ f₁ ⎦        ⎣ f₀ ⎦            rotation acts on rays, and the focal length is the
+                                z coordinate. Everything about panoramas follows.</span></div>
+
+      <h4>Three, four or five parameters instead of eight</h4>
+      <p>Because <code>H = K₁RK₀⁻¹</code> is a <i>constrained</i> homography, estimating it directly is far better conditioned than estimating a general one. The count depends on what is known:</p>
+      <table class="grid2">
+        <tr><th style="width:120px">Known</th><th class="num" style="width:56px">dof</th><th>Parameters</th><th>When</th></tr>
+        <tr><td>focal length</td><td class="num">3</td><td>the rotation only</td><td>a calibrated camera, or one whose focal length came from the file metadata and is trusted.</td></tr>
+        <tr><td>focal fixed but unknown</td><td class="num">4</td><td>rotation + one shared <code>f</code></td><td>the usual case for a hand-held sequence at a fixed zoom. <code>f</code> is estimated jointly with all the rotations.</td></tr>
+        <tr><td>nothing</td><td class="num">5</td><td>rotation + <code>f₀</code>, <code>f₁</code></td><td>zoom changed between shots. Estimable from a single pair, but weakly; better solved globally (§17).</td></tr>
+        <tr><td><i>general homography</i></td><td class="num"><i>8</i></td><td><i>all of H</i></td><td><i>Five of these eight parameters describe motions a rotating camera cannot make. Fitting them fits noise, and the excess shows up as drift when the estimates are chained.</i></td></tr>
+      </table>
+
+      <h4>The incremental update, which is what optimisers actually use</h4>
+      <div class="formula"><span class="lbl">compose a small rotation onto the current estimate</span><span class="eq">H(<span class="keep">ω</span>) = K₁ R(<span class="keep">ω</span>) R₁₀ K₀⁻¹ = [K₁R(<span class="keep">ω</span>)K₁⁻¹] · H₁₀ = D · H₁₀
+
+with the small-angle form R(<span class="keep">ω</span>) ≈ I + [<span class="keep">ω</span>]ₓ,
+
+D ≈ ⎡    1     −<span class="keep">ω</span>_z    f₁<span class="keep">ω</span>_y ⎤
+    ⎢   <span class="keep">ω</span>_z      1    −f₁<span class="keep">ω</span>_x ⎥
+    ⎣ −<span class="keep">ω</span>_y/f₁  <span class="keep">ω</span>_x/f₁    1   ⎦</span>
+<span class="lbl">and the resulting image-space motion — the Jacobian §26 needs</span><span class="eq">⎡ x̂′ − x ⎤     ⎡  −xy/f₁      f₁ + x²/f₁   −y ⎤ ⎡ <span class="keep">ω</span>_x ⎤
+⎣ ŷ′ − y ⎦  =  ⎣ −(f₁ + y²/f₁)     xy/f₁      x ⎦ ⎢ <span class="keep">ω</span>_y ⎥
+                                                  ⎣ <span class="keep">ω</span>_z ⎦
+
+Three columns, one per rotation axis. Read them: <span class="keep">ω</span>_z is a rotation in the image
+plane (the (−y, x) field); <span class="keep">ω</span>_x and <span class="keep">ω</span>_y are pans and tilts, and the f₁ + x²/f₁ term
+is what makes a pan stretch the edges of a wide-angle frame more than the centre.</span></div>
+
+      <div class="viz" id="viz-rot">
+        <div class="vhead">
+          <span class="vtitle">The nodal point: how exact is "pure" rotation?</span>
+          <span class="vhint">offset the rotation centre by a few centimetres and watch a supposedly exact model fail on the near objects first</span>
+        </div>
+        <div class="controls">
+          <label>rotation <input type="range" id="ro-r" min="2" max="45" step="1" value="25" /><span id="ro-rv" style="min-width:34px;display:inline-block">25°</span></label>
+          <label>centre offset <input type="range" id="ro-o" min="0" max="50" step="1" value="5" /><span id="ro-ov" style="min-width:44px;display:inline-block">5 cm</span></label>
+          <label>focal length <input type="range" id="ro-f" min="200" max="1600" step="50" value="600" /><span id="ro-fv" style="min-width:48px;display:inline-block">600 px</span></label>
+          <label>nearest object <input type="range" id="ro-z" min="0.5" max="12" step="0.25" value="2" /><span id="ro-zv" style="min-width:48px;display:inline-block">2.0 m</span></label>
+        </div>
+        <svg id="rot-svg" width="760" height="440" viewBox="0 0 760 440" role="img" aria-label="Left: the second image, with a few hundred scene points spread over a wide range of depths; each point is drawn as a short line from where the rotation-only homography predicts it to where it actually lands, coloured by the point's depth so that the near points are immediately identifiable as the ones with long error vectors. At a centre offset of zero every line has zero length. Right: a log log plot of that transfer error against the point's depth, which is a straight line of slope minus one because the error is inversely proportional to depth, together with the prediction focal length times baseline over depth drawn as a dashed reference line that the measurements track to within a few per cent, sitting a little below it at the near end and a little above it at the far end. The readout converts the current settings into the sentence that matters in practice: with this focal length, this much error in the rotation centre puts this many pixels of ghosting on an object at the chosen distance."></svg>
+        <div class="readout" aria-live="polite" id="rot-readout"></div>
+      </div>
+
+      <div class="callout"><b>Why panoramic tripod heads exist.</b> Rotating a camera about anything other than its optical centre introduces a real translation, and a real translation introduces parallax. Measured at <code>f</code> = 600 px, a 25° pan, and a scene from 2 to 60 m, averaged over 200 000 points: an offset of <b>1 cm</b> puts <b>2.95 px</b> of error on an object 2 m away; <b>5 cm</b> puts <b>14.8 px</b>; <b>20 cm</b> — roughly the distance from the sensor to the front of a long lens — puts <b>59.1 px</b>. At 10 m the same offsets give 0.63, 3.13 and 12.5 px. The rule of thumb is <code>error ≈ f·b/Z</code> pixels, and it is remarkably tight: 3.00, 15.00 and 60.00 predicted against 2.95, 14.8 and 59.1 measured, an error of 1.5%. It is the single most useful formula there is for predicting whether a stitch will ghost.</div>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="parallax" data-nav="A homography is NOT: parallax">
+      <h3><span class="idx">13</span> And nowhere else: the plane-plus-parallax residual</h3>
+      <p class="lede">This is the most misapplied fact in the subject, so here it is stated three ways, with the failure quantified rather than described.</p>
+
+      <div class="cards">
+        <div class="box good">
+          <div class="n">true · a theorem</div>
+          <div class="t">Any two views of a plane</div>
+          <div class="g">For a <b>planar</b> scene, <i>any</i> camera motion, <i>any</i> two sets of intrinsics: <code>H = K₁(R + t n̂ᵀ/d)K₀⁻¹</code>, exact. Measured residual 2.0 × 10⁻¹³ px (§11).</div>
+        </div>
+        <div class="box good">
+          <div class="n">true · a theorem</div>
+          <div class="t">Any scene, one camera centre</div>
+          <div class="g">For <i>any</i> scene, when the two camera centres <b>coincide</b>: <code>H = K₁RK₀⁻¹</code>, exact at every depth. Measured residual 2.3 × 10⁻¹³ px over a fortyfold depth range (§12). A zoom about the centre is included, because it only changes <code>K</code>.</div>
+        </div>
+        <div class="box bad">
+          <div class="n">false · and not approximately true</div>
+          <div class="t">Any scene, any motion</div>
+          <div class="g">For a non-planar scene seen from two different centres there is <b>no homography at all</b> — not a bad one, none. The residual after the best possible <code>H</code> is a well-defined non-zero field, and it is measured below.</div>
+        </div>
+        <div class="box warn">
+          <div class="n">the useful limiting case</div>
+          <div class="t">A distant scene</div>
+          <div class="g">As every depth <code>Z → ∞</code> the parallax term vanishes, so a homography becomes <i>arbitrarily</i> good. This is the plane at infinity, and it is why a landscape stitches from a hand-held camera and a room does not. "Distant" means <code>f·b/Z</code> is below your tolerance — a number, not an adjective.</div>
+        </div>
+      </div>
+
+      <h4>The exact decomposition</h4>
+      <p>Take any homography <code>H</code> induced by a reference plane <span class="keep">π</span>. Every point in the scene, on the plane or not, satisfies:</p>
+
+      <div class="formula"><span class="lbl">plane plus parallax</span><span class="eq">x̃₁  ~  H x̃₀  +  <span class="keep">ρ</span>(X) · ẽ₁
+
+ẽ₁ = K₁t          the EPIPOLE in image 1 — the projection of camera 0's centre.
+<span class="keep">ρ</span>(X)              the plane-induced parallax of the point, a scalar that is
+                  ZERO for points on <span class="keep">π</span> and grows with the point's departure
+                  from it, measured in inverse depth.</span>
+<span class="lbl">what that means for the residual, and it is a strong statement</span><span class="eq">1 · The residual of EVERY point lies on the line joining its transferred position
+    to the epipole. Not approximately — exactly.
+2 · Its magnitude is proportional to  |1/Z − 1/Z<span class="keep">π</span>| , the difference of inverse
+    depths between the point and the reference plane.
+3 · So the residual field is a RADIAL pattern centred on the epipole, whose length
+    encodes depth. That is stereo, and it is <a href="../index.html">Part 7</a>'s subject.</span>
+<span class="lbl">measured — 300 points, depths 3 to 30 m, plane at 10 m, baseline 0.63 m</span><span class="eq">angle between each residual and the direction to the epipole:
+    maximum deviation over all 300 points  =  1.5 × 10⁻⁶ degrees        ← claim 1 ✓
+
+residual magnitude ÷ |1/Z − 1/Z<span class="keep">π</span>| , by depth:
+    Z =  9 m   4.069 px / 0.01111  =  366.2
+    Z =  8 m   9.212 px / 0.02500  =  368.5
+    Z =  6 m  24.800 px / 0.06667  =  372.0
+    Z =  4 m  54.327 px / 0.15000  =  362.2
+    Z = 20 m  18.442 px / 0.05000  =  368.9
+    Z = 40 m  27.808 px / 0.07500  =  370.8
+    Z = ∞     36.354 px / 0.10000  =  363.5
+    spread ±1.4% about 368.7 — and f·‖t‖ = 600 × 0.6264 = 375.9.               ← claim 2 ✓</span>
+<span class="lbl">so, the number to carry around</span><span class="eq">parallax in pixels  ≈  f · b · | 1/Z − 1/Z<span class="keep">π</span> |
+
+and when the reference plane is at infinity (the pure-rotation approximation),
+this reduces to §12's  f·b/Z  — the same formula, seen from the other side.</span></div>
+
+      <div class="viz" id="viz-parallax">
+        <div class="vhead">
+          <span class="vtitle">One homography, a scene that is not a plane</span>
+          <span class="vhint">move the reference plane through the scene and watch the zero-residual surface move with it</span>
+        </div>
+        <div class="controls">
+          <label>baseline b <input type="range" id="px-b" min="0" max="150" step="5" value="60" /><span id="px-bv" style="min-width:52px;display:inline-block">0.60 m</span></label>
+          <label>reference plane Z<span class="keep">π</span> <input type="range" id="px-d" min="3" max="40" step="0.5" value="10" /><span id="px-dv" style="min-width:48px;display:inline-block">10.0 m</span></label>
+          <label>scene <select id="px-s">
+            <option value="slab" selected>a room · depths 3 to 30 m</option>
+            <option value="plane">a single plane, at the reference depth</option>
+            <option value="far">a landscape · depths 60 to 600 m</option>
+            <option value="two">two planes, 5 m and 20 m</option>
+          </select></label>
+          <label>fit H to <select id="px-f">
+            <option value="exact" selected>the reference plane, exactly</option>
+            <option value="ls">all the points, by least squares</option>
+          </select></label>
+        </div>
+        <svg id="parallax-svg" width="760" height="470" viewBox="0 0 760 470" role="img" aria-label="Left: image two, with one arrow per scene point running from the position the homography predicts to the position the point actually occupies, coloured by depth. The arrows form a radial pattern that converges on the epipole; the epipole lies far outside the frame for this sideways camera motion, so it is marked on the panel edge with its coordinates rather than drawn in place, and their lengths shrink to nothing on the surface at the reference plane's depth and grow in both directions away from it — nearer points move one way along the epipolar line and farther points the other. Selecting the single plane scene collapses every arrow to a point. Right: the residual magnitude plotted against inverse depth, which is a V shape with its vertex exactly at the reference plane's inverse depth and two straight arms whose common slope is the focal length times the length of the translation; the fitted slope and that prediction are printed together. Below that, the maximum angle between any residual and the direction to the epipole, which stays at the order of ten to the minus six degrees and is the numerical statement that the residual field is exactly epipolar."></svg>
+        <div class="readout" aria-live="polite" id="parallax-readout"></div>
+      </div>
+
+      <div class="wrong"><span class="say">The sentence to stop saying.</span> "A homography relates two views of the same scene." <span class="fix">A homography relates two views of the same <i>plane</i>, or two views from the same <i>point</i>.</span> Both qualifications are essential and each is sufficient on its own. The version without a qualifier is false, and it is false in a way that no amount of data, no better estimator and no robust loss will fix — because there is no <code>H</code> that fits, not merely a hard-to-find one. RANSAC will happily return the homography of whichever surface happens to dominate the correspondences and declare everything else an outlier, which looks exactly like success right up until you composite the image.</div>
+
+      <div class="callout"><b>How to tell, from the residuals alone, in one glance.</b> Fit your homography, then draw the residual vectors on image 2. If they point along a common pencil of lines through a single point, you have <b>parallax</b>: the scene is not planar and the camera translated, the common point is the epipole, and the fix is a different model — <a href="../index.html">Part 7</a>'s two-view geometry — not a better fit. If they are random in direction, you have <b>noise</b> and you are done. If they curve smoothly outward from the image centre, you have unmodelled <b>radial distortion</b> (<a href="../image-formation/pinhole-camera.html#distortion">Part 1 §17</a>) and should undistort first. Three diagnoses from one picture, and the second figure of this section is that picture.</div>
+    </section>
+
+    <nav class="pager" aria-label="Alignment &amp; Motion series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="parametric-fitting.html">← Parametric Alignment &amp; the DLT</a>
+      <a href="../alignment-motion.html" style="color:var(--muted)">Alignment &amp; Motion · overview</a>
+      <a href="stitching.html">Image Stitching &amp; Panoramas →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../vision-viz.js"></script>
+<script src="../alignment-motion.viz.js"></script>
+</body>
+</html>

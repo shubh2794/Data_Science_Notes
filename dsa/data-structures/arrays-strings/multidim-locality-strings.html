@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Multidimensional Arrays, Locality &amp; Strings</title>
+<script src="../../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../arrays-strings.html">Arrays &amp; Strings</a> · part 2 of 5</p>
+      <h1>Multidimensional Arrays, Locality &amp; Strings</h1>
+      <p>How layout decides speed: multidimensional arrays flattened row- or column-major with strides, traversal order against cache lines, slices as views that alias rather than copy, and strings as compact, usually immutable arrays of encoded character codes.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Arrays &amp; Strings</span>
+        <span class="pill">Row- vs column-major · strides · cache lines · views & aliasing · strings as arrays</span>
+      </div>
+    </header>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="multidimensional" data-nav="Multidimensional arrays">
+      <h3><span class="idx">08</span> Multidimensional arrays: rows, columns, and strides</h3>
+      <p class="lede">Memory is one-dimensional. A matrix is not. So a two-dimensional array is always a <b>convention for flattening</b> — a rule that turns a pair of subscripts <code>(i, j)</code> into a single offset. There are exactly two sensible rules, they differ only in which subscript varies fastest along the block, and the choice is invisible to correctness and enormous to performance.</p>
+
+      <div class="formula"><span class="lbl">row-major: the last subscript varies fastest — rows are contiguous</span><span class="eq">offset(i, j) = i × ncols + j                     address = base + offset × itemsize</span>
+<span class="lbl">column-major: the first subscript varies fastest — columns are contiguous</span><span class="eq">offset(i, j) = j × nrows + i</span>
+<span class="lbl">the general d-dimensional form, in terms of strides</span><span class="eq">offset(i₁, i₂, …, i_d) = i₁·s₁ + i₂·s₂ + ⋯ + i_d·s_d</span>
+<span class="lbl">row-major strides for shape (n₁, n₂, …, n_d)</span><span class="eq">s_d = 1,   s_k = n_(k+1) × n_(k+2) × ⋯ × n_d       (each stride is the size of one slice below it)</span>
+<span class="lbl">cost</span><span class="eq">d multiplies and d−1 adds — O(d), independent of every nₖ. Still O(1) for fixed d.</span></div>
+
+      <h4>A worked offset</h4>
+      <p>Take a 3 × 5 array of 4-byte values with <code>base = 4096</code>. Row-major strides are <code>s₁ = 5</code>, <code>s₂ = 1</code>. Then element <code>(2, 3)</code> — third row, fourth column, counting from zero — sits at offset <code>2 × 5 + 3 = 13</code>, so at address <code>4096 + 13 × 4 = 4148</code>. Under column-major the strides are <code>s₁ = 1</code>, <code>s₂ = 3</code>, the same element sits at offset <code>3 × 3 + 2 = 11</code>, and its address is <code>4096 + 44 = 4140</code>. <b>The same logical element, two different addresses, because the flattening rule is different.</b> Nothing about the matrix changed; the convention did. This is why passing a buffer between two libraries that disagree about the convention transposes your data silently, and why every serious array library records the strides explicitly rather than assuming them.</p>
+
+      <h4>Strides make views free</h4>
+      <p>Once the offset is a dot product of subscripts with strides, several operations become <b>pure bookkeeping on the stride vector</b>, touching no data at all:</p>
+      <ul class="notes">
+        <li><b>Transpose</b> — swap the two strides and the two dimension lengths. <code>O(1)</code>. The transposed view is row-major read as column-major; no element is moved, which is precisely why a transposed view then traverses badly (§09).</li>
+        <li><b>A row slice</b> — keep the row stride, advance the base by <code>i × s₁ × itemsize</code>. <code>O(1)</code>, and the result is itself contiguous.</li>
+        <li><b>A column slice</b> — keep the base, take stride <code>s₁</code> with length <code>nrows</code>. <code>O(1)</code>, and the result is <i>not</i> contiguous: a column of a row-major matrix is a strided walk with a gap of <code>ncols − 1</code> elements between consecutive entries.</li>
+        <li><b>Every other step</b>, reversal, broadcasting a length-1 axis — all expressible as changes to strides and lengths. The <a href="../../../programming/numpy.html">ndarray</a> is exactly this idea made into a type, and "is this array contiguous?" is a question its users learn to ask because the answer decides whether an operation copies.</li>
+      </ul>
+
+      <h4>The other layout: an array of arrays</h4>
+      <p>Instead of one flat block, hold an array of <code>nrows</code> references, each pointing at its own row block. <code>A[i][j]</code> then means "read the reference in slot <code>i</code>, then index into that block at <code>j</code>" — two address computations and <b>two dependent memory accesses</b>. The consequences are a clean list of trade-offs:</p>
+      <table class="cmp">
+        <tr><th></th><th>Single flat block + strides</th><th>Array of row arrays</th></tr>
+        <tr><td>Element access</td><td>one address computation, one access</td><td>two address computations, two dependent accesses</td></tr>
+        <tr><td>Rows must be equal length</td><td>yes — the stride is a single number</td><td>no — rows can be ragged</td></tr>
+        <tr><td>Swapping two rows</td><td><code><span class="keep">Θ</span>(ncols)</code> — copy the elements</td><td><code>O(1)</code> — swap two references</td></tr>
+        <tr><td>Whole-matrix traversal</td><td>one contiguous run; perfect prefetching</td><td><code>nrows</code> separate runs, wherever the allocator put them</td></tr>
+        <tr><td>Memory overhead</td><td>none beyond the elements</td><td>one reference per row, plus per-block allocator overhead</td></tr>
+        <tr><td>Transpose as a view</td><td><code>O(1)</code>, swap strides</td><td>impossible — requires a real copy</td></tr>
+      </table>
+      <p>The flat block is what numerical and image code uses; the array of rows is what a general-purpose language gives you when you write a list of lists, and it is why a "2-D list" and a real 2-D array have such different performance despite identical subscript syntax. Higher dimensions extend both schemes without any new idea — a 3-D array is a flat block with three strides, or an array of arrays of arrays, and the same table applies one level deeper.</p>
+      <div class="callout"><b>The matrix ADT sits on top of either.</b> A matrix is a 2-D array <i>plus</i> the operations that make it a matrix: scalar multiply, add and subtract (all elementwise, all <code><span class="keep">Θ</span>(nrows × ncols)</code>), transpose, and the multiply that costs <code><span class="keep">Θ</span>(n³)</code> by the schoolbook method and less by <a href="../../algorithms/analysis/recurrences-master-theorem.html#master-theorem">divide-and-conquer methods such as Strassen's</a>. The storage decision above is invisible in that interface and decisive in its constants — which is the <a href="memory-dynamic-arrays.html#array-adt">§03</a> lesson again, in the place where it costs the most.</p>
+      </div>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="cache-locality" data-nav="Traversal order &amp; the cache">
+      <h3><span class="idx">09</span> Traversal order and the cache, measured</h3>
+      <p class="lede"><b>Traversal order is the sequence of addresses a loop nest actually visits</b>, and for a multidimensional array it is decided by which subscript sits in the inner loop. A nest whose inner subscript is the fastest-varying one — <code>j</code> for a <a href="#multidimensional">row-major</a> array — walks the block from front to back, one offset at a time. A nest that puts the other subscript inside walks it in jumps of one full row. Both visit exactly the same <code>n²</code> cells, do exactly the same arithmetic and produce exactly the same output, so no complexity analysis can tell them apart; measured on a machine they can differ by close to an order of magnitude. This is the canonical demonstration that <a href="../../algorithms/analysis/space-empirical-limits.html#misleading">asymptotics and running time are different questions</a>, and it is worth doing once with the misses actually counted rather than asserted.</p>
+
+      <div class="formula"><span class="lbl">the two loops over a row-major n × n array</span><span class="eq">for i = 0 … n−1:  for j = 0 … n−1:  visit A[i][j]      // consecutive offsets: 0, 1, 2, 3, …</span>
+<span class="eq">for j = 0 … n−1:  for i = 0 … n−1:  visit A[i][j]      // offsets jump by n each step</span>
+<span class="lbl">the cache model used below, stated so the numbers mean something</span><span class="eq">fully associative, LRU replacement, C lines, L elements per line, initially empty</span>
+<span class="eq">a miss fetches the whole line containing the element; a hit costs nothing</span>
+<span class="lbl">row-major sweep — each line is entered once, used L times, never revisited</span><span class="eq">misses = ceil(n² / L)</span>
+<span class="lbl">column-major sweep — when the working set of one column exceeds the cache</span><span class="eq">misses = n²      (every access fetches a line and evicts it before it is reused)</span></div>
+
+      <div class="viz" id="viz-rm">
+        <div class="vhead">
+          <span class="vtitle">The same n² visits, two orders, misses counted under an explicit cache</span>
+          <span class="vhint">colour is the cache line a cell belongs to — read the grid left to right to see the storage order</span>
+        </div>
+        <div class="controls">
+          <label for="rm-n">matrix n = <b id="rm-n-out"></b></label>
+          <input type="range" id="rm-n" min="4" max="16" step="1" value="8" />
+          <label for="rm-l">line size</label>
+          <select id="rm-l">
+            <option value="2">2 elements</option>
+            <option value="4">4 elements</option>
+            <option value="8" selected>8 elements</option>
+            <option value="16">16 elements</option>
+          </select>
+          <label for="rm-c">cache lines C = <b id="rm-c-out"></b></label>
+          <input type="range" id="rm-c" min="1" max="8" step="1" value="4" />
+          <label for="rm-order">traversal</label>
+          <select id="rm-order">
+            <option value="row" selected>row-major — along the storage</option>
+            <option value="col">column-major — across the storage</option>
+          </select>
+        </div>
+        <svg id="rm-svg" width="690" height="348" viewBox="0 0 690 348" role="img" aria-label="An eight by eight matrix with cells coloured by cache line beside a tape of hit and miss squares for the first sixty-four accesses, and two bars comparing total misses for the row-major and column-major sweeps"></svg>
+        <div class="readout" id="rm-readout" aria-live="polite"></div>
+      </div>
+      <p>At the default settings — <code>n = 8</code>, eight elements per line, a four-line cache — the row-major sweep records <b>8 misses and 56 hits</b>: it enters each of the eight lines once and then reads the other seven elements of that line for free. Select the column-major traversal and the same sweep records <b>64 misses and 0 hits</b>, one per access — its tape turns solid red. That is a factor of eight, which is not a coincidence: it is <code>L</code>, the line size, because the bad order throws away exactly the <code>L − 1</code> elements that came along for the ride with every fetch. Raise the line size and the ratio rises with it; raise <code>C</code> until the whole matrix fits and the gap collapses, because at that point the cache is big enough that even the bad order revisits resident lines.</p>
+
+      <h4>Read the controls as an experiment, not a demo</h4>
+      <ul class="notes">
+        <li><b>The gap is governed by the working set, not by the order as such.</b> A column sweep of a row-major matrix touches one element from every line in the array before it returns to the first — a working set of <code>n²/L</code> lines. If the cache holds that many, every miss is compulsory and both orders take <code>ceil(n²/L)</code>. Push <code>C</code> to 8 with <code>n = 4</code> and <code>L = 4</code> and you can watch the two bars meet. On a real machine the same collapse happens for small matrices and is the reason a micro-benchmark on a 64 × 64 matrix can show no effect at all while a 4096 × 4096 one shows a factor of ten.</li>
+        <li><b>The fix is to change the order, not the algorithm.</b> Swapping the loop nest so the inner variable indexes the fastest-varying subscript costs nothing and is the single highest-leverage change available in array code. Where the algorithm genuinely needs both orders — matrix multiply reads one operand along rows and the other along columns — the standard answer is <b>blocking</b>: process the matrices in tiles small enough that a tile's working set fits in cache, so each loaded line is fully used before it is evicted. The asymptotic count of multiplications is unchanged; only the miss count moves.</li>
+        <li><b>The model here is deliberately simple, and its errors do not all point the same way.</b> The formula block above states the model exactly — fully associative, LRU, <code>C</code> lines of <code>L</code> elements, initially empty — and every number the figure prints is a count under <i>that</i> model, not a prediction about a machine. Three ways a real cache departs from it, with the direction of each departure named honestly:
+          <ul class="notes">
+            <li><b>Set associativity widens the gap.</b> A real cache maps an address to one of a few ways in a fixed set. A column sweep whose stride is a large power of two can land on the same set every time, so the column's working set thrashes a handful of ways instead of the whole cache — <b>conflict misses</b> the fully associative model cannot produce. The column side gets worse; the row side is untouched. The figure understates the gap here.</li>
+            <li><b>Address translation widens the gap for large arrays.</b> Each step of a column sweep advances by one row. Once a row is as large as a page, every access lands on a new page and the translation lookaside buffer misses as well as the cache. The row-major sweep pays one TLB miss per page; the column sweep can pay one per access. None of this is in a model that counts only cache lines.</li>
+            <li><b>Prefetching does not straightforwardly widen it, and can narrow it.</b> This is the claim to be careful with. First, a prefetch does not remove a line transfer — the line is still fetched from memory; the prefetcher only issues the request early enough to hide the latency. <b>The miss counts this figure reports are therefore unchanged by prefetching</b>; what changes is time, which is a different ledger. Second, and more to the point, the hardware prefetchers on mainstream cores track <i>constant strides</i>, not just unit strides — and a column sweep of a row-major matrix is a perfectly constant stride. When the row is small enough that the stride stays inside the prefetcher's window (typically a few hundred bytes) and does not cross a page boundary — most prefetchers will not prefetch across one — the column sweep gets prefetched too, and the measured time gap <i>narrows</i> relative to what a pure miss count predicts. For large matrices, where the row stride exceeds those limits, prefetching helps only the row-major side and the gap widens. <b>So the honest statement is: the direction of the prefetching correction depends on the row length, and the figure's miss counts are not a proxy for it either way.</b></li>
+          </ul>
+        </li>
+      </ul>
+      <p><b>What the figure does license, then, is the narrow claim and not the broad one.</b> Under the stated model, at the stated parameters, the bad order pays <code>L</code> times the line transfers of the good one, and that ratio is a theorem about the model. Whether a particular machine shows a factor of eight, or three, or none at all is an empirical question about associativity, prefetchers, page size and the size of the matrix, and the only way to settle it is to <a href="../../algorithms/analysis/space-empirical-limits.html#empirical">measure on that machine</a>. The reason to trust the qualitative conclusion anyway is that the mechanism — a fetched line whose other <code>L − 1</code> elements are discarded before they are used — is real on every cache ever built.</p>
+      <div class="callout"><b>Why this belongs on a page about arrays.</b> Contiguity is not merely a way to compute addresses; it is a promise about <i>which elements arrive together</i>. An algorithm that consumes elements in storage order collects on that promise and one that does not throws it away. Every later structure in this series can be judged on the same axis, and it is most of the reason a flat array with a worse asymptotic bound so often beats a pointer structure with a better one.</div>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="slicing-aliasing" data-nav="Slices, views &amp; aliasing">
+      <h3><span class="idx">10</span> Slices, views, copies — and the aliasing bug</h3>
+      <p class="lede">A <b>slice</b> is a contiguous run of an array named as if it were an array itself. Because the run is contiguous, it can be described by three numbers — base, length, stride — and therefore there are two entirely reasonable things a language can mean by <code>A[2:6]</code>: a <b>view</b> that shares the original storage, or a <b>copy</b> that owns new storage. They have different costs and, far more dangerously, different semantics under mutation.</p>
+
+      <div class="formula"><span class="lbl">a slice as a triple, with no data touched</span><span class="eq">view(A, lo, hi)  =  (base + lo × itemsize,  length = hi − lo,  stride = 1)</span>
+<span class="lbl">cost</span><span class="eq">view: O(1) time, O(1) extra space, writes are visible through the original</span>
+<span class="eq">copy: <span class="keep">Θ</span>(hi − lo) time and space, writes are private</span>
+<span class="lbl">a strided slice</span><span class="eq">view(A, lo, hi, step) = (base + lo × itemsize, length = ceil((hi − lo)/step), stride = step)</span></div>
+
+      <h4>Three layers of "copy", and which one a language gives you</h4>
+      <ul class="notes">
+        <li><b>No copy — a view.</b> The slice is a window onto the same bytes. Free to make, and every write through either name is seen through the other. This is what array libraries built for numerical work do, because copying a 100 MB sub-matrix to read one row would be absurd.</li>
+        <li><b>A shallow copy.</b> A new block of cells is allocated and the <i>cell contents</i> are copied. For a compact array of numbers that is a full copy and there is nothing more to say. For a <a href="memory-dynamic-arrays.html#referential-compact">referential array</a> the cells contain addresses, so what is copied is the addresses — <b>the new array points at the very same objects</b>. The containers are independent; the elements are shared.</li>
+        <li><b>A deep copy.</b> The cells and, recursively, the objects they refer to are duplicated. This is the only one that gives complete independence, it is the most expensive, and it is the one a language almost never gives you by default.</li>
+      </ul>
+
+      <h4>The bug, in its standard form</h4>
+      <p>The classic failure is building a grid of rows by <i>replicating a row</i>. Replication in a referential array copies the <b>reference</b> <code>n</code> times, so all <code>n</code> "rows" are one row under <code>n</code> names. Writing one cell appears to write a whole column:</p>
+      <div class="formula"><span class="lbl">what was intended</span><span class="eq">grid = n copies of a fresh row of zeros</span>
+<span class="lbl">what replication actually builds</span><span class="eq">grid[0] = grid[1] = … = grid[n−1] = the SAME row object</span>
+<span class="lbl">so</span><span class="eq">grid[0][2] = 7    ⇒    grid[i][2] == 7 for every i</span>
+<span class="lbl">the fix — construct a distinct row per index</span><span class="eq">grid[i] = a new row of zeros, allocated once per i</span></div>
+      <p>The same mechanism produces the subtler version: appending a mutable element to a list and then mutating it afterwards changes what the list holds, because the list holds the object rather than a snapshot of it. Both bugs feel like the container misbehaving; both are the container behaving exactly as documented, on a mental model in which cells hold values rather than addresses.</p>
+
+      <h4>A defensive checklist</h4>
+      <ul class="notes">
+        <li><b>Know which of the three you got.</b> Whether slicing yields a view or a copy is a documented property of the type you are using, and the two are indistinguishable until someone writes through one of them. If a function receives a slice and mutates it, the answer decides whether the caller's data changed.</li>
+        <li><b>Views keep the whole buffer alive.</b> A 12-element view of a 100-million-element array holds a reference to the whole allocation, so the memory cannot be released. Extracting a small window from a large array and retaining it is a genuine leak pattern; the cure is an explicit copy at the point of extraction.</li>
+        <li><b>Sharing is only safe when the elements are immutable.</b> This is the argument for immutable strings (<a href="#what-a-string-is">§11</a>) stated from the other side: if a value cannot change, sharing it can never surprise anyone, and every copy can safely be a reference copy.</li>
+        <li><b>Mutating a container while iterating over it is a separate hazard with the same flavour.</b> Deleting during a forward scan shifts the tail left under the cursor and silently skips an element. Iterate over a copy, build a new array, or walk backwards.</li>
+      </ul>
+      <div class="callout"><b>The general rule.</b> An array cell holds <i>a fixed-width thing</i>. Whether that thing is the value or the address of the value is the single most consequential fact about the type you are using, and almost every surprising behaviour of arrays and lists in a high-level language reduces to it.</div>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="what-a-string-is" data-nav="What a string is">
+      <h3><span class="idx">11</span> What a string is: an array with two extra rules</h3>
+      <p class="lede"><b>A string is a compact array of character codes.</b> That is the whole definition, and everything distinctive about strings follows from two decisions layered on top of it: the elements are drawn from an <i>encoding</i> rather than being plain integers, and in most modern languages the array is <i>immutable</i>. The first decision breaks the assumption that one character is one cell; the second turns an innocuous loop into a quadratic one.</p>
+
+      <h4>Rule one: encodings, and why "length" is ambiguous</h4>
+      <ul class="notes">
+        <li><b>Fixed-width encodings keep §01 intact.</b> ASCII or Latin-1 at one byte per character, or UTF-32 at four, make <code>itemsize</code> a constant, so <code>s[i]</code> is one address computation and the i-th cell is the i-th character. Simple, and wasteful for text that is mostly ASCII.</li>
+        <li><b>Variable-width encodings break it.</b> In UTF-8 a code point occupies one to four bytes; in UTF-16 one or two 16-bit units. The cells are still uniform — they are bytes, or 16-bit units — but <b>a cell is no longer a character</b>. Indexing by code point then costs <code><span class="keep">Θ</span>(i)</code>, because you must decode forward from the start, and the <code>O(1)</code> promise of §01 quietly applies to a different unit than the one you meant.</li>
+        <li><b>So "the length of a string" has at least four answers</b> — bytes, code units, code points, and user-perceived characters (grapheme clusters, where an accent or a skin-tone modifier joins the preceding character). They coincide for ASCII and diverge for everything else, and a great many text bugs are a disagreement about which one a piece of code is counting. Languages pick different defaults; libraries that slice by byte offset can cut a code point in half.</li>
+        <li><b>Implementations cheat productively.</b> A common strategy is to store an all-ASCII string as one byte per character and widen only when a non-ASCII character appears, so the common case keeps constant-time indexing and the general case still works. The lesson is the <a href="memory-dynamic-arrays.html#array-adt">§03</a> one: the interface says "a sequence of characters", and what it costs depends entirely on the layout underneath.</li>
+      </ul>
+
+      <h4>Rule two: immutability, and the loop everyone writes once</h4>
+      <p>If a string cannot be modified, then <code>s = s + ch</code> cannot append. It must <b>allocate a new block of length <code>|s| + 1</code> and copy every character of <code>s</code> into it</b>. Doing that in a loop to build a string of length <code>n</code> copies <code>1 + 2 + ⋯ + n</code> characters:</p>
+      <div class="formula"><span class="lbl">building an n-character string by repeated concatenation</span><span class="eq">∑ₖ₌₁ⁿ k  =  n(n+1)/2  =  <span class="keep">Θ</span>(n²)  character copies, and n allocations</span>
+<span class="lbl">building it by collecting into a growable array and joining once</span><span class="eq">n amortized appends + one pass to join  =  <span class="keep">Θ</span>(n)  character copies, and O(log n) allocations</span>
+<span class="lbl">the ratio, measured, at two lengths</span><span class="eq">n = 200:  20 100 copies against 655        n = 400:  80 200 against 1 311</span></div>
+
+      <div class="viz" id="viz-cat">
+        <div class="vhead">
+          <span class="vtitle">Two ways to build one string, every character copy counted</span>
+          <span class="vhint">switch to a log axis to see that one curve has twice the slope of the other</span>
+        </div>
+        <div class="controls">
+          <label for="cat-n">length n = <b id="cat-n-out"></b></label>
+          <input type="range" id="cat-n" min="8" max="400" step="8" value="200" />
+          <label for="cat-scale">y axis</label>
+          <select id="cat-scale">
+            <option value="lin" selected>linear</option>
+            <option value="log">logarithmic</option>
+          </select>
+        </div>
+        <svg id="cat-svg" width="690" height="300" viewBox="0 0 690 300" role="img" aria-label="Measured character copies against final string length: a steep parabola for repeated concatenation lying on its closed form, and a nearly flat line for collect-and-join"></svg>
+        <div class="readout" id="cat-readout" aria-live="polite"></div>
+      </div>
+      <p>The parabola sits exactly on its dashed closed form <code>n(n+1)/2</code> at every point, which is the check that the counter is counting what the algebra describes. The green line is <code><span class="keep">Θ</span>(n)</code> with a small constant — roughly three copies per character, one to place it, about one more for the array's amortized doubling (<a href="memory-dynamic-arrays.html#dynamic-arrays">§06</a>), and one for the final join. On the logarithmic axis the two become straight lines of slope 2 and slope 1, which is the cleanest possible statement that one is quadratic and the other linear. <b>The asymmetry is brutal and grows without bound:</b> at <code>n = 200</code> the measured ratio is <b>30.7×</b>, at <code>n = 400</code> it is <b>61.2×</b> — it roughly doubles when <code>n</code> does, because a quadratic divided by a linear is a linear.</p>
+
+      <h4>Why immutability is chosen anyway</h4>
+      <ul class="notes">
+        <li><b>Sharing becomes free and safe.</b> An immutable string can be handed to any number of holders, stored as a dictionary key, cached, interned, or shared between threads without a lock, because no holder can invalidate another's view. That is the <a href="#slicing-aliasing">§10</a> aliasing problem simply not existing.</li>
+        <li><b>Hashes and lengths can be cached.</b> A value that cannot change can have its hash computed once and stored, which is what makes strings cheap dictionary keys.</li>
+        <li><b>Substrings can be views.</b> If nobody can write, a substring can share the parent's buffer. (This is a real technique with a real cost — it keeps the parent alive, §10 again — so implementations differ on whether they do it.)</li>
+        <li><b>The escape hatch is a mutable builder.</b> Every language that makes strings immutable provides a growable buffer for the times you need to accumulate: build there, convert once at the end. That is exactly the green line in the figure, and it is the only correct habit for assembling text in a loop.</li>
+      </ul>
+      <div class="callout"><b>A warning about the warning.</b> Some runtimes special-case <code>s += ch</code> when they can prove there is exactly one reference to <code>s</code>, mutating the buffer in place and turning the quadratic loop linear. That optimisation is fragile — one extra reference anywhere and the quadratic behaviour returns — and it is not guaranteed across implementations. <b>Do not write code whose complexity class depends on an optimiser noticing something.</b> Collect and join.</div>
+    </section>
+
+    <nav class="pager" aria-label="Arrays &amp; Strings series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="memory-dynamic-arrays.html">← Array Memory Layout &amp; Dynamic Arrays</a>
+      <a href="../arrays-strings.html" style="color:var(--muted)">Arrays &amp; Strings · overview</a>
+      <a href="array-techniques.html">Two Pointers, Sliding Window &amp; Prefix Sums →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../../data.js"></script>
+<script src="../../../notes.js"></script>
+<script src="../../dsa-viz.js"></script>
+<script src="../arrays-strings.viz.js"></script>
+</body>
+</html>

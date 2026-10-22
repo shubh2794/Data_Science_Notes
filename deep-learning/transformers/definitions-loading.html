@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Model Definitions &amp; Loading</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to the other pages of the series */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../transformers.html">Transformers</a> · part 6 of 7</p>
+      <h1>Model Definitions &amp; Loading</h1>
+      <p>The transformer as code and bytes: the anatomy of a model definition, how a checkpoint is laid out, loading with dtype, meta device and placement, weight conversion at load time, heterogeneous per-layer configurations, eager/SDPA/Flash/flex attention backends, paged attention's block table, and experts backends for MoE layers.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Transformers</span>
+        <span class="pill">Model anatomy · checkpoints · meta device · conversion · SDPA/Flash · paged · MoE</span>
+      </div>
+    </header>
+
+    <!-- ═══ 36 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="anatomy" data-nav="Anatomy of a model definition">
+      <h3><span class="idx">36</span> The model as an implementation defines it: a configuration, a base model, a head, and a preprocessor</h3>
+      <p class="lede">Everything above this section is the architecture as mathematics. From here to §51 the page follows the same Transformer into a real implementation at inference time: how it is described, stored, loaded and placed; which attention kernel actually runs; how the KV cache is managed; what the generate loop does to the logits; how perplexity is measured; and how a chat is turned into tokens. The first fact is structural: <b>an implementation splits a model into three objects that travel separately</b> — a <b>configuration</b> (the hyper-parameters §22 counted, and nothing else), a <b>model</b> built from it (a base model plus zero or more task heads), and a <b>preprocessor</b> (a tokenizer, and for chat models a template; for vision models an image processor) that turns raw input into the integer ids §20 embeds.</p>
+
+      <div class="formula"><span class="lbl">the three objects, and what each one owns</span><span class="eq">configuration   a flat record of hyper-parameters, no weights:
+                  vocab_size V, hidden_size d, intermediate_size d_ff, num_hidden_layers L,
+                  num_attention_heads h, num_key_value_heads g, head_dim dₖ, rope_theta (§07's base),
+                  norm epsilon, tie_word_embeddings (§21), max_position_embeddings, torch dtype …
+base model      embedding (§20) → L blocks (§02) → final norm N_f (§11)
+                output: the last hidden states, (batch × n × d) — no vocabulary anywhere
+task head       ONE small module on top of the base model's output:
+                  causal-LM head        d × V              (§21, possibly tied to the embedding)
+                  sequence classifier   d × num_labels     read at the last non-padding token
+                  token classifier      d × num_labels     read at every token
+                  extractive QA         d × 2              a start logit and an end logit per token
+preprocessor    text → ids (tokenizer), messages → text (chat template, §50),
+                pixels → normalised patches (image processor)
+
+"architecture" = the code that turns a configuration into modules (the skeleton)
+"checkpoint"   = one set of trained weights for that skeleton (§37)</span></div>
+
+      <h4>A configuration is the parameter count, before any weight exists</h4>
+      <p>The configuration is not documentation; it is the complete specification of every tensor shape, which means §22's closed form can be evaluated from it alone. Take the fields of an 8B-class decoder of the 2024 generation and push them through the formula. Nothing below was looked up except the eight configuration values; the total matches the parameter count such models are published with.</p>
+      <div class="formula"><span class="lbl">by hand — configuration → shapes → parameters (§22's formula, gated FFN, GQA, untied head, RMSNorm)</span><span class="eq">V = 128 256   d = 4 096   d_ff = 14 336   L = 32   h = 32   g = 8   dₖ = 128   tied = false
+
+embedding       V·d                        = 128 256 × 4 096            =   525 336 576
+per block
+  q_proj        d × h·dₖ = 4096 × 4096                                   =    16 777 216
+  k_proj, v_proj  2 × d × g·dₖ = 2 × 4096 × 1024                         =     8 388 608
+  o_proj        h·dₖ × d                                                  =    16 777 216
+  gate, up, down  3 × d × d_ff = 3 × 4096 × 14336                        =   176 160 768
+  2 RMSNorms    2 × d                                                     =         8 192
+  block total                                                            =   218 112 000
+32 blocks                                                                 = 6 979 584 000
+final norm      d                                                         =         4 096
+LM head         d·V (untied)                                              =   525 336 576
+total                                                                     = 8 030 261 248
+
+bytes at 2 per parameter (bf16):  16 060 522 496 B  =  16.06 GB  =  14.96 GiB     — §37 stores exactly this</span></div>
+
+      <h4>Base model against head: why the split exists</h4>
+      <p>Every head in the table reads the same <code>(n × d)</code> output, so one pretrained base model serves every task, and swapping the task means swapping one small matrix. The head that ships with a generative checkpoint is the <code>d × V</code> LM head; asking for a sequence classifier on the same checkpoint loads the base model's weights and creates a <code>d × num_labels</code> matrix that has <b>no pretrained values</b> — 4 096 × 2 = 8 192 fresh numbers for a binary classifier on the 8B model, initialised randomly and reported as "newly initialised" at load time. That warning is the expected signal that fine-tuning is required, not an error. The mechanics that make the swap work are naming conventions: every parameter has a dotted path (<code>model.layers.0.self_attn.q_proj.weight</code>), the base model lives under one fixed prefix (<code>model.</code>), and a loader that sees a checkpoint with the prefix and a module without it — or the reverse — strips or adds the prefix. <b>Weight tying</b> (§21) is declared rather than copied: the head's weight is recorded as an alias of the embedding's, so it is stored once on disk and a device placer never puts the two copies on different devices.</p>
+
+      <table class="grid2">
+        <tr><th>head on the 8B base</th><th>shape</th><th>new parameters</th><th>share of the model</th><th>read at</th></tr>
+        <tr><td><b>causal LM</b></td><td class="mono">4096 × 128256</td><td class="num">525 336 576</td><td class="num">6.54%</td><td>every position (next token)</td></tr>
+        <tr><td><b>sequence classification, 2 labels</b></td><td class="mono">4096 × 2</td><td class="num">8 192</td><td class="num">0.0001%</td><td>the last non-padding token — a decoder's only position that has seen the whole input</td></tr>
+        <tr><td><b>token classification, 9 labels</b></td><td class="mono">4096 × 9</td><td class="num">36 864</td><td class="num">0.0005%</td><td>every position</td></tr>
+        <tr><td><b>extractive QA</b></td><td class="mono">4096 × 2</td><td class="num">8 192</td><td class="num">0.0001%</td><td>every position: one start and one end logit each</td></tr>
+      </table>
+
+      <h4>Backbones: the same split for vision, read at several depths</h4>
+      <p>Detection and segmentation models use a <b>backbone</b> (feature extractor), a <b>neck</b> (combines feature maps) and a <b>head</b> (predicts boxes or masks), and the backbone is exposed as a base model whose output is not only its last layer but a chosen set of stages. Asking a hierarchical vision Transformer for its first stage returns a map of shape <code>(1, 96, 56, 56)</code> on a <code>224 × 224</code> input: the patch embedding strides by 4, so <code>224/4 = 56</code> positions per side, and 96 is that stage's channel width. Later stages halve the grid and double the channels (<code>28 × 28 × 192</code>, <code>14 × 14 × 384</code>, <code>7 × 7 × 768</code>), which is exactly the multi-scale pyramid a detection neck expects. The patch embedding and the encoder stack are <a href="../../vision/vision-transformers.html">Vision Transformers</a>' subject; the point here is only that "backbone" is the base-model / head split with more than one read-out depth.</p>
+
+      <h4>Changing a component without rewriting the model</h4>
+      <p>Because the configuration fully determines the modules, a model can be modified by replacing one module class before the weights are loaded. The standard example splits a fused <code>qkv</code> projection into three so that a low-rank adapter can be attached to <code>q</code> and <code>v</code> only: a load-time hook chunks each <code>(3d × d)</code> fused weight into three <code>(d × d)</code> pieces as the checkpoint streams in. With rank 16 on the two projections of a 12-layer, <code>d = 768</code> vision encoder that adds <code>12 × 2 × 16 × (768 + 768) = 589 824</code> trainable parameters to a 94 274 096-parameter model — 0.63%, which is <a href="../../llm/parameter-efficient-fine-tuning.html#lora">Parameter-Efficient Fine-Tuning</a>'s subject. The order matters: swapping the class <b>after</b> loading leaves the three new projections randomly initialised, because the hook runs only while the checkpoint is read. The model still runs and produces fluent-looking nonsense — another bug that does not crash (§35).</p>
+
+      <h4>The conventions that make loading and placement possible</h4>
+      <ul class="notes">
+        <li><b>Modules are built on the meta device</b> (§38): a tensor with a shape and no storage. Any initial value written in a constructor is therefore discarded; initialisation lives in a separate routine that runs only for parameters the checkpoint did not supply.</li>
+        <li><b>The block class is declared unsplittable</b>, so an automatic device placer never cuts a residual block — and its residual addition — across two devices (§38).</li>
+        <li><b>One rotary module per model, not per layer</b>: the angle table <code>θᵢ = base^(−2i/dₖ)</code> of §06 is built once and the cos/sin are passed down; one copy per attention layer duplicates buffers 32 times and invites the per-layer drift §06's pairing warning describes.</li>
+        <li><b>No hard-coded <code>−1e9</code> in a masked fill</b>: fp16's largest finite value is 65 504 (§28), so <code>−1e9</code> overflows to <code>−∞</code> in fp16 while being nowhere near the smallest fp32 value — the same constant means different things in different dtypes. §35's query-axis mask test is the consequence.</li>
+        <li><b>No positional container names</b>: a sequential container names its children <code>mlp.0</code>, <code>mlp.2</code>, and every conversion map (§39), tying declaration and parallelism plan that refers to them breaks when a layer is inserted.</li>
+        <li><b>Remote code is code</b>: a model whose architecture is not in the library ships its own Python and runs it at load time. Pin the exact revision you reviewed; a moving branch can change what executes.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 37 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="checkpoint" data-nav="How a checkpoint is laid out">
+      <h3><span class="idx">37</span> How a checkpoint is laid out on disk: sharded tensors, an index, a configuration and a tokenizer</h3>
+      <p class="lede">A trained model on disk is a directory, not a file. The weights are split into <b>shards</b> of a bounded size, an <b>index</b> maps every parameter name to its shard, and beside them sit the configuration of §36, the generation defaults of §46, and the tokenizer and chat template of §50. Each file exists because of a specific failure it prevents, and the byte counts follow from §36's arithmetic.</p>
+
+      <div class="formula"><span class="lbl">the directory, file by file</span><span class="eq">config.json                          §36's hyper-parameters, plus the stored dtype
+generation_config.json               default decoding settings (§46): eos ids, temperature, max length …
+model-00001-of-00004.safetensors     shard 1  ┐
+model-00002-of-00004.safetensors     shard 2  │  every tensor lives in exactly one shard;
+model-00003-of-00004.safetensors     shard 3  │  shards are filled in parameter order
+model-00004-of-00004.safetensors     shard 4  ┘
+model.safetensors.index.json         { "metadata": { "total_size": &lt;bytes&gt; },
+                                       "weight_map": { "model.embed_tokens.weight": "model-00001-of-00004.safetensors",
+                                                       "lm_head.weight":            "model-00004-of-00004.safetensors", … } }
+tokenizer.json, tokenizer_config.json    the vocabulary, merges, special tokens (§50)
+chat_template.jinja                  how a list of messages becomes one string (§50)</span>
+<span class="lbl">one safetensors file, byte by byte</span><span class="eq">[ 8 bytes: N, little-endian u64 ][ N bytes: JSON header ][ raw tensor bytes, back to back ]
+header entry:  "model.layers.0.mlp.up_proj.weight": { "dtype": "BF16", "shape": [14336, 4096],
+                                                       "data_offsets": [start, end] }
+end − start = 14336 × 4096 × 2 = 117 440 512 bytes — the header is enough to know every size
+
+why this format: the header is data, not code — loading cannot execute anything (a pickled
+file can); and the tensor bytes can be memory-mapped and read lazily, one tensor at a time,
+straight into their destination (§38)</span></div>
+
+      <h4>Sharding, worked</h4>
+      <p>A shard cap bounds the size of any single file, which matters for downloads that resume, for file systems and hosts with per-file limits, and for the loader, which can read shards in parallel. The rule is greedy: walk the parameters in order, append each tensor to the current shard, and start a new shard when the next tensor would push it over the cap; a single tensor larger than the cap gets a shard of its own. For §36's 8B model in bf16 the total is 16 060 522 496 bytes. Under a 5 GB cap that is <code>⌈16.06 / 5⌉ = 4</code> shards at best, and the greedy walk gives exactly four (the embedding and the first blocks, two shards of middle blocks, the last blocks and the 1.05 GB head); the four-shard layout is what such checkpoints were commonly published with. Under the 50 GB default the current library version saves with, the same model is <b>one</b> file, and a 70B-class model in bf16 (137.95 GB, §22's row times two bytes) is three. The index's <code>total_size</code> is the sum of the tensors' bytes — the number to compare with a device's memory before anything is loaded, and the figure below computes it from the configuration exactly as a loader would.</p>
+
+      <table class="grid2">
+        <tr><th>model (§22 shapes)</th><th>parameters</th><th>fp32</th><th>bf16 / fp16</th><th>int8</th><th>4-bit (+ group-64 scales)</th><th>bf16 shards, 5 GB cap</th><th>bf16 shards, 50 GB cap</th></tr>
+        <tr><td>8B-class (§36)</td><td class="num">8 030 261 248</td><td class="num">32.12 GB</td><td class="num">16.06 GB</td><td class="num">8.03 GB</td><td class="num">≈ 4.52 GB</td><td class="num">4</td><td class="num">1</td></tr>
+        <tr><td>70B-class</td><td class="num">68 976 648 192</td><td class="num">275.9 GB</td><td class="num">137.95 GB</td><td class="num">68.98 GB</td><td class="num">≈ 38.8 GB</td><td class="num">≥ 28</td><td class="num">3</td></tr>
+        <tr><td>8 × 7B mixture of experts</td><td class="num">46 702 792 704</td><td class="num">186.8 GB</td><td class="num">93.41 GB</td><td class="num">46.70 GB</td><td class="num">≈ 26.3 GB</td><td class="num">≥ 19</td><td class="num">2</td></tr>
+      </table>
+      <p>The 4-bit column counts half a byte per weight plus one 16-bit scale and one 16-bit offset per group of 64 weights, <code>0.5 + 4/64 = 0.5625</code> bytes per parameter; real schemes differ in group size and in which layers they leave unquantised (typically the embedding and the head), so it is an estimate of the order, and quantisation itself is <a href="../../mlops/model-acceleration.html#quant">Model Acceleration</a>'s. The mixture-of-experts row is a model whose FFN is eight SwiGLU experts of <code>d_ff = 14 336</code> at <code>d = 4 096</code>: 1.41 billion expert parameters per layer, and §39 shows why its checkpoint layout differs from its runtime layout.</p>
+
+      <div class="viz" id="viz-ck">
+        <div class="vhead">
+          <span class="vtitle">From a configuration to bytes, shards, and the memory curve while loading — with and without a meta-device skeleton</span>
+          <span class="vhint">the tensor list is generated from the configuration, sharded greedily, then "loaded" shard by shard; the naive loader first materialises a random-initialised copy, the meta-device loader never does — watch the peak, then shrink the GPU and see where the device placer puts the overflow</span>
+        </div>
+        <div class="controls">
+          <label>model <select id="ck-m"><option value="1b">1B-class (d 2048, L 16)</option><option value="8b" selected>8B-class (§36)</option><option value="moe">8 × 7B experts</option><option value="70b">70B-class</option></select></label>
+          <label>dtype <select id="ck-t"><option value="4">fp32</option><option value="2" selected>bf16</option><option value="1">int8</option><option value="0.5625">4-bit + scales</option></select></label>
+          <label>shard cap <select id="ck-s"><option value="2">2 GB</option><option value="5" selected>5 GB</option><option value="10">10 GB</option><option value="50">50 GB</option></select></label>
+          <label>GPU memory <select id="ck-g"><option value="24">24 GB</option><option value="80" selected>80 GB</option><option value="160">2 × 80 GB</option></select></label>
+          <label>CPU RAM <select id="ck-c"><option value="32">32 GB</option><option value="128" selected>128 GB</option></select></label>
+        </div>
+        <svg id="ck-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Top: one horizontal bar per shard, its length the shard's size in gigabytes, with the shard cap drawn as a dashed vertical line; at the defaults, the 8B-class model in bf16 under a 5 GB cap, there are four shards, three near five gigabytes and a smaller last one holding the output head. Bottom left: memory in use on the loading device against loading progress in shards, for two loaders: a naive one that first allocates a randomly initialised model of full size and then reads every shard into a separate state dictionary before copying, whose curve starts at the model size and peaks near twice it; and a meta-device loader whose skeleton costs nothing and whose curve rises shard by shard to exactly the model size. Bottom right: a stacked bar showing how an automatic device placer distributes whole blocks, fastest device first — the GPU up to its budget, then CPU memory, then disk — with the number of blocks on each device printed. The readout prints the total bytes, the shard count, both loaders' peaks, the per-device block counts, and the time to stream the non-GPU weights once per generated token at assumed transfer rates."></svg>
+        <div class="readout" aria-live="polite" id="ck-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 38 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="loading" data-nav="Loading: dtype, meta device, placement">
+      <h3><span class="idx">38</span> Loading: the stored dtype, an empty skeleton on the meta device, and a device map that fills the fastest memory first</h3>
+      <p class="lede">Loading a checkpoint is three decisions: <b>in what dtype</b> to hold the weights, <b>how to avoid holding them twice</b> while they are read, and <b>on which device</b> each block should live. Each has a default that is right most of the time and a failure mode that costs memory or speed without raising an error.</p>
+
+      <h4>The dtype: load what was stored</h4>
+      <p>A model trained in bf16 carries no information in an fp32 copy of its weights — upcasting pads each mantissa with zeros (§28) — and costs twice the memory: 32.12 GB instead of 16.06 GB for the 8B model. Current library versions therefore default to the dtype recorded in the configuration (or, failing that, the dtype of the first floating-point tensor in the checkpoint), and an explicit dtype overrides it. Older versions defaulted to fp32, and older guides still say so; the safe habit is to state the dtype explicitly (<code>dtype="auto"</code> or <code>torch.bfloat16</code>). The one reason to change dtype at load time is hardware: fp16 on a device without bf16 support, which brings back §28's overflow risk for the largest activations.</p>
+
+      <div class="formula"><span class="lbl">the two loaders, and their peak memory</span><span class="eq">NAIVE        1  build the model: every parameter allocated and randomly initialised     M bytes
+             2  read the checkpoint into a separate dictionary of tensors                + M bytes
+             3  copy the dictionary into the parameters, free the dictionary
+             peak ≈ 2M        (8B in bf16: ≈ 32.1 GB for a 16.1 GB model)
+             read shard by shard, freeing each after its copy: peak ≈ M + the largest shard —
+             one reason checkpoints are sharded (8B, 5 GB shards: ≈ 21 GB)
+             and the random initialisation of step 1 is pure waste: every value is overwritten
+
+META DEVICE  1  build the model on the "meta" device: shapes and dtypes, NO storage        0 bytes
+             2  for each tensor in the (memory-mapped) shards: allocate it on its target
+                device in its target dtype and copy the bytes in; free the source view
+             3  initialise only what the checkpoint did not contain (a new head, §36);
+                re-establish tied weights
+             peak ≈ M  (+ the largest tensor group a conversion needs at once, §39)</span></div>
+
+      <h4>Placement: fill the fastest memory first, never cut a block</h4>
+      <p>When the model does not fit on one device, an automatic device map assigns modules in order — embedding, blocks, final norm, head — to the fastest device until its budget is spent, then to the next: GPU(s), then CPU memory, then disk. The unit it moves is the <b>block</b>: the block class is declared unsplittable (§36), because cutting a block would put a residual addition's two operands on two devices. Parameters placed on the CPU or disk are not computed there; they are <b>streamed to the GPU for every forward pass</b> and discarded. That is why offloading makes a model runnable but not fast, and the arithmetic is decisive.</p>
+      <div class="formula"><span class="lbl">by hand — a 70B-class model (137.95 GB in bf16) on one 80 GB GPU with a 70 GB budget</span><span class="eq">per block:     855.6 M parameters × 2 B = 1.711 GB        (§22: 68 452.4 M in 80 blocks)
+embedding:     32 000 × 8 192 × 2 B    = 0.524 GB     placed first
+GPU blocks:    ⌊ (70 − 0.524) / 1.711 ⌋ = 40 blocks  → 68.98 GB on the GPU
+CPU:           the other 40 blocks + final norm + head   = 68.98 GB
+
+one decode step must read EVERY weight once (§47):
+   GPU-resident part at 3.35 TB/s:   68.98 GB / 3.35 TB/s  ≈  21 ms
+   CPU part over PCIe at ~25 GB/s:   68.98 GB / 25 GB/s    ≈  2.8 s        ← about 130× the GPU part
+   if that half were on an NVMe disk at ~3 GB/s:                          ≈  23 s per token
+(transfer rates are representative assumptions, not measurements; the ratio is the point)</span></div>
+      <p>So a device map that spills half a model to the CPU generates at roughly one token every three seconds, not at half the GPU speed. The remedies are the ones that shrink the model rather than move it — fewer bytes per weight (<a href="../../mlops/model-acceleration.html#quant">quantisation</a>), or more GPU memory through <a href="../distributed-training/tensor-sequence-context.html#model">tensor or pipeline parallelism</a> — and the device map is best read as a way to <i>run</i> something that does not fit, for evaluation or debugging. Two further details keep loading fast: shards are read by a small pool of threads (the work is I/O-bound, so a handful suffices; changing dtype during the copy makes it CPU-bound), and every tensor is written once, directly into its destination, so there is no second pass. The figure in §37 runs the placement for any configuration and budget.</p>
+
+      <div class="wrong"><span class="say">The default that quietly doubles memory.</span> Loading a bf16 checkpoint "with no dtype argument" on a version or code path that defaults to fp32. <span class="fix">The model loads, runs, and gives essentially the same answers (the weights are identical; only the arithmetic precision differs), in twice the memory and at roughly half the decode speed.</span> §47 shows decode time is weight bytes over bandwidth; fp32 doubles the bytes. Check the loaded model's dtype once, and compare the device's memory in use with §37's <code>total_size</code>.</div>
+    </section>
+
+    <!-- ═══ 39 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="weightconv" data-nav="Weight conversion at load time">
+      <h3><span class="idx">39</span> Dynamic weight loading: when the checkpoint's layout is not the model's, and the conversion runs as the bytes arrive</h3>
+      <p class="lede">The tensors on disk are named and shaped the way the model was <i>trained or published</i>; the tensors in memory are named and shaped the way the <i>kernels want them</i>. The two differ more often than not — fused projections, experts stacked into one 3-D tensor, a different RoPE pairing, legacy names — and a modern loader closes the gap with a list of small, <b>reversible</b> tensor operations applied to each group of checkpoint tensors as it is read, so that saving applies the inverses and reproduces the original files.</p>
+
+      <div class="formula"><span class="lbl">the operations, each with its inverse (the inverse is what saving runs)</span><span class="eq">rename            "LayerNorm.gamma" → "LayerNorm.weight",  ".block_sparse_moe." → ".mlp."
+chunk(dim)        one tensor → k equal pieces        e.g. a fused (3d × d) qkv → three (d × d)      inverse: concatenate
+concatenate(dim)  k tensors → one                    e.g. gate (d_ff × d) and up (d_ff × d) → gate_up          inverse: chunk
+merge list(dim)   E tensors of rank 2 → one of rank 3 e.g. E experts' matrices → (E × · × ·)         inverse: split list
+transpose         swap two axes                      a (d_in × d_out) against (d_out × d_in) convention
+permute for RoPE  reorder Q and K rows per head      adjacent pairing ↔ rotate-half pairing (§06)
+one converter may "claim" a checkpoint key; any number of renames may fire on it first.</span></div>
+
+      <h4>Worked: an 8-expert layer, from 24 tensors to two</h4>
+      <p>A mixture-of-experts checkpoint commonly stores each expert's three SwiGLU matrices separately — for 8 experts that is 24 tensors per layer — while a grouped-matmul kernel (§43) wants all experts' gate and up projections in one tensor and all down projections in another. Two converters do it: stack the gate matrices and the up matrices across experts, then concatenate the two stacks along the output axis.</p>
+      <div class="formula"><span class="lbl">by hand — d = 4 096, d_ff = 14 336, E = 8 experts, bf16</span><span class="eq">checkpoint, per layer:   experts.{0…7}.w1 (gate), .w3 (up), .w2 (down)   24 tensors, 14336 × 4096 (w1, w3) or 4096 × 14336 (w2)
+merge list(dim 0) on w1:  (8, 14336, 4096)          merge list(dim 0) on w3:  (8, 14336, 4096)
+concatenate(dim 1):       gate_up  (8, 28672, 4096)  =  939 524 096 elements  =  1.879 GB
+merge list(dim 0) on w2:  down     (8, 4096, 14336)  =  469 762 048 elements  =  0.940 GB
+(every matrix is stored as (out × in); the concatenation runs along the output axis)
+
+peak memory while converting: a concatenation writes a NEW tensor while its inputs are alive,
+so the group briefly needs 2× its size. The worst case is the whole model plus the largest group:
+   model  46 702 792 704 params × 2 B = 93.41 GB
+   worst  93.41 + 1.88 (the 16 gate/up inputs still alive while the fused copy is written) ≈ 95.3 GB
+   against the naive loader of §38:  2 × 93.41 = 186.8 GB</span></div>
+
+      <h4>The RoPE permutation: §06's warning, turned into a load step</h4>
+      <p>§06 showed that "adjacent" pairing <code>(2i, 2i+1)</code> and "rotate-half" pairing <code>(i, i + dₖ/2)</code> are different functions of <code>q</code>, and that running a checkpoint under the wrong one does not crash. A converter fixes it at load time by permuting the output rows of <code>W_Q</code> and <code>W_K</code> within each head so that the coordinates a checkpoint rotated together land in the positions the other convention rotates together. With <code>dₖ = 8</code> the adjacent pairs are (0,1), (2,3), (4,5), (6,7) and the rotate-half pairs are (0,4), (1,5), (2,6), (3,7); the permutation that moves old row <code>2i</code> to new row <code>i</code> and old row <code>2i+1</code> to new row <code>i + 4</code> is <code>[0, 2, 4, 6, 1, 3, 5, 7]</code> (new position <code>j</code> takes old row <code>perm[j]</code>). Check pair 1 under rotate-half: new rows 1 and 5 hold old rows 2 and 3 — an adjacent pair, as required. Because <code>q·k</code> sums over the same coordinates in both conventions, permuting both <code>W_Q</code> and <code>W_K</code> identically leaves every unrotated score unchanged and makes every rotated score identical to the original model's; <code>V</code> is never touched (§06). The same permutation applied to only one of <code>W_Q</code>, <code>W_K</code> is a silent bug, and the §17-style check that catches it is one forward pass compared against a reference implementation.</p>
+
+      <h4>Sharding while loading, and the packed-weight trap</h4>
+      <p>With tensor parallelism each device holds a slice of every matrix (<a href="../distributed-training/tensor-sequence-context.html#model">Distributed Training</a> owns the scheme), and a dynamic loader slices each tensor <i>as it is materialised</i>, so a device never holds more than its share. Fused tensors need care. A <code>gate_up</code> projection of width <code>2·d_ff</code> is laid out <code>[G₀ G₁ G₂ G₃ | U₀ U₁ U₂ U₃]</code>; split naively in two, device 0 gets all of the gate and device 1 all of the up projection, and <code>silu(gate) ⊙ up</code> would multiply the wrong halves. The correct split interleaves: device 0 gets <code>[G₀ G₁ | U₀ U₁]</code>, device 1 gets <code>[G₂ G₃ | U₂ U₃]</code>. At <code>d_ff = 14 336</code> and two devices that is 7 168 gate columns and 7 168 up columns each. The shapes of the right and the wrong split are identical, so this is a bug that does not crash — caught only by comparing outputs against an unsharded run.</p>
+    </section>
+
+    <!-- ═══ 40 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="perlayer" data-nav="Heterogeneous, per-layer configurations">
+      <h3><span class="idx">40</span> Heterogeneous stacks: when the blocks are not identical, and every per-layer quantity must be computed per layer</h3>
+      <p class="lede">§01 said the stack is <code>L</code> identical blocks, and §22's accounting multiplied by <code>L</code>. Several recent checkpoints break that on purpose: architecture search on a trained model shrinks the FFN of some layers, cuts the key/value heads of others, or removes a sub-layer entirely where the model can do without it — a 253B model derived from a 405B one and a 49B model from a 70B one are published examples. A configuration then needs a global value plus a sparse list of per-layer overrides, and every formula that multiplied by <code>L</code> becomes a sum over layers.</p>
+
+      <div class="formula"><span class="lbl">the per-layer form of §22's count and of the KV cache</span><span class="eq">parameters   =  embeddings  +  ∑ₗ [ attnₗ(h, gₗ, dₖ)·[attention kept]  +  ffnₗ(d_ffₗ)·[mlp kept]  +  normsₗ ]  +  head
+KV bytes per token  =  ∑ₗ  2 · gₗ · dₖ · b · [layer ℓ has attention]           b = bytes per element
+
+a sparse override list, and the resolved view of it:
+   global      d = 4096, d_ff = 14336, L = 32, g = 8
+   layer  5    d_ff = 8192
+   layer 11    g = 4
+   layer 23    skip the MLP
+   layer 27    skip attention
+reading "g" without a layer index is now AMBIGUOUS — a well-behaved implementation refuses to answer.</span>
+<span class="lbl">by hand — what the four overrides do to the 8B model of §36</span><span class="eq">FFN params:     layer 5:  3 × 4096 × 8192 = 100 663 296  instead of 176 160 768   (−75 497 472)
+                layer 23: 0                                instead of 176 160 768   (−176 160 768)
+attention:      layer 11: 4096×4096·2 + 2×4096×512 = 37 748 736  instead of 41 943 040  (−4 194 304)
+                layer 27: 0                                   instead of 41 943 040  (−41 943 040)
+total           8 030 261 248 − 297 795 584 = 7 732 465 664 parameters
+                (the skipped sub-layers' RMSNorms are counted as kept; and the architecture must read the
+                 overrides when it builds each layer — a configuration record alone removes nothing)
+
+KV per token:   30 layers × (2·8·128·2 = 4 096 B)  +  layer 11: 2·4·128·2 = 2 048 B  +  layer 27: 0
+                = 122 880 + 2 048 = 124 928 B,  against 131 072 B if sized from the global g
+a cache allocated from the global value is 4.9% too large — and, worse, its layer-11 tensors
+have the wrong head count, which a static cache (§45) discovers only when it writes into them.</span></div>
+      <p>Two further kinds of heterogeneity are common enough to have their own fields. <b>Layer types</b>: many recent decoders interleave sliding-window layers (§45, window 4 096 for example) with full-attention layers — one to one in some models, several sliding layers per full one in others — so part of the cache is capped and the rest grows; a per-layer cache that ignores the type allocates the full length everywhere. <b>Sub-configurations</b>: a vision–language model has a vision configuration and a text configuration, each with its own attention backend (§41) and cache. The general rule the whole section reduces to: <b>anything the model sizes per layer, compute per layer</b>, and treat a global attribute as a default, not a fact.</p>
+    </section>
+
+    <!-- ═══ 41 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="backends" data-nav="Attention backends: eager, SDPA, Flash, flex">
+      <h3><span class="idx">41</span> Attention backends: the same softmax(QKᵀ/√dₖ + M)·V, five ways to schedule it, and the mask format each one needs</h3>
+      <p class="lede">Every attention backend computes the function <a href="../attention/scores-scaling.html#scale">the attention page</a> derived; none approximates it. What differs is <b>which intermediate arrays exist in device memory</b>, <b>how many times they cross the memory hierarchy</b>, and <b>what shape of mask the kernel can accept</b>. An implementation selects the backend by name at load time (<code>attn_implementation="sdpa"</code>, <code>"flash_attention_2"</code>, <code>"flex_attention"</code>, <code>"eager"</code>, or a paged variant of these), and the choice changes memory and speed and — because floating-point addition is not associative — the last bits of the output, but nothing else.</p>
+
+      <table class="grid2">
+        <tr><th>backend</th><th>what it materialises</th><th>memory beyond Q, K, V, O</th><th>mask it takes</th><th>returns weights?</th><th>when it is the right choice</th></tr>
+        <tr><td><b>eager</b></td><td>the scores <code>S</code> and the weights <code>A</code>, <code>h·n²</code> each, then <code>A·V</code></td><td class="mono">O(h·n²)</td><td>an additive float mask, 0 / −∞, broadcast to (batch, 1, n_q, n_k)</td><td>yes — the only one</td><td>debugging, inspecting attention maps (§32's figures), exotic score modifications, tiny n</td></tr>
+        <tr><td><b>SDPA</b> (the framework's fused op)</td><td>depends on the kernel it dispatches to: a flash-style kernel (nothing), a memory-efficient kernel (nothing), or a math fallback (same as eager)</td><td class="mono">O(n) or O(h·n²)</td><td>a boolean or float 4-D mask; passing any explicit mask rules out the flash-style kernel (the memory-efficient kernel accepts one)</td><td>no</td><td>the default: portable, fast when the mask is plain causal or padding</td></tr>
+        <tr><td><b>FlashAttention-2 / -3</b></td><td>tiles of <code>S</code> in on-chip SRAM only; a running max and sum per row (§31 of the attention page)</td><td class="mono">O(h·n) — the log-sum-exp per row</td><td>no 4-D mask: causal as a flag, padding as sequence offsets (or a 2-D padding mask), sliding window as a width</td><td>no</td><td>long sequences on supported GPUs in fp16/bf16</td></tr>
+        <tr><td><b>flex attention</b></td><td>like a flash kernel, generated from a user function of (b, h, q_idx, kv_idx)</td><td class="mono">O(h·n) + the block mask</td><td>a <b>block mask</b>: which (query tile, key tile) pairs have any allowed entry</td><td>no</td><td>custom patterns — document masks, prefix-LM, sliding windows, soft-capping — without writing a kernel</td></tr>
+        <tr><td><b>paged variants</b></td><td>as their base kernel, but keys and values are gathered from fixed-size pages through a block table (§42)</td><td class="mono">as base</td><td>as base, plus the block table</td><td>no</td><td>serving many sequences of unknown length (continuous batching)</td></tr>
+      </table>
+
+      <h4>The memory, computed at two lengths</h4>
+      <p><a href="../attention/cost-limits.html#memory">The attention page's memory section</a> tabulated the <code>h·n²</code> score array; here it is set against what a fused kernel holds instead, for one layer of §36's model (<code>h = 32</code>, <code>g = 8</code>, <code>dₖ = 128</code>), batch 1, bf16.</p>
+      <div class="formula"><span class="lbl">by hand — eager against a flash-style kernel, one layer</span><span class="eq">                               n = 4 096                          n = 32 768
+score elements h·n²            32 × 4096² = 536 870 912           32 × 32768² = 34 359 738 368
+eager, S and A in bf16         2 × 1 GiB = 2 GiB                   2 × 64 GiB = 128 GiB   (does not fit on an 80 GB GPU)
+flash-style, Q, O (n·h·dₖ)     2 × 4096 × 4096 × 2 B = 64 MiB     512 MiB
+             K, V (n·g·dₖ)     2 × 4096 × 1024 × 2 B = 16 MiB     128 MiB
+             row statistics    32 × 4096 × 4 B = 0.5 MiB          4 MiB
+             total             ≈ 80.5 MiB                         ≈ 644 MiB
+ratio eager / flash            ≈ 26×                              ≈ 205×          (eager also holds Q, K, V, O) — and it grows linearly with n</span></div>
+      <p>The published kernels report the speed side of the same trade: the first FlashAttention gave a 2–4× speed-up over optimised baselines with linear rather than quadratic memory (15% end-to-end on BERT-large at length 512, 3× on GPT-2 at length 1K); FlashAttention-2 roughly doubled that by better partitioning of work across thread blocks and warps, reaching 50–73% of an A100's peak and up to 225 TFLOP/s per GPU when training GPT-style models (72% model FLOPs utilisation); FlashAttention-3, written for the H100's asynchronous units, reports 1.5–2.0× over FlashAttention-2 in fp16, up to 740 TFLOP/s (75% utilisation), and close to 1.2 PFLOP/s in fp8. The IO argument behind all three is <a href="../attention/efficient-attention.html#flash">the attention page's FlashAttention section</a>; the kernels, their compilation and their packaging are <a href="../../mlops/model-acceleration.html">Model Acceleration</a>'s.</p>
+
+      <h4>Masks: one semantics, four formats — and the float-mask trap</h4>
+      <p>The mask is the same object everywhere (§18): which key each query may read. But an eager kernel <i>adds</i> it to the scores, so it must be <code>0</code> where allowed and <code>−∞</code> where not; SDPA accepts that or a boolean; a flash kernel takes a causal flag and sequence offsets; flex attention takes a block mask built from a Boolean function. Handing an additive kernel the <code>1 / 0</code> convention of a 2-D padding mask is the classic mistake, and it does not crash:</p>
+      <div class="formula"><span class="lbl">by hand — a causal mask in the wrong convention, n = 5</span><span class="eq">intended "1 = attend, 0 = masked"         what an ADDITIVE kernel does with it
+   k0 k1 k2 k3 k4
+q0  1  0  0  0  0                          adds +1 to allowed scores and +0 to FORBIDDEN ones:
+q1  1  1  0  0  0                          every future key stays visible; the "mask" is a +1 bias
+q2  1  1  1  0  0                          on the past. Row q0 now reads all five keys.
+q3  1  1  1  1  0
+q4  1  1  1  1  1                          correct additive form: 0 where 1, −∞ where 0
+a model evaluated this way sees the future: its loss on a held-out text drops (it can copy the
+next token), which reads as an improvement until generation — which has no future — falls apart.</span></div>
+      <p>Flex attention's block mask is also what makes structured sparsity cheap. With 128-wide tiles and <code>n = 8 192</code> there are <code>64 × 64 = 4 096</code> tile pairs; a causal mask leaves <code>64·65/2 = 2 080</code> with any allowed entry (50.8%), and a causal sliding window of 1 024 leaves <code>∑ᵢ₌₀⁷ (i+1) + 56 × 9 = 36 + 504 = 540</code> (13.2%) — every tile outside those is skipped, not computed and discarded. The figure below evaluates the memory of each backend and a bandwidth-and-compute time model against the sequence length.</p>
+
+      <div class="viz" id="viz-bm">
+        <div class="vhead">
+          <span class="vtitle">Attention backends, one layer: memory held and a roofline time model against sequence length</span>
+          <span class="vhint">eager and the SDPA math fallback hold h·n² scores and pay for them in memory traffic; a flash-style kernel holds O(n) and skips the masked half; a sliding-window block mask skips most tiles — move n and the head counts, and read the crossover where eager stops fitting</span>
+        </div>
+        <div class="controls">
+          <label>query heads h <select id="bm-h"><option value="16">16</option><option value="32" selected>32</option><option value="64">64</option></select></label>
+          <label>KV heads g <select id="bm-g"><option value="1">1 (MQA)</option><option value="8" selected>8 (GQA)</option><option value="h">= h (MHA)</option></select></label>
+          <label>dₖ <select id="bm-d"><option value="64">64</option><option value="128" selected>128</option></select></label>
+          <label>sequence n (log₂) <input type="range" id="bm-n" min="9" max="17" step="1" value="12" /><span id="bm-nv" style="min-width:60px;display:inline-block">4 096</span></label>
+          <label>window for flex <select id="bm-w"><option value="1024" selected>1 024</option><option value="4096">4 096</option></select></label>
+          <label>GPU <select id="bm-gpu"><option value="a100">A100 80 GB</option><option value="h100" selected>H100 80 GB</option></select></label>
+        </div>
+        <svg id="bm-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left: memory held by one attention layer's forward pass on a logarithmic vertical axis against sequence length on a logarithmic horizontal axis from 512 to 131072 tokens, one line per backend: eager, which holds the score and weight arrays and rises with the square of the length, crossing the dashed 80 gigabyte device line between 16 and 32 thousand tokens at the defaults; and the flash-style and flex kernels, which hold only queries, keys, values, outputs and per-row statistics and rise linearly. Right: a roofline time model for the same layer — the larger of arithmetic time at the device's peak and memory-traffic time at its bandwidth — for eager computing the full square, a flash-style causal kernel computing half of it, and a flex kernel with a causal sliding window computing only the tiles the block mask keeps. The current length is marked on both panels. The readout prints the memory of each backend, the ratio, the fraction of tiles the block mask keeps, and the three modelled times."></svg>
+        <div class="readout" aria-live="polite" id="bm-readout"></div>
+      </div>
+
+      <div class="callout"><b>How a backend is chosen in practice.</b> The default is the framework's fused SDPA, because it runs everywhere and dispatches to a flash-style kernel when no explicit mask has to be passed (plain causal attention without padding). A dedicated FlashAttention build is chosen for long contexts on supported GPUs and in half precision; it is also what makes padding-free "packed" batches cheap, since sequence offsets replace a padding mask. Flex attention is chosen when the mask is structured but unusual. Eager is chosen when attention weights must be <i>returned</i> — the other kernels never form them — or when a score modification has no fused form. A multimodal model may set one backend per sub-model (a vision encoder that needs fp32, which flash kernels do not support, beside a text decoder on FlashAttention), and a backend registered under a new name must come with a mask formatter of the same name, or mask creation is silently skipped: the attention function receives no mask, and the padding and window constraints it would have carried are lost unless the function re-derives them.</div>
+    </section>
+
+    <!-- ═══ 42 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="paged" data-nav="Paged attention and the block table">
+      <h3><span class="idx">42</span> Paged attention: the KV cache in fixed-size pages, a block table per sequence, and what it does to fragmentation</h3>
+      <p class="lede">A server generating for many users at once does not know how long each answer will be. Reserving a contiguous cache of the maximum length for every request wastes most of it; growing each cache by reallocation fragments memory. <b>Paged attention</b> borrows the operating system's answer: cut the cache into fixed-size <b>blocks</b> of <code>B</code> tokens, give each sequence a <b>block table</b> mapping its logical blocks to physical ones anywhere in a shared pool, and teach the attention kernel to gather keys and values through the table.</p>
+
+      <div class="formula"><span class="lbl">the scheme</span><span class="eq">pool            P physical blocks, each holding B tokens' K and V for every layer
+block table     sequence s:  logical block 0 → physical 17,  1 → physical 3,  2 → physical 40, …
+token t of s    lives in physical block table_s[⌊t/B⌋], slot t mod B
+allocation      a new block only when a sequence crosses a multiple of B
+waste           at most B − 1 slots per sequence (its last, partly filled block) — independent of max length
+sharing         sequences with a common prefix (parallel samples, beams, a shared system prompt) point at the
+                SAME physical blocks, with a reference count; a block is copied only when one of them writes
+                into it (copy-on-write)
+bytes per block, §36's model, B = 16:   16 tokens × 2·g·dₖ·b per layer = 16 × 4 096 B = 64 KiB per layer,
+                                         2 MiB across all 32 layers</span>
+<span class="lbl">by hand — four requests, each reserved for up to 2 048 tokens, that end at 300, 900, 1 500 and 120</span><span class="eq">contiguous reservation   4 × 2 048 = 8 192 token slots    used 2 820     utilisation 34.4%
+paged, B = 16            ⌈300/16⌉ + ⌈900/16⌉ + ⌈1500/16⌉ + ⌈120/16⌉ = 19 + 57 + 94 + 8 = 178 blocks
+                         = 2 848 slots for 2 820 tokens      waste 28 slots = 0.98%
+at 128 KiB per token (§36's model), the reservation holds 1.0 GiB; the pages hold 356 MiB.</span></div>
+      <p>The measurement that motivated the design found that earlier serving systems stored actual token states in only 20.4–38.2% of the KV-cache memory they held — 60–80% lost to reservation and fragmentation — against under 4% waste with paging; the resulting larger batches gave 2–4× higher throughput at the same latency. The block size is a trade: too small and the gather through the table costs more per token; too large and the partly filled last block wastes more and fewer blocks can be shared. 16 tokens is one widely used default (the paper's system uses it); other implementations choose blocks of hundreds of tokens. The kernel side is a change of indirection only — the scores are the same numbers — which is why paged variants of eager, SDPA and FlashAttention can all exist (§41). How requests are scheduled onto the pool, pre-empted and resumed — continuous batching — is <a href="../../mlops/model-acceleration.html">Model Acceleration</a>'s.</p>
+
+      <div class="viz" id="viz-pg">
+        <div class="vhead">
+          <span class="vtitle">Contiguous reservation against paged allocation, on the same batch of requests</span>
+          <span class="vhint">each coloured bar is the token slots a request actually wrote; grey is reserved but never written, and the red slivers are the unused tail of each paged request's last block — raise the reservation, change the block size, add requests, and read the utilisation of each scheme</span>
+        </div>
+        <div class="controls">
+          <label>requests <input type="range" id="pg-r" min="2" max="12" step="1" value="6" /><span id="pg-rv" style="min-width:20px;display:inline-block">6</span></label>
+          <label>reserved max length <select id="pg-m"><option value="1024">1 024</option><option value="2048" selected>2 048</option><option value="4096">4 096</option></select></label>
+          <label>block size B <select id="pg-b"><option value="8">8</option><option value="16" selected>16</option><option value="64">64</option><option value="256">256</option></select></label>
+          <label>seed <input type="range" id="pg-seed" min="1" max="9" step="1" value="3" /><span id="pg-seedv" style="min-width:16px;display:inline-block">3</span></label>
+        </div>
+        <svg id="pg-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Upper panel: one row per request drawn as a long bar of the reserved maximum length, the written prefix coloured and the unused remainder grey, showing that most of each reservation is empty. Lower panel: the same requests under paging, drawn as a pool of equal-sized blocks packed one after another, each block coloured by its owning request, with only the last block of each request partly unused, drawn as a red sliver. The utilisation of each scheme is printed beside its panel; at the defaults the contiguous scheme uses about half of what it reserves (from about a third to about two-thirds across seeds) and the paged scheme wastes about one percent. The readout prints the request lengths, the slots each scheme holds, the utilisation, the bytes held for an 8B-class model, and the maximum possible waste per sequence under paging."></svg>
+        <div class="readout" aria-live="polite" id="pg-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 43 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="experts" data-nav="Experts backends for MoE layers">
+      <h3><span class="idx">43</span> Experts backends: the same routed FFN, computed by a loop, by duplicated weights, or by one grouped matrix multiply</h3>
+      <p class="lede">In a <a href="../mixture-of-experts.html#routing">mixture-of-experts</a> layer a router picks <code>k</code> of <code>E</code> expert FFNs for each token and mixes their outputs with the routing weights. Every implementation computes that same function. What differs is how the <code>k · T</code> token–expert pairs of a batch of <code>T</code> tokens become matrix multiplies — and the three standard answers trade launches against memory in opposite directions, which is why a good implementation switches between them between prefill and decode.</p>
+
+      <div class="formula"><span class="lbl">three schedules for y(t) = ∑ over the k chosen experts e of  w(t, e) · FFN_e(x_t)</span><span class="eq">loop ("eager")     for each expert e with any tokens: gather its tokens, run FFN_e, scatter back
+                   ≤ E small matmuls per layer; which experts are busy is data-dependent — hard to
+                   capture in a static compiled graph
+batched            for EVERY (token, expert) pair, gather that expert's weights into a batch and run
+                   one batched matmul of k·T independent problems
+                   extra memory:  k · T · (3·d·d_ff) weights, copied   ← grows with the batch
+grouped            sort the k·T pairs by expert; one "grouped" matmul whose groups are the experts,
+                   with offsets marking where each expert's rows start; no weight copies
+                   extra memory:  the sorted activations, k · T · d</span>
+<span class="lbl">by hand — 8 experts of d = 4 096, d_ff = 14 336, top-2, bf16</span><span class="eq">one expert       3 × 4096 × 14336 = 176 160 768 parameters = 352.3 MB
+batched, decode  T = 1 token:     2 × 352.3 MB   =  704.6 MB of copied weights per layer — tolerable,
+                                  and ONE launch instead of two
+batched, prefill T = 512 tokens:  1 024 × 352.3 MB = 360.8 GB per layer — impossible
+grouped, prefill T = 512:         1 024 activation rows of 4 096 × 2 B = 8.4 MB, and one launch
+routing example, T = 6, top-2:    token→experts  (0,3) (1,3) (3,5) (0,6) (5,7) (1,3)
+                                  group sizes by expert 0…7:  2, 2, 0, 4, 0, 2, 1, 1     (sum 12 = k·T)
+                                  the loop runs 6 matmuls (experts 2 and 4 idle), grouped runs one</span></div>
+      <p>Hence the switch: a grouped matmul for prefill, where <code>T</code> is large and copying weights per token is ruinous, and a batched matmul for decode, where <code>T</code> is the batch size, the copy is small, and one fixed-shape launch per layer is what a compiled, graph-captured decode step wants. One widely used library does exactly this on GPUs when the grouped backend is selected, switching back when generation ends; on CPUs it keeps the grouped form throughout, which its documentation reports as the most efficient at every input size. Vendor kernels go further — fusing the router dispatch, the gated up-projection, the activation and the down-projection into one kernel, or running the experts in fp8 or fp4 with per-block scales — and are <a href="../../mlops/model-acceleration.html">Model Acceleration</a>'s. The routing itself, the load-balancing loss and why only <code>k</code> of <code>E</code> experts' parameters are read per token are <a href="../mixture-of-experts.html">Mixture of Experts</a>'; the checkpoint side of the same layer is §39's worked example.</p>
+    </section>
+
+    <nav class="pager" aria-label="Transformers series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="shape-live-lens.html">← Depth, Width &amp; the Logit Lens</a>
+      <a href="../transformers.html" style="color:var(--muted)">Transformers · overview</a>
+      <a href="kv-cache-generation.html">KV Cache &amp; Generation →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../transformers.viz.js"></script>
+</body>
+</html>

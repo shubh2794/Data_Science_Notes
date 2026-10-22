@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · KV Cache, GQA &amp; MLA</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to the other pages of the series */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../attention.html">Attention</a> · part 5 of 6</p>
+      <h1>KV Cache, GQA &amp; MLA</h1>
+      <p>Why decoding is bound by memory rather than arithmetic: the KV cache and its byte arithmetic, the arithmetic-intensity argument for why the cache binds, multi-query and grouped-query attention as ways to shrink it, and multi-head latent attention compressing keys and values into a shared latent.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Attention</span>
+        <span class="pill">KV cache · byte arithmetic · arithmetic intensity · MQA · GQA · latent attention</span>
+      </div>
+    </header>
+
+    <!-- ═══ 24 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="kvcache" data-nav="The KV cache">
+      <h3><span class="idx">24</span> The KV cache: what it stores, and why generation would be impossible without it</h3>
+      <p class="lede"><b>The KV cache is the stored keys and values of every token already processed, kept per layer so that each new token computes only its own <code>q</code>, <code>k</code>, <code>v</code>, appends <code>k</code> and <code>v</code>, and attends against the store.</b> Autoregressive generation runs the model once per output token; done naively that is <code>O(n²)</code> work per <i>token</i> and <code>O(n³)</code> for the sequence, and the cache turns the first into <code>O(n)</code> — creating, in the process, the object that governs every inference cost from here on.</p>
+
+      <div class="formula"><span class="lbl">the observation the cache rests on, which is a consequence of §15's mask</span><span class="eq">Under a CAUSAL mask, position j attends only to positions ≤ j. So
+
+     kⱼ  and  vⱼ    depend only on  x₁ … x_j
+
+and appending a new token x_{n+1} CANNOT CHANGE any earlier key or value.
+They are final the moment they are computed. (Without causality this is
+false, which is why a bidirectional encoder cannot be decoded
+incrementally at all.)</span>
+<span class="lbl">so one decode step, with and without the cache</span><span class="eq">WITHOUT   recompute everything for the whole prefix:
+            Q, K, V for n+1 positions   →  3(n+1)·d·(…)   MACs
+            scores and gather            →  2(n+1)²·d      MACs
+          per token: O(n²).   Whole sequence: O(n³).
+
+WITH      compute Q, K, V for the ONE new token, append K and V:
+            projections   2·d² + 2·d·(g·dₖ)   MACs   ← no n at all
+                          (W_Q and W_O, then W_K and W_V)
+            scores q·Kᵀ   n·(h·dₖ) = n·d       MACs
+            gather A·V    n·(h·d_v) = n·d      MACs
+          per token: O(n).   Whole sequence: O(n²).
+
+The cache does not make generation cheap. It makes it POSSIBLE, and it
+converts a compute problem into a MEMORY problem — which §26 shows is the
+harder kind on current hardware.</span></div>
+
+      <p>Note what the second block says about the arithmetic. Per generated token, per layer, the model does <code>≈ 12d²</code> MACs against the weights (four attention projections plus a classic <code>4d</code> FFN; a SwiGLU FFN makes it somewhat more) and <code>2nd</code> MACs against the cache. At <code>d = 4096</code> and <code>n = 8192</code> those are <code>2.0e8</code> and <code>6.7e7</code> — the cache term is a quarter of the arithmetic. But the <b>bytes</b> tell a completely different story, and §26 is that story.</p>
+
+      <div class="viz" id="viz-kv">
+        <div class="vhead">
+          <span class="vtitle">Generating a sequence, with and without the cache</span>
+          <span class="vhint">step through the decode and watch which keys and values are recomputed — the whole column, or one row</span>
+        </div>
+        <div class="controls">
+          <label>tokens generated <input type="range" id="kv-t" min="1" max="16" step="1" value="7" /><span id="kv-tv" style="min-width:20px;display:inline-block">7</span></label>
+          <label>prompt length <input type="range" id="kv-p" min="0" max="8" step="1" value="3" /><span id="kv-pv" style="min-width:16px;display:inline-block">3</span></label>
+          <label>mode <select id="kv-m">
+            <option value="cache" selected>with the KV cache</option>
+            <option value="none">recompute everything each step</option>
+          </select></label>
+          <label>plot <select id="kv-v">
+            <option value="step" selected>work per step</option>
+            <option value="cum">cumulative work</option>
+          </select></label>
+        </div>
+        <svg id="kv-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Left: the causal score matrix for the sequence generated so far, with the prompt positions shaded differently from the generated ones. Cells whose key and value are recomputed at the current step are outlined: with the cache that is a single new column and a single new row of scores, and without it that is the entire lower triangle. Beside it, the cache itself drawn as a stack of key and value rows, growing by exactly one row per step, with the number of elements it holds printed and updated. Right: the multiply-accumulate count per decode step plotted against step index for both modes, on a logarithmic vertical axis, with the cached curve rising linearly and the uncached curve rising quadratically, and a second view showing the cumulative totals where the gap is a further factor of the sequence length. The readout prints the work at the current step under each mode, the ratio between them, the cumulative work for the whole generation under each, and the exact size of the cache in elements and in bytes."></svg>
+        <div class="readout" aria-live="polite" id="kv-readout"></div>
+      </div>
+
+      <div class="callout"><b>Two things the cache is not.</b> It is <b>not</b> an optimisation you can turn off for long sequences to save memory and pay in time — the recompute cost is quadratic per token, so the trade is catastrophic, not marginal. And in its basic form it is <b>not</b> a cache in the usual sense: there are no misses, no eviction policy, and nothing is being <i>re-derived</i> more cheaply (serving systems do add eviction and prefix sharing on top, but that is bookkeeping around the object, not the object itself). It is a materialised intermediate result whose size is dictated by the architecture. Everything in §27 and §28 is an attempt to make that materialised result smaller without changing what it means.</div>
+    </section>
+
+    <!-- ═══ 25 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="kvmem" data-nav="KV-cache arithmetic">
+      <h3><span class="idx">25</span> KV-cache memory, exactly</h3>
+      <p class="lede">One formula, four symbols, and it decides how many users a machine can serve.</p>
+
+      <div class="formula"><span class="lbl">the cache, per token, for the whole stack</span><span class="eq">   elements per token  =  2 · g · dₖ · L
+                          ─   ─   ──   ─
+                          K   KV  head  layers
+                          and heads dim
+                          V
+
+   bytes per token     =  2 · g · dₖ · L · (bytes per element)
+   total bytes         =  (bytes per token) · n · (batch size)
+
+Note what is NOT in it: d_model does not appear except through g·dₖ, the
+FFN width does not appear, and the number of QUERY heads h does not appear
+at all. The cache is set by the KEY/VALUE side alone, which is exactly why
+§27's fix works.</span></div>
+
+      <table class="grid2">
+        <tr><th>configuration</th><th class="num">elements / token</th><th class="num">KiB / token (bf16)</th><th class="num">at 4k</th><th class="num">at 32k</th><th class="num">at 128k</th></tr>
+        <tr><td><b>GPT-2 small</b> · MHA, h 12, dₖ 64, 12 layers</td><td class="num">18 432</td><td class="num">36.0</td><td class="num">0.141 GiB</td><td class="num">1.125 GiB</td><td class="num">4.500 GiB</td></tr>
+        <tr><td><b>Llama-2 7B</b> · MHA, h 32, dₖ 128, 32 layers</td><td class="num">262 144</td><td class="num">512.0</td><td class="num">2.000 GiB</td><td class="num">16.000 GiB</td><td class="num">64.000 GiB</td></tr>
+        <tr><td><b>Llama-3 8B</b> · GQA g 8, dₖ 128, 32 layers</td><td class="num">65 536</td><td class="num">128.0</td><td class="num">0.500 GiB</td><td class="num">4.000 GiB</td><td class="num">16.000 GiB</td></tr>
+        <tr><td><b>Llama-3 70B</b> · GQA g 8, dₖ 128, 80 layers</td><td class="num">163 840</td><td class="num">320.0</td><td class="num">1.250 GiB</td><td class="num">10.000 GiB</td><td class="num">40.000 GiB</td></tr>
+        <tr class="tot"><td><b>DeepSeek-V3</b> · MLA, d_c 512, d_R 64, 61 layers</td><td class="num">35 136</td><td class="num">68.6</td><td class="num">0.268 GiB</td><td class="num">2.145 GiB</td><td class="num">8.578 GiB</td></tr>
+      </table>
+
+      <p>Three readings of that table are worth making explicit.</p>
+      <ul class="notes">
+        <li><b>Llama-2 7B at 128k context would need 64 GiB of cache for a single sequence</b> — five times the 12.6 GiB its own weights occupy in bf16 (6.74 B parameters × 2 bytes). This is the observation that made the KV cache an architectural concern rather than an implementation detail: <b>past some context length the cache is bigger than the model</b>. For Llama-2 7B that length is <code>12.55 GiB / 512 KiB ≈ 25 700</code> tokens.</li>
+        <li><b>The cache scales with layers, not with width.</b> Llama-3 70B has nearly nine times the parameters of Llama-3 8B and only 2.5 times the cache, because both use <code>g = 8</code> and <code>dₖ = 128</code> and the only difference is <code>80</code> layers against <code>32</code>. Cache cost and parameter cost are genuinely different axes.</li>
+        <li><b>Batch multiplies it and nothing amortises it.</b> Serving 32 concurrent 8k-token conversations on Llama-3 70B is <code>32 × 8192 × 320 KiB = 80 GiB</code> of cache, on top of 131.5 GiB of weights. The weights are shared across all 32; the cache is not. That single asymmetry is what makes inference economics what they are.</li>
+      </ul>
+
+      <div class="viz" id="viz-km">
+        <div class="vhead">
+          <span class="vtitle">Cache size against context and batch, with the weights drawn for scale</span>
+          <span class="vhint">the crossing where the cache overtakes the weights is the one to remember — move the batch slider and watch it walk to the left</span>
+        </div>
+        <div class="controls">
+          <label>configuration <select id="km-p">
+            <option value="gpt2s">GPT-2 small · MHA h 12, 12 layers</option>
+            <option value="l27b">Llama-2 7B · MHA h 32, 32 layers</option>
+            <option value="l38b" selected>Llama-3 8B · GQA g 8, 32 layers</option>
+            <option value="l370b">Llama-3 70B · GQA g 8, 80 layers</option>
+            <option value="dsv3">DeepSeek-V3 · MLA, 61 layers</option>
+          </select></label>
+          <label>batch <input type="range" id="km-b" min="1" max="128" step="1" value="1" /><span id="km-bv" style="min-width:26px;display:inline-block">1</span></label>
+          <label>bytes per cache element <select id="km-t">
+            <option value="2" selected>2 — bf16</option><option value="1">1 — fp8</option><option value="0.75">0.75 — 6 bits</option>
+          </select></label>
+          <label>device memory, GiB <input type="range" id="km-g" min="16" max="640" step="8" value="80" /><span id="km-gv" style="min-width:34px;display:inline-block">80</span></label>
+        </div>
+        <svg id="km-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left panel: total key-value cache bytes plotted against context length on logarithmic axes, one line per batch size with the selected one emphasised, together with two horizontal reference lines: the model's own weight bytes and the selected device memory. Two vertical rules mark where the cache overtakes the weights and where it exhausts the device, both labelled with their exact token counts; raising the batch slider slides both to the left in inverse proportion. Right panel: a stacked bar for the current setting decomposing device memory into weights and cache, with the free space shown, and beside it the maximum number of concurrent sequences of the current length that the device can hold, which is the quantity a serving system actually optimises. The readout gives the cache per token in bytes, the cache for one sequence at the plotted length, the total at the current batch, the context length at which the cache equals the weights, and the largest batch that fits in the device."></svg>
+        <div class="readout" aria-live="polite" id="km-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 26 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="intensity" data-nav="Why the cache binds, not the maths">
+      <h3><span class="idx">26</span> Why the cache binds and the arithmetic does not: arithmetic intensity</h3>
+      <p class="lede"><b>At decode, attention does about one multiply–accumulate per byte of cache it reads, while the accelerator can do a hundred or more per byte it fetches from memory; the step is therefore limited by memory bandwidth, not arithmetic, and its time is the time to read the cache.</b> That one ratio — arithmetic intensity — is why the variants aimed at decode (MQA, GQA, MLA, cache quantisation) are about <b>bytes</b> and not about operations. One derivation, one number per configuration, and the question is settled for the decode step.</p>
+
+      <div class="formula"><span class="lbl">the arithmetic intensity of one decode step's attention over the cache</span><span class="eq">   MACs   =  n·(h·dₖ)   for q·Kᵀ    +   n·(h·d_v)  for A·V     =  2·n·h·dₖ
+   bytes  =  2·n·(g·dₖ)·b            reading K and V out of memory,
+                                     b = bytes per element
+
+   intensity  I  =  2·n·h·dₖ / (2·n·g·dₖ·b)  =  h / (g·b)   MAC per byte
+                    ───────────────────────
+                    the sequence length CANCELS.
+
+   in FLOP per byte, which is how hardware quotes its peak (2 FLOP per MAC):
+
+              I  =  2h / (g·b)                — the unit the table below uses
+
+Two consequences, both decisive:
+
+ 1 · I does not depend on n. A longer context does not make the attention
+     step more or less compute-bound; it makes it uniformly bigger.
+
+ 2 · I does not improve with BATCH. Batching amortises the WEIGHTS — one
+     read of W serves B sequences — but every sequence owns its own cache,
+     so the cache read scales with B exactly as the arithmetic does. The
+     one lever that fixes every other memory-bound operation does not
+     touch this one.</span></div>
+
+      <div class="formula"><span class="lbl">the numbers, bf16 (b = 2), against the hardware's ridge point</span><span class="eq">  variant                     h     g     I (FLOP/byte)
+  MHA        (Llama-2 7B)    32    32          1.00
+  GQA-8      (Llama-3 8B)    32     8          4.00
+  GQA-8      (Llama-3 70B)   64     8          8.00
+  MQA                        32     1         32.00
+  MQA                        64     1         64.00
+
+  accelerator        bf16 TFLOP/s   HBM TB/s    ridge point, FLOP/byte
+  A100 80GB SXM             312.0       2.04                     153.0
+  H100 SXM5                 989.4       3.35                     295.3
+  H200 SXM                  989.4       4.80                     206.1
+  RTX 4090                  165.2       1.01                     163.9
+
+Every intensity is between 1 and 64. Every ridge point is between 150 and
+300. Decode attention therefore runs at
+
+  MHA   on an H100:   1.00 / 295.3  =  0.34%  of peak arithmetic
+  GQA-8 on an H100:   4.00 / 295.3  =  1.35%
+  MQA   on an H100:  32.00 / 295.3  = 10.83%
+
+The gap is two orders of magnitude. Attention at decode is a MEMORY COPY
+with a little arithmetic attached, and its cost is the copy.</span></div>
+
+      <div class="formula"><span class="lbl">what that means in wall-clock, Llama-3 70B at 128k context on an H100</span><span class="eq">  KV cache at n = 131 072     40.00 GiB      (§25's table)
+  read once at 3.35 TB/s      12.82 ms       per generated token, PER SEQUENCE
+  ceiling from cache traffic  78.0 tokens/s  before a single weight is read
+
+  weights, bf16               131.5 GiB   →  42.15 ms/token — but that is
+                              SHARED across the whole batch, and the 12.82 ms
+                              is not.
+
+At batch 8 the weight read is still 42.15 ms for all eight, while the cache
+read is 8 × 12.82 = 102.6 ms. The cache has overtaken the model.</span></div>
+
+      <div class="viz" id="viz-ai">
+        <div class="vhead">
+          <span class="vtitle">The roofline for a decode step, and where each attention variant sits on it</span>
+          <span class="vhint">nothing you do to the batch moves the attention points sideways — that is the finding, and the weight point moving is the contrast</span>
+        </div>
+        <div class="controls">
+          <label>accelerator <select id="ai-hw">
+            <option value="a100">A100 80GB SXM · 312 TFLOP/s, 2.04 TB/s</option>
+            <option value="h100" selected>H100 SXM5 · 989 TFLOP/s, 3.35 TB/s</option>
+            <option value="h200">H200 SXM · 989 TFLOP/s, 4.80 TB/s</option>
+            <option value="rtx">RTX 4090 · 165 TFLOP/s, 1.01 TB/s</option>
+          </select></label>
+          <label>batch <input type="range" id="ai-b" min="1" max="256" step="1" value="1" /><span id="ai-bv" style="min-width:30px;display:inline-block">1</span></label>
+          <label>context n <input type="range" id="ai-n" min="9" max="18" step="1" value="13" /><span id="ai-nv" style="min-width:52px;display:inline-block">8 192</span></label>
+          <label>cache precision <select id="ai-t">
+            <option value="2" selected>bf16</option><option value="1">fp8</option>
+          </select></label>
+        </div>
+        <svg id="ai-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="A roofline diagram: attainable arithmetic rate plotted against arithmetic intensity on logarithmic axes, with the memory-bandwidth roof drawn as a line of slope one and the compute roof as a horizontal line, meeting at the ridge point which is labelled with its value for the selected accelerator. Points are plotted for the attention step of several attention variants — multi-head, grouped-query at several group counts, multi-query and multi-head latent — and, for contrast, for the weight matrix multiplications of the same decode step. As the batch slider rises the weight point slides to the right along the bandwidth roof and eventually crosses the ridge into the compute-bound region, while every attention point stays exactly where it is, because each sequence owns its cache and batching does not amortise it. A side panel converts the same information into time per generated token, split into cache traffic and weight traffic, as a stacked bar against batch size, showing the crossover batch at which cache traffic overtakes weight traffic. The readout gives the intensity of each variant, the ridge point, the fraction of peak each achieves, the milliseconds per token from each source, and the batch size at which the cache overtakes the weights."></svg>
+        <div class="readout" aria-live="polite" id="ai-readout"></div>
+      </div>
+
+      <div class="callout"><b>Read the decode-efficiency literature through this one number.</b> <code>I = h/(g·b)</code>. Within the formula there are three levers: reduce <code>g</code> (MQA and GQA, §27), reduce <code>b</code> (cache quantisation), or reduce the <i>bytes per token</i> some other way (MLA's low-rank cache, §28). Outside the formula, the remaining options all reduce how much of the cache is read per step rather than the intensity of reading it: cap <code>n</code> with a sliding window (§29), share one cache across several layers, or read only a selected subset of the cache for each query. None of them is about doing less arithmetic — the arithmetic was never the problem.</div>
+    </section>
+
+    <!-- ═══ 27 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="gqa" data-nav="MQA and GQA">
+      <h3><span class="idx">27</span> MQA and GQA: fewer key/value heads, and exactly what that costs</h3>
+      <p class="lede">§25's formula has one term the architect can shrink without touching the query side: <code>g</code>, the number of key/value heads. Setting it to 1 is multi-query attention; setting it between 1 and <code>h</code> is grouped-query attention. The saving is exact, the quality cost is real and small, and the reason it is small is worth understanding.</p>
+
+      <div class="formula"><span class="lbl">the change, in one line</span><span class="eq">   MHA    every query head j has its own Kⱼ, Vⱼ            g = h
+   GQA    query heads are partitioned into g groups, one
+          K, V per group; head j reads group ⌊j·g/h⌋       1 < g < h
+   MQA    all query heads share ONE K and V                g = 1
+
+Nothing else changes. Same scores, same softmax, same output projection,
+same masking, same backward pass. The query side is untouched — h separate
+query projections, h separate attention maps, h separate outputs. Only the
+things that get CACHED are shared.</span>
+<span class="lbl">what shrinks, exactly</span><span class="eq">   KV cache        2·g·dₖ·L per token       ∝ g         shrinks by h/g
+   K,V parameters  2·d·g·dₖ                 ∝ g         shrinks by h/g
+   block params    d·dₖ·(h+g)·2             →  (h+g)/(2h) of 4d²
+   PROJECTION MACs 2nd² + 2nd·g·dₖ          shrinks
+   QUADRATIC MACs  2n²·h·dₖ                 UNCHANGED — every query head
+                                            still scores against n keys
+   decode intensity  h/(g·b) MAC/byte        IMPROVES by h/g   ← the point</span></div>
+
+      <div class="formula"><span class="lbl">computed, for the Llama-3 8B shape: h = 32, d<span class="keep">ₖ</span> = 128, L = 32, bf16</span><span class="eq">  variant             g   elements/token   KiB/token   × smaller   reduction   @128k
+  MHA                32          262 144       512.0        1.0×       0.00%   64.000 GiB
+  GQA-16             16          131 072       256.0        2.0×      50.00%   32.000 GiB
+  GQA-8  (Llama-3)    8           65 536       128.0        4.0×      75.00%   16.000 GiB
+  GQA-4               4           32 768        64.0        8.0×      87.50%    8.000 GiB
+  GQA-2               2           16 384        32.0       16.0×      93.75%    4.000 GiB
+  MQA                 1            8 192        16.0       32.0×      96.88%    2.000 GiB
+
+  and the block's parameter count, 4d² = 67 108 864 at g = h:
+      g = 8   →  41 943 040     37.50% fewer, exactly a factor of 1.6</span></div>
+
+      <h4>Why the quality cost is smaller than the compression suggests</h4>
+      <p>Going from 32 KV heads to 8 removes three-quarters of the cache, and the quality loss is small enough that most recent model families have taken the trade. Three reasons, in decreasing order of confidence:</p>
+      <ul class="notes">
+        <li><b>The query side is untouched.</b> §12 established that the binding constraint is the number of independent <i>selections</i>, and that is <code>h</code>, not <code>g</code>. GQA keeps all 32 attention maps; it only makes the things being selected <i>from</i> shared. A group of four query heads reading one key set can still attend to four completely different positions.</li>
+        <li><b>Heads within a group were already correlated.</b> §12's own measurement showed seeds putting two heads on the same relation. Real models have measurable redundancy between neighbouring heads, and a shared key/value set is a way of paying for it once.</li>
+        <li><b>It can be added to an existing model cheaply.</b> A trained multi-head checkpoint is converted by <b>mean-pooling</b> the key and value projections within each group — which works better than picking one head's or reinitialising — followed by a short continued-training run at a small fraction of the original pretraining compute. That an averaged initialisation recovers is itself evidence that the heads within a group were doing similar things.</li>
+      </ul>
+
+      <div class="viz" id="viz-gq">
+        <div class="vhead">
+          <span class="vtitle">Query heads to key/value heads: the mapping, the cache and the intensity</span>
+          <span class="vhint">watch the cache and the parameters fall by <code>h/g</code> while the quadratic-MAC line does not move at all</span>
+        </div>
+        <div class="controls">
+          <label>query heads h <input type="range" id="gq-h" min="4" max="64" step="4" value="32" /><span id="gq-hv" style="min-width:22px;display:inline-block">32</span></label>
+          <label>KV heads g <input type="range" id="gq-g" min="0" max="6" step="1" value="3" /><span id="gq-gv" style="min-width:22px;display:inline-block">8</span></label>
+          <label>dₖ <select id="gq-dk"><option value="64">64</option><option value="128" selected>128</option></select></label>
+          <label>layers L <input type="range" id="gq-L" min="8" max="96" step="4" value="32" /><span id="gq-Lv" style="min-width:22px;display:inline-block">32</span></label>
+          <label>context n <input type="range" id="gq-n" min="10" max="18" step="1" value="17" /><span id="gq-nv" style="min-width:56px;display:inline-block">131 072</span></label>
+        </div>
+        <svg id="gq-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Left: a bipartite diagram with one node per query head on the upper row and one node per key-value head on the lower row, with an edge from each query head to the key-value head its group uses, coloured by group. At the extremes the diagram becomes all edges converging on a single lower node, which is multi-query attention, or a clean one-to-one matching, which is multi-head attention. Right: three quantities plotted against the number of key-value heads on logarithmic axes — the cache bytes per token, the block's parameter count, and the decode arithmetic intensity — with the first two falling and the third rising, and a vertical rule at the current setting. A fourth flat line shows the quadratic multiply-accumulate count, which does not move at all, because sharing key-value heads does not reduce the number of scores that have to be computed; that flat line is the most important thing in the panel. The readout gives the cache per token and at the selected context, the reduction factor against multi-head attention, the parameter saving, the decode intensity and its percentage of an H100's ridge point, and names the variant."></svg>
+        <div class="readout" aria-live="polite" id="gq-readout"></div>
+      </div>
+
+      <div class="wrong"><span class="say">The misreading to avoid.</span> "GQA makes attention cheaper." <span class="fix">It makes the <b>cache</b> and the <b>projections</b> cheaper and leaves the quadratic term exactly where it was.</span> During <i>prefill</i> — processing the prompt — the quadratic term is untouched and the only saving is on the <code>K</code> and <code>V</code> projections, which takes the projection term from <code>4nd²</code> to <code>2.5nd²</code> at <code>g = h/4</code>: worth a few per cent of a layer at the lengths in §19's table, and less as the prompt grows. Its real value is at <i>decode</i>, where the cost is bytes read per generated token, and there it buys a factor of <code>h/g</code> on the binding resource. Two different phases, two different bottlenecks; a variant that fixes one may do nothing for the other.</div>
+    </section>
+
+    <!-- ═══ 28 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="mla" data-nav="Multi-head latent attention">
+      <h3><span class="idx">28</span> Multi-head latent attention: compress the cache instead of sharing it</h3>
+      <p class="lede">GQA shrinks the cache by making heads share. The other option is to keep every head distinct and store a <b>low-rank latent</b> from which the keys and values are reconstructed. It reaches a smaller cache than GQA at quality reported to match or exceed full multi-head attention, and the trick that keeps the reconstruction off the per-token byte budget is worth seeing.</p>
+
+      <div class="formula"><span class="lbl">the construction</span><span class="eq">  compress    c_t  =  x_t · W_DKV                  c_t is d_c wide, d_c ≪ h·dₖ
+  expand      k_tᶜ =  c_t · W_UK                   per head, on demand
+              v_t  =  c_t · W_UV
+
+  CACHE  c_t  ONLY.  d_c numbers per token per layer, instead of
+  2·g·dₖ. The keys and values are never stored; they are recomputed
+  from c_t, which costs arithmetic and saves bytes — which §26 says is
+  exactly the right direction.
+
+  the complication: ROTARY POSITION. A rotation applied to k depends on
+  the position t, so it cannot be folded into a position-independent
+  W_UK. The fix is to carry a small SEPARATE rotary key:
+
+  decoupled   k_tᴿ  =  RoPE( x_t · W_KR )          dₕᴿ wide, SHARED by
+                                                    all heads
+  cached per token per layer:   d_c + dₕᴿ</span>
+<span class="lbl">the trick that keeps the expansion off the byte budget at decode</span><span class="eq">The score a query head needs is, in the row convention (q, c row vectors):
+
+     q · kᶜᵀ  =  q · ( c·W_UK )ᵀ  =  q · W_UKᵀ · cᵀ  =  ( q·W_UKᵀ ) · cᵀ
+                                                          └────┬────┘
+                                                    re-associate: a d_c-wide
+                                                    "absorbed" query
+
+So instead of expanding c into a key and then dotting, ABSORB W_UK into
+the query projection ONCE, and dot the (already-absorbed) query directly
+against the cached latent c. The same trick absorbs W_UV into W_O on the
+output side. At decode, MLA therefore never materialises a key or a value:
+it attends against the latent directly. What it pays is ARITHMETIC — each
+head now dots a d_c-wide query against a d_c-wide latent, d_c/dₖ = 4 times
+the work of a 128-wide key — and §26 says arithmetic is the resource that
+was never binding.</span></div>
+
+      <div class="formula"><span class="lbl">the published shapes, and the arithmetic reproduced</span><span class="eq">  DeepSeek-V2:  n_h = 128,  dₕ = 128,  L = 60,  d_c = 512,  dₕᴿ = 64
+
+  cache per token per layer  =  d_c + dₕᴿ  =  512 + 64  =  576
+  the paper's "≈ (9/2)·dₕ"    =  4.5 × 128   =  576             EXACT
+  "equal to GQA with 2.25 groups": 2·n_g·dₕ = 576 ⇒ n_g = 2.25  EXACT
+
+  MHA equivalent  2·n_h·dₕ·L  =  1 966 080 elements per token
+  MLA             (d_c+dₕᴿ)·L =    34 560 elements per token
+  ratio                            56.89×          98.24% smaller</span></div>
+
+      <div class="wrong"><span class="say">The headline number, checked.</span> The report's abstract says MLA "reduces the KV cache by <b>93.3%</b>". <span class="fix">That figure is not the MLA-against-MHA ratio, and it is not reproducible from the architecture alone.</span> Recomputed against the previous generation's published shape — 95 layers, 64 query heads, <b>GQA with 8 KV heads</b>, <code>dₕ</code> 128, which is <code>2·8·128·95 = 194 560</code> elements per token, or <b>380.0 KiB</b> in bf16 — the new model's <code>34 560</code> elements are <b>67.5 KiB</b>, a reduction of <b>82.24%</b>. The missing factor is that the report also <b>quantises the deployed cache to 6 bits per element on average</b>: <code>34 560 × 0.75 = 25 920</code> bytes = <b>25.3 KiB</b>, and <code>1 − 25.3/380.0 = <b>93.34%</b></code>. The report does not spell out this derivation; it is the reconstruction that reproduces the headline to four significant figures. So the headline is <b>architecture plus quantisation, against a GQA baseline with a different layer count</b> — not the attention mechanism on its own. The mechanism's own number is 82.2% against that baseline, or 98.2% against an MHA of the same shape. All three are defensible; only one is what the sentence sounds like.</div>
+
+      <table class="grid2">
+        <tr><th></th><th>MHA</th><th>GQA</th><th>MQA</th><th>MLA</th></tr>
+        <tr><td><b>cache / token / layer</b></td><td class="mono">2·h·dₖ</td><td class="mono">2·g·dₖ</td><td class="mono">2·dₖ</td><td class="mono">d_c + dₕᴿ</td></tr>
+        <tr><td><b>how it shrinks</b></td><td>—</td><td>shares key/value sets between query heads</td><td>one shared set</td><td>keeps every head distinct and stores a compressed <i>joint</i> representation</td></tr>
+        <tr><td><b>expansion cost at decode</b></td><td>none</td><td>none</td><td>none</td><td><b>none</b> — absorbed into <code>W_Q</code> and <code>W_O</code></td></tr>
+        <tr><td><b>position encoding</b></td><td>ordinary</td><td>ordinary</td><td>ordinary</td><td>needs a <b>decoupled</b> rotary key, because a position-dependent rotation cannot be absorbed</td></tr>
+        <tr><td><b>quality against MHA</b></td><td>—</td><td>very close, with a short conversion run</td><td>a noticeable step down</td><td>reported at or slightly above MHA</td></tr>
+        <tr class="tot"><td><b>complexity</b></td><td>lowest</td><td>one index map</td><td>one index map</td><td>four extra matrices, an absorption step, and a separate rotary path</td></tr>
+      </table>
+
+      <div class="viz" id="viz-ml">
+        <div class="vhead">
+          <span class="vtitle">The four cache designs at the same shape, and where the latent rank puts MLA</span>
+          <span class="vhint">sweep the latent width and read off the GQA group count it is equivalent to — the published choice lands at 2.25</span>
+        </div>
+        <div class="controls">
+          <label>query heads h <input type="range" id="ml-h" min="8" max="128" step="8" value="128" /><span id="ml-hv" style="min-width:26px;display:inline-block">128</span></label>
+          <label>dₖ <select id="ml-dk"><option value="64">64</option><option value="128" selected>128</option></select></label>
+          <label>layers L <input type="range" id="ml-L" min="12" max="96" step="4" value="60" /><span id="ml-Lv" style="min-width:22px;display:inline-block">60</span></label>
+          <label>latent width d_c <input type="range" id="ml-dc" min="64" max="2048" step="64" value="512" /><span id="ml-dcv" style="min-width:34px;display:inline-block">512</span></label>
+          <label>decoupled rotary width <input type="range" id="ml-dr" min="0" max="256" step="16" value="64" /><span id="ml-drv" style="min-width:26px;display:inline-block">64</span></label>
+        </div>
+        <svg id="ml-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Left: a schematic of one token's path through multi-head latent attention, drawn as boxes with their widths to scale — the hidden state, the compressed latent, the decoupled rotary key, and the reconstructed per-head keys and values which are drawn dashed to indicate that they are never stored. The cached region is shaded and labelled with its exact element count, and beside it the multi-head equivalent is drawn at the same scale so that the ratio between the two is visible as a length rather than only as a number. Right: cache elements per token plotted against the number of key-value heads for the grouped-query family as a falling staircase, with horizontal lines at the multi-head, multi-query and latent values so that the latent design can be read off as the group count it is equivalent to; at the published settings that reading is two and a quarter groups, which is stated in the readout and is not an integer, which is the point of the design. A second small panel gives the parameter cost of the extra projection matrices the latent design needs, against the cache it saves, so the trade is visible in both directions. The readout gives the cache per token, the ratio against multi-head and against the selected grouped-query configuration, the equivalent group count, and the extra parameters."></svg>
+        <div class="readout" aria-live="polite" id="ml-readout"></div>
+      </div>
+    </section>
+
+    <nav class="pager" aria-label="Attention series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="cost-limits.html">← Attention Cost &amp; Limits</a>
+      <a href="../attention.html" style="color:var(--muted)">Attention · overview</a>
+      <a href="efficient-attention.html">Sparse, Linear &amp; Flash Attention →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../attention.viz.js"></script>
+</body>
+</html>

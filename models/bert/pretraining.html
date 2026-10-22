@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · BERT: Masked-LM &amp; NSP Pretraining</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../bert.html">BERT</a> · part 2 of 4</p>
+      <h1>BERT: Masked-LM &amp; NSP Pretraining</h1>
+      <p>How BERT is pretrained: masked language modelling with the 15% and 80/10/10 rule worked by hand, what the released data generator actually does, next-sentence prediction and the conflicting ablations that led RoBERTa to drop it, the BooksCorpus and Wikipedia schedule with its 128 → 512 switch, and forward FLOPs per sequence.</p>
+      <div style="margin-top:10px">
+        <span class="pill">BERT</span>
+        <span class="pill">15% · 80/10/10 · MLM by hand · released masking code · NSP · Table 5 vs RoBERTa · BooksCorpus + Wikipedia · 128 → 512 · FLOPs</span>
+      </div>
+    </header>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="mlm" data-nav="Masked language modelling">
+      <h3><span class="idx">09</span> Masked language modelling: 15% and 80 / 10 / 10</h3>
+      <p class="lede">The data generator picks 15% of the WordPiece positions for prediction. Each chosen position is replaced by <code>[MASK]</code> 80% of the time, by a random token 10% of the time, and left unchanged 10% of the time. The model must recover the original token at every chosen position, whatever it now shows.</p>
+
+      <div class="viz" id="viz-bert">
+        <div class="vhead">
+          <span class="vtitle">The corruption procedure, run for real</span>
+          <span class="vhint">pick a sentence · resample the random draws · the lower panel runs 20,000 sequences and tallies the outcomes</span>
+        </div>
+        <div class="controls">
+          <label>sentence
+            <select id="bert-sel">
+              <option value="0">my dog is hairy … (paper A.1)</option>
+              <option value="1">the man went to the store … (NSP example)</option>
+              <option value="2">paris is the capital of france …</option>
+            </select>
+          </label>
+          <button class="btn" id="bert-resample">Resample ▸</button>
+          <label>selection rate <input type="range" id="bert-rate" min="0.05" max="0.4" step="0.05" value="0.15" /><span id="bert-ratev" style="min-width:34px;display:inline-block">0.15</span></label>
+        </div>
+        <svg id="bert-svg" width="640" height="330" viewBox="0 0 640 330" role="img" aria-label="Original tokens, corrupted tokens and loss-bearing positions under BERT's masking procedure, with outcome frequencies"></svg>
+        <div class="readout" aria-live="polite" id="bert-read"></div>
+        <p class="vcap">The number of predictions follows the released <code>create_pretraining_data.py</code>: <code>k = max(1, round(n × rate))</code> over the whole sequence length n (special tokens included in n, but never chosen), capped by <code>max_predictions_per_seq</code> (default 20). Candidate positions exclude <code>[CLS]</code> and <code>[SEP]</code>. The tally panel uses the same procedure on 20,000 synthetic 128-token sequences with a fixed seed.</p>
+      </div>
+
+      <div class="formula"><span class="lbl">the MLM head at a chosen position i (E = tied token-embedding matrix)</span><span class="eq">P( xᵢ = v | x̃ ) = softmax( E · LN( GELU( W·Tᵢ + b ) ) + b_out )ᵥ</span>
+<span class="lbl">expected share of all positions, by outcome</span><span class="eq">[MASK]: 0.15 × 0.8 = 12%     random: 0.15 × 0.1 = 1.5%     unchanged: 0.15 × 0.1 = 1.5%     no loss: 85%</span></div>
+
+      <h4>Why the 10% random and 10% unchanged</h4>
+      <ul class="notes">
+        <li><b>Pretrain/fine-tune mismatch.</b> <code>[MASK]</code> never appears downstream. If every chosen position showed <code>[MASK]</code>, the model could learn "only the <code>[MASK]</code> slots need a good representation". The paper: the encoder "does not know which words it will be asked to predict or which have been replaced by random words, so it is forced to keep a distributional contextual representation of every input token".</li>
+        <li><b>Unchanged</b> tokens "bias the representation towards the actual observed word". <b>Random</b> tokens teach the model not to trust the surface token completely; at 1.5% of all tokens the paper judges the noise harmless.</li>
+        <li>Unlike a denoising autoencoder, only the chosen positions are predicted, not the whole input.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> 15% of positions carry the loss; of those, 80% show <code>[MASK]</code>, 10% a random token, 10% the truth. That makes 12% of all input positions <code>[MASK]</code> — the part of the input distribution fine-tuning never sees.</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="mlm-hand" data-nav="MLM worked by hand, and its ablation">
+      <h3><span class="idx">10</span> MLM worked by hand, and the masking-strategy ablation</h3>
+      <p class="lede">The loss is ordinary cross-entropy averaged over the chosen positions only. Four numbers are enough to see what it rewards.</p>
+
+      <h4>A hand-worked batch</h4>
+      <p>Take the paper's sentence "my dog is hairy" in a sequence where three positions were chosen: <code>hairy</code> was replaced by <code>[MASK]</code>, <code>dog</code> by the random token <code>apple</code>, and <code>is</code> was left unchanged. Suppose the model assigns the true tokens these probabilities:</p>
+      <table class="cmp">
+        <tr><th>Position</th><th>Input shown</th><th>Target</th><th>P(target)</th><th>− ln P</th></tr>
+        <tr><td>2</td><td>apple (random)</td><td>dog</td><td>0.20</td><td>1.609</td></tr>
+        <tr><td>3</td><td>is (unchanged)</td><td>is</td><td>0.90</td><td>0.105</td></tr>
+        <tr><td>4</td><td>[MASK]</td><td>hairy</td><td>0.05</td><td>2.996</td></tr>
+        <tr><td colspan="4"><b>mean over the 3 chosen positions</b></td><td><b>1.570 nats</b></td></tr>
+      </table>
+      <ul class="notes">
+        <li>Positions 1 (<code>my</code>) and every unchosen token contribute nothing, however badly they are predicted. In the Transformers library this is done with label <code>-100</code> at unchosen positions.</li>
+        <li>The unchanged position is cheap to get right (the answer is in the input), which is why it is only 10% of the chosen set: if it were most of it, copying would dominate.</li>
+        <li>The paper's Table 6 reports MLM <b>perplexity</b> on held-out training data: 3.99 for BERT-Base and 3.23 for BERT-Large, i.e. mean losses of <code>ln 3.99 = 1.38</code> and <code>ln 3.23 = 1.17</code> nats per predicted token. A uniform guess over 30,522 entries would be <code>ln 30,522 ≈ 10.3</code>.</li>
+      </ul>
+
+      <h4>Does the 80/10/10 split matter? Appendix C.2</h4>
+      <div class="viz" id="viz-maskabl">
+        <div class="vhead">
+          <span class="vtitle">Masking strategies (paper Table 8, BERT-Base dev sets)</span>
+          <span class="vhint">choose the evaluation · bars are relative to BERT's own 80/10/10 row · differences are computed</span>
+        </div>
+        <div class="controls">
+          <label>evaluation <select id="ma-metric"><option value="mnli">MNLI (fine-tune, accuracy)</option><option value="nerft">NER (fine-tune, F1)</option><option value="nerfb" selected>NER (feature-based, F1)</option></select></label>
+        </div>
+        <svg id="ma-svg" width="640" height="260" viewBox="0 0 640 260" role="img" aria-label="Bar chart of downstream scores for six masking strategies"></svg>
+        <div class="readout" aria-live="polite" id="ma-read"></div>
+        <p class="vcap">Each row gives the probabilities of MASK / SAME / RND for a chosen position during pretraining. The feature-based NER column concatenates the last four layers without fine-tuning, where the mismatch cannot be trained away. The table reports single dev-set numbers; the paper gives no variance, so differences of a few tenths are within ordinary run-to-run noise.</p>
+      </div>
+      <ul class="notes">
+        <li>The paper's reading: "fine-tuning is surprisingly robust to different masking strategies", but "using only the MASK strategy was problematic when applying the feature-based approach to NER", and "using only the RND strategy performs much worse than our strategy as well".</li>
+        <li>On MNLI, 100% MASK (84.3) and 80/20/0 (84.4) are at or above 80/10/10 (84.2); the case for 80/10/10 rests mainly on the feature-based column.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> MLM is cross-entropy on the chosen subset. The corruption mix barely moves fine-tuned results but visibly matters when the representations are used frozen — which is exactly where the pretrain/fine-tune mismatch cannot be repaired.</div>
+    </section>
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="masking-code" data-nav="Masking in the released code">
+      <h3><span class="idx">11</span> Masking as the released code actually does it</h3>
+      <p class="lede">The paper's two sentences on masking hide several implementation choices in the released data generator. They matter when reproducing BERT, and several were changed by later work.</p>
+      <table class="cmp">
+        <tr><th>Choice</th><th>Released code (create_pretraining_data.py)</th><th>Consequence</th></tr>
+        <tr><td>How many to predict</td><td><code>min(max_predictions_per_seq, max(1, round(n × 0.15)))</code></td><td>for n = 128: 19 predictions; a cap of 20 is the default flag</td></tr>
+        <tr><td>Static masks</td><td>masking is done once, offline; <code>dupe_factor = 10</code> copies of the data, each masked differently</td><td>RoBERTa: over the "40 epochs" each sequence is seen with the same mask four times</td></tr>
+        <tr><td>Short sequences</td><td><code>short_seq_prob = 0.1</code>: 10% of examples get a random shorter target length</td><td>reduces the mismatch with short fine-tuning inputs</td></tr>
+        <tr><td>Word pieces</td><td>masked independently (original release)</td><td>"phil ##am ##mon" with one piece masked is often easy to complete from the other pieces</td></tr>
+        <tr><td>Whole-word masking</td><td>added in a later release (May 2019), not in the paper</td><td>all pieces of a chosen word are masked together; the 15% rate and 80/10/10 are unchanged, applied per word</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Dynamic masking</b> (RoBERTa) regenerates the mask every time a sequence is fed. RoBERTa found it "comparable or slightly better" than static masking at BERT's scale and adopted it because it "becomes crucial when pretraining for more steps or with larger datasets".</li>
+        <li><b>Span masking</b> (SpanBERT, arXiv 1907.10529) masks contiguous spans and predicts them from the span boundaries; <b>higher masking rates</b> were later argued to work better for larger encoders (ModernBERT uses 30%, citing "Should You Mask 15% in Masked Language Modeling?", arXiv 2202.08005).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> "15% at random" is really "round(0.15·n), capped at 20, chosen once per duplicate, per word piece". Each of those details was later revised — dynamic masks, whole words or spans, and higher rates.</div>
+    </section>
+
+    <!-- 12 ───────────────────────────────────────────── -->
+    <section class="topic" id="nsp" data-nav="Next Sentence Prediction">
+      <h3><span class="idx">12</span> Next Sentence Prediction, and why it was dropped</h3>
+      <p class="lede">The second pretraining task is binary: given segments A and B, is B the text that actually followed A (IsNext, 50%) or a random span from the corpus (NotNext, 50%)? The final hidden state <code>C</code> of <code>[CLS]</code>, through the pooler, feeds a two-way softmax. The paper reports that the final model reaches 97–98% NSP accuracy.</p>
+      <div class="formula"><span class="lbl">NSP loss (C = final [CLS] state)</span><span class="eq">ℒ_NSP = − log softmax( W_nsp · tanh( W_p·C + b_p ) )[y]        y ∈ {IsNext, NotNext}</span>
+<span class="lbl">sentence-order prediction (ALBERT): same two segments, order swapped for negatives</span><span class="eq">positive: (A, B)        negative: (B, A)</span></div>
+
+      <div class="viz" id="viz-nsp">
+        <div class="vhead">
+          <span class="vtitle">How far does word overlap alone get on NSP versus SOP?</span>
+          <span class="vhint">a no-learning baseline: predict "positive" when the two segments share enough words · slide the threshold</span>
+        </div>
+        <div class="controls">
+          <label>task <select id="nsp-task"><option value="nsp" selected>NSP (random negatives)</option><option value="sop">SOP (swapped negatives)</option></select></label>
+          <label>overlap threshold <input type="range" id="nsp-th" min="0" max="0.5" step="0.02" value="0.1" /><span id="nsp-thv" style="min-width:34px;display:inline-block">0.10</span></label>
+        </div>
+        <svg id="nsp-svg" width="640" height="270" viewBox="0 0 640 270" role="img" aria-label="Histogram of word-overlap scores for positive and negative segment pairs under NSP and SOP"></svg>
+        <div class="readout" aria-live="polite" id="nsp-read"></div>
+        <p class="vcap">A toy corpus of four short documents on different topics. Every consecutive sentence pair is a positive; NSP negatives pair a sentence with every sentence of the other documents; SOP negatives are the positives reversed. The score is the Jaccard overlap of content words (stop-words removed), computed for every pair. Because overlap is symmetric, a swapped pair scores exactly what the original did, so no threshold can beat 50% on SOP — the feature carries no order information at all.</p>
+      </div>
+
+      <h4>What went wrong with NSP</h4>
+      <ul class="notes">
+        <li><b>The negatives are too easy.</b> A random segment usually comes from another document, so topic mismatch — which MLM already learns — nearly solves the task. ALBERT's authors put it as NSP conflating "topic prediction" with "coherence prediction", the easier of which dominates.</li>
+        <li><b>It shortens the context.</b> Packing two segments whose combined length is at most 512, half of them unrelated, means the model often reads two half-length unrelated spans instead of one long coherent one.</li>
+        <li>ALBERT reports that a model trained with NSP solves SOP only at chance level, while a model trained with SOP solves NSP "to a reasonable degree".</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> NSP is a lesson about negative sampling. An auxiliary objective helps only if its negatives cannot be separated by a feature the model already has — sentence-order prediction keeps the topic fixed so that only coherence remains.</div>
+    </section>
+
+    <!-- 13 ───────────────────────────────────────────── -->
+    <section class="topic" id="nsp-ablation" data-nav="The objective ablations">
+      <h3><span class="idx">13</span> The objective ablations: BERT's Table 5 against RoBERTa's Table 2</h3>
+      <p class="lede">BERT's ablation found that removing NSP hurt; RoBERTa's found that removing it did not. Both are real results from different comparisons, and the difference between them is instructive.</p>
+
+      <div class="viz" id="viz-ablate">
+        <div class="vhead">
+          <span class="vtitle">Pretraining-objective ablations, BERT-Base scale</span>
+          <span class="vhint">choose the source table and task · deltas to each table's reference row are computed</span>
+        </div>
+        <div class="controls">
+          <label>source <select id="ab-src"><option value="bert" selected>BERT Table 5 (dev)</option><option value="roberta">RoBERTa Table 2 (dev, medians of 5 seeds)</option></select></label>
+          <label>task <select id="ab-task"></select></label>
+        </div>
+        <svg id="ab-svg" width="640" height="260" viewBox="0 0 640 260" role="img" aria-label="Bar chart comparing pretraining objectives on a chosen downstream task"></svg>
+        <div class="readout" aria-live="polite" id="ab-read"></div>
+        <p class="vcap">BERT rows: the full model, the same model without NSP, a left-to-right LM without NSP "like OpenAI GPT" but on BERT's data and recipe, and that model with a randomly initialised BiLSTM added on top during fine-tuning. RoBERTa rows: its reimplementation with the original segment-pair input and NSP, pairs of single sentences with NSP, and two formats without NSP that fill the 512 tokens with contiguous full sentences (crossing document boundaries or not).</p>
+      </div>
+
+      <h4>Reading the two tables together</h4>
+      <ul class="notes">
+        <li><b>Bidirectionality is the large effect.</b> In BERT's Table 5, "LTR &amp; No NSP" falls 9.0 points on MRPC and 10.1 F1 on SQuAD relative to "No NSP". Adding a BiLSTM recovers SQuAD partly (77.8 → 84.9) but not GLUE.</li>
+        <li><b>NSP's effect is small and depends on the input format.</b> BERT's "No NSP" kept the two-segment input and removed only the loss; RoBERTa suggests this is why it hurt: "It is possible that the original BERT implementation may only have removed the loss term while still retaining the SEGMENT-PAIR input format." Filling the window with contiguous text and dropping NSP "matches or slightly improves downstream task performance".</li>
+        <li>Sentence-pair inputs (much shorter than 512) did worst in RoBERTa's table even with NSP, and even with a larger batch to equalise tokens — evidence that long contiguous context, not the pair objective, is what mattered.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the left-to-right versus bidirectional gap is several points; the NSP versus no-NSP gap is a fraction of a point and flips sign once the input is long contiguous text. Later encoders (RoBERTa, ELECTRA, DeBERTa, ModernBERT) all train without NSP.</div>
+    </section>
+
+    <!-- 14 ───────────────────────────────────────────── -->
+    <section class="topic" id="data" data-nav="Pretraining data and schedule">
+      <h3><span class="idx">14</span> Pretraining data, schedule and the 128 → 512 switch</h3>
+      <p class="lede">BooksCorpus (800M words) plus English Wikipedia (2,500M words, text passages only — lists, tables and headers removed). The paper stresses using a document-level corpus rather than a sentence-shuffled one such as the Billion Word Benchmark, "in order to extract long contiguous sequences".</p>
+
+      <div class="viz" id="viz-sched">
+        <div class="vhead">
+          <span class="vtitle">The pretraining schedule, and how many tokens it really processes</span>
+          <span class="vhint">slide the fraction of steps run at length 128 · the learning-rate curve uses the paper's warm-up and linear decay</span>
+        </div>
+        <div class="controls">
+          <label>fraction of steps at 128 <input type="range" id="sc-f" min="0" max="1" step="0.05" value="0.9" /><span id="sc-fv" style="min-width:34px;display:inline-block">0.90</span></label>
+          <label>model <select id="sc-model"><option value="base" selected>BERT-Base (16 TPU chips)</option><option value="large">BERT-Large (64 TPU chips)</option></select></label>
+        </div>
+        <svg id="sc-svg" width="640" height="280" viewBox="0 0 640 280" role="img" aria-label="Learning-rate schedule and sequence-length phases over one million pretraining steps"></svg>
+        <div class="readout" aria-live="polite" id="sc-read"></div>
+        <p class="vcap">Tokens are counted as batch × sequence length × steps, treating every sequence as full length, so they are an upper bound: <code>short_seq_prob</code> and segment packing leave some padding. "Epochs" divides tokens by the 3.3B <i>words</i> of the corpus; WordPiece produces somewhat more tokens than words, so the true number of passes is lower still.</p>
+      </div>
+
+      <h4>The published hyperparameters (Appendix A.2)</h4>
+      <ul class="notes">
+        <li>Batch 256 sequences; 1,000,000 steps; Adam with learning rate 1e-4, β₁ = 0.9, β₂ = 0.999, L2 weight decay 0.01; warm-up over the first 10,000 steps then linear decay; dropout 0.1 everywhere; GELU.</li>
+        <li>Sequence length 128 for 90% of the steps, then 512 for the remaining 10% "to learn the positional embeddings" — because "attention is quadratic to the sequence length".</li>
+        <li>Hardware: BERT-Base on 4 Cloud TPUs in pod configuration (16 TPU chips); BERT-Large on 16 Cloud TPUs (64 chips); "each pretraining took 4 days to complete".</li>
+      </ul>
+
+      <h4>An internal inconsistency in the paper</h4>
+      <ul class="notes">
+        <li>The paper describes the batch as "256 sequences * 512 tokens = 128,000 tokens/batch" (256 × 512 is 131,072) and the whole run as "approximately 40 epochs over the 3.3 billion word corpus" — which is what 1M full-length steps give (131B tokens / 3.3B ≈ 39.7).</li>
+        <li>But the same appendix says 90% of steps used length 128. With that schedule, the run processes about 29.5B + 13.1B = 42.6B tokens — roughly 13 passes, not 40. The "128,000 words per batch" in Appendix A.4 (the GPT comparison) inherits the same full-length assumption. The paper does not reconcile the two; the figure computes both.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> 3.3B words, 1M steps of 256 sequences, lr 1e-4 with 10k warm-up, and mostly 128-token sequences. RoBERTa later showed this was far from saturated: ten times the data and larger batches for longer kept improving results (<a href="successors-practice.html#successors">§26</a>).</div>
+    </section>
+
+    <!-- 15 ───────────────────────────────────────────── -->
+    <section class="topic" id="compute" data-nav="Compute and where encoders win">
+      <h3><span class="idx">15</span> Compute: FLOPs per sequence, and where encoders still win</h3>
+      <p class="lede">An encoder pass is one parallel forward over the whole input: no autoregressive loop and no KV cache. Its cost has a part linear in length (the weight matrices) and a part quadratic in length (the attention scores).</p>
+      <div class="formula"><span class="lbl">forward FLOPs for one sequence of n tokens (multiply + add = 2)</span><span class="eq">C_fwd ≈ 2 · (12·L·H²) · n   +   4 · L · n² · H</span>
+<span class="lbl">the two terms are equal when</span><span class="eq">24·L·H²·n = 4·L·n²·H   ⇔   n = 6H     (4,608 for Base, 6,144 for Large)</span>
+<span class="lbl">training estimate</span><span class="eq">C_train ≈ 3 · C_fwd per sequence   ≈ 6 · N · D  when the n² term is small</span></div>
+
+      <div class="viz" id="viz-flops">
+        <div class="vhead">
+          <span class="vtitle">Where the FLOPs go as the input grows</span>
+          <span class="vhint">choose the model and a sequence length · the curve extends past 512 to show where attention would take over</span>
+        </div>
+        <div class="controls">
+          <label>model <select id="fl-model"><option value="base" selected>BERT-Base</option><option value="large">BERT-Large</option></select></label>
+          <label>n <input type="range" id="fl-n" min="16" max="8192" step="16" value="512" /><span id="fl-nv" style="min-width:40px;display:inline-block">512</span></label>
+        </div>
+        <svg id="fl-svg" width="640" height="270" viewBox="0 0 640 270" role="img" aria-label="Log-log plot of linear and quadratic forward FLOPs against sequence length"></svg>
+        <div class="readout" aria-live="polite" id="fl-read"></div>
+        <p class="vcap">Counts matrix multiplies only (projections, FFN, QKᵀ and attention-times-V); softmax, LayerNorm and the embedding lookup are ignored. FLOPs are not latency: at long lengths the n × n score matrix also costs memory traffic, which is what FlashAttention-style kernels address (<a href="../../deep-learning/attention/cost-limits.html#cost">Attention — cost</a>). Lengths beyond 512 are impossible for the released checkpoints and are drawn only to locate the crossover.</p>
+      </div>
+
+      <h4>Where a fine-tuned encoder is still the right tool</h4>
+      <ul class="notes">
+        <li><b>High-volume classification and routing</b> — intent, moderation, spam, safety filters — where a ~110M-parameter model with one forward pass costs orders of magnitude fewer FLOPs per call than generating even a short answer with a multi-billion-parameter decoder.</li>
+        <li><b>Token-level outputs</b> — NER, span extraction, tagging — which map directly to per-position heads (<a href="fine-tuning-results.html#finetuning">§17</a>).</li>
+        <li><b>Retrieval and reranking</b> — bi-encoders for first-stage search and cross-encoders for reranking (<a href="successors-practice.html#embedding-model">§28</a>).</li>
+        <li>Whether an encoder also matches a large prompted decoder in <i>accuracy</i> depends on the task and the amount of labelled data; measure both on the target data.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> at BERT's 512-token limit, attention scores are only about 10% (Base) of the forward FLOPs — the weight matrices dominate. The crossover is at <code>n = 6H</code>, thousands of tokens. The 512 ceiling comes from the learned position table and from attention memory, not from attention FLOPs.</div>
+    </section>
+
+    <nav class="pager" aria-label="BERT series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="inputs-encoder.html">← BERT: Inputs, WordPiece &amp; Encoder Stack</a>
+      <a href="../bert.html" style="color:var(--muted)">BERT · overview</a>
+      <a href="fine-tuning-results.html">BERT: Fine-Tuning, Probing &amp; Results →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../bert.viz.js"></script>
+</body>
+</html>

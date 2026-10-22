@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · EfficientNet: B0, MBConv &amp; Training Recipe</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../efficientnet.html">EfficientNet</a> · part 3 of 5</p>
+      <h1>EfficientNet: B0, MBConv &amp; Training Recipe</h1>
+      <p>The network that gets scaled: the MnasNet-style search that found B0, its stem, seven MBConv stages and head, the 5.29 M parameters and 0.39 B FLOPs recounted, the mobile inverted bottleneck and its cost, squeeze-and-excitation, Swish/SiLU, and the RMSProp, stochastic-depth training recipe.</p>
+      <div style="margin-top:10px">
+        <span class="pill">EfficientNet</span>
+        <span class="pill">MnasNet-style NAS · B0 stages · 5.29 M counted · MBConv · SE · Swish · recipe</span>
+      </div>
+    </header>
+
+    <!-- 14 ───────────────────────────────────────────── -->
+    <section class="topic" id="nas" data-nav="The NAS that found B0">
+      <h3><span class="idx">14</span> The architecture search that produced B0</h3>
+      <p class="lede">Scaling cannot fix a weak baseline, because scaling never changes <code>F̂ᵢ</code>. B0 was found with the MnasNet search space and a MnasNet-style multi-objective reward. The one difference the paper names is <b>FLOPs instead of measured phone latency</b> in the reward.</p>
+
+      <div class="formula"><span class="lbl">the multi-objective reward</span><span class="eq">reward(m) = ACC(m) · [ FLOPS(m) / T ]ʷ</span>
+<span class="eq">T = 400 M  (target FLOPs)          w = −0.07</span>
+<span class="lbl">where −0.07 comes from (MnasNet's reasoning)</span><span class="eq">“doubling the cost buys about 5% relative accuracy”  →  2ʷ = 1/1.05</span>
+<span class="eq">w = −ln 1.05 / ln 2 = −0.0704</span></div>
+
+      <h4>What the exponent means</h4>
+      <ul class="notes">
+        <li><code>w</code> is the <b>exchange rate</b> between accuracy and cost. With <code>w = −0.07</code>, a model that doubles FLOPs must raise accuracy by a factor of <code>2⁰·⁰⁷ = 1.0497</code>, about <b>5% relative</b>, just to keep the same reward. Halving FLOPs is rewarded by the same factor.</li>
+        <li>It is a <b>soft</b> constraint. Nothing forbids 600 M FLOPs, it is just discounted. MnasNet defined the exponent piecewise, one value below T and another above. Setting 0 below and −1 above gave a hard constraint, and −0.07 on both sides gave the soft one. EfficientNet uses a single exponent, the symmetric soft setting.</li>
+        <li>The objective is <b>scale-free in cost</b>. Only the ratio FLOPS/T matters, so the reward traces a smooth Pareto front rather than a cliff at T.</li>
+      </ul>
+
+      <h4>Hand-worked: three candidates</h4>
+      <div class="formula"><span class="lbl">T = 400 M, w = −0.07</span><span class="eq">A: 76.0% at 400 M   → 0.760 · pow(1.0, −0.07) = 0.760 · 1.00000 = 0.7600</span>
+<span class="eq">B: 77.5% at 800 M   → 0.775 · pow(2.0, −0.07) = 0.775 · 0.95264 = 0.7383</span>
+<span class="eq">C: 74.0% at 200 M   → 0.740 · pow(0.5, −0.07) = 0.740 · 1.04971 = 0.7768</span>
+<span class="lbl">break-even accuracy for B to tie A</span><span class="eq">0.760 · pow(2, 0.07) = 0.760 · 1.04971 = 79.78%</span></div>
+      <p>B's +1.5 points is not enough, because at double the cost it would need about +3.8. C <b>wins</b>, trading 2 points for half the compute. With the reward symmetric around T, being cheaper is rewarded as much as being more expensive is penalised. The target is where the search is centred, not a ceiling. B0 landed at 0.39 B, within 3% of T.</p>
+
+      <div class="viz" id="viz-nas">
+        <div class="vhead">
+          <span class="vtitle">Reward landscape ACC · (FLOPS/T)ʷ</span>
+          <span class="vhint">iso-reward curves in (FLOPs, accuracy) space; drag the candidate with the sliders</span>
+        </div>
+        <div class="controls">
+          <label>w <input type="range" id="nas-w" min="-0.3" max="0" step="0.01" value="-0.07"></label>
+          <label>candidate FLOPs (M) <input type="range" id="nas-f" min="100" max="1600" step="10" value="800"></label>
+          <label>candidate top-1 (%) <input type="range" id="nas-a" min="70" max="82" step="0.1" value="77.5"></label>
+        </div>
+        <svg id="nas-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Iso-reward curves of accuracy times FLOPs over target to the power w, with a reference model at the target and a movable candidate"></svg>
+        <div class="readout" aria-live="polite" id="nas-read"></div>
+      </div>
+
+      <h4>The search space and procedure (inherited from MnasNet)</h4>
+      <ul class="notes">
+        <li><b>Factorised hierarchical space.</b> The network is split into a fixed number of blocks (stages). Each stage independently chooses its convolution type (regular, depthwise, or mobile inverted bottleneck with expansion 3 or 6), kernel size (3×3 or 5×5), squeeze-and-excitation ratio (0 or 0.25), skip operation, output channels, and number of repeated layers. Layers <i>within</i> a stage are identical, which is exactly the <code>Fᵢᴸⁱ</code> structure equation 1 assumes.</li>
+        <li><b>Search algorithm.</b> MnasNet used a recurrent controller trained with reinforcement learning (policy gradient via PPO). Each sampled child network was trained briefly on a proxy ImageNet task and scored with the reward above. The EfficientNet paper states only that it used “the same search space” and a multi-objective search. It does not report compute, number of samples or proxy settings for the B0 search.</li>
+        <li><b>Why FLOPs and not latency:</b> “we are not targeting any specific hardware device.” That choice is what makes B0 hardware-neutral on paper, and it is also the root of the later speed critiques (§28).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> B0 is, as far as the paper says, MnasNet's search setup rerun with a FLOP budget of 400 M and a 5%-per-doubling exchange rate. Because the reward is soft, the result sits at the target by choice, not by force. Because it is FLOP-based, it inherits no knowledge of how fast any particular chip runs it.</div>
+    </section>
+
+    <!-- 15 ───────────────────────────────────────────── -->
+    <section class="topic" id="b0" data-nav="B0, stage by stage">
+      <h3><span class="idx">15</span> The B0 architecture, stage by stage (Table 1)</h3>
+      <p class="lede">Nine rows: a stem, seven stages of MBConv blocks, and a head. Resolution halves five times from 224 to 7, and channels grow from 32 to 320 before the 1280-wide head.</p>
+
+      <table class="cmp">
+        <tr><th>Stage</th><th>Operator</th><th>Input res</th><th>Out ch</th><th>Layers</th><th>Stride (first layer)</th><th>Expansion → hidden width</th></tr>
+        <tr><td>1</td><td>Conv3×3</td><td>224×224</td><td>32</td><td>1</td><td>2</td><td>—</td></tr>
+        <tr><td>2</td><td>MBConv1, k3×3</td><td>112×112</td><td>16</td><td>1</td><td>1</td><td>1 → 32 (no expand conv)</td></tr>
+        <tr><td>3</td><td>MBConv6, k3×3</td><td>112×112</td><td>24</td><td>2</td><td>2</td><td>6 → 96, then 144</td></tr>
+        <tr><td>4</td><td>MBConv6, k5×5</td><td>56×56</td><td>40</td><td>2</td><td>2</td><td>6 → 144, then 240</td></tr>
+        <tr><td>5</td><td>MBConv6, k3×3</td><td>28×28</td><td>80</td><td>3</td><td>2</td><td>6 → 240, then 480</td></tr>
+        <tr><td>6</td><td>MBConv6, k5×5</td><td>14×14</td><td>112</td><td>3</td><td>1</td><td>6 → 480, then 672</td></tr>
+        <tr><td>7</td><td>MBConv6, k5×5</td><td>14×14</td><td>192</td><td>4</td><td>2</td><td>6 → 672, then 1152</td></tr>
+        <tr><td>8</td><td>MBConv6, k3×3</td><td>7×7</td><td>320</td><td>1</td><td>1</td><td>6 → 1152</td></tr>
+        <tr><td>9</td><td>Conv1×1 &amp; Pooling &amp; FC</td><td>7×7</td><td>1280</td><td>1</td><td>—</td><td>—</td></tr>
+      </table>
+      <p>The table's “Resolution” column is each stage's <b>input</b> resolution. The strides come from the reference block strings (<code>s11</code>/<code>s22</code>). The stride sits on the depthwise convolution of a stage's first block. Stage 7 is where 14 → 7 happens, even though its row says 14×14.</p>
+
+      <div class="viz" id="viz-arch">
+        <div class="vhead">
+          <span class="vtitle">The network, drawn to scale and counted live</span>
+          <span class="vhint">block height ∝ channels (log), width ∝ repeats · hover a stage for its params and MACs, computed from the spec</span>
+        </div>
+        <div class="controls">
+          <label>model
+            <select id="arch-model"><option value="0">B0</option><option value="1">B1</option><option value="2">B2</option><option value="3">B3</option><option value="4">B4</option><option value="5">B5</option><option value="6">B6</option><option value="7">B7</option></select>
+          </label>
+          <label>colour by
+            <select id="arch-color"><option value="M">MACs</option><option value="P">parameters</option><option value="act">activation elements</option></select>
+          </label>
+        </div>
+        <svg id="arch-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Stage diagram of the selected EfficientNet model with per-stage parameter and MAC counts on hover"></svg>
+        <div class="readout" aria-live="polite" id="arch-read"></div>
+      </div>
+
+      <h4>Design features worth noticing</h4>
+      <ul class="notes">
+        <li><b>Mixed kernel sizes.</b> The search chose 5×5 depthwise kernels in stages 4, 6 and 7. In depthwise form a 5×5 costs 25/9 ≈ 2.8× a 3×3 on the <i>depthwise</i> term only, and the depthwise term is under 10% of the network's MACs (§05), so larger kernels are cheap here in a way they are not in ordinary convolutions.</li>
+        <li><b>Stage 2 has no expansion</b> (MBConv1). The search chose this and the paper gives no reason. A likely one: with 32 input channels at 112×112, expanding 6× would create a 192-channel map at the highest resolution in the network, which is expensive in both FLOPs and memory.</li>
+        <li><b>Channel counts are small.</b> The widest block output is 320, while ResNet-50 reaches 2048. Capacity comes from the 6× expanded hidden width (up to 1152) inside blocks and from the 1280-wide head.</li>
+        <li><b>SE in every block</b>, with the squeeze width set to a quarter of the block's <i>input</i> channels (§19).</li>
+        <li><b>Head</b>: 1×1 conv 320 → 1280, global average pooling, dropout (0.2 for B0), then a 1280 × 1000 fully connected layer. The head holds 32% of B0's parameters and 5.5% of its MACs.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> B0 is a 3×3 stride-2 stem, seven MBConv stages at expansion 6 (except the first), mixed 3×3/5×5 kernels, SE in every block, and a 1280-channel head. The paper calls it “similar to MnasNet”. It differs from MnasNet-A1, which uses SE in only some stages, an expansion-3 stage, and different stage widths. It is a mobile network that happens to scale well.</div>
+    </section>
+
+    <!-- 16 ───────────────────────────────────────────── -->
+    <section class="topic" id="counting" data-nav="B0 counted: 5.29 M, 0.39 B">
+      <h3><span class="idx">16</span> B0 counted in full: 5.29 M parameters, 0.388 B MACs</h3>
+      <p class="lede">Table 2's “5.3M params, 0.39B FLOPs” can be reproduced exactly from the block list. Recounting it shows where the parameters sit and where the compute sits, and the two are in different places.</p>
+
+      <h4>Per-stage totals (recomputed from the reference spec)</h4>
+      <table class="cmp">
+        <tr><th>Stage</th><th>What</th><th>Params</th><th>% params</th><th>MACs</th><th>% MACs</th></tr>
+        <tr><td>1</td><td>stem 3×3 s2, 3 → 32, + BN</td><td>928</td><td>0.02%</td><td>10 838 016</td><td>2.8%</td></tr>
+        <tr><td>2</td><td>MBConv1 k3, 32 → 16, ×1</td><td>1 448</td><td>0.03%</td><td>10 437 120</td><td>2.7%</td></tr>
+        <tr><td>3</td><td>MBConv6 k3, → 24, ×2</td><td>16 714</td><td>0.3%</td><td>55 697 856</td><td>14.4%</td></tr>
+        <tr><td>4</td><td>MBConv6 k5, → 40, ×2</td><td>46 640</td><td>0.9%</td><td>38 240 640</td><td>9.9%</td></tr>
+        <tr><td>5</td><td>MBConv6 k3, → 80, ×3</td><td>242 930</td><td>4.6%</td><td>43 790 400</td><td>11.3%</td></tr>
+        <tr><td>6</td><td>MBConv6 k5, → 112, ×3</td><td>543 148</td><td>10.3%</td><td>86 459 904</td><td>22.3%</td></tr>
+        <tr><td>7</td><td>MBConv6 k5, → 192, ×4</td><td>2 026 348</td><td>38.3%</td><td>91 730 496</td><td>23.6%</td></tr>
+        <tr><td>8</td><td>MBConv6 k3, → 320, ×1</td><td>717 232</td><td>13.6%</td><td>29 576 448</td><td>7.6%</td></tr>
+        <tr><td>9</td><td>1×1 320 → 1280 + BN; FC 1280 → 1000</td><td>412 160 + 1 281 000</td><td>32.0%</td><td>20 070 400 + 1 280 000</td><td>5.5%</td></tr>
+        <tr><td></td><td><b>total</b></td><td><b>5 288 548</b></td><td>100%</td><td><b>388 121 280</b></td><td>100%</td></tr>
+      </table>
+
+      <h4>Conventions behind the count</h4>
+      <ul class="notes">
+        <li>Convolutions have no bias (BatchNorm follows each one). Each BatchNorm contributes 2 learned parameters per channel (scale γ, shift β). The two SE convolutions have biases. The classifier has a bias.</li>
+        <li>BatchNorm's running mean and variance are buffers, not parameters. There are 21 008 BN channels in B0, so 42 016 buffers. Keras reports B0 as “5 330 571 total, 5 288 548 trainable, 42 023 non-trainable”. The 42 023 is exactly these 42 016 buffers plus 7 values of its input-normalisation layer, so the trainable count matches ours exactly.</li>
+        <li>MACs count every multiply-add in the convolutions, the SE MLP and the FC, plus one multiply per element for the SE rescale. BatchNorm, activations, pooling and the residual additions are elementwise and excluded, as is usual.</li>
+      </ul>
+
+      <h4>Where parameters and compute sit</h4>
+      <ul class="notes">
+        <li><b>Parameters are at the end.</b> Stages 7–9 hold <b>84%</b> of the parameters (38.3 + 13.6 + 32.0), because weight counts scale with channels² and channels are largest there. The FC layer alone is 24% of the network.</li>
+        <li><b>Compute is in the middle.</b> Stages 3, 6 and 7 do 60% of the MACs. Early stages are cheap in parameters and costly in arithmetic because of their large maps, and late stages the reverse. This is the pattern described on <a href="../../deep-learning/convolutional-networks/arithmetic-receptive-fields.html#counting">counting one layer exactly</a>.</li>
+        <li><b>By operation type:</b> the expand 1×1s do 166.2 M MACs (42.8%), project 1×1s 152.3 M (39.2%), depthwise 34.5 M (8.9%), stem 10.8 M (2.8%), head 1×1 20.1 M (5.2%), SE 2.9 M (0.8%), FC 1.3 M (0.3%). The 1×1 convolutions together are <b>87.2%</b>.</li>
+        <li><b>SE is cheap in compute, not in parameters.</b> 0.8% of MACs but 636 540 parameters, <b>12.0%</b> of B0.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> 5 288 548 parameters and 388.1 M MACs, matching the paper's 5.3 M / 0.39 B. The 1×1 convolutions do 87% of the arithmetic, and the last three stages hold 84% of the weights.</div>
+    </section>
+
+    <!-- 17 ───────────────────────────────────────────── -->
+    <section class="topic" id="mbconv" data-nav="The MBConv block">
+      <h3><span class="idx">17</span> The MBConv block: inverted residual with a linear bottleneck</h3>
+      <p class="lede">Every stage after the stem is a stack of one block type, the mobile inverted bottleneck from MobileNetV2 with squeeze-and-excitation added. Four operations in a fixed order, plus a skip connection when the shapes allow.</p>
+
+      <div class="formula"><span class="lbl">MBConv(e, k), input x of shape H × W × C_in</span><span class="eq">1. expand     h₁ = swish( BN( Conv1×1(x) ) )           C_in → e·C_in        (skipped when e = 1)</span>
+<span class="eq">2. depthwise  h₂ = swish( BN( DWConv k×k, stride s (h₁) ) )  e·C_in → e·C_in, H → H/s</span>
+<span class="eq">3. SE         h₃ = h₂ ⊙ σ( W₂ · swish( W₁ · GAP(h₂) + b₁ ) + b₂ )</span>
+<span class="eq">4. project    h₄ = BN( Conv1×1(h₃) )                    e·C_in → C_out      ← NO activation</span>
+<span class="eq">5. skip       y  = x + DropPath(h₄)   if s = 1 and C_in = C_out,  else  y = h₄</span></div>
+
+      <div class="viz" id="viz-mb">
+        <div class="vhead">
+          <span class="vtitle">One MBConv block, live</span>
+          <span class="vhint">bar height ∝ channels · the counts below are computed from the settings, term by term</span>
+        </div>
+        <div class="controls">
+          <label>C_in <select id="mb-cin"><option>16</option><option>24</option><option selected>40</option><option>80</option><option>112</option><option>192</option></select></label>
+          <label>C_out <select id="mb-cout"><option>24</option><option>40</option><option selected>80</option><option>112</option><option>192</option><option>320</option></select></label>
+          <label>expansion <select id="mb-e"><option>1</option><option>3</option><option>4</option><option selected>6</option></select></label>
+          <label>kernel <select id="mb-k"><option selected>3</option><option>5</option><option>7</option></select></label>
+          <label>stride <select id="mb-s"><option>1</option><option selected>2</option></select></label>
+          <label>input H <select id="mb-h"><option>112</option><option>56</option><option selected>28</option><option>14</option></select></label>
+          <label>SE <select id="mb-se"><option value="1" selected>on (0.25 of C_in)</option><option value="0">off</option></select></label>
+        </div>
+        <svg id="mb-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Diagram of an MBConv block showing the expand, depthwise, squeeze-and-excitation and projection stages with channel counts"></svg>
+        <div class="readout" aria-live="polite" id="mb-read"></div>
+      </div>
+
+      <h4>Why each design choice</h4>
+      <ul class="notes">
+        <li><b>“Inverted”:</b> a ResNet bottleneck goes wide → narrow → wide and puts the skip on the wide ends. MBConv goes narrow → wide → narrow and puts the skip on the <b>narrow</b> ends. The tensors that cross block boundaries, and are kept for the skip, are small. The expensive spatial filtering happens in the wide space, where a depthwise conv is cheap because it costs <code>k²</code> per channel instead of <code>k²·C</code>.</li>
+        <li><b>“Linear bottleneck”:</b> the projection has no activation. MobileNetV2's argument is that a ReLU applied in a low-dimensional space destroys information: once the manifold of features is squeezed into few channels, zeroing half of each coordinate is lossy. A linear projection keeps it. EfficientNet uses Swish rather than ReLU, but keeps the projection linear.</li>
+        <li><b>Expansion 6</b> is MobileNetV2's default. The depthwise stage works on six times the input channels. Expansion 1 (stage 2) drops the expand conv entirely.</li>
+        <li><b>Skip only when shapes match.</b> The reference code adds the residual only if stride is 1 <b>and</b> input channels equal output channels. There is no projection shortcut, unlike ResNet's. The first block of every stage therefore has no skip. B0 has 9 skip-connected blocks out of 16.</li>
+        <li><b>DropPath</b> (stochastic depth) is applied only on skip-connected blocks, because only there does dropping the branch leave a valid identity path. See §21 for the per-block rate.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> MBConv = 1×1 expand (×e) → k×k depthwise (stride here) → SE gate → 1×1 linear project → add input if the shape is unchanged. Wide in the middle, narrow at the ends, no activation after the projection.</div>
+    </section>
+
+    <!-- 18 ───────────────────────────────────────────── -->
+    <section class="topic" id="mbconv-cost" data-nav="MBConv cost, worked">
+      <h3><span class="idx">18</span> The cost of one MBConv block, derived and worked</h3>
+      <p class="lede">With the block written out, its parameter and MAC counts follow term by term. Two worked blocks from B0 show which terms dominate.</p>
+
+      <div class="formula"><span class="lbl">MBConv(e, k, s): input H×H×C_in, output H′×H′×C_out, H′ = ceil(H/s), E = e·C_in, S = floor(C_in/4)</span><span class="eq">term        params                      MACs</span>
+<span class="eq">expand      C_in·E                      H² · C_in · E          (0 if e = 1)</span>
+<span class="eq">depthwise   k²·E                        H′² · k² · E</span>
+<span class="eq">SE          E·S + S + S·E + E           2·E·S  (+ H′²·E for the rescale)</span>
+<span class="eq">project     E·C_out                     H′² · E · C_out</span>
+<span class="eq">BN          2·(E [if e≠1] + E + C_out)  —</span></div>
+
+      <h4>Worked block 1: stage 5, first block (40 → 80, e = 6, k = 3, s = 2, 28 → 14)</h4>
+      <div class="formula"><span class="lbl">E = 6·40 = 240, S = floor(40/4) = 10, H = 28, H′ = 14</span><span class="eq">expand    params  40·240          =  9 600      MACs 28²·40·240   = 7 526 400</span>
+<span class="eq">depthwise params  9·240           =  2 160      MACs 14²·9·240    =   423 360</span>
+<span class="eq">SE        params  2400+10+2400+240 = 5 050      MACs 2·240·10 + 14²·240 = 4 800 + 47 040 = 51 840</span>
+<span class="eq">project   params  240·80          = 19 200      MACs 14²·240·80   = 3 763 200</span>
+<span class="eq">BN        params  2·(240+240+80)  =  1 120</span>
+<span class="eq">total     params 37 130                         MACs 11 764 800</span></div>
+      <p>The expand conv does <b>64%</b> of this block's MACs because it runs <b>before</b> the stride, at 28×28. The projection runs after, at 14×14. The depthwise conv, the operation the block is built around, is 3.6%.</p>
+
+      <h4>Worked block 2: stage 5, a repeated block (80 → 80, e = 6, k = 3, s = 1, 14 → 14)</h4>
+      <div class="formula"><span class="lbl">E = 480, S = 20</span><span class="eq">expand 38 400 / 7 526 400    depthwise 4 320 / 846 720    SE 19 700 / 113 280</span>
+<span class="eq">project 38 400 / 7 526 400   BN 2 080</span>
+<span class="eq">total   params 102 900        MACs 16 012 800        skip: yes (s = 1, 80 = 80)</span></div>
+
+      <h4>The general pattern, from the formula</h4>
+      <ul class="notes">
+        <li>For stride-1 blocks with <code>C_in = C_out = C</code>, expand and project each cost <code>H²·e·C²</code> and depthwise costs <code>H²·k²·e·C</code>. The ratio of depthwise to 1×1 work is <code>k² / (2C)</code>: 9/160 = 5.6% at C = 80 with 3×3. The depthwise term matters only when channels are very few, as in stage 2.</li>
+        <li>Going from <b>k = 3 to k = 5</b> raises that ratio by 25/9. For stage 6 (C = 112) it moves from 4.0% to 11.2% of the 1×1 work, which is why the search could afford 5×5 kernels.</li>
+        <li>The SE parameter count is about <code>2·E·C_in/4 = e·C_in²/2</code>, which equals half of one 1×1 conv's parameters at e = 6. So SE adds about a fifth of the block's weights at negligible compute (19.1% in worked block 2).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> per block, the two 1×1 convolutions carry nearly all the MACs and most of the parameters. The depthwise conv that names the design is a few percent of the arithmetic. That is efficient in FLOPs, and §28 shows why it is not necessarily fast.</div>
+    </section>
+
+    <!-- 19 ───────────────────────────────────────────── -->
+    <section class="topic" id="se" data-nav="Squeeze-and-excitation">
+      <h3><span class="idx">19</span> Squeeze-and-excitation inside MBConv</h3>
+      <p class="lede">SE turns each block's channels into a context-dependent reweighting. It pools the whole map to one number per channel, passes that vector through a tiny two-layer MLP, and multiplies every channel by the resulting gate in (0, 1).</p>
+
+      <div class="formula"><span class="lbl">squeeze-and-excitation on a map h of shape H × W × E</span><span class="eq">squeeze   zᶜ = (1 / HW) · Σᵢⱼ h[i, j, c]                 global average pool → vector z ∈ ℝᴱ</span>
+<span class="eq">excite    g  = σ( W₂ · swish( W₁ z + b₁ ) + b₂ )          W₁ : S × E,   W₂ : E × S</span>
+<span class="eq">scale     h′[i, j, c] = gᶜ · h[i, j, c]</span>
+<span class="lbl">EfficientNet's choice of squeeze width S</span><span class="eq">S = max(1, floor(0.25 · C_in))      ← a quarter of the BLOCK INPUT channels</span></div>
+
+      <h4>The ratio is of the input channels, not the expanded ones</h4>
+      <ul class="notes">
+        <li>The reference code computes <code>num_reduced_filters = int(input_filters · se_ratio)</code> with <code>se_ratio = 0.25</code>, where <code>input_filters</code> is the block's <b>input</b> width, not the expanded width it gates. Torchvision's implementation does the same (<code>max(1, input_channels // 4)</code>).</li>
+        <li>With expansion 6, a squeeze of <code>C_in/4</code> is <b>E/24</b> of the gated width. So relative to the channels it gates, EfficientNet's SE bottleneck is narrower than SENet's original <code>E/16</code>, not wider as “0.25” suggests.</li>
+        <li>The inner activation is <b>Swish</b> in EfficientNet, where SENet used ReLU, and the gate is a sigmoid.</li>
+      </ul>
+
+      <h4>Hand-worked gate</h4>
+      <div class="formula"><span class="lbl">four channels, squeeze width 2 (numbers chosen for the example)</span><span class="eq">z = (0.8, 0.1, 0.5, 0.0)</span>
+<span class="eq">W₁ = [[1, 0, 1, 0], [0, 1, 0, 1]],  b₁ = 0      → u = (1.3, 0.1) → swish(u) = (1.0216, 0.0525)</span>
+<span class="eq">W₂ = [[2, 0], [−2, 0], [1, 1], [0, −3]], b₂ = 0 → (2.0432, −2.0432, 1.0741, −0.1575)</span>
+<span class="eq">g = σ(·) = (0.885, 0.115, 0.745, 0.461)</span></div>
+      <p>Channel 1 (strongly active, and correlated through <code>W</code> with channel 3) is kept at 89%. Channel 2 is suppressed to 11%. The gate depends on the <b>whole image's</b> statistics, which gives each 3×3 or 5×5 filter a global context signal it could not otherwise see.</p>
+
+      <div class="viz" id="viz-se">
+        <div class="vhead">
+          <span class="vtitle">SE gating on eight channels</span>
+          <span class="vhint">left: pooled channel means · middle: gates σ(·) · right: rescaled means · weights fixed, input editable</span>
+        </div>
+        <div class="controls">
+          <label>scene
+            <select id="se-scene"><option value="0">textured object</option><option value="1">flat background</option><option value="2">edge-heavy</option></select>
+          </label>
+          <label>boost channel 1 <input type="range" id="se-boost" min="-1" max="2" step="0.1" value="0"></label>
+          <label>squeeze width S <select id="se-s"><option>1</option><option selected>2</option><option>4</option></select></label>
+        </div>
+        <svg id="se-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Bar charts showing pooled channel means, sigmoid gates, and the rescaled channel means of a squeeze-and-excitation module"></svg>
+        <div class="readout" aria-live="polite" id="se-read"></div>
+      </div>
+
+      <h4>Cost, and where it bites</h4>
+      <ul class="notes">
+        <li>Compute is negligible (0.8% of B0's MACs), but the parameters are 12% of B0 (§16).</li>
+        <li><b>It is a global synchronisation point.</b> Every spatial position must be pooled before any output can be scaled. That needs a full pass over the expanded map, which makes it harder to fuse the block into one streaming kernel and adds memory traffic. EfficientNet-Lite removes SE; its release notes give the reason as poor support on some mobile accelerators (§32).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> SE = global pool → tiny MLP (squeeze to a quarter of the block's input channels) → sigmoid gates on every channel. It is cheap in FLOPs, 12% of the parameters, and it adds a global synchronisation point inside every block.</div>
+    </section>
+
+    <!-- 20 ───────────────────────────────────────────── -->
+    <section class="topic" id="swish" data-nav="Swish / SiLU">
+      <h3><span class="idx">20</span> The activation: Swish, also called SiLU</h3>
+      <p class="lede">EfficientNet replaces ReLU with <code>x · σ(x)</code>. The function was found by an automated search over activation formulas, and the same function had been proposed earlier as the sigmoid-weighted linear unit (SiLU). It is smooth, non-monotonic, and unbounded above.</p>
+
+      <div class="formula"><span class="lbl">definition and derivative</span><span class="eq">swish(x) = x · σ(x) = x / (1 + e⁻ˣ)</span>
+<span class="eq">swish′(x) = σ(x) + x · σ(x) · (1 − σ(x)) = σ(x) · (1 + x · (1 − σ(x)))</span>
+<span class="lbl">parametric form from the search paper</span><span class="eq">swish_b(x) = x · σ(b·x)       b → ∞ : ReLU,   b = 0 : x/2,   b = 1 : SiLU (“Swish-1”)</span></div>
+
+      <h4>Hand-worked values</h4>
+      <table class="cmp">
+        <tr><th>x</th><th>σ(x)</th><th>swish(x)</th><th>swish′(x)</th><th>ReLU(x)</th></tr>
+        <tr><td>−3</td><td>0.0474</td><td>−0.1423</td><td>−0.0881</td><td>0</td></tr>
+        <tr><td>−1.2785</td><td>0.2178</td><td>−0.2785 (minimum)</td><td>0.0000</td><td>0</td></tr>
+        <tr><td>−1</td><td>0.2689</td><td>−0.2689</td><td>0.0723</td><td>0</td></tr>
+        <tr><td>0</td><td>0.5000</td><td>0</td><td>0.5000</td><td>0</td></tr>
+        <tr><td>1</td><td>0.7311</td><td>0.7311</td><td>0.9277</td><td>1</td></tr>
+        <tr><td>3</td><td>0.9526</td><td>2.8577</td><td>1.0881</td><td>3</td></tr>
+      </table>
+
+      <div class="viz" id="viz-swish">
+        <div class="vhead">
+          <span class="vtitle">Swish against ReLU, and their gradients</span>
+          <span class="vhint">solid: function · dashed: derivative · the parameter b interpolates between x/2 and ReLU</span>
+        </div>
+        <div class="controls">
+          <label>b <input type="range" id="swish-b" min="0" max="10" step="0.1" value="1"></label>
+          <label>probe x <input type="range" id="swish-x" min="-5" max="5" step="0.05" value="-1.25"></label>
+        </div>
+        <svg id="swish-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Plot of the swish function with adjustable b against ReLU, with both derivatives"></svg>
+        <div class="readout" aria-live="polite" id="swish-read"></div>
+      </div>
+
+      <h4>What it changes, and what it costs</h4>
+      <ul class="notes">
+        <li><b>A small but nonzero gradient for negative inputs</b> (−0.088 at x = −3, 0.072 at x = −1), so units do not “die” the way ReLU units can (see <a href="../../deep-learning/neural-network-training/gradient-flow-init.html#dying-relu">the dying ReLU</a>).</li>
+        <li><b>The derivative exceeds 1</b> for x above 1.2785, the mirror image of the minimum. It peaks at 1.0998 near x ≈ 2.40 and then decays back towards 1. This is harmless in a BatchNormed network but worth knowing.</li>
+        <li><b>Memory:</b> the backward pass needs <code>σ(x)</code>, so a naive implementation stores extra tensors. The reference code's native swish uses a custom gradient to save memory, and frameworks now ship fused SiLU kernels.</li>
+        <li><b>Quantisation:</b> the sigmoid is awkward in int8. EfficientNet-Lite switches to ReLU6. MobileNetV3's “hard-swish” <code>x · ReLU6(x+3)/6</code> is a piecewise-linear approximation (the reference builder includes it as an option).</li>
+        <li>How much Swish alone contributes to EfficientNet's accuracy is not ablated in the paper. The search paper reported gains of a few tenths to about a point over ReLU on ImageNet models.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> Swish = x·σ(x): ReLU-like for large |x|, smooth near zero, slightly negative with a minimum of −0.2785 at x ≈ −1.28. It helps accuracy a little and costs something in memory and quantisation friendliness.</div>
+    </section>
+
+    <!-- 21 ───────────────────────────────────────────── -->
+    <section class="topic" id="training" data-nav="The training recipe">
+      <h3><span class="idx">21</span> The ImageNet training recipe</h3>
+      <p class="lede">The paper gives the recipe in one paragraph, and the reference code and the EfficientNetV2 paper fill in what it leaves out. The recipe accounts for part of the published accuracy, and the paper says so: gains come “from both better architectures, better scaling, and better training settings”.</p>
+
+      <table class="cmp">
+        <tr><th>Setting</th><th>Value</th><th>Source</th></tr>
+        <tr><td>Optimiser</td><td>RMSProp, decay 0.9, momentum 0.9</td><td>paper</td></tr>
+        <tr><td>BatchNorm momentum</td><td>0.99 (TF convention: running = 0.99·running + 0.01·batch; PyTorch <code>momentum=0.01</code>), ε = 1e-3</td><td>paper; ε from reference code</td></tr>
+        <tr><td>Weight decay</td><td>1e-5</td><td>paper</td></tr>
+        <tr><td>Learning rate</td><td>0.256, ×0.97 every 2.4 epochs</td><td>paper</td></tr>
+        <tr><td>Batch size</td><td>4096 (0.256 = 0.016 × 4096/256, the code's linear-scaling rule; code default 2048 → 0.128)</td><td>inferred from the lr and the code's rule; the EfficientNetV2 paper uses 4096 for its own runs, which it says “largely follow EfficientNets”</td></tr>
+        <tr><td>Warmup / length</td><td>5 warmup epochs; 350 epochs</td><td>reference code; EfficientNetV2 paper</td></tr>
+        <tr><td>Activation</td><td>SiLU / Swish-1</td><td>paper</td></tr>
+        <tr><td>Augmentation</td><td>AutoAugment (ImageNet policy)</td><td>paper</td></tr>
+        <tr><td>Stochastic depth</td><td>survival probability 0.8, scaled per block</td><td>paper; per-block rule from reference code</td></tr>
+        <tr><td>Dropout before FC</td><td>0.2 (B0) → 0.5 (B7), in steps</td><td>paper; exact values from reference config</td></tr>
+        <tr><td>Label smoothing; weight EMA</td><td>0.1; decay 0.9999</td><td>reference code only</td></tr>
+        <tr><td>Model selection</td><td>25 K training images held out as “minival”; early-stop on minival; report on the validation set</td><td>paper</td></tr>
+      </table>
+
+      <h4>Hand-worked: the learning-rate schedule</h4>
+      <div class="formula"><span class="lbl">staircase exponential decay (ignoring the 5-epoch warmup)</span><span class="eq">lr(epoch) = 0.256 · pow(0.97, floor(epoch / 2.4))</span>
+<span class="eq">epoch  24 : 0.256 · 0.97¹⁰  = 0.256 · 0.7374 = 0.1888</span>
+<span class="eq">epoch 100 : 0.256 · 0.97⁴¹  = 0.256 · 0.2868 = 0.0734</span>
+<span class="eq">epoch 350 : 0.256 · 0.97¹⁴⁵ = 0.256 · 0.01208 = 0.00309</span></div>
+
+      <h4>Hand-worked: stochastic depth is not uniform</h4>
+      <p>The reference code sets block <code>i</code>'s survival probability (i = 0 … N−1) to <code>1 − 0.2 · i / N</code>. The 0.8 is the floor, approached by the <b>last</b> block, as in the linear-decay rule of the original stochastic-depth paper. For B0, N = 16:</p>
+      <div class="formula"><span class="lbl">B0, survival by block index</span><span class="eq">block 0: 1.000   block 8: 0.900   block 15: 1 − 0.2·15/16 = 0.8125</span>
+<span class="lbl">but only the 9 skip-connected blocks can be dropped (indices 2, 4, 6, 7, 9, 10, 12, 13, 14)</span><span class="eq">expected blocks dropped per step = (0.2/16) · (2+4+6+7+9+10+12+13+14) = 0.0125 · 77 = 0.96</span></div>
+
+      <div class="viz" id="viz-train">
+        <div class="vhead">
+          <span class="vtitle">Schedules in the recipe</span>
+          <span class="vhint">learning rate over training, or per-block survival probability for the chosen model, both from the formulas above</span>
+        </div>
+        <div class="controls">
+          <label>show
+            <select id="train-show"><option value="lr">learning rate</option><option value="sd">stochastic-depth survival per block</option></select>
+          </label>
+          <label>batch size <select id="train-bs"><option>512</option><option>1024</option><option>2048</option><option selected>4096</option></select></label>
+          <label>model (for survival) <select id="train-model"><option value="0">B0</option><option value="3">B3</option><option value="7">B7</option></select></label>
+        </div>
+        <svg id="train-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Plot of the learning rate schedule or per-block stochastic depth survival probability"></svg>
+        <div class="readout" aria-live="polite" id="train-read"></div>
+      </div>
+
+      <h4>Why each piece is there</h4>
+      <ul class="notes">
+        <li><b>RMSProp with momentum and a tiny weight decay</b> is inherited from the MnasNet/MobileNet recipes, which are tuned for depthwise-heavy networks. Depthwise weights have few parameters per filter and are easily over-regularised, hence the 1e-5 decay (ResNets typically use 1e-4). Optimiser mechanics are covered in <a href="../../deep-learning/neural-network-training/optimizers.html#adagrad">AdaGrad &amp; RMSProp</a>.</li>
+        <li><b>Regularisation grows with size.</b> Dropout 0.2 → 0.5 and, in later checkpoints, stronger augmentation. The paper's rule is “bigger models need more regularisation”. EfficientNetV2 develops that into regularisation that also changes with image size <i>during</i> training (§29).</li>
+        <li><b>Minival early stopping</b> avoids selecting the checkpoint on the validation set that is then reported. Many papers of the period did not describe how they selected checkpoints, so this is a point in the paper's favour.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> RMSProp(0.9, 0.9), lr 0.256 at batch 4096 decaying 0.97 per 2.4 epochs, wd 1e-5, BN momentum 0.99, Swish, AutoAugment, per-block stochastic depth down to 0.8, stepped dropout 0.2 → 0.5. The core of it is in the paper; batch size, warmup, the per-block drop rule, the exact dropout steps, label smoothing and EMA come from the code. The recipe is part of the result.</div>
+    </section>
+
+    <nav class="pager" aria-label="EfficientNet series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="compound-scaling.html">← EfficientNet: Compound Scaling</a>
+      <a href="../efficientnet.html" style="color:var(--muted)">EfficientNet · overview</a>
+      <a href="results.html">EfficientNet: Results, Transfer &amp; Latency →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../efficientnet.viz.js"></script>
+</body>
+</html>

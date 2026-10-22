@@ -56,7 +56,9 @@ const GV = (function(){
       .attr("text-anchor",o.anchor||"start").attr("font-family",o.mono?"SF Mono,Menlo,monospace":null)
       .attr("font-weight",o.bold?600:null).text(s);
   }
-  function safe(name, fn){ try { fn(); } catch(e){ if (typeof console!=="undefined") console.error("[gpt.viz] "+name+" failed:", e); } }
+  // figures are spread across the hub and its sub-pages; skip any whose svg is not on this page
+  const SVG_ID = { lineage:"lin", generation:"gen", prepost:"ln", params:"pc", compute:"cx", mixture:"mix", finetune:"ft", fewshot:"shot", sweep:"sw", sampling:"sp", kvcache:"kv", rlhf:"rl" };
+  function safe(name, fn){ if (!document.getElementById((SVG_ID[name] || name) + "-svg")) return; try { fn(); } catch(e){ if (typeof console!=="undefined") console.error("[gpt.viz] "+name+" failed:", e); } }
   function lcg(seed){ let s = seed >>> 0; return () => { s = (1664525*s + 1013904223) >>> 0; return s/4294967296; }; }
   return {P, params, CFG, fmtN, sci, bytes, softmax, entropyBits, txt, safe, lcg};
 })();

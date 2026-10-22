@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · LR Schedules, Batch Size &amp; Precision</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to part 1 */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../neural-network-training.html">Neural Network Training</a> · part 4 of 6</p>
+      <h1>LR Schedules, Batch Size &amp; Precision</h1>
+      <p>Making each step stable and affordable: learning-rate schedules and why warmup exists, the range test for choosing η, batch size with its memory arithmetic and coupling to the learning rate, mixed precision and loss scaling, and gradient accumulation with activation checkpointing.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Neural Network Training</span>
+        <span class="pill">Warmup · cosine · range test · batch–η coupling · bf16/fp16 · loss scaling · checkpointing</span>
+      </div>
+    </header>
+
+    <!-- ═══ 24 ══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="schedules" data-nav="Schedules &amp; warmup">
+      <h3><span class="idx">24</span> Learning-rate schedules, and why warmup exists</h3>
+      <p class="lede">A constant learning rate is wrong at both ends of a run. Early on, the parameters are random and the gradients are large and uninformative, so a big step does damage. Late on, the true gradient has shrunk toward zero while the sampling noise has not, so a big step just rattles the iterate around the minimum without ever settling. The schedule is the fix at both ends, and it is worth more tuning effort than the choice of optimiser.</p>
+
+      <div class="formula"><span class="lbl">why a decaying rate is REQUIRED for SGD and optional for full-batch descent</span><span class="eq">Near a minimum:   true gradient → 0        sampling noise → constant
+So the update is eventually pure noise, and the iterate settles into a ball
+of radius roughly proportional to <span class="keep">η</span>·<span class="keep">σ</span>_noise/(<span class="keep">λ</span>·<span class="keep">√</span>B). The ONLY way to shrink
+that ball is to shrink <span class="keep">η</span> (or grow B — §26 says they are two views of one knob).
+Full-batch descent has <span class="keep">σ</span>_noise = 0 and needs no schedule at all.</span>
+<span class="lbl">the classical sufficient condition — asymptotic, and nobody uses it</span><span class="eq"><span class="keep">∑</span>_t <span class="keep">η</span>_t = <span class="keep">∞</span>          the steps must add to enough total distance
+<span class="keep">∑</span>_t <span class="keep">η</span>_t² &lt; <span class="keep">∞</span>        the accumulated noise must be finite
+<span class="keep">η</span>_t ∝ 1/t satisfies both. <span class="keep">η</span>_t ∝ 1/<span class="keep">√</span>t fails the second. A constant fails both.
+Real schedules satisfy neither, because they run for a FIXED budget and the
+conditions are statements about t → <span class="keep">∞</span>.</span></div>
+
+      <table class="grid2">
+        <tr><th style="width:120px">Schedule</th><th>Form</th><th>When it is the right choice</th></tr>
+        <tr><td><b>constant</b></td><td class="mono"><span class="keep">η</span>_t = <span class="keep">η</span>₀</td><td>Debugging, and only debugging. It is the right baseline for "is my model capable of learning this at all", and it is never the right thing to ship.</td></tr>
+        <tr><td><b>step</b></td><td class="mono"><span class="keep">η</span>₀·<span class="keep">γ</span>^{⌊t/s⌋}, usually <span class="keep">γ</span> = 0.1</td><td>The classical vision recipe: drop by 10× at fixed milestones. Simple, effective, and produces the characteristic staircase loss curve where each drop is followed by a visible step down. Its weakness is that <code>s</code> is a schedule of magic numbers.</td></tr>
+        <tr><td><b>exponential</b></td><td class="mono"><span class="keep">η</span>₀·<span class="keep">γ</span>^{t/s}</td><td>The smooth version of the step schedule. Easy to tune (two numbers), no discontinuities, and it decays forever, so a run that goes long enough stops learning.</td></tr>
+        <tr><td><b>power / inverse</b></td><td class="mono"><span class="keep">η</span>₀/(1 + t/s)^{c}</td><td>Halves at <code>s</code>, thirds at <code>2s</code>, quarters at <code>3s</code>. Decays fast at first and then very slowly, so it never quite stops learning — the closest common schedule to the classical condition.</td></tr>
+        <tr class="tot"><td><b>cosine</b></td><td class="mono"><span class="keep">η</span>₀·½(1 + cos(<span class="keep">π</span>·t/T))</td><td>The modern default. Smooth, decays to zero exactly at the end of the budget, spends most of its time at a useful rate and only collapses at the very end. Requires knowing <code>T</code> in advance, which is its only real drawback — stop early and you stop at a rate that was still high.</td></tr>
+        <tr><td><b>inverse square root</b></td><td class="mono"><span class="keep">η</span>₀·<span class="keep">√</span>(w/max(t, w))</td><td>Peaks at the end of warmup and decays as <code>t^{−1/2}</code>. Budget-free — it does not need <code>T</code> — which is why it is the standard for very long or open-ended pretraining runs.</td></tr>
+        <tr><td><b>one-cycle</b></td><td class="mono">up, then down, then a tail</td><td>Ramp up to a peak well above what a constant rate could tolerate, back down, then a final collapse by orders of magnitude. Reported to reach a given accuracy in dramatically fewer epochs than a standard recipe. Momentum is usually cycled in the opposite direction at the same time.</td></tr>
+      </table>
+
+      <h4>Warmup, and the three separate reasons for it</h4>
+      <p>Warmup is not a schedule; it is a <b>prefix</b> that any schedule can carry — a linear ramp from zero (or near zero) to the peak over the first few hundred to few thousand steps. It looks like superstition until you notice that it is defending against three genuinely different failures at once.</p>
+
+      <div class="cards">
+        <div class="box warn">
+          <div class="n">reason 1</div>
+          <div class="t">The adaptive optimiser's variance estimate is garbage at first</div>
+          <div class="g">Adam's <code>v̂</code> is an average over roughly <code>1/(1−β₂) = 1000</code> steps. In the first few dozen steps it is an estimate from almost no data, so the per-coordinate step it produces is erratic in exactly the period when the model is most fragile. §22 showed the corrected first step is exactly right in <i>expectation</i> and says nothing about its variance. Warmup keeps <code>η</code> small until the estimate has settled.</div>
+        </div>
+        <div class="box warn">
+          <div class="n">reason 2</div>
+          <div class="t">Early gradients are large and point nowhere useful</div>
+          <div class="g">At step 0 the network is random. The gradient is large — it is telling you the output is wrong, which you knew — and its direction encodes essentially nothing about the data. Taking a full-size step on it moves the parameters a long way for no information, and §11 measured the cost: at a learning rate high enough to matter, warmup took the first hidden layer's dead fraction from <b>22% to 0%</b> with no loss in final performance.</div>
+        </div>
+        <div class="box warn">
+          <div class="n">reason 3</div>
+          <div class="t">Post-norm residual stacks are unstable at initialisation</div>
+          <div class="g">Where a normalisation layer sits <i>after</i> the residual addition, the gradient at the bottom of a deep stack at initialisation scales with the depth, so a deep post-norm transformer genuinely cannot be trained at its target learning rate from step 0. Warmup was found empirically before this was understood, and §30 is where the mechanism lives — along with the architectural fix that makes warmup less necessary.</div>
+        </div>
+        <div class="box good">
+          <div class="n">and the rule of thumb</div>
+          <div class="t">Longer warmup for larger batches</div>
+          <div class="g">The larger the batch, the larger the learning rate you intend to use (§26), and the more damage a full-size early step does. Warmup lengths in the low thousands of steps are ordinary for large-batch training and unnecessary for small-batch. Quote warmup in <b>steps</b>, never in epochs — the two differ by <code>N/B</code>.</div>
+        </div>
+      </div>
+
+      <div class="viz" id="viz-sched">
+        <div class="vhead">
+          <span class="vtitle">Every schedule on one axis, with warmup as a prefix to all of them</span>
+          <span class="vhint">the second panel is the one that decides things: the <i>cumulative</i> <span class="keep">η</span>, which is roughly how far the parameters are allowed to travel in total</span>
+        </div>
+        <div class="controls">
+          <label>schedule <select id="sc-kind">
+            <option value="cosine" selected>cosine</option>
+            <option value="constant">constant</option>
+            <option value="linear">linear to zero</option>
+            <option value="step">step, ×0.1 at milestones</option>
+            <option value="exp">exponential</option>
+            <option value="power">power / inverse</option>
+            <option value="invsqrt">inverse square root</option>
+            <option value="onecycle">one-cycle</option>
+          </select></label>
+          <label>total steps T <input type="range" id="sc-T" min="200" max="5000" step="100" value="2000" /><span id="sc-Tv" style="min-width:40px;display:inline-block">2000</span></label>
+          <label>warmup <input type="range" id="sc-w" min="0" max="1000" step="25" value="200" /><span id="sc-wv" style="min-width:34px;display:inline-block">200</span></label>
+          <label>current step <input type="range" id="sc-t" min="0" max="5000" step="10" value="600" /><span id="sc-tv" style="min-width:40px;display:inline-block">600</span></label>
+          <label><input type="checkbox" id="sc-all" checked /> ghost the other schedules behind it</label>
+        </div>
+        <svg id="sched-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Upper panel: the learning rate as a fraction of its peak, plotted against training step, for the selected schedule, with the other schedules drawn faintly behind it for comparison. A shaded band marks the linear warmup prefix, which is applied identically to every schedule and during which all of them coincide exactly. A vertical marker at the current step reads off the rate there. Lower panel: the cumulative sum of the learning rate over the run so far, for the same schedules, which is proportional to the total distance the parameters are permitted to travel; schedules that look very different in the upper panel can have nearly identical totals, and the readout reports each one's total so the comparison is numerical rather than visual. The inverse-square-root schedule is the only one whose cumulative curve keeps rising without approaching an asymptote within the budget, which is what makes it the choice for open-ended runs."></svg>
+        <div class="readout" aria-live="polite" id="sched-readout"></div>
+      </div>
+
+      <div class="wrong"><span class="say">The tempting shortcut.</span> "I'll copy the schedule from the paper." <span class="fix">Copy it in the right units, and check the budget.</span> A cosine schedule is defined relative to <code>T</code>, so the same code on a dataset ten times larger decays ten times more slowly in wall-clock terms. A warmup of "500 steps" on <code>B = 32</code> is a warmup of "16 000 examples"; on <code>B = 4096</code> it is two million. And a schedule that decays to zero at <code>T</code> is <i>wrong</i> if you stop at <code>T/2</code> — you will stop while the rate is still half its peak, and the model will be measurably worse than one that was scheduled for the budget you actually used.</div>
+    </section>
+
+    <!-- ═══ 25 ══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="lr-range" data-nav="Choosing η: the range test">
+      <h3><span class="idx">25</span> Choosing <span class="keep">η</span>: the range test, and reading the cliff</h3>
+      <p class="lede">The learning rate is the hyperparameter that matters most, and it is also the one that can be found in a few minutes without a search. The range test runs a single short training pass while raising the learning rate exponentially, and reads the answer off the resulting curve. It works because §16 guarantees the failure is a <b>cliff</b> and not a slope.</p>
+
+      <div class="formula"><span class="lbl">the procedure</span><span class="eq">1  Start from the initial parameters and a very small rate, e.g. <span class="keep">η</span> = 10⁻⁸.
+2  Take one minibatch step. Record the loss.
+3  Multiply <span class="keep">η</span> by a constant factor (so that it covers ~10⁻⁸ to ~10 in a
+   few hundred steps) and repeat.
+4  Stop when the loss exceeds a few times its best value so far.
+5  Plot the loss against log <span class="keep">η</span>. Read off:
+       · the region where the loss is FLAT      — <span class="keep">η</span> too small to do anything
+       · the region where it FALLS steeply      — this is the useful band
+       · the point where it turns UP sharply    — <span class="keep">η</span>_div, the divergence point
+6  Choose <span class="keep">η</span> about an ORDER OF MAGNITUDE below <span class="keep">η</span>_div, or equivalently at
+   the steepest point of the descent — NOT at the minimum of the curve,
+   which is already too close to the cliff.</span></div>
+
+      <div class="cards">
+        <div class="box good">
+          <div class="n">why it works</div>
+          <div class="t">The failure is a cliff, and cliffs are easy to find</div>
+          <div class="g">§16 measured the transition: one per cent below <code>2/λ_max</code> the iteration converges, one per cent above it it diverges. On a log axis that appears as a near-vertical wall, and a wall is a much easier thing to locate than an optimum.</div>
+        </div>
+        <div class="box warn">
+          <div class="n">why not simply take the minimum</div>
+          <div class="t">The steepest-descent reading is a deliberate safety margin</div>
+          <div class="g">The lowest point of the range-test curve sits close to the edge of the cliff, and a rate that survives a few hundred steps there need not survive a few hundred thousand. The steepest-descent point is typically three to ten times below it, and that gap is the margin. <b>On a short, easy problem the margin is pure loss</b> — the figure below measures both readings against a ground-truth sweep and, with an adaptive optimiser, the curve minimum comes out closer. Read the steepest-descent point as the <i>peak</i> of a schedule with warmup and decay (§24), which is where the margin earns its keep, rather than as a constant rate.</div>
+        </div>
+        <div class="box warn">
+          <div class="n">the catch</div>
+          <div class="t">It measures the rate for step 0, not for step 100 000</div>
+          <div class="g">The test runs from the initial parameters, so it finds the rate that is safe <i>at initialisation</i>. The curvature changes as training proceeds — usually the surface gets sharper. This is one more reason the answer is a peak rate to be used with warmup and decay, not a constant.</div>
+        </div>
+        <div class="box plain">
+          <div class="n">for one-cycle</div>
+          <div class="t">The test's answer is the peak, and <code><span class="keep">η</span>₀ = peak/10</code></div>
+          <div class="g">One-cycle takes the range test's maximum usable rate as its peak <code>η₁</code>, ramps to it, and comes back down to about a tenth of it before the final collapse. The two techniques are designed together.</div>
+        </div>
+      </div>
+
+      <div class="viz" id="viz-lrrange">
+        <div class="vhead">
+          <span class="vtitle">The range test on a real network, and the full sweep it approximates</span>
+          <span class="vhint">the range test takes one pass; the ground-truth sweep behind it trains a separate model at every rate — compare where each one says the answer is</span>
+        </div>
+        <div class="controls">
+          <label>optimiser <select id="lt-opt">
+            <option value="sgd" selected>SGD</option>
+            <option value="momentum">momentum, β = 0.9</option>
+            <option value="adam">Adam</option>
+          </select></label>
+          <label>test length <input type="range" id="lt-n" min="40" max="240" step="20" value="140" /><span id="lt-nv" style="min-width:30px;display:inline-block">140</span></label>
+          <label>smoothing <span class="keep">β</span> <input type="range" id="lt-sm" min="0" max="0.98" step="0.02" value="0.9" /><span id="lt-smv" style="min-width:36px;display:inline-block">0.90</span></label>
+          <label>width <input type="range" id="lt-w" min="8" max="64" step="8" value="32" /><span id="lt-wv" style="min-width:26px;display:inline-block">32</span></label>
+          <label><input type="checkbox" id="lt-truth" checked /> run the ground-truth sweep too</label>
+        </div>
+        <svg id="lrrange-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Main panel: the range-test curve, being the smoothed training loss recorded after each of a sequence of single minibatch steps taken at exponentially increasing learning rates, plotted against the learning rate on a logarithmic axis. The curve is flat on the left where the rate is too small to change anything, descends through a band where the rate is useful, reaches a minimum, and then turns sharply upward at the divergence point. Three vertical markers show the minimum of the curve, the point of steepest descent, and the divergence point, each labelled with its learning rate. Overlaid as a second series is the ground truth: the final loss of a separate model trained from scratch for a full budget at each of a dozen fixed rates across the same range, so that the one-pass estimate can be compared against the answer it is approximating. The steepest-descent marker lands close to the ground-truth optimum, while the minimum of the range-test curve lands well to its right, in the region where the fully trained models are already worse."></svg>
+        <div class="readout" aria-live="polite" id="lrrange-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 26 ══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="batch-size" data-nav="Batch size &amp; the LR coupling">
+      <h3><span class="idx">26</span> Batch size: the memory arithmetic and the coupling to <span class="keep">η</span></h3>
+      <p class="lede">Batch size is usually chosen by what fits, which is fine — as long as you know that <b>changing it silently changes two other things</b>: the amount of noise in each update (§15) and the number of updates per epoch. Both interact with the learning rate, and failing to compensate is the most common reason a model that trained fine on one machine trains badly on another.</p>
+
+      <h4>What changes when you double B</h4>
+      <table class="grid2">
+        <tr><th>Quantity</th><th>Effect of doubling B</th><th>Why</th></tr>
+        <tr><td>gradient noise</td><td class="num">÷ √2</td><td>The <code>1/√B</code> law, measured in §15.</td></tr>
+        <tr><td>arithmetic per step</td><td class="num">× 2</td><td>Twice the examples through the same network.</td></tr>
+        <tr><td>steps per epoch</td><td class="num">÷ 2</td><td><code>⌈N/B⌉</code>. So the same number of <i>epochs</i> is now half the number of <i>updates</i>.</td></tr>
+        <tr><td>arithmetic per epoch</td><td class="num">unchanged</td><td>Half the steps, twice the work each.</td></tr>
+        <tr class="tot"><td>activation memory</td><td class="num">× 2</td><td>Every example's activations must be kept alive for the backward pass (§01). This is the binding constraint.</td></tr>
+        <tr><td>parameter, gradient and optimiser-state memory</td><td class="num">unchanged</td><td>None of them depend on B at all.</td></tr>
+        <tr><td>hardware utilisation</td><td class="num">↑, up to a point</td><td>Larger matrix products keep the multiply units busy. Beyond the point where the operation is compute-bound rather than memory-bound, there is nothing more to gain.</td></tr>
+      </table>
+
+      <h4>The two scaling rules, and which to believe</h4>
+      <div class="formula"><span class="lbl">two proposals for how <span class="keep">η</span> should follow B</span><span class="eq">LINEAR    <span class="keep">η</span> ∝ B      motivated by: k steps of size <span class="keep">η</span> on k small batches
+                        ≈ one step of size k<span class="keep">η</span> on the union, PROVIDED the
+                        gradient does not change much over those k steps.
+SQUARE-ROOT  <span class="keep">η</span> ∝ <span class="keep">√</span>B   motivated by: hold the NOISE SCALE <span class="keep">η</span>²/B constant,
+                        which is what the continuous-time picture preserves.</span>
+<span class="eq">Linear is the one that is used, and it works well over a wide range of B — with
+two conditions attached, both of which are load-bearing:
+    · it needs WARMUP, because the approximation fails at the start of training
+      when the gradient changes fastest;
+    · it BREAKS above some problem-dependent batch size, beyond which further
+      increases buy nothing at all. That threshold is a real phenomenon, not a
+      tuning failure, and it varies by orders of magnitude across problems.</span></div>
+
+      <div class="callout"><b>The thing to keep constant is not <code><span class="keep">η</span></code> and not <code>B</code>.</b> The quantity that governs the trajectory is the <b>noise scale</b>, roughly <code>η/B</code> per unit of progress (or <code>η²/B</code> depending on which continuous-time limit you take). This is why three different-looking interventions have the same effect: <i>raising the learning rate</i>, <i>shrinking the batch</i>, and <i>decaying the learning rate more slowly</i> are all ways of moving along the same axis. It is also why "increase the batch size instead of decaying the learning rate" works as a schedule — the two are the same knob viewed from opposite ends.</div>
+
+      <div class="viz" id="viz-batch">
+        <div class="vhead">
+          <span class="vtitle">The batch-size ledger: memory, steps, and the learning rate that goes with it</span>
+          <span class="vhint">every number in the table is computed from the model shape you set, not from a rule of thumb — watch which rows move when you slide B and which do not</span>
+        </div>
+        <div class="controls">
+          <label>batch size, log₂ B <input type="range" id="bt-B" min="0" max="12" step="1" value="6" /><span id="bt-Bv" style="min-width:40px;display:inline-block">64</span></label>
+          <label>parameters <select id="bt-P">
+            <option value="1e6">1 M</option>
+            <option value="1e8" selected>100 M</option>
+            <option value="7e9">7 B</option>
+            <option value="7e10">70 B</option>
+          </select></label>
+          <label>activations / example <select id="bt-A">
+            <option value="1e5">100 k values (small vision net)</option>
+            <option value="4e6" selected>4 M values (mid-size transformer)</option>
+            <option value="4e7">40 M values (long context)</option>
+          </select></label>
+          <label>dataset N <select id="bt-N">
+            <option value="5e4">50 k</option>
+            <option value="1e6" selected>1 M</option>
+            <option value="1e9">1 B</option>
+          </select></label>
+          <label>scaling rule <select id="bt-rule">
+            <option value="linear" selected>linear: η ∝ B</option>
+            <option value="sqrt">square root: η ∝ √B</option>
+            <option value="none">none: η fixed</option>
+          </select></label>
+        </div>
+        <svg id="batch-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left panel: a stacked area chart of total device memory against batch size on a logarithmic horizontal axis, split into parameters, gradients, optimiser state and stored activations. The first three bands are perfectly flat because none of them depends on the batch, while the activation band grows linearly and eventually dominates. A horizontal line marks a chosen device memory capacity, and the batch size at which the total crosses it is marked and printed. Right upper panel: the number of optimiser updates in one epoch against batch size, a straight line of slope minus one on logarithmic axes, with the current batch marked. Right lower panel: the learning rate implied by the selected scaling rule, as a multiple of the rate at the reference batch, plotted against batch size, with the linear rule appearing as a line of slope one, the square-root rule as slope one half, and no scaling as a horizontal line. A table beneath reports, for the current batch, the memory in each category, the steps per epoch, the gradient noise relative to the reference, and the scaled learning rate."></svg>
+        <div class="readout" aria-live="polite" id="batch-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 27 ══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="precision" data-nav="Mixed precision &amp; loss scaling">
+      <h3><span class="idx">27</span> Mixed precision, loss scaling, and what actually overflows</h3>
+      <p class="lede">Half-precision arithmetic halves the memory for activations and runs several times faster on hardware built for it. It also has a <b>dynamic range so narrow that ordinary gradients fall off the bottom of it</b>. Mixed precision is the set of three specific compromises that make it work anyway, and understanding which quantity lives in which format is the whole of it.</p>
+
+      <div class="formula"><span class="lbl">the three formats, exactly</span><span class="eq">                 exponent  mantissa   max          min normal     min subnormal   <span class="keep">ε</span>
+float32 (fp32)      8 bits   23 bits   3.403e+38    1.175e−38      1.401e−45     1.19e−07
+float16 (fp16)      5 bits   10 bits   6.550e+04    6.104e−05      5.960e−08     9.77e−04
+bfloat16 (bf16)     8 bits    7 bits   3.390e+38    1.175e−38      9.184e−41     7.81e−03</span>
+<span class="eq">Read the two 16-bit rows against each other. bfloat16 keeps float32's EXPONENT
+and throws away mantissa; float16 keeps more mantissa and throws away RANGE.
+That single choice is why bfloat16 needs no loss scaling and float16 does.</span></div>
+
+      <h4>What breaks, precisely</h4>
+      <p>Gradients in a trained network are small. Values of <code>10⁻⁷</code> to <code>10⁻¹⁰</code> are entirely ordinary, and float16's smallest subnormal is <code>5.96×10⁻⁸</code>. So a large fraction of the gradient distribution <b>flushes to exactly zero</b> — not "loses precision", but becomes the number 0, which contributes nothing to any update. The forward pass usually survives; the backward pass is where the format runs out.</p>
+
+      <div class="kbox">a gradient of 1.0e−08 in float16:                 0          (flushed)
+the same gradient scaled by 1024, in float16:    1.0250e−05  (fine)
+then divided by 1024 in float32:                 1.0010e−08  (recovered)
+
+a gradient of 1.0e−04 in float16:                1.0002e−04  (fine unscaled)
+the same scaled by 65536:                        6.5547e+00  (still fine)
+a value of 70 000 in float16:                    inf         (overflow at 65 520)</div>
+
+      <div class="formula"><span class="lbl">the mixed-precision loop, in full</span><span class="eq">keep a MASTER COPY of the weights in fp32 — the updates are far smaller
+than the weights, and adding 1e−7 to 1.0 in fp16 is exactly 1.0
+
+each step:
+  1  cast weights to 16-bit; forward pass in 16-bit          ← fast, small
+  2  L_scaled = S · L            S a large power of two      ← LOSS SCALING
+  3  backward pass in 16-bit; every gradient is S times too large,
+     which moves the whole distribution UP into the representable range
+  4  cast gradients to fp32 and divide by S                  ← exact, S is 2ᵏ
+  5  if any gradient is inf or NaN: SKIP THE UPDATE and halve S
+     else: apply the update to the fp32 master weights, and every
+           N successful steps, double S                      ← DYNAMIC SCALING</span>
+<span class="eq">Steps 2–5 are the entire mechanism. S is a power of two so that multiplying
+and dividing by it are EXACT — they only change the exponent field.</span></div>
+
+      <div class="cards">
+        <div class="box good">
+          <div class="n">why skip rather than clip</div>
+          <div class="t">An overflowed gradient carries no information</div>
+          <div class="g">If a gradient became <code>inf</code>, its value is lost — there is nothing to clip <i>to</i>. The only correct response is to discard the step and lower <code>S</code>. Skipping a handful of steps out of thousands costs nothing; applying a garbage update costs the run.</div>
+        </div>
+        <div class="box good">
+          <div class="n">why fp32 master weights</div>
+          <div class="t">Small updates vanish into large weights</div>
+          <div class="g">fp16 has about three decimal digits of precision. A weight of <code>1.0</code> and an update of <code>10⁻⁴</code> add to exactly <code>1.0</code> in fp16 — the update is <i>silently discarded</i>, every step, forever. The master copy exists so that the accumulation happens where there is enough mantissa to hold it.</div>
+        </div>
+        <div class="box warn">
+          <div class="n">what stays in fp32 regardless</div>
+          <div class="t">Reductions, and anything that sums many terms</div>
+          <div class="g">Softmax denominators, loss reductions, normalisation-layer statistics, and attention score sums are accumulated in fp32 even in a 16-bit model, because summing thousands of 16-bit values loses precision catastrophically. Every serious implementation does this; it is why "the model is in fp16" is never literally true.</div>
+        </div>
+        <div class="box plain">
+          <div class="n">bfloat16</div>
+          <div class="t">Same range as fp32, so none of this is needed</div>
+          <div class="g">No loss scaling, no overflow handling, no skipped steps — the exponent range is identical to fp32, so anything representable in fp32 is representable in bf16 to within its coarser mantissa. The cost is precision: <code>ε = 7.8×10⁻³</code> against fp16's <code>9.8×10⁻⁴</code>, eight times worse. In practice the range matters far more than the mantissa, which is why bf16 has largely displaced fp16 where the hardware supports it.</div>
+        </div>
+      </div>
+
+      <div class="viz" id="viz-prec">
+        <div class="vhead">
+          <span class="vtitle">A gradient histogram against the representable range of each format</span>
+          <span class="vhint">slide the loss scale and watch the histogram move bodily between the two cliffs — too little and the left tail is lost, too much and the right tail overflows</span>
+        </div>
+        <div class="controls">
+          <label>format <select id="pr-fmt">
+            <option value="f16" selected>float16</option>
+            <option value="bf16">bfloat16</option>
+            <option value="f32">float32</option>
+          </select></label>
+          <label>loss scale, log₂ S <input type="range" id="pr-S" min="0" max="24" step="1" value="0" /><span id="pr-Sv" style="min-width:48px;display:inline-block">1</span></label>
+          <label>typical gradient, log₁₀ <input type="range" id="pr-mu" min="-12" max="-1" step="0.25" value="-6" /><span id="pr-muv" style="min-width:44px;display:inline-block">1e−6</span></label>
+          <label>spread (decades) <input type="range" id="pr-sd" min="0.5" max="4" step="0.1" value="2" /><span id="pr-sdv" style="min-width:30px;display:inline-block">2.0</span></label>
+          <label><input type="checkbox" id="pr-auto" /> pick S automatically</label>
+        </div>
+        <svg id="prec-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Main panel: a histogram of gradient magnitudes on a logarithmic horizontal axis spanning fifty orders of magnitude, shifted bodily to the right by the chosen loss scale. Two vertical boundaries mark the smallest and largest magnitudes representable in the selected format; the part of the histogram to the left of the lower boundary is shaded to show the gradients that flush to zero and the part to the right of the upper boundary is shaded to show the gradients that overflow to infinity. Raising the loss scale slides the whole histogram right, moving mass out of the underflow region and eventually into the overflow region, so the two shaded fractions trade off against each other. Lower panel: those two fractions plotted against the loss scale over the whole slider range, as two crossing curves, with the region where both are acceptably small marked and the automatic choice indicated. The float16 panel shows a narrow safe band; the bfloat16 panel shows the underflow curve pinned at zero across the entire range, which is why that format needs no scaling at all."></svg>
+        <div class="readout" aria-live="polite" id="prec-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 28 ══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="memory" data-nav="Accumulation &amp; checkpointing">
+      <h3><span class="idx">28</span> Gradient accumulation and activation checkpointing</h3>
+      <p class="lede">Two techniques for the same situation: the batch size you want does not fit on the device you have. Both trade time for memory, both are single-device, and neither changes the mathematics. Anything that needs a <i>second</i> device — data, tensor or pipeline parallelism, sharded optimiser state — is <a href="../distributed-training.html">Distributed Training</a>'s and not this page's.</p>
+
+      <h4>Gradient accumulation: a large batch, one micro-batch at a time</h4>
+      <div class="formula"><span class="lbl">the identity it rests on</span><span class="eq">The loss is a MEAN over the batch, and the gradient of a mean is the mean of
+the gradients:
+    <span class="keep">∇</span>[ (1/B) <span class="keep">∑</span>_{i=1}^{B} ℓᵢ ]  =  (1/B) <span class="keep">∑</span>_{i=1}^{B} <span class="keep">∇</span>ℓᵢ
+So a batch of B can be split into k micro-batches of B/k, their gradients
+summed, and the result is EXACTLY the gradient of the batch of B — not an
+approximation, an identity.</span>
+<span class="lbl">the loop</span><span class="eq">zero the gradient buffer
+for each of k micro-batches:
+    forward, backward, ADD into the buffer      ← activations for B/k only
+divide the buffer by k                          ← or scale each micro-loss by 1/k
+one optimiser step</span>
+<span class="eq">Memory: activations for B/k instead of B. Parameters, gradients and optimiser
+state are unchanged, so the saving applies only to the activation term.
+Time: k forward-backward passes instead of 1, so essentially k× the wall clock
+for the same arithmetic — the per-step overhead is amortised over less work.</span></div>
+
+      <div class="wrong"><span class="say">The mistake that makes accumulation subtly wrong.</span> Divide by <code>k</code> and everything is exact — <span class="fix">unless the model contains a batch-normalisation layer.</span> BatchNorm's statistics are computed over whatever is in the current forward pass, so <code>k</code> micro-batches of <code>B/k</code> give <code>k</code> <i>different</i> sets of statistics, none of which is the statistic the batch of <code>B</code> would have produced. The gradient is then genuinely different, not just numerically. Dropout has the same property in a milder form. Accumulation is exact for a model whose forward pass is a function of each example independently, and only for such a model — which is one more entry in the long list of reasons sequence models use <a href="normalization-regularization.html#layernorm">LayerNorm</a>.</div>
+
+      <h4>Activation checkpointing: recompute instead of store</h4>
+      <p>§08 established that backpropagation is a <i>schedule</i> — store every node, or recompute some. Checkpointing takes the second option deliberately. Split the network into <code>s</code> segments, store only the activation at each segment <b>boundary</b>, and during the backward pass recompute a segment's interior from its boundary just before it is needed.</p>
+
+      <div class="formula"><span class="lbl">the arithmetic, for a chain of L layers split into s equal segments</span><span class="eq">memory   s boundaries + the interior of ONE segment at a time
+         =  O(s + L/s)  activations instead of O(L)
+         minimised at  s = <span class="keep">√</span>L, giving  O(<span class="keep">√</span>L)</span>
+<span class="eq">time     each segment's forward pass is done TWICE — once on the way forward
+         and once during the backward sweep — so one extra forward pass over
+         the whole network:  4 units of arithmetic per step instead of 3
+         (§01's rule), about a 33% slowdown.</span>
+<span class="lbl">a concrete case: L = 64 layers</span><span class="eq">store everything     64 activations,  3.0× forward cost
+s = 8 segments        8 + 8 = 16 activations (a 4.0× saving),  ~4.0× forward
+s = <span class="keep">√</span>64 = 8            the optimum for this L
+store nothing         1 activation, but recomputation is quadratic — do not</span></div>
+
+      <p>The trade is usually worth taking, because the constraint is almost never arithmetic. A 33% slowdown that lets you quadruple the batch size, or fit a model that otherwise does not fit at all, is a good deal. It also composes with everything else: checkpointing and accumulation together let a single device train at an effective batch size it could not hold by two independent factors.</p>
+
+      <div class="callout"><b>The whole single-device memory toolkit, in the order to reach for it.</b> <b>(1)</b> Reduce the batch size — free, and costs only gradient noise (§15). <b>(2)</b> Mixed precision (§27) — halves the activation term and usually makes the run <i>faster</i>. <b>(3)</b> Gradient accumulation — recovers the effective batch size, costs wall clock. <b>(4)</b> Activation checkpointing — buys a factor of <code>√L</code> on the activation term for a third more arithmetic. <b>(5)</b> A more frugal optimiser: momentum instead of Adam saves <code>4P</code> bytes, plain SGD saves <code>8P</code> (§19). <b>(6)</b> Only then: a second device, and <a href="../distributed-training.html">Distributed Training</a>.</div>
+    </section>
+
+    <nav class="pager" aria-label="Neural Network Training series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="optimizers.html">← Gradient Descent &amp; Optimizers</a>
+      <a href="../neural-network-training.html" style="color:var(--muted)">Neural Network Training · overview</a>
+      <a href="normalization-regularization.html">Normalization Layers &amp; Training Regularization →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../neural-network-training.viz.js"></script>
+</body>
+</html>

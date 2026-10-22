@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Structure from Motion &amp; Bundle Adjustment</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses, carried over from parts 1-6 */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../stereo-sfm.html">Stereo &amp; Structure from Motion</a> · part 5 of 5</p>
+      <h1>Structure from Motion &amp; Bundle Adjustment</h1>
+      <p>Reconstruction from many views: the incremental structure-from-motion pipeline, affine factorization recovering shape and motion in one SVD, bundle adjustment as the reprojection objective solved by Levenberg–Marquardt, the arrowhead sparsity and Schur complement, gauge freedom, self-calibration for metric structure, and drift removed by loop closure.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Stereo &amp; Structure from Motion</span>
+        <span class="pill">SfM pipeline · affine factorization · bundle adjustment · Schur complement · gauge · drift</span>
+      </div>
+    </header>
+
+    <!-- ═══ 25 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="sfm" data-nav="The SfM pipeline">
+      <h3><span class="idx">25</span> Structure from motion: the pipeline</h3>
+      <p class="lede">Two views give relative pose up to scale. Many views give a whole reconstruction — but only if the pairwise answers can be glued together without the seams accumulating, and that gluing is the entire engineering problem.</p>
+
+      <div class="keyline">
+        <span>images</span><i>→</i><span>features</span><i>→</i><span>pairwise matching</span><i>→</i><span>geometric verification (§11)</span><i>→</i><span>tracks</span><i>→</i><span>pick an initial pair</span><i>→</i><span>E, pose, triangulate</span><i>→</i><span>add a camera by pose from 3-D points</span><i>→</i><span>triangulate new points</span><i>→</i><span>bundle adjust</span><i>→</i><span>repeat</span><i>→</i><span>final global bundle adjustment</span>
+      </div>
+
+      <h4>The four steps that are not obvious</h4>
+      <ul class="notes">
+        <li><b>Track building.</b> A <i>track</i> is the set of 2-D features across many images that are all projections of one 3-D point. It is built by taking the transitive closure of pairwise matches, and it goes wrong constantly: two different 3-D points on a repeating façade get matched into a single track, and that track then pulls two unrelated parts of the scene together. Tracks that are internally inconsistent — the same image contributing two features to one track — must be split or discarded.</li>
+        <li><b>Choosing the initial pair.</b> Not the pair with the most matches. The pair with many matches <b>and</b> substantial out-of-plane parallax, because §11's planar degeneracy is fatal here. The standard test is to fit a homography to the matches as well as an essential matrix and to prefer the pair where the homography <i>fails</i> — a low homography inlier ratio means real 3-D structure.</li>
+        <li><b>Adding a camera.</b> Once some 3-D points exist, a new image that observes enough of them can be posed by <b>perspective-n-point</b>: solve for <code>(R, t)</code> from 2-D–3-D correspondences, inside RANSAC. This is the step that lets the reconstruction grow, and it is also the step through which a bad track injects a bad camera.</li>
+        <li><b>When to bundle adjust.</b> After every camera is too slow; after all of them is too late, because the initialisation for the last cameras will be hopeless. In practice: after every few cameras, plus a full pass at the end, plus a full pass whenever the reconstruction grows by some fraction.</li>
+      </ul>
+
+      <h4>Incremental against global</h4>
+      <table class="grid2">
+        <tr><th style="width:16%"></th><th style="width:42%">Incremental — seed and grow</th><th>Global — solve for everything at once</th></tr>
+        <tr><td><b>Method</b></td><td>Start from one good pair; repeatedly add the camera that sees the most reconstructed points; triangulate; bundle adjust locally; occasionally globally.</td><td>Estimate all pairwise relative rotations, then solve <b>rotation averaging</b> for a globally consistent set of orientations; then <b>translation averaging</b> for the positions; then triangulate everything and run one bundle adjustment.</td></tr>
+        <tr><td><b>Robustness</b></td><td><b>High.</b> Every addition is verified against an existing model, so a bad match usually fails to find support and is rejected.</td><td>Lower. Translation averaging in particular is fragile: relative translations are known only in direction, and a few wrong directions can poison the whole solve.</td></tr>
+        <tr><td><b>Drift</b></td><td><b>Accumulates.</b> Each addition is an estimate on top of an estimate; §31.</td><td>Essentially none by construction — every constraint is used at once, so there is no order in which to drift.</td></tr>
+        <tr><td><b>Cost</b></td><td>Re-running bundle adjustment as the model grows gives roughly <b>quartic</b> scaling in the number of images if done naively: <code>O(N)</code> additions × <code>O(N³)</code> per solve.</td><td>One large solve. Much cheaper for large collections.</td></tr>
+        <tr><td><b>Fix</b></td><td>Bundle adjust only a local window; select a <b>skeletal subset</b> of images that spans the collection with bounded uncertainty, reconstruct that, and register the rest afterwards.</td><td>Robust rotation averaging with outlier rejection; then a final bundle adjustment to clean up.</td></tr>
+        <tr><td><b>In practice</b></td><td>The default for unordered photo collections and for anything where robustness matters more than throughput.</td><td>Preferred at very large scale, and often as an <i>initialiser</i> for an incremental refinement — hybrid pipelines take the rotations globally and the rest incrementally.</td></tr>
+      </table>
+
+      <div class="callout"><b>A third option that is not a compromise.</b> <b>Hierarchical</b> reconstruction builds reliable three-view sub-models first — a triplet is the smallest configuration in which a reconstruction can be checked against a constraint it was not fitted to — and then merges sub-models pairwise up a tree. It has the robustness of incremental and the <code>O(N log N)</code> shape of global, at the cost of a merging step that has its own failure modes.</div>
+    </section>
+
+    <!-- ═══ 26 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="factorization" data-nav="Affine factorization">
+      <h3><span class="idx">26</span> Factorization: the whole reconstruction in one SVD</h3>
+      <p class="lede">If the camera is affine rather than perspective, structure and motion come out of a single matrix decomposition — no initialisation, no iteration, no local minima. The catch is in the "if".</p>
+
+      <div class="formula"><span class="lbl">the measurement matrix, and why it has rank 3</span><span class="eq">under orthographic or weak-perspective projection there is no division by depth, so
+
+    xⱼᵢ  =  Mⱼ pᵢ  +  tⱼ            Mⱼ = the top 2 × 3 block of camera j
+
+Put the world origin at the CENTROID of the points. Then the centroid of the
+observations in frame j is x̄ⱼ = Mⱼ·0 + tⱼ = tⱼ, so subtracting the per-frame centroid
+removes the translations exactly:
+
+    x̃ⱼᵢ  =  xⱼᵢ − x̄ⱼ  =  Mⱼ pᵢ
+
+Stack every frame and every point into one 2M × N matrix:
+
+        ⎡ x̃₁₁  ⋯ x̃₁N  ⎤     ⎡ M₁  ⎤
+    Ŵ = ⎢  ⋮      ⋮   ⎥  =  ⎢ ⋮   ⎥ [ p₁ ⋯ p_N ]  =  M̂ Ŝ
+        ⎣ x̃_M1 ⋯ x̃_MN ⎦     ⎣ M_M ⎦
+          (2M × N)        (2M × 3)   (3 × N)</span>
+<span class="eq">A product of a 2M × 3 and a 3 × N matrix has rank AT MOST 3, whatever M and N are.
+That is the theorem, and it is the whole method: the measurement matrix of a rigid
+scene under affine projection is rank 3, and its rank-3 factors ARE the motion and
+the structure.</span></div>
+
+      <div class="formula"><span class="lbl">recovering the factors, and the ambiguity that survives</span><span class="eq">SVD:   Ŵ = U <span class="keep">Σ</span> Vᵀ.  Keep the leading three:   M̂ = U₃,   Ŝ = <span class="keep">Σ</span>₃V₃ᵀ.
+With noise, the rank-3 truncation is the CLOSEST rank-3 matrix in the Frobenius norm
+(Eckart–Young again, §09) — so the SVD also does the denoising for free.
+
+But the factorisation is not unique: for ANY invertible 3 × 3 matrix Q,
+
+    Ŵ  =  (M̂ Q)(Q⁻¹ Ŝ)
+
+so M̂ and Ŝ are recovered only up to a linear transformation of space. Fixing Q is
+the "metric upgrade", and it uses what we know about the CAMERAS, not the scene: the
+two rows of every Mⱼ are orthogonal and of equal length (scaled orthography). Writing
+L = QQᵀ and uⱼ, vⱼ for the two rows of M̂ belonging to frame j:
+
+    uⱼᵀ L uⱼ  −  vⱼᵀ L vⱼ  =  0            2M linear equations
+    uⱼᵀ L vⱼ                =  0            in the SIX entries of the symmetric L
+
+Solve that homogeneous system by — of course — the smallest right singular vector,
+then take Q as a matrix square root of L via its eigen-decomposition.</span>
+<span class="eq">WHAT SURVIVES. L determines Q only up to Q → QO with O orthogonal, so the shape is
+recovered up to a global rotation — expected, since no world frame was ever given —
+AND up to a REFLECTION, because O may have determinant −1. That reflection is the
+classic DEPTH REVERSAL: a convex object rotating left and its mirror image rotating
+right produce identical orthographic image sequences. It is the same thing as the
+Necker cube illusion, and no amount of affine data resolves it.</span></div>
+
+      <h4>Measured</h4>
+      <table class="grid2">
+        <tr><th style="width:32%">Configuration</th><th style="width:20%"><span class="keep">σ</span>₄/<span class="keep">σ</span>₃ of the centred Ŵ</th><th style="width:22%">Shape RMS after alignment</th><th>Reading</th></tr>
+        <tr><td><b>Orthographic, no noise</b><br>30 points, 12 frames</td><td class="num">1.6 × 10⁻¹⁵</td><td class="num">0.00000</td><td>Exactly rank 3 and exactly recovered — but only after allowing the reflection: the alignment that fits has determinant <b>−1</b>.</td></tr>
+        <tr><td>Orthographic, 0.5 px noise</td><td class="num">5.4 × 10⁻³</td><td class="num">0.00399</td><td>The rank-3 truncation absorbs the noise gracefully. This is the regime factorization was designed for.</td></tr>
+        <tr><td>Perspective, object at <code>Z₀ = 9</code> and about 1 unit across</td><td class="num">6.6 × 10⁻²</td><td class="num">0.19213</td><td>The fourth singular value is no longer negligible, and the shape error is 50 times larger. The affine model is now visibly wrong.</td></tr>
+        <tr class="tot"><td>Perspective, <code>Z₀ = 3.5</code></td><td class="num">2.4 × 10⁻¹</td><td class="num">0.55176</td><td>Broken. <code><span class="keep">σ</span>₄/<span class="keep">σ</span>₃</code> is a usable <b>diagnostic</b>: if it is not small, do not use this method.</td></tr>
+      </table>
+
+      <h4>Its two real limitations, and what they became</h4>
+      <ul class="notes">
+        <li><b>It needs a complete measurement matrix.</b> Every point must be visible in every frame. Real tracks are riddled with holes — points leave the field of view, get occluded, or fail to match. The classical repair is to factor a dense sub-block first and use it to hallucinate the missing entries, then grow; the modern framing is <b>low-rank matrix completion</b>, and the same problem appears wherever <a href="../../math/linear-algebra-quadratic-pca.html">principal component analysis</a> meets missing data.</li>
+        <li><b>It needs an affine camera.</b> The fix is to iterate: reconstruct affinely, estimate the per-frame perspective correction <code><span class="keep">η</span>ⱼ = 1/t_zⱼ</code> from the reconstruction, divide it out of the measurements, and factor again. Three to five rounds usually converge. A fully <b>projective</b> factorization instead scales each measurement by its projective depth and iterates on those, which needs no calibration at all.</li>
+        <li><b>What it is actually for now.</b> Not as a final answer — bundle adjustment (§27) is strictly better whenever it can be initialised. Factorization's value is that it is a <b>closed form</b>: it cannot get stuck in a local minimum, so it is an excellent initialiser for the thing that can.</li>
+      </ul>
+
+      <div class="viz" id="viz-fact">
+        <div class="vhead">
+          <span class="vtitle">Affine factorization: the rank-3 cliff, the shape it recovers, and the reflection it cannot resolve</span>
+          <span class="vhint">the perspective slider starts at zero — pure scaled orthography — where the fourth singular value is exactly at rounding error</span>
+        </div>
+        <div class="controls">
+          <label>perspective <span class="keep">η</span> = 1/Z₀ <input type="range" id="fc-e" min="0" max="0.3" step="0.005" value="0" /><span id="fc-ev" style="min-width:40px;display:inline-block">0.000</span></label>
+          <label>pixel noise <span class="keep">σ</span> <input type="range" id="fc-s" min="0" max="2" step="0.1" value="0" /><span id="fc-sv" style="min-width:38px;display:inline-block">0.0 px</span></label>
+          <label>frames M <input type="range" id="fc-m" min="4" max="20" step="1" value="12" /><span id="fc-mv" style="min-width:22px;display:inline-block">12</span></label>
+          <label><input type="checkbox" id="fc-r" /> show the depth-reversed solution instead</label>
+        </div>
+        <svg id="fact-svg" width="760" height="416" viewBox="0 0 760 416" role="img" aria-label="Left: the feature tracks — the two-dimensional trajectory of every scene point across all frames, drawn as a light curve per point with the first frame's positions marked, which is the raw data the method consumes and in which the object's shape is already faintly visible. Middle: the singular values of the centred measurement matrix on a logarithmic axis, with the first three drawn in one colour and the rest in another; at the default of pure scaled orthography the fourth and beyond sit at the level of double-precision rounding, and the ratio of the fourth to the third is printed. Right: a plan view of the recovered three-dimensional structure after a similarity alignment to the ground truth, with the true points and the recovered points drawn together and joined by a residual segment where they differ; a checkbox switches to the depth-reversed solution, which fits the image measurements exactly as well and is visibly the mirror image."></svg>
+        <div class="readout" aria-live="polite" id="fact-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 27 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="bundle" data-nav="Bundle adjustment">
+      <h3><span class="idx">27</span> Bundle adjustment: the objective everything else approximates</h3>
+      <p class="lede">Every estimator on this page has been a way of getting close enough. This is the thing they were getting close to: minimise, over all cameras and all points at once, the distance between where the features were <i>seen</i> and where the model says they should <i>be</i>.</p>
+
+      <div class="formula"><span class="lbl">the objective</span><span class="eq">                                           ⎧                                        ⎫
+minimise over {Rⱼ, cⱼ, Kⱼ} and {pᵢ}:  ∑    ⎨ <span class="keep">ρ</span>( ‖ xᵢⱼ − <span class="keep">π</span>(pᵢ ; Rⱼ, cⱼ, Kⱼ) ‖²_<span class="keep">Σ</span>ᵢⱼ ) ⎬
+                                     i,j   ⎩                                        ⎭
+
+    <span class="keep">π</span>  is the full projection chain of <a href="../image-formation/pinhole-camera.html#camera-matrix">part 1 §16</a>: subtract the camera centre,
+       rotate, divide by z, apply radial distortion, apply K
+    <span class="keep">Σ</span>ᵢⱼ is the measurement covariance — a feature detected at scale <span class="keep">σ</span> is localised to
+       about <span class="keep">σ</span> pixels, so the weight should depend on the scale it was found at
+    <span class="keep">ρ</span>  is a robust loss (Huber, Cauchy, Tukey) so that one surviving mismatch does not
+       drag ten cameras with it. With <span class="keep">ρ</span>(s) = s it is plain least squares.
+    The sum runs ONLY over observations that actually exist — the visibility pattern.</span>
+<span class="eq">"Bundle" refers to the bundles of rays joining each camera centre to the points it
+sees; "adjustment" is the photogrammetric word for iterative refinement. The name is
+a century old and the method is still the one that ends every pipeline.</span></div>
+
+      <h4>Why it is not a linear problem, and how it is solved anyway</h4>
+      <p>It is non-linear twice over: <code><span class="keep">π</span></code> divides by depth, and the rotations live on a curved manifold. So it is solved by <b>iterative linearisation</b> — <a href="../../math/optimization.html#beyond">Gauss–Newton, damped into Levenberg–Marquardt</a>:</p>
+
+      <div class="formula"><span class="lbl">one step</span><span class="eq">stack every residual into r(<span class="keep">θ</span>) and let J = ∂r/∂<span class="keep">θ</span>. Then
+
+    Gauss–Newton:            (JᵀJ) <span class="keep">Δθ</span>  =  −Jᵀ r
+    Levenberg–Marquardt:     (JᵀJ + <span class="keep">λ</span> diag(JᵀJ)) <span class="keep">Δθ</span>  =  −Jᵀ r
+
+<span class="keep">λ</span> small → a Gauss–Newton step, fast near the optimum.
+<span class="keep">λ</span> large → a small step down the gradient, safe far from it.
+The standard schedule: try a step; if the cost fell, accept it and divide <span class="keep">λ</span>; if it
+rose, reject and multiply <span class="keep">λ</span>. Two lines of bookkeeping and it is what makes the
+method usable from a mediocre initialisation.</span>
+<span class="eq">AND THE DAMPING IS NOT OPTIONAL HERE. JᵀJ for a bundle adjustment problem is EXACTLY
+SINGULAR — it has a seven-dimensional null space, always, no matter how good the data
+is. Gauss–Newton cannot take a step at all; the <span class="keep">λ</span>diag term is what makes the matrix
+invertible. §29 explains where the seven comes from.</span></div>
+
+      <div class="callout"><b>Three parameterisation choices that are not cosmetic.</b>
+      <br>· <b>Rotations</b>: never as a 3 × 3 matrix with nine free entries — that is six redundant parameters and an orthogonality constraint the solver will violate. Use a <b>local</b> three-vector increment, <code>R ← R·exp([<span class="keep">δ</span>]ₓ)</code>, re-linearised each iteration, or a unit quaternion with a normalisation step. <a href="../image-formation/rotations.html#axis-angle">Part 1 §10</a> and <a href="../image-formation/rotations.html#quaternions">§11</a> own both.
+      <br>· <b>Points</b>: homogeneous four-vectors rather than <code>(X, Y, Z)</code>. A distant point has an enormous <code>Z</code> and a terrible condition number in Euclidean coordinates, and no condition number at all in homogeneous ones — it simply approaches <code>W = 0</code>. This is the same argument as §15's.
+      <br>· <b>The Jacobian</b>: computed by differentiating the chain of transforms one link at a time and composing, which is exactly <b>reverse-mode automatic differentiation</b>. A camera rig with several fixed cameras on a moving platform is then handled by inserting two more links in the chain rather than by rewriting anything.</div>
+
+      <h4>Measured, on a small problem</h4>
+      <p>Six cameras on an arc, 25 points, all visible in all views: 150 observations, 300 residuals, 111 parameters. The initialisation is the truth perturbed by about 1° of rotation, 5 cm of translation and 8 cm of point position; the observations carry 0.5 px of noise.</p>
+      <div class="formula"><span class="lbl">Levenberg–Marquardt, <span class="keep">λ</span>₀ = 10⁻³</span><span class="eq">iteration    cost ‖r‖²     RMS reprojection      <span class="keep">λ</span>
+    0        43086.47         11.984 px        1.0 × 10⁻³
+    1           89.13          0.545 px        3.3 × 10⁻⁴
+    2           56.46          0.434 px        1.1 × 10⁻⁴
+    3           56.45          0.434 px        3.7 × 10⁻⁵      converged
+
+  cost at the TRUE parameters:  75.43     ( 0.501 px RMS )</span>
+<span class="eq">Three observations, all of them worth pausing on.
+
+1 · THE OPTIMUM SCORES BETTER THAN THE TRUTH. 56.45 against 75.43. That is not a bug:
+    the estimate has absorbed some of the noise, as any fitted model does. If your
+    optimiser stops with a cost ABOVE the ground truth's, it has not converged.
+
+2 · THE EXPECTED COST IS PREDICTABLE. For least squares with m residuals and p
+    effective parameters, E‖r‖² = <span class="keep">σ</span>²(m − p). Here <span class="keep">σ</span>² = 0.25, m = 300, and p = 111 − 7 =
+    104 after the seven gauge directions are removed, giving E‖r‖² = 49. The measured
+    56.45 is about 1.5 standard deviations above that, which is unremarkable for a
+    single sample. A converged cost far ABOVE this is a sign of outliers or of a
+    wrong camera model; far BELOW it is a sign of over-parameterisation.
+
+3 · IT CONVERGES IN THREE ITERATIONS. From a genuinely bad start — 12 pixels of RMS
+    error. That is what a good initialisation plus a well-conditioned Jacobian buys,
+    and it is why the whole page has been about producing a good initialisation.</span></div>
+
+      <div class="viz" id="viz-ba">
+        <div class="vhead">
+          <span class="vtitle">Bundle adjustment converging, and Gauss–Newton failing to start</span>
+          <span class="vhint">step through the iterations; then tick the Gauss–Newton box and watch the normal equations refuse to be inverted</span>
+        </div>
+        <div class="controls">
+          <label>iteration <input type="range" id="ba-i" min="0" max="10" step="1" value="0" /><span id="ba-iv" style="min-width:20px;display:inline-block">0</span></label>
+          <label>initial error <input type="range" id="ba-p" min="0.2" max="3" step="0.1" value="1.0" /><span id="ba-pv" style="min-width:26px;display:inline-block">1.0</span></label>
+          <label>image noise <span class="keep">σ</span> <input type="range" id="ba-n" min="0" max="2" step="0.1" value="0.5" /><span id="ba-nv" style="min-width:38px;display:inline-block">0.5 px</span></label>
+          <label><input type="checkbox" id="ba-g" /> Gauss–Newton (<span class="keep">λ</span> = 0)</label>
+        </div>
+        <svg id="ba-svg" width="760" height="404" viewBox="0 0 760 404" role="img" aria-label="Left: the total squared reprojection error against iteration number on a logarithmic axis, falling by three orders of magnitude in the first two steps and then flattening, with a horizontal line marking the cost achieved by the true parameters — which the optimum passes below, because the fitted model absorbs some of the measurement noise — and a vertical marker at the iteration selected by the slider. Middle: the image plane of one camera, showing every observed feature as a ring and the current model's prediction of it as a dot, joined by a residual segment drawn at ten times its true length so that it is visible; at iteration zero the segments are long and systematically oriented, and by iteration three they are short and randomly oriented, which is what convergence looks like. Right: a plan view of the reconstruction at the selected iteration, with the true camera positions and points drawn against the current estimates. Ticking the Gauss–Newton box removes the damping term, at which point the normal equations are exactly singular — they have a seven-dimensional null space for any bundle adjustment problem — and the figure reports that no step can be computed at all."></svg>
+        <div class="readout" aria-live="polite" id="ba-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 28 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="sparsity" data-nav="Sparsity &amp; the Schur complement">
+      <h3><span class="idx">28</span> Sparsity, the arrowhead, and the Schur complement</h3>
+      <p class="lede">A real reconstruction has thousands of cameras and millions of points. Solving a dense linear system in that many unknowns is impossible, and it is also unnecessary, because the system is not dense — and the shape of its sparsity is dictated by one fact about the problem.</p>
+
+      <div class="formula"><span class="lbl">the fact</span><span class="eq">Every observation xᵢⱼ depends on EXACTLY TWO things: the 3-D point pᵢ and the camera j.
+It does not depend on any other point or on any other camera.</span>
+<span class="eq">So the two rows of J belonging to that observation are zero everywhere except in ONE
+6-column camera block and ONE 3-column point block. Structure from motion is a
+BIPARTITE problem — points on one side, cameras on the other, observations as edges —
+and every sparsity property below is a restatement of that.</span></div>
+
+      <h4>The Hessian, block by block</h4>
+      <p>Order the parameters with the <b>structure first and the motion second</b> — which is the right order when there are more points than cameras, as there almost always are. Then <code>A = JᵀJ</code> has four blocks:</p>
+
+      <div class="formula"><span class="lbl">the arrowhead</span><span class="eq">          ⎡ A_pp   A_pc ⎤        A_pp   3N × 3N,  BLOCK DIAGONAL with 3 × 3 blocks
+    A  =  ⎢             ⎥        A_cc   6M × 6M,  BLOCK DIAGONAL with 6 × 6 blocks
+          ⎣ A_pcᵀ  A_cc ⎦        A_pc   3N × 6M,  one 3 × 6 block per OBSERVATION
+
+A_pp is block diagonal because two different points share no residual — no residual
+depends on two points. A_cc is block diagonal for the same reason about cameras. All
+the coupling lives in A_pc, and it is as sparse as the visibility pattern.
+
+The shape is an ARROWHEAD: a diagonal spine with one dense border.</span></div>
+
+      <div class="formula"><span class="lbl">eliminating the points — the Schur complement</span><span class="eq">solve  ⎡ A_pp  A_pc ⎤ ⎡ <span class="keep">Δ</span>p ⎤  =  ⎡ b_p ⎤   by eliminating <span class="keep">Δ</span>p from the first row:
+       ⎣ A_pcᵀ A_cc ⎦ ⎣ <span class="keep">Δ</span>c ⎦     ⎣ b_c ⎦
+
+    <span class="keep">Δ</span>p  =  A_pp⁻¹ ( b_p − A_pc <span class="keep">Δ</span>c )
+
+substitute into the second row:
+
+    ( A_cc − A_pcᵀ A_pp⁻¹ A_pc ) <span class="keep">Δ</span>c  =  b_c − A_pcᵀ A_pp⁻¹ b_p
+      └──────────  A′_cc  ──────────┘        the REDUCED CAMERA SYSTEM, 6M × 6M</span>
+<span class="eq">And A_pp⁻¹ is free: A_pp is block diagonal, so inverting it is N independent 3 × 3
+inversions, not one 3N × 3N inversion. That is the whole trick, and it turns a system
+of size 6M + 3N into one of size 6M — for a thousand cameras and a million points,
+from 3 006 000 unknowns to 6 000.</span></div>
+
+      <h4>The fill-in, stated exactly</h4>
+      <div class="wrong">
+        <p><span class="say">Loose statement:</span> "eliminating the points makes the camera block dense."</p>
+        <p><span class="fix">Exact statement, and it is verified in the figure below:</span> the reduced camera matrix <code>A′_cc</code> has a non-zero <code>6 × 6</code> block in position <code>(j, k)</code> <b>if and only if cameras <code>j</code> and <code>k</code> observe at least one point in common</b>. Nothing more and nothing less. So <code>A′_cc</code> is dense only when the camera graph is a clique — every camera seeing something every other camera sees — which happens for a city square photographed from all round and does not happen for a vehicle driving down a road. <b>The sparsity of the reduced system is the sparsity of the co-visibility graph</b>, and that is a fact about the capture, not about the algebra.</p>
+      </div>
+
+      <div class="callout"><b>Three consequences that follow directly.</b>
+      <br>· <b>Order global parameters last.</b> A shared intrinsic calibration, or a rig's camera-to-rig transforms, couples <i>every</i> observation. Put those parameters at the end of the ordering, along the outer edge of the arrowhead, so their fill-in is confined to one border rather than smeared through the whole matrix.
+      <br>· <b>The reverse ordering is sometimes right.</b> Eliminating <i>cameras</i> instead of points is better when there are more cameras than points — tracking a handful of markers through thousands of video frames. The structure is symmetric; only the counts decide.
+      <br>· <b>Beyond a certain size, stop factorising.</b> Once <code>A′_cc</code> is itself too large or too dense, solve it by <b>conjugate gradients</b> with a preconditioner, which never forms the matrix at all — only its product with a vector, which the sparsity makes cheap.</div>
+
+      <div class="viz" id="viz-spar">
+        <div class="vhead">
+          <span class="vtitle">The bipartite graph, the Jacobian it implies, and the fill-in the Schur complement creates</span>
+          <span class="vhint">the fill-in pattern is checked against "these two cameras share a point" — the readout says whether it matches exactly</span>
+        </div>
+        <div class="controls">
+          <label>track length <input type="range" id="sp-w" min="3" max="25" step="1" value="8" /><span id="sp-wv" style="min-width:22px;display:inline-block">8</span></label>
+          <label>cameras M <input type="range" id="sp-m" min="4" max="10" step="1" value="6" /><span id="sp-mv" style="min-width:20px;display:inline-block">6</span></label>
+          <label>points N <input type="range" id="sp-n" min="8" max="30" step="1" value="20" /><span id="sp-nv" style="min-width:22px;display:inline-block">20</span></label>
+        </div>
+        <svg id="spar-svg" width="760" height="446" viewBox="0 0 760 446" role="img" aria-label="Top left: the bipartite visibility graph, with a row of circles for the three-dimensional points, a row of squares for the cameras, and a line joining each pair that produced an observation. Bottom left: the sparsity pattern of the Jacobian, drawn as a black-and-white image with one row per residual and one column per parameter, showing two narrow diagonal bands of camera blocks and point blocks and nothing else. Middle: the sparsity pattern of the Hessian with the structure parameters ordered before the motion parameters, showing the arrowhead — a block-diagonal spine of three by three point blocks, a block-diagonal six by six camera corner, and a sparse coupling border between them. Right, upper: the reduced camera matrix after the point variables have been eliminated by the Schur complement, with the entries that were already there and the entries created by the elimination drawn in different colours. Right, lower: the size and density of the system before and after elimination, as numbers, together with an explicit check that every block created by the fill-in corresponds to a pair of cameras that share at least one point and that no other block was created."></svg>
+        <div class="readout" aria-live="polite" id="spar-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 29 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="gauge" data-nav="Gauge freedom &amp; ambiguity">
+      <h3><span class="idx">29</span> Gauge freedom, and the ambiguities that are not gauge freedom</h3>
+      <p class="lede">A reconstruction has seven directions in which you can move every camera and every point at once without changing a single pixel of prediction. Recognising them is the difference between a solver that works and one that reports nonsense with confidence.</p>
+
+      <div class="formula"><span class="lbl">the seven</span><span class="eq">let S be any similarity transformation of space — a rotation, a translation and a
+uniform scaling. Replace every point and every camera by its transformed version:
+
+    pᵢ  →  S pᵢ            Pⱼ  →  Pⱼ S⁻¹
+
+then every predicted image point is unchanged, because Pⱼ S⁻¹ S pᵢ = Pⱼ pᵢ. So the
+objective is EXACTLY FLAT along the seven-parameter family of similarities:
+
+    3 rotation  +  3 translation  +  1 scale  =  7</span>
+<span class="eq">MEASURED. For the bundle problem of §27 — 6 cameras, 25 points, 300 residuals, 111
+parameters — the singular values of J at the true parameters are
+
+    …,  75.0,  61.0,  28.4,  |  5.5e-8, 4.8e-8, 4.5e-8, 4.3e-8, 3.9e-8, 3.3e-8, 2.7e-8
+
+Three healthy small values, then a gap of nine orders of magnitude, then EXACTLY SEVEN
+values at the level of rounding. Not six, not eight. The rank of J is 111 − 7 = 104.</span></div>
+
+      <h4>What it breaks and how each break is repaired</h4>
+      <table class="grid2">
+        <tr><th style="width:26%">Consequence</th><th>Repair</th></tr>
+        <tr><td><b><code>JᵀJ</code> is singular</b>, so Gauss–Newton has no unique step</td><td>Levenberg–Marquardt's <code><span class="keep">λ</span>·diag(JᵀJ)</code> makes it invertible, and the step it then takes is the minimum-norm one — which is why LM works on gauge-free problems without anyone having to think about it. The figure in §27 shows plain Gauss–Newton failing outright.</td></tr>
+        <tr><td><b>The covariance <code>(JᵀJ)⁻¹</code> does not exist</b></td><td>Two options. <b>Gauge fixing</b>: hold one camera's pose fixed and one inter-camera distance fixed, removing exactly seven parameters; the covariance is then relative to that choice and will look very different if you pick a different camera. <b>Free-network</b>: use the pseudo-inverse, i.e. discard the seven smallest eigenvalues of <code>JᵀJ</code> and invert the rest. The second is the honest one, because it does not pretend that a particular camera is exact.</td></tr>
+        <tr><td><b>Comparing two reconstructions is meaningless</b> until they are in the same frame</td><td>Align by a similarity (Procrustes) before computing any error. Every error number on this page that compares a reconstruction to a truth does this first.</td></tr>
+        <tr><td><b>Scale is unrecoverable</b>, forever</td><td>Only external information fixes it: a known baseline, a known object size, a GPS track, an inertial sensor with a known gravity magnitude. This is not a solvable problem; it is a missing measurement.</td></tr>
+      </table>
+
+      <h4>Three things that look like gauge freedom and are not</h4>
+      <ul class="notes">
+        <li><b>The bas-relief ambiguity.</b> A shallow object undergoing a large rotation and a deep object undergoing a small one produce almost the same images. This is a <i>near</i>-degeneracy, not an exact one: the objective is not flat along it, only very nearly flat, so it shows up as a small-but-non-zero eigenvalue rather than a zero. It is the direction along which the covariance is largest in almost every small-baseline reconstruction, and it is why depth-versus-motion is the hardest thing to pin down. The same ambiguity appears in factorization (§26) as the reflection, and in shading as the depth-versus-illuminant-angle trade.</li>
+        <li><b>The projective ambiguity.</b> With uncalibrated cameras the freedom is not seven-dimensional but <b>fifteen</b>-dimensional — the whole projective group of 3-space — because <code>Pⱼ → PⱼH⁻¹</code>, <code>pᵢ → Hpᵢ</code> preserves every image for any invertible <code>4 × 4 H</code>. Removing it down to the similarity's seven is exactly what self-calibration (§30) does, and the eight extra dimensions are why it is hard.</li>
+        <li><b>Individual parameter uncertainties.</b> A per-parameter error bar taken from the diagonal of the covariance hides the correlations, and in structure from motion the correlations are the whole story: point depths and camera baselines move together. Look at the leading eigenvectors of the covariance, not at its diagonal.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 30 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="calibration" data-nav="Calibration &amp; self-calibration">
+      <h3><span class="idx">30</span> Calibration: buying back the metric</h3>
+      <p class="lede">Everything metric on this page — angles, parallelism, ratios of lengths — depends on knowing <code>K</code>. There are two ways to know it: measure it once against a known object, or infer it from the images themselves and accept the conditions under which that is possible.</p>
+
+      <h4>What a calibration target buys, and how</h4>
+      <p>A planar target with a known pattern gives, per view, a set of 2-D–3-D correspondences whose 3-D points all lie on one plane. Put that plane at <code>Z = 0</code>; the projection then collapses to a <b>homography</b>:</p>
+
+      <div class="formula"><span class="lbl">from a planar target to constraints on K</span><span class="eq">for a point (X, Y, 0) on the target,
+
+    x̃  ∼  K [ r₁ r₂ r₃ | t ] (X, Y, 0, 1)ᵀ  =  K [ r₁ r₂ t ] (X, Y, 1)ᵀ  =  H (X, Y, 1)ᵀ
+
+so H = <span class="keep">λ</span> K [r₁ r₂ t], estimated from ≥ 4 correspondences by the direct linear transform
+(<a href="../alignment-motion.html">part 6</a>). Now use the fact that r₁ and r₂ are ORTHONORMAL columns of a rotation:
+
+    r₁ = <span class="keep">λ</span>⁻¹K⁻¹h₁     r₂ = <span class="keep">λ</span>⁻¹K⁻¹h₂         with h₁, h₂ the first two columns of H
+
+    r₁ᵀr₂ = 0    ⟹    h₁ᵀ (K⁻ᵀK⁻¹) h₂ = 0
+    ‖r₁‖=‖r₂‖    ⟹    h₁ᵀ (K⁻ᵀK⁻¹) h₁  =  h₂ᵀ (K⁻ᵀK⁻¹) h₂</span>
+<span class="eq">TWO linear constraints per view on the symmetric matrix B = K⁻ᵀK⁻¹, which has 6 entries
+and 5 degrees of freedom up to scale. So THREE views of a planar target determine K
+completely; two views suffice if the skew is assumed zero; one view suffices if the
+aspect ratio and principal point are also assumed. Recover K from B by Cholesky.
+
+Note the structure: this is EXACTLY the metric-upgrade step of factorization (§26) —
+solve a homogeneous linear system for a symmetric matrix, then take its square root.
+B is the image of the ABSOLUTE CONIC, and it is the single object that all of
+calibration and self-calibration is about.</span></div>
+
+      <div class="callout"><b>What the target really buys is <i>non-degeneracy</i>.</b> Every view of the target must be at a genuinely different orientation: two views of a plane at the same orientation give the same two constraints twice. It also buys distortion: the target's straight lines are known to be straight, so the radial coefficients of <a href="../image-formation/pinhole-camera.html#distortion">Part 1 §17</a> can be estimated at the same time, and they must be, because a distorted image of a plane is not related to the plane by a homography at all.</div>
+
+      <h4>Self-calibration, in outline</h4>
+      <p>With no target, the calibration has to come out of the correspondences. It cannot come out of them entirely: post-multiplying every camera by <code>H̃⁻¹</code> and pre-multiplying every point by <code>H̃</code> leaves every image unchanged (§29), and an <code>RQ</code> decomposition of the transformed cameras gives a completely different, equally valid, set of calibration matrices. <b>Every self-calibration method therefore assumes something</b>, and the assumption is what makes it work:</p>
+      <ul class="notes">
+        <li><b>Constant intrinsics across views.</b> The most common assumption. The same camera took all the pictures, so <code>K</code> is one unknown rather than <code>n</code>. Three or more views then generally suffice.</li>
+        <li><b>Zero skew, unit aspect ratio, principal point at the image centre.</b> Nearly always true of a modern sensor, and it reduces <code>K</code> to a single unknown focal length. It fails for a cropped image — the principal point is no longer central — and for a photograph of a photograph.</li>
+        <li><b>Two views and the Kruppa equations.</b> With the above assumptions, both focal lengths can be recovered from a single fundamental matrix. Write <code>D_j = K_jK_jᵀ = diag(f_j², f_j², 1)</code> and take the singular vectors <code>u₀, u₁, v₀, v₁</code> of <code>F</code> and its singular values <code><span class="keep">σ</span>₀, <span class="keep">σ</span>₁</code>; the three ratios <code>u₁ᵀD₀u₁ / <span class="keep">σ</span>₀²v₀ᵀD₁v₀ = −u₀ᵀD₀u₁ / <span class="keep">σ</span>₀<span class="keep">σ</span>₁v₀ᵀD₁v₁ = u₀ᵀD₀u₀ / <span class="keep">σ</span>₁²v₁ᵀD₁v₁</code> are each affine in <code>f₀²</code> over affine in <code>f₁²</code>, so cross-multiplying gives quadratics that solve directly.</li>
+        <li><b>Vanishing points.</b> Three mutually orthogonal vanishing points in one image determine <code>K</code> outright, because they are the images of three points on the plane at infinity that are conjugate with respect to the absolute conic. Architectural scenes hand this over for free.</li>
+      </ul>
+
+      <div class="wrong">
+        <p><span class="say">Stated as a theorem:</span> "two views with known principal point and zero skew determine both focal lengths."</p>
+        <p><span class="fix">Stated correctly:</span> they determine them <b>generically</b>, and there are configurations in which they determine nothing at all — notably when there is <b>no relative rotation</b> between the two views, and when the two <b>optical axes intersect</b>. In those cases the focal lengths trade off directly against the depth of the reconstruction, which is the bas-relief ambiguity of §29 again: a deeper scene photographed with a longer lens looks the same. The practical advice that follows is unromantic and correct: take the focal length from the image metadata as an <i>initial value</i>, and let bundle adjustment refine it along with everything else.</p>
+      </div>
+    </section>
+
+    <!-- ═══ 31 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="drift" data-nav="Drift &amp; loop closure">
+      <h3><span class="idx">31</span> Drift, and the one measurement that removes it</h3>
+      <p class="lede">An incremental reconstruction estimates each pose relative to the last. Errors therefore compound, and they compound at a rate that depends on <i>which</i> quantity is wrong — a fact worth knowing before deciding what to fix.</p>
+
+      <h4>Three growth laws, measured</h4>
+      <p>A camera walking in a straight line, one unit per step, with per-step errors added to its odometry. The end-point position error after <code>n</code> steps, fitted on a log–log axis over <code>n = 10</code> to <code>320</code>, 300 trials each — the same measurement the figure below runs live:</p>
+
+      <table class="grid2">
+        <tr><th style="width:30%">Per-step error</th><th style="width:18%">Measured exponent</th><th style="width:16%">Predicted</th><th>Why</th></tr>
+        <tr><td><b>Translation noise only</b>, <span class="keep">σ</span>_t = 0.02 per step</td><td class="num">0.503</td><td class="num">½</td><td>The position is a sum of <code>n</code> independent errors: an ordinary random walk, so the standard deviation grows like <code>√n</code>. Benign.</td></tr>
+        <tr><td><b>Rotation noise</b>, <span class="keep">σ</span>_θ = 0.005 rad per step</td><td class="num">1.441</td><td class="num">3⁄2</td><td><b>Much worse, and this is the one that matters.</b> The heading is itself a random walk, and the position integrates the heading. Lateral error <code>≈ ∑ₖ θₖ</code>, whose variance is <code><span class="keep">σ</span>_θ² ∑ₖ (n − k)² ≈ <span class="keep">σ</span>_θ² n³/3</code> — so the error grows like <code>n^1.5</code>. A rotation error is not a rotation error; it is a lever arm.</td></tr>
+        <tr class="tot"><td><b>A rotation bias</b> of 0.002 rad per step</td><td class="num">1.886</td><td class="num">2</td><td>A systematic error does not average out. The heading is off by <code>nb</code>, so the trajectory curves and the error grows like <code>n²</code>. At <code>n = 320</code> the bias produces an end-point error of about 102 units against about 17 from the same amount of <i>unbiased</i> rotation noise. <b>Bias is worse than noise by a whole power of <code>n</code>.</b></td></tr>
+      </table>
+
+      <div class="callout"><b>The design consequence.</b> Since rotation errors dominate, the effort belongs there: use wide-field-of-view cameras, which pin down rotation far better than narrow ones; use as many well-spread features as possible rather than many clustered ones; and prefer estimators that get the rotation right even at the cost of the translation, which is exactly why <b>global</b> methods solve rotation averaging first and separately (§25). And since a <i>bias</i> is worse than noise, hunt for systematic errors — an uncorrected radial distortion, a wrong principal point, a rolling shutter — before adding more features.</div>
+
+      <h4>Loop closure</h4>
+      <p>The cure for accumulated drift is not a better incremental estimator. It is <b>one measurement that is not incremental</b>: recognising that the camera has returned somewhere it has been before, and adding a constraint directly between two poses that are far apart in time. That single edge converts an open chain into a cycle, and a cycle has a consistency condition that the chain did not.</p>
+
+      <div class="formula"><span class="lbl">pose-graph optimisation</span><span class="eq">nodes: the poses x₀ … x_{n−1}.  edges: relative-pose measurements zᵢⱼ with weights.
+
+    minimise  ∑    ‖  ⊖xᵢ ⊕ xⱼ  ⊖  zᵢⱼ  ‖²_<span class="keep">Ω</span>ᵢⱼ
+             (i,j)
+
+where ⊕ and ⊖ compose and invert poses. This is bundle adjustment with the 3-D points
+already eliminated — the structure has been marginalised into the relative-pose
+constraints — so it is small, sparse and fast, and it is the standard back end of any
+system that has to run in real time.</span>
+<span class="eq">MEASURED, on a 40-pose closed loop with 0.02 translation noise, 0.01 rad rotation noise
+and a rotation bias of 0.004 rad per step:
+
+    open-loop RMS position error                   1.2574
+    gap between the last pose and the first        1.4144
+    after one loop-closure edge and 8 iterations    0.1883      a factor of 6.7
+
+The optimiser does not "close the gap" by moving the last pose. It DISTRIBUTES the
+inconsistency backwards over every pose in the loop, in proportion to how uncertain
+each edge was, which is why the whole trajectory improves and not just its end.</span></div>
+
+      <div class="wrong">
+        <p><span class="say">The hard part is the optimisation.</span></p>
+        <p><span class="fix">The hard part is the recognition.</span> Pose-graph optimisation is a well-conditioned sparse least-squares problem and is essentially solved. Deciding that <i>this</i> image shows the same place as <i>that</i> one, several thousand frames ago, is a retrieval problem — and it has an asymmetry that makes it dangerous: a <b>missed</b> loop closure costs you the drift you already had, while a <b>false</b> one welds two unrelated parts of the map together and destroys the reconstruction outright. So the verification is geometric and strict: retrieve candidates by appearance, then require a consistent relative pose supported by many inliers, then require that the closure is consistent with other closures. Repeated architecture is the adversary throughout, exactly as in §11 and §24.</p>
+      </div>
+
+      <div class="viz" id="viz-drift">
+        <div class="vhead">
+          <span class="vtitle">Drift accumulating around a loop, and one closure edge redistributing it</span>
+          <span class="vhint">the closure starts <b>off</b> — turn it on and watch the correction spread backwards over the whole trajectory</span>
+        </div>
+        <div class="controls">
+          <label>rotation noise <span class="keep">σ</span>_θ <input type="range" id="dr-r" min="0" max="0.03" step="0.002" value="0.010" /><span id="dr-rv" style="min-width:40px;display:inline-block">0.010</span></label>
+          <label>rotation bias <input type="range" id="dr-b" min="0" max="0.01" step="0.001" value="0.004" /><span id="dr-bv" style="min-width:40px;display:inline-block">0.004</span></label>
+          <label>translation noise <span class="keep">σ</span>_t <input type="range" id="dr-t" min="0" max="0.06" step="0.005" value="0.020" /><span id="dr-tv" style="min-width:40px;display:inline-block">0.020</span></label>
+          <label>poses <input type="range" id="dr-n" min="16" max="60" step="4" value="40" /><span id="dr-nv" style="min-width:22px;display:inline-block">40</span></label>
+          <label><input type="checkbox" id="dr-c" /> close the loop</label>
+        </div>
+        <svg id="drift-svg" width="760" height="428" viewBox="0 0 760 428" role="img" aria-label="Left: a plan view of a closed circular trajectory, showing the true poses as one curve and the dead-reckoned estimate as another; the estimate spirals away from the truth and its final pose does not return to its first, leaving a visible gap. When the loop-closure box is ticked a third curve appears, the pose-graph solution, which lies close to the truth all the way round because the inconsistency has been distributed backwards over every pose rather than absorbed at the end. Middle: the position error of each pose against its index along the trajectory, for the open-loop estimate and, when enabled, for the closed one; the open-loop curve grows monotonically while the closed one is roughly flat and much lower. Right: the end-point error against the number of steps on logarithmic axes, measured over many trials, drawn separately for translation noise alone, for rotation noise alone and for a rotation bias, with the least-squares slope of each printed; the three slopes come out close to one half, three halves and two respectively, which are the predicted exponents."></svg>
+        <div class="readout" aria-live="polite" id="drift-readout"></div>
+      </div>
+    </section>
+
+    <nav class="pager" aria-label="Stereo &amp; Structure from Motion series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="dense-stereo.html">← Dense Stereo Matching</a>
+      <a href="../stereo-sfm.html" style="color:var(--muted)">Stereo &amp; Structure from Motion · overview</a>
+      <a href="../stereo-sfm.html">Stereo &amp; Structure from Motion · overview →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../vision-viz.js"></script>
+<script src="../stereo-sfm.viz.js"></script>
+</body>
+</html>

@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Attention Cost &amp; Limits</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to the other pages of the series */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../attention.html">Attention</a> · part 4 of 6</p>
+      <h1>Attention Cost &amp; Limits</h1>
+      <p>What one attention layer costs and what it cannot do: the FLOP count, the sequence length at which n² actually dominates the projections, the n×n matrix as a memory bill, attention mixing tokens but never features, rank collapse with depth, and attention entropy as a diagnostic.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Attention</span>
+        <span class="pill">FLOPs · when n² dominates · n×n memory · token mixing · rank collapse · entropy</span>
+      </div>
+    </header>
+
+    <!-- ═══ 18 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="cost" data-nav="What one layer costs">
+      <h3><span class="idx">18</span> The cost of one layer, counted term by term</h3>
+      <p class="lede"><b>One layer costs three kinds of multiply–accumulate: the four projections (<code>4nd²</code>, linear in the sequence length), the two <code>n × n</code> products with the keys and values (<code>2n²d</code>, quadratic in it), and the feedforward sub-layer (<code>nmat·n·d·d_ff</code>, linear again).</b> They scale differently, and getting them separate is the whole prerequisite for §19, which computes when the quadratic one actually dominates.</p>
+
+      <div class="formula"><span class="lbl">MACs for one layer's forward pass, batch 1, sequence n</span><span class="eq">   PROJECTIONS   Q: n·d·(h·dₖ)     K,V: 2·n·d·(g·dₖ)     O: n·(h·d_v)·d
+   QUADRATIC     QKᵀ: n²·(h·dₖ)    A·V: n²·(h·d_v)
+   FFN           nmat · n · d · d_ff        nmat = 2 (GELU MLP), 3 (SwiGLU)
+
+with the standard  h·dₖ = h·d_v = d  and  g = h:
+
+   proj  =  4 n d²             linear in n, quadratic in d
+   quad  =  2 n² d             QUADRATIC in n, linear in d
+   ffn   =  nmat · n · d · d_ff  linear in n, quadratic in d (since d_ff ∝ d)
+
+   layer =  4nd²  +  2n²d  +  nmat·n·d·d_ff</span>
+<span class="lbl">two adjustments that matter and are usually left out</span><span class="eq">CAUSAL MASKING halves the quadratic term. Only the lower triangle is
+needed, and a kernel that skips fully-masked BLOCKS actually achieves it:
+
+   quad_causal  =  2 n² d · (n+1)/(2n)   ≈   n² d
+
+GROUPED-QUERY ATTENTION shrinks the PROJECTION term, not the quadratic one.
+K and V get g heads instead of h:
+
+   proj_gqa  =  2 n d²  +  2 n d (g·dₖ)        so at g = h/4:  2.5 n d²
+                                                instead of      4   n d²
+
+The quadratic term is UNCHANGED by GQA, because the KV heads are shared,
+not fewer — every query head still scores against a full set of n keys.
+This is a common misreading of GQA.</span></div>
+
+      <p>And a term that does not appear in the MAC count at all but decides whether the layer runs: <b>the softmax itself</b>. It is <code>h·n²</code> exponentials, a divide per entry, and — crucially — <code>h·n²</code> elements that have to exist somewhere. §20 counts that; §31 is about a kernel that arranges for them not to.</p>
+
+      <div class="viz" id="viz-co">
+        <div class="vhead">
+          <span class="vtitle">The three terms of one layer, against sequence length</span>
+          <span class="vhint">the crossing points are the whole picture — move the width and the FFN sliders and watch them slide by thousands of tokens</span>
+        </div>
+        <div class="controls">
+          <label>preset <select id="co-p">
+            <option value="gpt2s">GPT-2 small · d 768, h 12, MHA, FFN 3072×2</option>
+            <option value="gpt2xl">GPT-2 XL · d 1600, h 25, MHA, FFN 6400×2</option>
+            <option value="l27b">Llama-2 7B · d 4096, h 32, MHA, SwiGLU 11008×3</option>
+            <option value="l38b" selected>Llama-3 8B · d 4096, h 32, g 8, SwiGLU 14336×3</option>
+            <option value="l370b">Llama-3 70B · d 8192, h 64, g 8, SwiGLU 28672×3</option>
+          </select></label>
+          <label><input type="checkbox" id="co-c" /> causal (halves the quadratic term)</label>
+          <label>sequence n <input type="range" id="co-n" min="8" max="18" step="1" value="13" /><span id="co-nv" style="min-width:52px;display:inline-block">8 192</span></label>
+          <label>view <select id="co-v">
+            <option value="abs" selected>absolute MACs</option>
+            <option value="share">share of the layer</option>
+          </select></label>
+        </div>
+        <svg id="co-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left panel: the three multiply-accumulate terms of one layer — the projections, the quadratic attention term and the feedforward sub-layer — plotted against sequence length on logarithmic axes, with the total drawn on top. The projection and feedforward lines have slope one and the quadratic line has slope two, so the quadratic line starts far below the others at short sequences and crosses each of them at a specific length, which is marked with a vertical rule and labelled with the exact number of tokens. A vertical rule also marks the currently selected sequence length. Right panel: the same three terms as shares of the layer total, drawn as stacked areas against sequence length on a logarithmic horizontal axis, so the quadratic term's share is a curve that starts near zero, passes fifty per cent at the crossing against everything else, and approaches one hundred per cent only at very long sequences. Ticking the causal box halves the quadratic term and visibly slides every crossing point to the right by a factor of two. Selecting a configuration with fewer key-value heads than query heads lowers the projection line and therefore moves the projection crossing left, while leaving the quadratic line exactly where it was, which is the point that grouped-query attention does not touch the quadratic term. The readout prints all three terms at the selected length, the quadratic share, and the three crossing lengths."></svg>
+        <div class="readout" aria-live="polite" id="co-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 19 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="crossover" data-nav="When n² actually dominates">
+      <h3><span class="idx">19</span> When the quadratic term actually dominates — computed, not asserted</h3>
+      <p class="lede"><b>The quadratic term overtakes the two linear ones at a sequence length with a closed form, <code>n* = 2d + nmat·d_ff/2</code> — of the order of 5 000 to 50 000 tokens for real models — and below that length the projections and the feedforward sub-layer, not attention's <code>n²</code> term, are most of the arithmetic.</b> That is why "attention is quadratic, so it dominates the cost", the most repeated sentence about this architecture, is for most real configurations at their trained context length <b>false</b>. Here is the crossover, computed.</p>
+
+      <div class="formula"><span class="lbl">solve for the length at which the quadratic term overtakes each other term</span><span class="eq">    quad  =  proj      2n²d  =  4nd²                 ⇒   n* = 2d
+    quad  =  ffn       2n²d  =  nmat·n·d·d_ff        ⇒   n* = nmat·d_ff / 2
+    quad  =  BOTH      2n²d  =  4nd² + nmat·n·d·d_ff ⇒   n* = 2d + nmat·d_ff/2
+
+The width d cancels out of the second one entirely. What sets the
+crossover is  d_ff , the FFN's inner width — the part of the model that
+has nothing to do with attention.</span>
+<span class="lbl">evaluated, exactly, for five real configurations (MACs, non-causal)</span><span class="eq">  configuration        d      d_ff  nmat    n* vs proj  n* vs ffn  n* vs BOTH   trained n   quad share there
+  GPT-2 small        768      3072     2         1 536      3 072       4 608       1 024        18.18%
+  GPT-2 XL          1600      6400     2         3 200      6 400       9 600       1 024         9.64%
+  Llama-2 7B        4096     11008     3         8 192     16 512      24 704       4 096        14.22%
+  Llama-3 8B        4096     14336     3         5 120*    21 504      26 624       8 192        23.53%
+  Mistral-7B        4096     14336     3         5 120*    21 504      26 624      32 768        55.17%
+  Llama-3 70B       8192     28672     3         9 216*    43 008      52 224       8 192        13.56%
+
+  * these three use g = 8 KV heads instead of h, which shrinks the
+    PROJECTION term and therefore moves the first crossing LEFT. The other
+    two columns are untouched, because GQA does not change the n² term.</span></div>
+
+      <p>Read the last two columns. At the length these models were trained to run at, <b>the quadratic term is 10–24% of a layer's arithmetic</b>. For Llama-3 70B at its 8 192-token context it is <b>13.56%</b>: seven-eighths of the arithmetic in a "quadratic-cost architecture" is the linear-in-<code>n</code> part. The one entry above 50% is Mistral-7B <i>quoted at its 32 768-token context</i> — and the first release of that model used a 4 096-token sliding window precisely so that it did not pay it (§29).</p>
+
+      <div class="callout"><b>The honest summary, in three clauses.</b> <b>(1)</b> The quadratic term is genuinely quadratic and eventually wins — at <code>n = 131 072</code> it is 83% of a Llama-3 8B layer. <b>(2)</b> "Eventually" is <code>n ≈ 2d + nmat·d_ff/2</code> (less at <code>g &lt; h</code>), which is <b>three to nine times the context they were trained at</b> for every model in the table except Mistral-7B — whose 32 768-token context sits at 1.2× its own crossover, which is why its first release used a 4 096-token sliding window (§29). <b>(3)</b> The reason attention nevertheless dominates the <i>engineering</i> is not arithmetic at all — it is <b>memory</b>: the <code>n²</code> matrix has to exist (§20), and at inference the KV cache has to be read (§25–§26). Those two are what actually bind, and both are bandwidth problems rather than FLOP problems.</p></div>
+
+      <div class="viz" id="viz-cr">
+        <div class="vhead">
+          <span class="vtitle">The crossover, computed for any configuration you like</span>
+          <span class="vhint">the FFN width is the surprising control: it moves the crossover and it has nothing to do with attention</span>
+        </div>
+        <div class="controls">
+          <label>d_model <input type="range" id="cr-d" min="256" max="16384" step="256" value="4096" /><span id="cr-dv" style="min-width:44px;display:inline-block">4096</span></label>
+          <label>FFN inner width <input type="range" id="cr-ff" min="512" max="65536" step="512" value="14336" /><span id="cr-ffv" style="min-width:52px;display:inline-block">14336</span></label>
+          <label>FFN matrices <select id="cr-nm">
+            <option value="2">2 — GELU MLP</option><option value="3" selected>3 — SwiGLU</option>
+          </select></label>
+          <label>query heads h <input type="range" id="cr-h" min="4" max="128" step="4" value="32" /><span id="cr-hv" style="min-width:26px;display:inline-block">32</span></label>
+          <label>KV heads g <input type="range" id="cr-g" min="1" max="128" step="1" value="8" /><span id="cr-gv" style="min-width:26px;display:inline-block">8</span></label>
+          <label><input type="checkbox" id="cr-c" /> causal</label>
+        </div>
+        <svg id="cr-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left panel: the share of one layer's multiply-accumulates taken by the quadratic attention term, plotted against sequence length on a logarithmic horizontal axis, from short sequences where it is a per cent or two up to very long ones where it approaches one. A horizontal rule at fifty per cent meets the curve at the crossing length, which is drawn as a vertical rule and labelled with its exact value; two further vertical rules mark where the quadratic term overtakes the projection term alone and the feedforward term alone. Moving the feedforward width slider translates the whole curve horizontally, which is the point that a part of the model with nothing to do with attention is what sets the crossover. Right panel: a scatter of the crossing length against model width for a set of real published configurations, each drawn as a labelled point, together with the closed-form prediction drawn as a line, and each configuration's own trained context length drawn as a second marker on the same vertical axis; most published context lengths sit well below their crossing length, and the annotation counts how many and by what factor; the exceptions, a model quoted at a 32 768-token window and a mixture-of-experts model at 131 072 tokens, sit above theirs, which is the case the sliding window of section twenty-nine and the sparse feedforward of the mixture-of-experts page exist for. The readout gives the three crossing lengths, the quadratic share at a reference length, and the ratio between the crossing length and the width."></svg>
+        <div class="readout" aria-live="polite" id="cr-readout"></div>
+      </div>
+
+      <div class="wrong"><span class="say">The version of this claim that is right.</span> "Attention's cost grows quadratically, so <b>doubling</b> the context more than doubles the cost." <span class="fix">True and useful.</span> Doubling <code>n</code> multiplies the linear terms by 2 and the quadratic term by 4, so at Llama-3 8B's 23.5% quadratic share the total goes up by <code>2 × 0.765 + 4 × 0.235 = 2.47×</code>, not 2×. That is the operationally relevant statement. The one to drop is "attention dominates the cost", which is a statement about a <i>share</i> and is usually wrong.</div>
+    </section>
+
+    <!-- ═══ 20 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="memory" data-nav="The n×n matrix as memory">
+      <h3><span class="idx">20</span> The real constraint at training time: the <code>n × n</code> matrix has to exist</h3>
+      <p class="lede">§19 said the arithmetic is mostly not quadratic. The <b>memory</b> is, it is quadratic with a large constant, and it is what actually stops a naive implementation from running.</p>
+
+      <div class="formula"><span class="lbl">what a naive attention implementation must hold, per layer, per sequence</span><span class="eq">   Q, K, V, output      4 · n · d           elements       LINEAR in n
+   the score matrix S   h · n²              elements       QUADRATIC
+   the weight matrix A  h · n²              elements       QUADRATIC (and
+                                                           needed again in
+                                                           the backward pass)</span>
+<span class="lbl">the score matrix ALONE — h<span class="keep">·</span>n<span class="keep">²</span> elements — in bf16, batch 1, one layer. A naive implementation holds S <span class="keep">AND</span> A, so double every figure below</span><span class="eq">  model            h        n     h·n² elements          bytes     GiB    × all layers
+  GPT-2 small     12    1 024       12 582 912       25 165 824   0.023      0.28  (12)
+  GPT-2 small     12    8 192      805 306 368    1 610 612 736   1.500     18.00  (12)
+  Llama-3 8B      32    1 024       33 554 432       67 108 864   0.062      2.00  (32)
+  Llama-3 8B      32    4 096      536 870 912    1 073 741 824   1.000     32.00  (32)
+  Llama-3 8B      32    8 192    2 147 483 648    4 294 967 296   4.000    128.00  (32)
+  Llama-3 8B      32   32 768   34 359 738 368   68 719 476 736  64.000   2048.00  (32)
+  Llama-3 70B     64    8 192    4 294 967 296    8 589 934 592   8.000    640.00  (80)
+  Llama-3 70B     64   32 768   68 719 476 736  137 438 953 472 128.000  10240.00  (80)</span></div>
+
+      <p>Four gigabytes for one layer's attention weights, at a batch size of one, at a context length that model actually ships with. Multiply by the batch and it is hopeless; multiply by the layers, which a training step must do because the backward pass needs them, and it is 128 GiB for a single sequence. <b>This, and not the FLOP count, is why attention needed a new kernel</b>, and it is exactly what §31 is about: FlashAttention leaves the forward MAC count of §18 untouched (and adds some recomputation in the backward pass); what it changes is whether the <code>h·n²</code> array ever exists.</p>
+
+      <div class="formula"><span class="lbl">what the alternative costs</span><span class="eq">  keep only Q, K, V and the output:  4·n·d elements per layer
+
+  h = 32, d = 4096, n =  8 192:   4.000 GiB  →  0.2500 GiB      16× less
+  h = 32, d = 4096, n = 32 768:  64.000 GiB  →  1.0000 GiB      64× less
+  h = 64, d = 8192, n = 32 768: 128.000 GiB  →  2.0000 GiB      64× less
+
+The saving is a factor of h·n / (4d) = n / (4·dₖ), so it GROWS with the
+sequence length. At dₖ = 128 it is n/512: a factor of 16 at n = 8192 and
+a factor of 256 at n = 131072.</span></div>
+
+      <div class="viz" id="viz-mm">
+        <div class="vhead">
+          <span class="vtitle">Activation memory against sequence length: which term is which, and where the cliff is</span>
+          <span class="vhint">set a memory budget and read off the longest sequence that fits, with and without materialising the score matrix</span>
+        </div>
+        <div class="controls">
+          <label>preset <select id="mm-p">
+            <option value="gpt2s">GPT-2 small · d 768, h 12, 12 layers</option>
+            <option value="l38b" selected>Llama-3 8B · d 4096, h 32, 32 layers</option>
+            <option value="l370b">Llama-3 70B · d 8192, h 64, 80 layers</option>
+          </select></label>
+          <label>batch <input type="range" id="mm-b" min="1" max="32" step="1" value="1" /><span id="mm-bv" style="min-width:20px;display:inline-block">1</span></label>
+          <label>bytes per element <select id="mm-t">
+            <option value="2" selected>2 — bf16</option><option value="4">4 — fp32</option>
+          </select></label>
+          <label>budget, GiB <input type="range" id="mm-g" min="8" max="640" step="8" value="80" /><span id="mm-gv" style="min-width:34px;display:inline-block">80</span></label>
+          <label>scope <select id="mm-s">
+            <option value="layer">one layer</option><option value="all" selected>every layer (a training step)</option>
+          </select></label>
+        </div>
+        <svg id="mm-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left panel: activation memory in bytes plotted against sequence length on logarithmic axes, with three lines — the query, key, value and output tensors, which have slope one; the materialised score and weight matrices, which have slope two; and their total. A horizontal rule marks the selected memory budget and vertical rules mark the longest sequence that fits under it with and without materialising the score matrix, both labelled with their exact token counts. The gap between those two rules is typically a factor of several and grows with the model width. Right panel: a bar chart decomposing the memory at the selected length into the linear and quadratic parts, per layer and across all layers, with the percentages printed; at short sequences the linear part dominates and by a few thousand tokens the quadratic part is almost the whole bar. The readout prints both maximum lengths, the ratio between them, the memory at the currently plotted length, and the factor by which not materialising the score matrix reduces it."></svg>
+        <div class="readout" aria-live="polite" id="mm-readout"></div>
+      </div>
+
+      <div class="callout"><b>A note on what "activation memory" includes.</b> The counts above are the attention sub-layer's own tensors. A real training step also holds the FFN's intermediates (<code>n·d_ff</code> per layer, linear in <code>n</code>), the residual stream, the normalisation statistics, and the optimiser state — none of which is quadratic. <a href="../neural-network-training.html">The training page</a> owns the general activation-memory accounting and gradient checkpointing; this section owns only the term that is quadratic, because it is the only one whose growth is qualitatively different.</div>
+    </section>
+
+    <!-- ═══ 21 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="tokenmix" data-nav="Attention mixes tokens and nothing else">
+      <h3><span class="idx">21</span> What attention cannot do (1): it mixes tokens and does nothing to features</h3>
+      <p class="lede">Look at where the non-linearity in an attention block actually is. The softmax is non-linear <b>across positions</b>. Along the feature axis, the entire path from input to output is a chain of matrix multiplications — and a chain of matrix multiplications is one matrix.</p>
+
+      <div class="formula"><span class="lbl">the value path, written out</span><span class="eq">   Y  =  ∑ⱼ Aⱼ · X · ( W_Vʲ W_Oʲ )                    (§14's rewriting)
+                    ─   └─────┬─────┘
+                    │      a FIXED (d × d) linear map, the same for
+                    │      EVERY position and EVERY input
+                    the only place X enters non-linearly, and it does so
+                    through Aⱼ, which acts on the POSITION index
+
+Hold Aⱼ fixed and the map X ↦ Y is exactly LINEAR. Stack L attention
+layers with the A's held fixed and you have a product of matrices, which
+is one matrix. No amount of depth creates a per-token non-linearity.</span>
+<span class="lbl">the cleanest special case, because it removes the softmax entirely</span><span class="eq">   n = 1.   There is one key, so A = [1] whatever the score is.
+
+   Y = x · W_V W_O ,   and stacking L such layers gives
+
+   Y = x · (W_V¹W_O¹)(W_V²W_O²) … (W_Vᴸ W_Oᴸ)  =  x · M
+
+   ONE linear map, for any depth. A stack of attention layers applied to a
+   single token is a single matrix multiply. Insert one FFN and it is not.</span></div>
+
+      <p>To be precise about what is and is not being claimed: with more than one token, an attention-only stack is <i>not</i> a linear function of <code>X</code>, because the weights <code>Aⱼ</code> depend on <code>X</code> (§10), and §33's induction circuit is built from attention alone. The claim is narrower and exact — the non-linearity enters only through <i>which positions are mixed</i>, never through a per-feature map, so along the feature axis every head is the fixed linear map <code>W_Vʲ W_Oʲ</code> whatever the input.</p>
+
+      <p>This is why the position-wise feedforward sub-layer is not an accessory. <a href="../neural-networks.html">The feedforward page</a>'s whole argument — that depth plus a point-wise non-linearity is what buys the function class — applies to the feature axis, and attention supplies none of it. The standard division of labour is exactly that: <b>attention moves information between positions; the FFN computes with it.</b> Two-thirds to four-fifths of a block's parameters sit in the second job (§08), which is the arithmetic version of the same statement.</p>
+
+      <div class="viz" id="viz-tm">
+        <div class="vhead">
+          <span class="vtitle">Test the linearity directly: <code>f(αx + βy)</code> against <code>αf(x) + βf(y)</code></span>
+          <span class="vhint">stack as many attention layers as you like — with one token the residual stays at round-off; tick the FFN box and it does not</span>
+        </div>
+        <div class="controls">
+          <label>layers L <input type="range" id="tm-L" min="1" max="12" step="1" value="6" /><span id="tm-Lv" style="min-width:16px;display:inline-block">6</span></label>
+          <label>tokens n <input type="range" id="tm-n" min="1" max="12" step="1" value="1" /><span id="tm-nv" style="min-width:16px;display:inline-block">1</span></label>
+          <label>α <input type="range" id="tm-a" min="-2" max="2" step="0.1" value="0.7" /><span id="tm-av" style="min-width:30px;display:inline-block">0.70</span></label>
+          <label><input type="checkbox" id="tm-ffn" /> insert a position-wise FFN after each attention</label>
+          <label>probe <select id="tm-p">
+            <option value="lin" selected>additivity: f(αx+βy) − αf(x) − βf(y)</option>
+            <option value="jac">the Jacobian ∂Y/∂X, block by block</option>
+          </select></label>
+        </div>
+        <svg id="tm-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Left panel, additivity probe: three coloured strips showing the operator applied to a combination of two inputs, the same combination of the operator applied to each input separately, and their difference, together with the relative residual printed. With a single token the residual is at floating-point round-off for any number of stacked attention layers, and inserting a position-wise feedforward sub-layer raises it to order one immediately. With more than one token the residual is non-zero even without the feedforward, because the softmax makes the attention weights depend on the input; a second number separates that contribution by re-running with the weights frozen at their original values, at which point the residual returns to round-off. Left panel, Jacobian probe: the derivative of the output with respect to the input drawn as a block matrix with one block per token pair, showing that the off-diagonal blocks are non-zero — information does move between tokens — and that with the weights frozen every block is the same matrix, which is the section's claim. Right panel: the residual plotted against the number of stacked layers on a logarithmic vertical axis, one line for attention alone and one for attention with the feedforward, so the flat round-off line and the rising line are directly comparable. The readout prints the residual, the residual with the attention weights frozen, the ratio between them, and the rank of the composed feature map."></svg>
+        <div class="readout" aria-live="polite" id="tm-readout"></div>
+      </div>
+
+      <div class="callout"><b>The consequence that gets used.</b> Because the feature-axis map of a head factors through <code>W_Vʲ W_Oʲ</code>, a head's effect on the residual stream is a <b>rank-<code>d_v</code> linear write</b>, and the whole block is a sum of <code>h</code> such writes plus the mixing. That is the structure interpretability work exploits (§33), the structure the rank-collapse theorem of §22 is proved in, and the reason "attention is a communication primitive and the MLP is a computation primitive" is a genuinely accurate slogan rather than a nice-sounding one.</div>
+    </section>
+
+    <!-- ═══ 22 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="rankcollapse" data-nav="Rank collapse with depth">
+      <h3><span class="idx">22</span> What attention cannot do (2): stacked alone, it collapses to one token</h3>
+      <p class="lede">Every row of an attention matrix is a probability distribution, so <code>A</code> is <b>row-stochastic</b>, and applying a row-stochastic matrix is averaging. Compose enough averages and everything becomes the same thing. The rate is startling and it is measurable.</p>
+
+      <div class="formula"><span class="lbl">the quantity, and why it is the right one</span><span class="eq">   res(X)  =  X − 1·x̄ᵀ           x̄ = the column mean, so res removes the
+                                   best rank-1 "every token identical" part
+
+   relative residual  =  ‖res(X)‖ / ‖X‖      1 = tokens fully distinct
+                                             0 = every token identical
+
+Averaging is a contraction towards the mean. A stack of pure attention
+layers is a product of row-stochastic matrices, and the theorem bounds the
+residual DOUBLY exponentially: log(−log r) grows at least linearly in depth,
+not log r. The table below reaches round-off in four layers — too fast to
+resolve the rate, but not slower than the bound: log(−log r) rises by 2.8,
+2.7 and 1.4 over the first three layers before the floor is hit.</span></div>
+
+      <div class="formula"><span class="lbl">measured — 32 tokens, width 64, random weights, mean of 12 seeds</span><span class="eq">  layer   pure attention   + skip      + skip + MLP   + skip + MLP + pre-LN
+      0     9.848e−01       0.984802     0.984802        0.984802
+      1     7.752e−01       0.972985     0.873102        0.875869
+      2     2.624e−02       0.950102     0.755237        0.805865
+      3     3.604e−07       0.911193     0.630624        0.739400
+      4     4.036e−16       0.849324     0.557460        0.703580
+      8     3.265e−16       0.531950     0.311711        0.640612
+     12     3.170e−16       0.301841     0.120049        0.587614
+     16     3.094e−16       0.144001     0.040439        0.575592
+
+  first layer at which the mean pairwise cosine between tokens exceeds 0.99:
+      pure attention              2
+      + skip                      > 16 — never reaches it
+      + skip + MLP               14
+      + skip + MLP + pre-LN       > 16 — never reaches it</span></div>
+
+      <p>Read the first column. <b>Two layers.</b> By layer 2 the relative residual is 2.6%, by layer 3 it is <code>3.6e−07</code>, and by layer 4 it is at double-precision round-off — every one of the 32 tokens has become the same vector, to fifteen decimal places. Nothing was trained; these are random weights, and that is the point: this is what the <i>operation</i> does, before any learning gets a chance to counteract it.</p>
+
+      <h4>The discrepancy worth teaching</h4>
+      <div class="wrong"><span class="say">The usual summary.</span> "Skip connections and MLPs stop the degeneration." <span class="fix">Measured with random weights, the MLP on its own makes it <i>worse</i>, and it is the <b>normalisation</b> that does the work.</span> Compare the columns at layer 12: skip alone is at <code>0.302</code>, skip plus MLP is at <code>0.120</code> — the MLP <i>accelerated</i> the collapse — and skip plus MLP plus pre-LayerNorm is at <code>0.588</code> and has essentially stopped falling. The reason is scale: a residual branch <code>X + f(X)</code> with an untrained ReLU MLP amplifies whatever component is largest, which is the shared mean, whereas pre-normalisation re-standardises each token before every branch and denies the mean that advantage. The theoretical result is a statement about <i>upper bounds</i> under assumptions about the branch's Lipschitz constant; the measurement is about a specific untrained network. Both are right, and the practical lesson is the second: <b>the pre-norm is load-bearing here, not decorative.</b></div>
+
+      <div class="viz" id="viz-rc">
+        <div class="vhead">
+          <span class="vtitle">Rank collapse with depth, and the three things that slow it down</span>
+          <span class="vhint">the token-similarity strip under each curve is the same fact in a different form — watch every row become the same colour</span>
+        </div>
+        <div class="controls">
+          <label>depth <input type="range" id="rc-L" min="1" max="20" step="1" value="8" /><span id="rc-Lv" style="min-width:20px;display:inline-block">8</span></label>
+          <label>tokens n <input type="range" id="rc-n" min="8" max="48" step="4" value="24" /><span id="rc-nv" style="min-width:20px;display:inline-block">24</span></label>
+          <label>seeds averaged <select id="rc-s">
+            <option value="1">1</option><option value="4" selected>4</option><option value="12">12</option>
+          </select></label>
+          <label>wiring <select id="rc-w">
+            <option value="pure">pure attention</option>
+            <option value="skip">+ skip</option>
+            <option value="mlp">+ skip + MLP</option>
+            <option value="ln" selected>+ skip + MLP + pre-LN</option>
+          </select></label>
+        </div>
+        <svg id="rc-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Left panel: the relative residual, the norm of the token matrix after removing its column mean divided by its norm, plotted against depth on a logarithmic vertical axis, with one curve per wiring: pure attention, plus a skip connection, plus a skip and a feedforward branch, and plus a pre-normalisation as well. The pure-attention curve falls off the bottom of the axis within three or four layers, reaching double-precision round-off; the skip curve falls roughly geometrically; the skip-plus-feedforward curve falls faster than the skip curve alone, which is the measured contradiction of the usual summary; and the pre-normalised curve flattens out and stops falling. Right panel: for the selected wiring and depth, the matrix of pairwise cosine similarities between the token representations at that depth, drawn as a heat map, alongside the same matrix at depth zero for comparison; as the depth slider rises the map goes from a diagonal-dominant pattern to uniformly bright, meaning every token has become the same vector. A second small chart plots the mean off-diagonal cosine against depth for all four wirings. The readout prints the relative residual at the selected depth for all four wirings, the mean pairwise cosine, and the first depth at which that cosine exceeds ninety-nine per cent for each."></svg>
+        <div class="readout" aria-live="polite" id="rc-readout"></div>
+      </div>
+
+      <div class="callout"><b>What this does and does not license you to say.</b> It <b>does</b> say that attention has an intrinsic pull towards token uniformity, that the pull is extremely strong when nothing opposes it, and that the residual-plus-normalisation wiring of a real block is what opposes it. It <b>does not</b> say that trained deep transformers collapse in this way — they do not, although a milder version (token representations growing more similar in the later layers) is reported in trained models too. The measurement above uses random weights precisely so that the architectural tendency is visible without the training that counteracts it. The right reading is the same one <a href="../rnns-lstms/vanishing-exploding.html#spectral">the RNN page</a> gave for the spectral radius: this is the thing the architecture must be built to survive, and the wiring is how it survives it.</div>
+    </section>
+
+    <!-- ═══ 23 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="entropy" data-nav="Attention entropy">
+      <h3><span class="idx">23</span> What attention cannot do (3): the entropy of a row, and the two ways it fails</h3>
+      <p class="lede">One number summarises what an attention row is doing: the entropy of its weights. It has an interpretable maximum, an interpretable minimum, and a well-documented pathology at each end — and it is the cheapest diagnostic there is.</p>
+
+      <div class="formula"><span class="lbl">the statistic and its scale</span><span class="eq">   H(α)  =  − ∑ⱼ αᵢⱼ ln αᵢⱼ         in NATS
+
+   maximum   ln n     uniform: the row is reading everything equally
+   minimum   0        one-hot: the row is reading exactly one key
+
+   and the number to actually report:
+
+   effective number of keys read   =   eᴴ(α)        the PERPLEXITY of the row
+
+   eᴴ is in [1, n] and is directly interpretable: "this row is reading
+   about 4.2 of its 512 available keys". Entropy in nats is not.</span></div>
+
+      <div class="cards">
+        <div class="box bad"><div class="n">failure at the low end</div><div class="t">Entropy collapse</div><div class="g">Rows become near one-hot everywhere. The softmax Jacobian goes to zero (§06), so those rows stop learning; the layer becomes a hard, brittle router. Empirically it arrives <b>together with training instability</b> — loss spikes and divergence — and the work that named it reports low entropy as a leading indicator: preventing the collapse removed the instability in their runs.</div></div>
+        <div class="box warn"><div class="n">failure at the high end</div><div class="t">Dilution</div><div class="g">Rows approach uniform. The output is the mean of the values, which carries no positional information at all, and the Jacobian is small again — <code>‖J‖_F ≈ √(1/n)</code>. This is what long context does to a head that has not learned a large enough logit margin (§32).</div></div>
+        <div class="box plain"><div class="n">the healthy middle</div><div class="t">A few keys</div><div class="g">Trained heads are reported to sit mostly at <code>eᴴ</code> between about 1 and a few dozen, largely independent of <code>n</code> — which is what "attending to a handful of relevant tokens" means quantitatively.</div></div>
+      </div>
+
+      <p>The mechanism behind the low-end failure is a positive feedback loop worth stating, because it explains why it is a <i>training</i> phenomenon rather than an initialisation one. A head that finds a useful key gets gradient that increases that key's logit. Larger logits mean lower entropy. Lower entropy means a smaller softmax Jacobian for <i>every other</i> key in that row, so the alternatives stop receiving gradient. The row commits, and having committed it cannot un-commit. Nothing in the objective penalises this — an attention row has no regulariser of its own — so the only brakes are the ones the architecture supplies.</p>
+
+      <table class="grid2">
+        <tr><th style="width:190px">brake</th><th>what it does</th><th>what it costs</th></tr>
+        <tr><td><b>the <code>1/√dₖ</code> scale</b></td><td>starts every row near uniform (§05, §06). Does nothing about drift afterwards.</td><td>nothing</td></tr>
+        <tr><td><b>normalising <code>q</code> and <code>k</code></b> before the dot product</td><td>unit-normalising both (cosine attention) bounds every score in <code>[−1, 1]</code>, so the logit range is fixed by construction and cannot grow, and a learned temperature is then needed to allow sharpness at all; the more common QK-norm (a LayerNorm or RMSNorm on <code>q</code> and <code>k</code>, with learned gains) bounds the score <i>growth</i> instead of the score</td><td>one extra normalisation per head; in the strict form the model can no longer express an arbitrarily confident lookup without moving the temperature</td></tr>
+        <tr><td><b>bounding the weights' spectral norm</b> (a spectral reparameterisation of the linear layers)</td><td>bounds the score magnitude indirectly, by bounding <code>‖W_Q‖·‖W_K‖</code>. Reported to remove the need for learning-rate warmup entirely.</td><td>a power iteration per layer per step</td></tr>
+        <tr class="tot"><td><b>warmup and gradient clipping</b></td><td>keep the early steps small, so the logits do not run away before the representation is worth committing to. This is one reason warmup is near-universal in transformer training.</td><td>a schedule to tune — <a href="../neural-network-training/schedules-precision-memory.html#schedules">the training page</a> owns it</td></tr>
+      </table>
+
+      <div class="viz" id="viz-ec">
+        <div class="vhead">
+          <span class="vtitle">Row entropy: the two ends, the healthy middle, and what the logit scale does to each</span>
+          <span class="vhint">the effective-keys readout is the one to watch — it is the entropy in units a person can check against a sentence</span>
+        </div>
+        <div class="controls">
+          <label>keys n <select id="ec-n">
+            <option value="16">16</option><option value="64" selected>64</option>
+            <option value="512">512</option><option value="4096">4096</option>
+          </select></label>
+          <label>logit scale σ <input type="range" id="ec-s" min="0.05" max="8" step="0.05" value="1" /><span id="ec-sv" style="min-width:32px;display:inline-block">1.00</span></label>
+          <label>signal margin m <input type="range" id="ec-m" min="0" max="14" step="0.5" value="0" /><span id="ec-mv" style="min-width:28px;display:inline-block">0.0</span></label>
+          <label>bounded scores <select id="ec-b">
+            <option value="none" selected>unbounded — q·kᵀ/√dₖ</option>
+            <option value="norm">normalised q and k, temperature 1/τ</option>
+          </select></label>
+        </div>
+        <svg id="ec-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Left panel: entropy of an attention row in nats and the effective number of keys read, both plotted against the logit scale on a logarithmic horizontal axis, with the maximum entropy marked as a horizontal rule at the logarithm of the number of keys and zero marked at the bottom. The entropy falls monotonically from its maximum towards zero as the logit scale rises, and a shaded band marks the region where the softmax Jacobian norm is within a factor of two of its largest achievable value, which is the healthy middle: it is a band, not a point, and it sits at moderate scale. Selecting the bounded-score option flattens the curve, because normalised queries and keys cannot produce a score outside plus or minus the temperature, so at every temperature the entropy has a floor — one key at the top of the range against the rest at the bottom — that the readout states in nats and in effective keys. Right panel: the attention row itself drawn as bars at the current setting, alongside the softmax Jacobian norm plotted against logit scale on the same horizontal axis, which rises from near zero at the uniform end, peaks in the middle and falls to zero at the one-hot end, so that both failures are visible as the two arms of a single curve. Raising the signal margin gives one key an advantage and the row becomes concentrated on it at a much lower logit scale, which shifts both curves left. The readout prints the entropy, the effective number of keys, the largest weight, the Jacobian norm, and where the current setting sits relative to the healthy band."></svg>
+        <div class="readout" aria-live="polite" id="ec-readout"></div>
+      </div>
+    </section>
+
+    <nav class="pager" aria-label="Attention series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="multihead-masking.html">← Multi-Head Attention &amp; Masking</a>
+      <a href="../attention.html" style="color:var(--muted)">Attention · overview</a>
+      <a href="kv-cache-gqa-mla.html">KV Cache, GQA &amp; MLA →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../attention.viz.js"></script>
+</body>
+</html>

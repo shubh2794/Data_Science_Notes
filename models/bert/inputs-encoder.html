@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · BERT: Inputs, WordPiece &amp; Encoder Stack</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../bert.html">BERT</a> · part 1 of 4</p>
+      <h1>BERT: Inputs, WordPiece &amp; Encoder Stack</h1>
+      <p>The network BERT pretrains: how it differs from ELMo and GPT-1, why full bidirectional attention forces a masked objective, the packed [CLS]/[SEP] input summed from token, segment and position embeddings, the 30,522-entry WordPiece vocabulary, the post-LN GELU encoder block, Base and Large, and the parameter count recomputed from the configuration.</p>
+      <div style="margin-top:10px">
+        <span class="pill">BERT</span>
+        <span class="pill">ELMo & GPT-1 · why masking · [CLS]/[SEP] · three embeddings · WordPiece 30,522 · post-LN block · Base/Large · parameter count</span>
+      </div>
+    </header>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="context" data-nav="Before BERT: ELMo and GPT-1">
+      <h3><span class="idx">02</span> Before BERT: ELMo and GPT-1</h3>
+      <p class="lede">The BERT paper positions itself against two 2018 models, and its Appendix A.4 lists the differences explicitly. Both predecessors pretrain a <i>unidirectional</i> language model; they differ in how the result is used.</p>
+
+      <div class="viz" id="viz-context">
+        <div class="vhead">
+          <span class="vtitle">Which input tokens can a position's representation depend on?</span>
+          <span class="vhint">click a token · switch model · counts are computed from each model's connectivity</span>
+        </div>
+        <div class="controls">
+          <label>model <select id="ctx-model"><option value="elmo">ELMo (two separate LSTMs)</option><option value="gpt">GPT-1 (left-to-right Transformer)</option><option value="bert" selected>BERT (bidirectional Transformer)</option></select></label>
+        </div>
+        <svg id="ctx-svg" width="640" height="260" viewBox="0 0 640 260" role="img" aria-label="Receptive field of one token position in ELMo, GPT-1 and BERT"></svg>
+        <div class="readout" aria-live="polite" id="ctx-read"></div>
+        <p class="vcap">ELMo's forward LSTM sees positions 1…i and its backward LSTM sees i…n; the two streams meet only when their top-layer states are concatenated for the downstream model. GPT-1 sees positions 1…i in every layer. BERT sees all n positions in every layer, which the paper calls "jointly conditioned on both left and right context in all layers".</p>
+      </div>
+
+      <h4>ELMo: feature-based, shallowly bidirectional</h4>
+      <ul class="notes">
+        <li>Two-layer <a href="../../deep-learning/rnns-lstms/architectures-seq2seq.html#bidir">biLSTM</a> language model (4096 units, 512-dimensional projections) over a character-CNN input; a forward and a backward LM are trained, sharing only the input and softmax layers.</li>
+        <li>Used as <b>features</b>: a task-specific, softmax-weighted sum of the layers (scaled by a learned <code>γ</code>) is fed into an existing task architecture, which is still designed and trained per task.</li>
+        <li>BERT's criticism: each token's representation is a concatenation of a left-only and a right-only state — "shallow" bidirectionality.</li>
+      </ul>
+
+      <h4>GPT-1: fine-tuning, unidirectional</h4>
+      <ul class="notes">
+        <li>A 12-layer, 768-wide Transformer decoder trained left to right on BooksCorpus, then fine-tuned end to end with a linear head — the same transfer recipe BERT uses. BERT-Base was deliberately sized to match it.</li>
+        <li>Appendix A.4 lists the other differences the authors could not remove: GPT trained on BooksCorpus (800M words) only, BERT on BooksCorpus plus Wikipedia (2,500M words); GPT introduced <code>[SEP]</code> and <code>[CLS]</code> only at fine-tuning, while BERT learns them (and the A/B segment embeddings) during pretraining; GPT used batches of 32,000 words, BERT 128,000 words (both for 1M steps); BERT's Appendix A.4 says GPT used one fine-tuning learning rate, 5e-5, for all tasks (the GPT-1 paper itself reports 6.25e-5 "for most tasks"), while BERT picks one per task on the dev set.</li>
+        <li>Because of those confounds, the paper's claim that bidirectionality causes the gain rests on its own ablation (<a href="pretraining.html#nsp-ablation">§13</a>), which trains a left-to-right model on BERT's data and recipe.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> ELMo gave bidirectional <i>features</i>; GPT-1 gave a <i>fine-tunable</i> Transformer but only left context. BERT's pitch was to have both at once — and that required a new objective, because a bidirectional model cannot be trained as an ordinary language model.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="bidirectional" data-nav="Why bidirectional needs masking">
+      <h3><span class="idx">03</span> Why bidirectional, and why masking is required</h3>
+      <p class="lede">A standard language model predicts each token from the tokens before it. If every position may attend to every other position, the token being predicted is already in the input, and in a multi-layer stack it can reach its own prediction indirectly — the paper's phrase is that each word could "see itself".</p>
+
+      <div class="viz" id="viz-leak">
+        <div class="vhead">
+          <span class="vtitle">Counting the paths by which a target token reaches its own prediction</span>
+          <span class="vhint">change sequence length and depth · toggle the attention pattern and whether the target is masked</span>
+        </div>
+        <div class="controls">
+          <label>n <input type="range" id="lk-n" min="3" max="8" step="1" value="5" /><span id="lk-nv" style="min-width:18px;display:inline-block">5</span></label>
+          <label>layers L <input type="range" id="lk-L" min="1" max="4" step="1" value="2" /><span id="lk-Lv" style="min-width:18px;display:inline-block">2</span></label>
+          <label>attention <select id="lk-att"><option value="full">full (bidirectional)</option><option value="causal">causal (left-to-right)</option></select></label>
+          <label><input type="checkbox" id="lk-mask" checked /> replace the target input with [MASK]</label>
+        </div>
+        <svg id="lk-svg" width="640" height="290" viewBox="0 0 640 290" role="img" aria-label="Layered graph of attention paths from an input token to an output position"></svg>
+        <div class="readout" aria-live="polite" id="lk-read"></div>
+        <p class="vcap">Nodes are positions at each layer; an edge means "may attend to". The count of paths from the target's input to the output that must predict it is computed by dynamic programming over the edges. Under full attention with the target visible there are exactly n^(L−1) routes for L layers, multiplying with depth; masking the input removes the information, not the edges, so the count of paths carrying the answer drops to zero. Under causal attention the prediction for position i is made from position i−1, whose inputs never include position i.</p>
+      </div>
+
+      <h4>Three ways out</h4>
+      <ul class="notes">
+        <li><b>Two unidirectional models</b> (ELMo): valid, but each direction never sees the other inside a layer. The paper calls this "strictly less powerful than a deep bidirectional model" and notes it is twice as expensive and awkward for QA, where a right-to-left model could not condition the answer on the question.</li>
+        <li><b>Causal masking</b> (GPT): valid and dense — every position is a target — but only left context.</li>
+        <li><b>Hide the answer</b> (BERT): corrupt a subset of input positions and predict only those. The answer is absent from the input, so full attention is safe. The price is that only the corrupted ~15% of positions give a loss.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> masking is what makes bidirectional pretraining well-posed. It turns BERT into a denoising model rather than a language model: it cannot score a sentence's probability or sample text left to right, and it gets a training signal from a fraction of positions.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="input" data-nav="Input representation">
+      <h3><span class="idx">04</span> Input representation: [CLS], [SEP] and three embeddings</h3>
+      <p class="lede">One packed sequence carries either a single text or a pair. Every position's input vector is the <b>sum</b> of a token embedding, a segment (A/B) embedding and a learned position embedding, followed by LayerNorm and dropout.</p>
+      <div class="formula"><span class="lbl">position i, token tᵢ, segment sᵢ ∈ {A, B}</span><span class="eq">eᵢ = E_tok[tᵢ] + E_seg[sᵢ] + E_pos[i]        h⁰ᵢ = Dropout( LayerNorm( eᵢ ) )</span>
+<span class="lbl">packing (paper Figure 2)</span><span class="eq">[CLS] my dog is cute [SEP] he likes play ##ing [SEP]
+  A    A   A  A   A     A    B    B     B     B     B</span></div>
+
+      <div class="viz" id="viz-bert-input">
+        <div class="vhead">
+          <span class="vtitle">Three embeddings, summed — with numbers</span>
+          <span class="vhint">hover a column · toy 6-dimensional tables · the sum and LayerNorm are computed live</span>
+        </div>
+        <div class="controls">
+          <label>example
+            <select id="bert-input-sel">
+              <option value="0">single sentence</option>
+              <option value="1" selected>sentence pair (paper Figure 2)</option>
+            </select>
+          </label>
+        </div>
+        <svg id="bert-input-svg" width="640" height="330" viewBox="0 0 640 330" role="img" aria-label="Token, segment and position embeddings summed into the input vector, then layer-normalised"></svg>
+        <div class="readout" aria-live="polite" id="bert-input-read"></div>
+        <p class="vcap">The three tables are random toy vectors (seeded, so they are stable), six dimensions instead of 768. What is real is the structure: the token row depends only on the token, the segment row only on A/B (the same vector for every token of a segment), the position row only on the index. The readout recomputes the sum and its LayerNorm (mean 0, variance 1 before the learned scale and shift) for the hovered column.</p>
+      </div>
+
+      <h4>The special tokens</h4>
+      <ul class="notes">
+        <li><code>[CLS]</code> is always first. Its final hidden state, written <code>C ∈ ℝᴴ</code>, is the "aggregate sequence representation" used for classification. The paper warns in a footnote that <code>C</code> "is not a meaningful sentence representation without fine-tuning, since it was trained with NSP".</li>
+        <li><code>[SEP]</code> ends each segment. A pair is <code>[CLS] A [SEP] B [SEP]</code>; a single text is <code>[CLS] A [SEP]</code>. <code>[PAD]</code> fills a batch and is excluded by the attention mask; <code>[MASK]</code> exists only for pretraining; <code>[UNK]</code> replaces any word that cannot be built from vocabulary pieces.</li>
+        <li>A "sentence" in the paper is "an arbitrary span of contiguous text, rather than an actual linguistic sentence"; in pretraining the two segments are typically much longer than single sentences.</li>
+      </ul>
+
+      <h4>Segments and positions</h4>
+      <ul class="notes">
+        <li>The segment table has two rows (<code>type_vocab_size = 2</code>): row 0 for A, row 1 for B. That is how one encoder handles pairs without a second stack; in the Transformers library it is the <code>token_type_ids</code> input.</li>
+        <li>The position table is <b>learned</b>, <code>512 × H</code>. There is no row 512, so 512 tokens is a hard ceiling for the released checkpoints (<a href="../../deep-learning/transformers/positional-encodings.html#learned">Transformers — learned positions</a>). The paper trains rows beyond 128 only in the last 10% of steps (<a href="pretraining.html#data">§14</a>).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> summing keeps the width at <code>H</code>; "which token", "which segment" and "where" are blended into one vector from layer one. The segment embedding and learned <code>[CLS]</code>/<code>[SEP]</code> are part of what BERT pretrains that GPT-1 did not.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="wordpiece" data-nav="WordPiece and the 30,522 vocabulary">
+      <h3><span class="idx">05</span> WordPiece and the 30,522-entry vocabulary</h3>
+      <p class="lede">BERT's tokeniser runs in two stages: a "basic" pre-tokeniser (optional lower-casing and accent stripping, splitting on whitespace and punctuation, and isolating CJK characters), then <b>WordPiece</b>, which splits each word greedily into the longest prefixes found in the vocabulary. Non-initial pieces carry a <code>##</code> prefix.</p>
+
+      <div class="viz" id="viz-wp">
+        <div class="vhead">
+          <span class="vtitle">Greedy longest-match-first WordPiece on a toy vocabulary</span>
+          <span class="vhint">pick a word · each line is one vocabulary lookup · the search shrinks the candidate from the right</span>
+        </div>
+        <div class="controls">
+          <label>word <select id="wp-word">
+            <option value="unaffable" selected>unaffable</option>
+            <option value="playing">playing</option>
+            <option value="hairy">hairy</option>
+            <option value="flightless">flightless</option>
+            <option value="embeddings">embeddings</option>
+            <option value="naïve">naïve (after accent stripping)</option>
+            <option value="qzx">qzx (no path)</option>
+          </select></label>
+        </div>
+        <svg id="wp-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Step-by-step greedy longest-match WordPiece tokenisation of one word"></svg>
+        <div class="readout" aria-live="polite" id="wp-read"></div>
+        <p class="vcap">The toy vocabulary is listed in the figure; the algorithm is the one in the released tokenizer: start at the word's first character, take the longest vocabulary entry that matches (with <code>##</code> prepended when not at the start), advance, repeat. If some remainder has no match at all, the <b>whole word</b> becomes <code>[UNK]</code> — not just the failing piece. "unaffable → un ##aff ##able" is the example in the released code's docstring.</p>
+      </div>
+
+      <h4>What the numbers are</h4>
+      <table class="cmp">
+        <tr><th>Checkpoint family</th><th>Vocabulary entries</th><th>Casing</th></tr>
+        <tr><td>English uncased (Base and Large)</td><td>30,522</td><td>lower-cased, accents stripped</td></tr>
+        <tr><td>English cased</td><td>28,996</td><td>case and accents kept</td></tr>
+        <tr><td>Multilingual cased (104 languages)</td><td>119,547</td><td>case kept</td></tr>
+      </table>
+      <ul class="notes">
+        <li>The paper says "a 30,000 token vocabulary"; the released uncased vocabulary file has 30,522 lines, which is also the Transformers library's default <code>vocab_size</code>. The file includes the five special tokens, about a thousand <code>[unused…]</code> placeholder rows reserved for users' own tokens, and single characters, so "30,000" is the target size rather than the file's length. See <a href="../bert.html#paper-vs-code">§32</a>.</li>
+        <li>WordPiece chooses merges by a likelihood criterion rather than raw pair frequency (as BPE does) — the training-side difference is covered in <a href="../../nlp/tokenization.html#wordpiece-unigram">Tokenization — WordPiece and Unigram</a>. At inference the released tokenizer only needs the vocabulary list and the greedy rule above.</li>
+        <li>MLM masking is applied <b>after</b> WordPiece, per piece: the paper says "no special consideration given to partial word pieces". A later code release added <b>whole-word masking</b> (<a href="pretraining.html#masking-code">§11</a>).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> about 30k pieces, <code>##</code> for continuations, greedy longest match, and a whole-word <code>[UNK]</code> fallback. Cased and uncased checkpoints have different vocabularies — the tokenizer and the checkpoint must match.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="architecture" data-nav="The encoder block">
+      <h3><span class="idx">06</span> The encoder block as BERT uses it</h3>
+      <p class="lede">The paper omits "an exhaustive background description" and points to the original Transformer; the details below are what the released code and configuration implement. It is the original post-LN encoder block with GELU in place of ReLU and learned positions in place of sinusoids.</p>
+      <div class="formula"><span class="lbl">one block, post-LN (the residual sum is normalised)</span><span class="eq">a  = LayerNorm( h + Dropout( MultiHead(h) ) )
+h′ = LayerNorm( a + Dropout( W₂ · GELU( W₁·a + b₁ ) + b₂ ) )</span>
+<span class="lbl">attention with a padding mask only</span><span class="eq">Attn(Q, K, V) = softmax( QKᵀ/√dₖ + M_pad ) V      dₖ = H/A = 64 for both sizes</span>
+<span class="lbl">feed-forward width (paper footnote 3)</span><span class="eq">d_ff = 4H :  3072 for H = 768,  4096 for H = 1024</span></div>
+
+      <h4>Component by component</h4>
+      <table class="cmp">
+        <tr><th>Component</th><th>BERT</th><th>Note</th></tr>
+        <tr><td>Attention mask</td><td>none except padding</td><td>every token attends to every non-pad token in every layer</td></tr>
+        <tr><td>Norm placement</td><td>post-LN, ε = 1e-12</td><td>as in the original Transformer; GPT-2 onward moved to pre-LN</td></tr>
+        <tr><td>Activation</td><td>GELU</td><td>the paper: "rather than the standard relu, following OpenAI GPT"; the original code used the tanh approximation (<a href="../bert.html#paper-vs-code">§32</a>)</td></tr>
+        <tr><td>Positions</td><td>learned, 512 rows</td><td>absolute; no extrapolation</td></tr>
+        <tr><td>Dropout</td><td>0.1 on all layers and on attention probabilities</td><td>kept at 0.1 for fine-tuning</td></tr>
+        <tr><td>Initialisation</td><td>truncated normal, std 0.02</td><td><code>initializer_range</code> in the config</td></tr>
+        <tr><td>Pooler</td><td><code>tanh(W_p · h_[CLS] + b_p)</code></td><td>not in the paper's text; trained by NSP; used by the classification heads (<a href="fine-tuning-results.html#pooler">§16</a>)</td></tr>
+        <tr><td>Output (MLM head)</td><td>dense H→H, GELU, LayerNorm, then the <b>tied</b> token-embedding matrix plus a per-token bias</td><td>tying means the vocabulary projection adds only V biases</td></tr>
+      </table>
+      <h4>Why post-LN mattered little here</h4>
+      <ul class="notes">
+        <li>At 12 and 24 layers, post-LN trains stably with the 10,000-step learning-rate warm-up BERT used. The general argument about post-LN needing warm-up at depth is in <a href="../../deep-learning/transformers/residual-norms-ffn.html#prepost">Transformers — pre-norm against post-norm</a>.</li>
+        <li>Later encoders changed this block (ModernBERT: pre-norm, GeGLU, rotary positions, no biases in most layers — <a href="successors-practice.html#successors">§26</a>), which is one reason weights cannot be moved between the two families.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> nothing in the BERT block is new. Post-LN, GELU, learned absolute positions, a 4× FFN and a tied output layer were all conventional by late 2018; the "B" in BERT is entirely the absence of the causal mask.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="configs" data-nav="Base and Large configurations">
+      <h3><span class="idx">07</span> Base and Large, and the released family</h3>
+      <p class="lede">The paper reports two sizes. BERT-Base was chosen "to have the same model size as OpenAI GPT for comparison purposes"; BERT-Large was larger than the largest Transformer the authors report finding in the literature, a 235M-parameter, 64-layer character-level model.</p>
+      <table class="cmp">
+        <tr><th>Model</th><th>L (layers)</th><th>H (hidden)</th><th>A (heads)</th><th>d_head</th><th>d_ff</th><th>Params (paper)</th><th>Params (recomputed, <a href="#params">§08</a>)</th></tr>
+        <tr><td>BERT-Base</td><td>12</td><td>768</td><td>12</td><td>64</td><td>3072</td><td>110M</td><td>109.48M</td></tr>
+        <tr><td>BERT-Large</td><td>24</td><td>1024</td><td>16</td><td>64</td><td>4096</td><td>340M</td><td>335.14M</td></tr>
+      </table>
+      <h4>The rest of the released family</h4>
+      <ul class="notes">
+        <li><b>Cased and uncased</b> versions of both sizes, and <b>whole-word-masking</b> versions of Large (<a href="pretraining.html#masking-code">§11</a>); a multilingual cased Base covering 104 languages and a Chinese Base.</li>
+        <li><b>24 smaller models</b> from "Well-Read Students Learn Better" (arXiv 1908.08962), with L ∈ {2, 4, 6, 8, 10, 12} and H ∈ {128, 256, 512, 768}, heads = H/64. Four have names: BERT-Tiny (2/128), Mini (4/256), Small (4/512) and Medium (8/512). They are in the parameter calculator below.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> remember two rows — 12/768/12 and 24/1024/16 — and that the head dimension is 64 in both. The paper's 110M and 340M are rounded; the released configurations give 109.5M and 335.1M.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="params" data-nav="Counting the parameters">
+      <h3><span class="idx">08</span> Counting the parameters from the configuration</h3>
+      <p class="lede">Every weight in <code>BertModel</code> follows from six configuration fields: <code>vocab_size</code> V = 30,522, <code>hidden_size</code> H, <code>num_hidden_layers</code> L, <code>intermediate_size</code> I = 4H, <code>max_position_embeddings</code> P = 512 and <code>type_vocab_size</code> T = 2. Head count does not change the total.</p>
+      <div class="formula"><span class="lbl">embeddings (three tables + LayerNorm)</span><span class="eq">V·H + P·H + T·H + 2H</span>
+<span class="lbl">one encoder layer</span><span class="eq">Q, K, V, O          4·(H² + H)
+attention LayerNorm  2H
+FFN  H→I→H           2·H·I + I + H
+output LayerNorm     2H
+layer total (I = 4H) 12H² + 13H</span>
+<span class="lbl">pooler, and the pretraining heads (not in BertModel's encoder)</span><span class="eq">pooler  H² + H        MLM head  H² + H + 2H + V (tied decoder)        NSP  2H + 2</span></div>
+
+      <h4>BERT-Base, worked</h4>
+      <table class="cmp">
+        <tr><th>Part</th><th>Arithmetic</th><th>Parameters</th></tr>
+        <tr><td>token embeddings</td><td>30,522 × 768</td><td>23,440,896</td></tr>
+        <tr><td>positions + segments + LN</td><td>512 × 768 + 2 × 768 + 2 × 768</td><td>396,288</td></tr>
+        <tr><td>12 layers</td><td>12 × (12 × 768² + 13 × 768) = 12 × 7,087,872</td><td>85,054,464</td></tr>
+        <tr><td>pooler</td><td>768² + 768</td><td>590,592</td></tr>
+        <tr><td colspan="2"><b>BertModel total</b></td><td><b>109,482,240</b></td></tr>
+      </table>
+      <ul class="notes">
+        <li>BERT-Large by the same formula: 31,782,912 (embeddings) + 24 × 12,596,224 (layers) + 1,049,600 (pooler) = <b>335,141,888</b>. The paper's "340M" is about 1.4% above it.</li>
+        <li>Without the pooler the counts are 108,891,648 and 334,092,288 — exactly the "108M" and "334M" that the ALBERT paper lists for BERT-Base and BERT-Large.</li>
+        <li>Embeddings are 21.8% of Base; the non-embedding part is almost exactly <code>12·L·H²</code> (84.93M of 85.05M).</li>
+      </ul>
+
+      <div class="viz" id="viz-params">
+        <div class="vhead">
+          <span class="vtitle">Parameter calculator for BERT-style encoders</span>
+          <span class="vhint">pick a preset or drag the sliders · every number is recomputed from the formula above</span>
+        </div>
+        <div class="controls">
+          <label>preset <select id="bp-preset">
+            <option value="tiny">BERT-Tiny (2/128)</option>
+            <option value="mini">BERT-Mini (4/256)</option>
+            <option value="small">BERT-Small (4/512)</option>
+            <option value="medium">BERT-Medium (8/512)</option>
+            <option value="base" selected>BERT-Base</option>
+            <option value="large">BERT-Large</option>
+            <option value="distil">DistilBERT (6 layers, no segments, no pooler)</option>
+            <option value="mbert">Multilingual BERT-Base</option>
+          </select></label>
+          <label>L <input type="range" id="bp-L" min="1" max="48" step="1" value="12" /><span id="bp-Lv" style="min-width:22px;display:inline-block">12</span></label>
+          <label>H <input type="range" id="bp-H" min="64" max="2048" step="64" value="768" /><span id="bp-Hv" style="min-width:36px;display:inline-block">768</span></label>
+          <label>V <input type="range" id="bp-V" min="1000" max="250000" step="1" value="30522" /><span id="bp-Vv" style="min-width:50px;display:inline-block">30522</span></label>
+          <label><input type="checkbox" id="bp-pool" checked /> pooler</label>
+          <label><input type="checkbox" id="bp-mlm" /> + MLM &amp; NSP heads</label>
+        </div>
+        <svg id="bp-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Stacked bar breakdown of BERT parameters into embeddings, attention, feed-forward, norms, pooler and heads"></svg>
+        <div class="readout" aria-live="polite" id="bp-read"></div>
+        <p class="vcap">The intermediate size is held at 4H and the position table at 512 rows, as in every released BERT configuration. The DistilBERT preset removes the segment table and the pooler, as its paper describes; its computed 66.36M matches the 66M in DistilBERT's Table 3. The multilingual preset uses its 119,547-entry vocabulary, which is why it is about 68M larger than the English Base.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> <code>12·L·H² + V·H</code> gets within a percent of any BERT; the exact count needs the biases, LayerNorms, the 512 positions, the 2 segments and the pooler. When a paper's number disagrees by a few million, check whether it included the pooler and the pretraining heads.</div>
+    </section>
+
+    <nav class="pager" aria-label="BERT series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../bert.html">← BERT · overview</a>
+      <a href="../bert.html" style="color:var(--muted)">BERT · overview</a>
+      <a href="pretraining.html">BERT: Masked-LM &amp; NSP Pretraining →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../bert.viz.js"></script>
+</body>
+</html>

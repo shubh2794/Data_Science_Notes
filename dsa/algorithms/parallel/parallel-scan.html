@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Parallel Prefix Sums &amp; Scan</title>
+<script src="../../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../parallel.html">Parallel Algorithms</a> · part 4 of 5</p>
+      <h1>Parallel Prefix Sums &amp; Scan</h1>
+      <p>Prefix sums as the primitive behind parallel data movement, the naive doubling scan with Θ(log n) span but Θ(n log n) work, the work-efficient up-sweep and down-sweep scan that keeps Θ(n) work, and what scan unlocks: stream compaction, partition, radix sort and segmented scan.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Parallel Algorithms</span>
+        <span class="pill">Prefix sums · naive Θ(n log n) scan · up-sweep · down-sweep · compaction · partition · radix sort</span>
+      </div>
+    </header>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="prefix-sums" data-nav="Prefix sums (scan)">
+      <h3><span class="idx">14</span> Prefix sums (scan), and the naive parallel scan</h3>
+      <p class="lede"><b>The prefix sum, or scan, of <code>x₀, x₁, …, x_{n−1}</code> under an associative operator <code>⊕</code> is the sequence of running totals. Serially it is a single loop of <code>n − 1</code> additions, each depending on the one before — a chain with span <code>n − 1</code>, apparently the least parallel computation there is. It turns out to be parallelisable to logarithmic span with linear work, and it is the most useful parallel primitive after reduction: an enormous range of apparently serial computations are scans in disguise (§16).</b></p>
+
+      <div class="formula"><span class="lbl">definitions</span><span class="eq">INCLUSIVE scan   yᵢ = x₀ ⊕ x₁ ⊕ … ⊕ xᵢ            [3, 1, 7, 0, 4]  →  [3, 4, 11, 11, 15]
+EXCLUSIVE scan   yᵢ = x₀ ⊕ … ⊕ x_{i−1},  y₀ = e    [3, 1, 7, 0, 4]  →  [0, 3, 4, 11, 11]     (e = identity of ⊕)
+requirement      ⊕ associative.  Commutativity is NOT needed; an identity only for the exclusive form.</span>
+<span class="lbl">the naive parallel scan: log n rounds of "add the value 2ᵈ to my left"</span><span class="eq">for d = 0, 1, …, ⌈log₂ n⌉ − 1:
+    parallel for i = 0 to n − 1:
+        if i ≥ 2ᵈ:  x'[i] = x[i − 2ᵈ] ⊕ x[i]   else  x'[i] = x[i]
+    x = x'
+invariant after round d:  x[i] = sum of the (up to) 2ᵈ⁺¹ elements ending at i
+
+PRAM steps   ⌈log₂ n⌉ rounds
+additions    Σ_d (n − 2ᵈ) = n·log₂ n − n + 1   for n a power of two      → WORK Θ(n log n)
+fork-join    each round is a parallel for, span Θ(log n)                  → SPAN Θ(log² n)</span></div>
+
+      <p>The naive scan has the right span on a PRAM and the wrong work. It performs <code>Θ(n log n)</code> additions where the serial loop needs <code>n − 1</code>, so on <code>p</code> processors its time is <code>Θ((n log n)/p + log n)</code> against the serial <code>Θ(n)</code>: it only beats the serial loop when <code>p &gt; log n</code>, and on a machine with fewer processors than that it is strictly slower. That is the definition of not work-efficient, and it is exactly the kind of algorithm §06 warned against. Its virtue is that each round is perfectly regular — every element does the same thing — which is why it is still used within a GPU warp, where 32 lanes execute in lockstep anyway and idle lanes cost nothing extra.</p>
+
+      <div class="callout"><b>Double buffering is part of the algorithm.</b> The round must read the <i>old</i> <code>x[i − 2ᵈ]</code>, not a value another strand has already updated in this round. Writing in place is a determinacy race in the sense of §12: whether <code>x[i − 2ᵈ]</code> has been overwritten depends on the schedule. The <code>x'</code> buffer makes each round's reads and writes disjoint.</div>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="work-efficient-scan" data-nav="Work-efficient scan">
+      <h3><span class="idx">15</span> The work-efficient scan: up-sweep and down-sweep</h3>
+      <p class="lede"><b>The work-efficient scan does <code>2(n − 1)</code> additions — twice the serial count, a constant factor — in <code>2·log₂ n</code> parallel rounds. It runs a reduction up a balanced binary tree (the <i>up-sweep</i>), keeping the partial sums at internal nodes, and then pushes prefixes back down the same tree (the <i>down-sweep</i>): each node passes its incoming prefix to its left child unchanged and passes "prefix ⊕ left child's sum" to its right child.</b></p>
+
+      <div class="formula"><span class="lbl">in-place on an array, n a power of two</span><span class="eq">UP-SWEEP     for d = 1, 2, 4, …, n/2:
+                parallel for k = 0, 2d, 4d, … &lt; n:
+                    x[k + 2d − 1] = x[k + d − 1] ⊕ x[k + 2d − 1]           ▸ right child ← left + right
+             now x[n − 1] holds the total, and every x[k + 2d − 1] a subtree sum
+
+CLEAR        x[n − 1] = e                                                   ▸ the root's prefix is empty
+
+DOWN-SWEEP   for d = n/2, …, 2, 1:
+                parallel for k = 0, 2d, 4d, … &lt; n:
+                    t = x[k + d − 1]
+                    x[k + d − 1]  = x[k + 2d − 1]                          ▸ left child gets the parent's prefix
+                    x[k + 2d − 1] = t ⊕ x[k + 2d − 1]                      ▸ right child gets prefix ⊕ left sum
+             now x holds the EXCLUSIVE scan</span>
+<span class="lbl">cost</span><span class="eq">additions     (n − 1) up + (n − 1) down = 2(n − 1)       → WORK Θ(n)   — work-efficient
+PRAM steps    2·log₂ n rounds                                → Θ(log n)
+fork-join     written recursively (up: spawn both halves, add; down: spawn both halves with their prefixes)
+              T₁(n) = 2T₁(n/2) + Θ(1) = Θ(n)      T∞(n) = T∞(n/2) + Θ(1) = Θ(log n)
+              — written as 2 log n parallel-for rounds instead, the span picks up the loop's log: Θ(log² n)</span></div>
+
+      <p>Step through the figure and watch both phases. In the up-sweep each round halves the number of active additions — <code>n/2</code>, <code>n/4</code>, …, 1 — so the total is <code>n − 1</code>, exactly the additions of a reduction tree. The clear step saves the total and zeroes the root. The down-sweep reverses the pattern, and each round's teal arrows copy a parent prefix down to a left child while the amber arrows add the left child's saved subtree sum into the right child. Switch to the naive algorithm to compare: fewer rounds, but every round touches almost every element, and the addition counter runs away from <code>n − 1</code>.</p>
+
+      <div class="viz" id="viz-scan">
+        <div class="vhead">
+          <span class="vtitle">The scan, round by round: work-efficient up-sweep / down-sweep against the naive rounds</span>
+          <span class="vhint">each frame is one parallel round — every arrow in it happens at the same time. Additions and rounds are counted as the real routine runs; the last frame checks the result against a serial scan</span>
+        </div>
+        <div class="controls">
+          <label for="scan-alg">algorithm</label>
+          <select id="scan-alg">
+            <option value="eff" selected>work-efficient (up-sweep / down-sweep), exclusive</option>
+            <option value="naive">naive (log n rounds), inclusive</option>
+          </select>
+          <label for="scan-n">n</label>
+          <select id="scan-n">
+            <option value="8" selected>8</option>
+            <option value="16">16</option>
+          </select>
+        </div>
+        <svg id="scan-svg" width="700" height="300" viewBox="0 0 700 300" role="img" aria-label="An array before and after one parallel round of a prefix-sum algorithm, with arrows from each source element to the element it updates; amber arrows add, teal arrows copy"></svg>
+        <div class="readout" id="scan-readout" aria-live="polite"></div>
+      </div>
+
+      <p>Why is it correct? After the up-sweep, the cell for each tree node holds the sum of that node's leaves. The down-sweep maintains the invariant <i>"the cell for node v holds the sum of all leaves to the left of v's subtree"</i>: true at the root, whose prefix is empty; and preserved going down, because a left child has the same leaves to its left as its parent, and a right child has those plus the whole left sibling. At the leaves the invariant is the definition of the exclusive scan. Getting the inclusive scan costs one more parallel step, <code>yᵢ = scanᵢ ⊕ xᵢ</code>.</p>
+
+      <div class="callout"><b>For more than a handful of processors, block it.</b> With <code>p ≪ n</code> the best practical scan is three phases: each processor scans its own block of <code>n/p</code> elements serially; the <code>p</code> block totals are scanned (by the tree, or serially if <code>p</code> is small); each processor adds its block's offset to its elements. Work <code>≈ 2n</code>, time <code>Θ(n/p + log p)</code>. This is Brent's trade from §02 again, and it is how library scans on CPUs and GPUs are organised, with the in-block step itself a warp-level scan on a GPU.</div>
+    </section>
+
+    <!-- ═══ 16 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="scan-applications" data-nav="What scan unlocks">
+      <h3><span class="idx">16</span> What scan unlocks: compaction, partition, radix sort and more</h3>
+      <p class="lede"><b>A scan turns "each element needs to know where it goes" into a parallel computation: if each element computes a count of how many slots it will occupy, the exclusive scan of those counts is exactly each element's output offset. That one idea parallelises filtering, partitioning, sorting by digits, allocating variable-sized outputs, and building sparse structures — all at <code>Θ(n)</code> work and <code>Θ(log n)</code> span.</b></p>
+
+      <div class="formula"><span class="lbl">stream compaction — keep the elements satisfying a predicate, in order</span><span class="eq">input        x    = [ 5, 8, 2, 9, 4, 7, 6, 1 ]         keep if even
+flags        f    = [ 0, 1, 1, 0, 1, 0, 1, 0 ]         parallel map          Θ(n) work, Θ(log n) span
+offsets      s    = exclusive-scan(f)
+                  = [ 0, 0, 1, 2, 2, 3, 3, 4 ]         scan                  Θ(n) work, Θ(log n) span
+scatter      if fᵢ = 1:  out[sᵢ] = xᵢ                   parallel map          out = [8, 2, 4, 6]
+size         s_{n−1} + f_{n−1} = 4                      no two writes collide, so no race</span>
+<span class="lbl">parallel partition and one pass of radix sort</span><span class="eq">SPLIT by a bit (or by "&lt; pivot"):
+   zeros go first, in order:    position = exclusive-scan(1 − b)ᵢ
+   ones go after them, in order: position = (#zeros) + exclusive-scan(b)ᵢ
+   → a STABLE partition in Θ(n) work, Θ(log n) span
+LSD radix sort on k-bit keys = k stable splits                     → Θ(k·n) work, Θ(k·log n) span
+QUICKSORT with a parallel partition: Θ(n log n) expected work, Θ(log² n) expected span</span></div>
+
+      <p>The radix-sort line is why scan matters for sorting on GPUs: <a href="../sorting-searching/heapsort-linear-library.html#radix-sort">LSD radix sort</a> needs each pass to be a <i>stable</i> distribution by one digit, and a split by scan is stable by construction, because the offsets preserve the input order within each bucket. With <code>r</code>-bit digits instead of single bits, each pass becomes a histogram and a scan over <code>2ʳ</code> buckets per block, which is the structure of the fastest known GPU sorts. The quicksort line is the same partition step with a pivot comparison as the predicate: the recursion depth is <code>Θ(log n)</code> in expectation and each level's partition has span <code>Θ(log n)</code>, so the expected span is <code>Θ(log² n)</code>.</p>
+
+      <p>The pattern generalises well beyond sorting. <b>Segmented scan</b> — a scan that restarts at flagged segment boundaries, itself a scan under a cleverly defined associative operator on (flag, value) pairs — runs many independent scans in one pass, which is how sparse matrix–vector products and per-row operations are parallelised over irregular data. <b>Allocation</b>: when each of <code>n</code> tasks produces a variable number of outputs, a scan of the output counts gives each task its slice of one shared output buffer, with no locking. <b>Linear recurrences</b> <code>yᵢ = aᵢ·y_{i−1} + bᵢ</code> are a scan under the associative composition of affine maps, which is how state-space sequence models evaluate a length-<code>n</code> recurrence in logarithmic span during training.</p>
+
+      <div class="callout"><b>Recognising a scan.</b> If a serial loop carries one accumulator from iteration to iteration, and the update is "combine the accumulator with something from this iteration" under an operation you can show is associative — addition, max, min, matrix product, composition of affine or linear maps, the carry logic of binary addition — the loop is a scan and has logarithmic span. If the update does something non-associative with the accumulator (a data-dependent branch that changes <i>which</i> operation applies, say), it may not be.</div>
+    </section>
+
+    <nav class="pager" aria-label="Parallel Algorithms series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="span-races-synchronisation.html">← Span Recurrences, Races &amp; Synchronisation</a>
+      <a href="../parallel.html" style="color:var(--muted)">Parallel Algorithms · overview</a>
+      <a href="sort-matrix-mapreduce-bfs.html">Parallel Merge Sort, Matrix Multiply &amp; BFS →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../../data.js"></script>
+<script src="../../../notes.js"></script>
+<script src="../../dsa-viz.js"></script>
+<script src="../parallel.viz.js"></script>
+</body>
+</html>

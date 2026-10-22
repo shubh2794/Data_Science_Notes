@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · GPT: Decoder Block, Configs &amp; Training Data</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../gpt.html">GPT</a> · part 2 of 4</p>
+      <h1>GPT: Decoder Block, Configs &amp; Training Data</h1>
+      <p>The network and what it costs: the decoder block without cross-attention, GPT-2's move to pre-LN with a scaled residual initialisation, byte-pair tokenisation across generations, every published configuration, parameter counts from 12·L·d² + V·d, compute from 2N and 6ND FLOPs, and each generation's training-data mixture.</p>
+      <div style="margin-top:10px">
+        <span class="pill">GPT</span>
+        <span class="pill">Decoder block · post-LN → pre-LN · scaled residual init · BPE across generations · 13 configurations · 12·L·d² + V·d · 6ND · data mixtures</span>
+      </div>
+    </header>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="block" data-nav="The decoder block GPT uses">
+      <h3><span class="idx">08</span> The decoder block as GPT uses it</h3>
+      <p class="lede">A GPT block is the original Transformer decoder block with the cross-attention sub-layer deleted: masked multi-head self-attention, then a two-layer feed-forward network, each wrapped in a residual connection and a LayerNorm. The details below are what the GPT papers state; where a later paper only says it "largely follows" or uses "the same model and architecture" as its predecessor, the entry is inherited, and weight tying for GPT-2 is confirmed by its released checkpoints rather than its text.</p>
+      <div class="formula"><span class="lbl">embedding (GPT-1 eq. 2; tied output matrix)</span><span class="eq">h₀ = U·W_e + W_p        P(u) = softmax( h_L · W_eᵀ )</span>
+<span class="lbl">one block, pre-LN form used from GPT-2 on</span><span class="eq">a = h + Attn_causal( LN₁(h) )
+h′ = a + W₂ · GELU( W₁ · LN₂(a) + b₁ ) + b₂</span>
+<span class="lbl">feed-forward width, all three generations</span><span class="eq">d_ff = 4 · d_model      (GPT-1: 768 → 3072)</span></div>
+
+      <h4>Components, as stated in the papers (or inherited by their "same architecture" statements)</h4>
+      <table class="cmp">
+        <tr><th>Component</th><th>GPT-1</th><th>GPT-2</th><th>GPT-3</th></tr>
+        <tr><td>Attention</td><td>masked multi-head, 12 heads</td><td>masked multi-head</td><td>alternating dense and locally banded sparse layers</td></tr>
+        <tr><td>Norm placement</td><td>post-LN (follows the original Transformer)</td><td>pre-LN + a final LN before the output</td><td>as GPT-2</td></tr>
+        <tr><td>Activation</td><td>GELU</td><td>GELU</td><td>GELU</td></tr>
+        <tr><td>Positions</td><td>learned, 512 rows</td><td>learned, 1024 rows</td><td>learned, 2048 rows</td></tr>
+        <tr><td>Output layer</td><td>tied to token embeddings (<code>W_eᵀ</code>)</td><td>tied</td><td>tied</td></tr>
+        <tr><td>Initialisation</td><td><code>N(0, 0.02)</code></td><td>residual projections scaled by <code>1/√N</code></td><td>as GPT-2</td></tr>
+        <tr><td>Regularisation</td><td>dropout 0.1 (residual, embedding, attention); modified L2, w = 0.01</td><td>not stated in the paper</td><td>weight decay 0.1</td></tr>
+      </table>
+
+      <h4>Three choices worth understanding</h4>
+      <ul class="notes">
+        <li><b>GELU</b> (<code>x · Φ(x)</code>, with <code>Φ</code> the standard normal CDF) replaced the original ReLU. It is smooth near zero and lets small negative inputs through with a small negative output. GPT-1 was an early large-scale adopter (BERT, released months later, also used it); later families moved to gated variants (see <a href="../../deep-learning/transformers/residual-norms-ffn.html#gated">Transformers — activations and gated units</a>).</li>
+        <li><b>Learned absolute positions.</b> GPT-1 explicitly chose "learned position embeddings instead of the sinusoidal version". The table has one row per position, so the context length is a hard ceiling: GPT-2 cannot attend to position 1025 because row 1025 does not exist. Rotary and relative schemes, which later decoders adopted, are covered in <a href="../../deep-learning/transformers/positional-encodings.html#positional">Transformers — positional encoding</a>.</li>
+        <li><b>Weight tying.</b> The output projection reuses the input embedding matrix transposed. For GPT-2 small that saves <code>50,257 × 768 ≈ 38.6M</code> parameters — about 31% of the model — and couples "what a token means as input" to "what it takes to predict it as output".</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> nothing in the GPT block is exotic. Its specific choices — GELU, learned positions, tied output, 4× FFN — were shared with BERT and became common defaults by 2019. The consequential change inside the block across generations was where the LayerNorm sits.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="prepost" data-nav="Post-LN to pre-LN">
+      <h3><span class="idx">09</span> Post-LN to pre-LN, and the scaled residual init</h3>
+      <p class="lede">GPT-2's paper lists its architecture changes in three sentences: LayerNorm moved to the input of each sub-block, one extra LayerNorm after the final block, and residual-layer weights scaled at initialisation by <code>1/√N</code>. Together they are widely credited with making the 48-layer GPT-2 and the 96-layer GPT-3 stacks train stably.</p>
+
+      <div class="viz" id="viz-ln">
+        <div class="vhead">
+          <span class="vtitle">Where the LayerNorm sits — and what the residual stream does with depth</span>
+          <span class="vhint">toggle placement · slide depth · the growth curve is computed from a random-sum model</span>
+        </div>
+        <div class="controls">
+          <label>placement <select id="ln-mode"><option value="pre">pre-LN (GPT-2, GPT-3)</option><option value="post">post-LN (GPT-1)</option></select></label>
+          <label>blocks L <input type="range" id="ln-L" min="4" max="96" step="4" value="48" /><span id="ln-Lv" style="min-width:24px;display:inline-block">48</span></label>
+          <label><input type="checkbox" id="ln-scale" checked /> scale residual init by 1/√N</label>
+        </div>
+        <svg id="ln-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Diagram of post-LN and pre-LN residual blocks with residual stream growth over depth"></svg>
+        <div class="readout" aria-live="polite" id="ln-read"></div>
+      </div>
+
+      <div class="formula"><span class="lbl">post-LN (GPT-1)</span><span class="eq">h′ = LN( h + F(h) )</span>
+<span class="lbl">pre-LN (GPT-2, GPT-3)</span><span class="eq">h′ = h + F( LN(h) )        output = LN_f( h_L ) · W_eᵀ</span>
+<span class="lbl">scaled init of residual projections</span><span class="eq">std = 0.02 / √N        N = number of residual layers</span></div>
+
+      <h4>Why the move helps</h4>
+      <ul class="notes">
+        <li>In <b>post-LN</b>, every residual sum is renormalised, so the gradient to early layers passes through <code>2L</code> LayerNorm Jacobians (one after each of the two sub-layers in every block). Deep post-LN stacks are known to need learning-rate warm-up and can diverge without it.</li>
+        <li>In <b>pre-LN</b>, the residual path from input to output is a plain sum: <code>h_L = h₀ + ∑ F_ℓ(…)</code>. There is always an identity route for the gradient, which is the same argument as for <a href="../../deep-learning/residual-skip-connections.html">residual connections</a> in general.</li>
+        <li>The cost is that nothing normalises the stream itself, so its magnitude grows with depth — hence the <b>extra final LayerNorm</b> before the output projection, and hence the scaled initialisation.</li>
+      </ul>
+
+      <h4>The 1/√N scaling, worked</h4>
+      <ul class="notes">
+        <li>If each of <code>N</code> sub-blocks adds an independent update of variance <code>s²</code> to a stream of variance 1, the stream variance after all of them is <code>1 + N·s²</code>. Scaling each update's weights by <code>1/√N</code> divides <code>s²</code> by <code>N</code>, so the total added variance stays about <code>s²</code> regardless of depth.</li>
+        <li>The paper says only "N is the number of residual layers". Common reimplementations take <code>N = 2L</code> (two residual sub-blocks per block) and apply it to the attention and FFN output projections. For GPT-2 small, <code>N = 24</code>: <code>1/√24 = 0.204</code>, so the output-projection std becomes <code>0.02 × 0.204 ≈ 0.0041</code>. For GPT-2 XL, <code>N = 96</code> and the factor is <code>0.102</code>.</li>
+        <li>The trade-offs of norm placement in general (including RMSNorm and the later "sandwich" variants) live in <a href="../../deep-learning/transformers/residual-norms-ffn.html#prepost">Transformers — pre-norm against post-norm</a>.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> pre-LN gives the gradient a clean identity path; the final LN and the <code>1/√N</code> init compensate for the stream growth that pre-LN allows. All three arrived together in GPT-2 and were inherited unchanged by GPT-3.</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="tokenisation" data-nav="Tokenisation across generations">
+      <h3><span class="idx">10</span> Tokenisation across generations</h3>
+      <p class="lede">Every GPT reads subword units produced by byte-pair encoding (BPE): start from small symbols, repeatedly merge the most frequent adjacent pair. What changed between generations is the base alphabet and the number of merges. General tokenisation theory is in <a href="../../nlp/tokenization.html#bpe">Tokenization — BPE</a>; this section covers the GPT-specific choices.</p>
+
+      <div class="viz" id="viz-bpe">
+        <div class="vhead">
+          <span class="vtitle">BPE merges on a toy corpus</span>
+          <span class="vhint">each click performs the most frequent pair merge · counts are recomputed from the corpus every step</span>
+        </div>
+        <div class="controls">
+          <button class="btn" id="bpe-step">Merge once ▸</button>
+          <button class="btn ghost" id="bpe-reset">Reset</button>
+        </div>
+        <svg id="bpe-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Byte-pair encoding merge steps on a toy word-frequency corpus"></svg>
+        <div class="readout" aria-live="polite" id="bpe-read"></div>
+      </div>
+
+      <h4>A hand-worked merge</h4>
+      <p>Toy corpus (word: count) — <code>low: 5</code>, <code>lower: 2</code>, <code>newest: 6</code>, <code>widest: 3</code>, each split into characters with an end-of-word marker <code>·</code>. The pair <code>e s</code> occurs in "newest" (6) and "widest" (3), so it has count 9, and so does <code>s t</code>; ties go to the pair seen first, so <code>e s → es</code> is merge 1. Now <code>es t</code> has count 9 and becomes merge 2, then <code>est ·</code> (9) becomes merge 3. Only then does <code>l o</code> (5 + 2 = 7) win. The figure recomputes all counts after each merge.</p>
+
+      <h4>Generation by generation</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Tokeniser</th><th>Vocabulary</th><th>Notes</th></tr>
+        <tr><td>GPT-1</td><td>BPE over characters, after ftfy cleaning and spaCy pre-tokenisation</td><td>40,000 merges (≈40,478 entries in the released code)</td><td>In the released code, pre-tokenisation lower-cased and normalised text, so not every string was representable</td></tr>
+        <tr><td>GPT-2</td><td>byte-level BPE, merges blocked across character categories except spaces</td><td>50,257 = 256 bytes + 50,000 merges + <code>&lt;|endoftext|&gt;</code></td><td>Any Unicode string encodes; no unknown token; reversible</td></tr>
+        <tr><td>GPT-3</td><td>"the same … reversible tokenization" as GPT-2</td><td>50,257</td><td>Same vocabulary; the tiktoken library names it <code>r50k_base</code></td></tr>
+        <tr><td>GPT-3.5-turbo, GPT-4</td><td>byte-level BPE (not described in the GPT-4 report)</td><td>≈100k (<code>cl100k_base</code>)</td><td>Documented only through the public tokeniser library</td></tr>
+        <tr><td>GPT-4o</td><td>byte-level BPE</td><td>≈200k (<code>o200k_base</code>)</td><td>Also documented only through the library; outside the scope of the published papers</td></tr>
+      </table>
+
+      <h4>Why byte-level mattered</h4>
+      <ul class="notes">
+        <li>A code-point BPE would need a base vocabulary of over 130,000 symbols to cover Unicode; a byte-level base needs 256. GPT-2 got universality without an enormous base.</li>
+        <li>Naive byte-level BPE wastes merges on variants such as <code>dog.</code>, <code>dog!</code>, <code>dog?</code>. GPT-2 blocked merges across character categories (letters, digits, punctuation), with an exception for a leading space — which is why GPT-2 tokens so often look like <code>Ġthe</code> (a space-prefixed word).</li>
+        <li>Because the model can assign a probability to any string, GPT-2 could be evaluated on benchmarks with their own preprocessing without converting them — which is how its zero-shot language-modelling table was produced.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> GPT-1 used a character-level BPE over pre-tokenised text; GPT-2 introduced byte-level BPE with 50,257 entries and GPT-3 kept it. Later tokenisers are larger but are documented only through the public tokeniser library, not the papers.</div>
+    </section>
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="configs" data-nav="Every published configuration">
+      <h3><span class="idx">11</span> Every published configuration</h3>
+      <p class="lede">Thirteen configurations are documented across the three papers that give numbers. GPT-4's report gives none. The head dimension column shows that GPT-3's authors did not hold it fixed; they chose shapes "based on computational efficiency and load-balancing" across GPUs.</p>
+      <table class="cmp">
+        <tr><th>Model</th><th>Params (reported)</th><th>Layers L</th><th>d_model</th><th>Heads</th><th>d_head</th><th>Context</th><th>Batch</th></tr>
+        <tr><td>GPT-1</td><td>not stated (≈117M)</td><td>12</td><td>768</td><td>12</td><td>64</td><td>512</td><td>64 seqs</td></tr>
+        <tr><td>GPT-2 small</td><td>117M</td><td>12</td><td>768</td><td>12*</td><td>64*</td><td>1024</td><td>512 seqs</td></tr>
+        <tr><td>GPT-2 medium</td><td>345M</td><td>24</td><td>1024</td><td>16*</td><td>64*</td><td>1024</td><td>512 seqs</td></tr>
+        <tr><td>GPT-2 large</td><td>762M</td><td>36</td><td>1280</td><td>20*</td><td>64*</td><td>1024</td><td>512 seqs</td></tr>
+        <tr><td>GPT-2 XL</td><td>1542M</td><td>48</td><td>1600</td><td>25*</td><td>64*</td><td>1024</td><td>512 seqs</td></tr>
+        <tr><td>GPT-3 Small</td><td>125M</td><td>12</td><td>768</td><td>12</td><td>64</td><td>2048</td><td>0.5M tok</td></tr>
+        <tr><td>GPT-3 Medium</td><td>350M</td><td>24</td><td>1024</td><td>16</td><td>64</td><td>2048</td><td>0.5M tok</td></tr>
+        <tr><td>GPT-3 Large</td><td>760M</td><td>24</td><td>1536</td><td>16</td><td>96</td><td>2048</td><td>0.5M tok</td></tr>
+        <tr><td>GPT-3 XL</td><td>1.3B</td><td>24</td><td>2048</td><td>24</td><td>128</td><td>2048</td><td>1M tok</td></tr>
+        <tr><td>GPT-3 2.7B</td><td>2.7B</td><td>32</td><td>2560</td><td>32</td><td>80</td><td>2048</td><td>1M tok</td></tr>
+        <tr><td>GPT-3 6.7B</td><td>6.7B</td><td>32</td><td>4096</td><td>32</td><td>128</td><td>2048</td><td>2M tok</td></tr>
+        <tr><td>GPT-3 13B</td><td>13.0B</td><td>40</td><td>5140</td><td>40</td><td>128</td><td>2048</td><td>2M tok</td></tr>
+        <tr><td>GPT-3 175B</td><td>175.0B</td><td>96</td><td>12288</td><td>96</td><td>128</td><td>2048</td><td>3.2M tok</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">* GPT-2's paper gives only parameters, layers and d_model; head counts are from the released model configurations. GPT-3's 13B row lists d_model 5140 and 40 heads of 128 (40 × 128 = 5120), exactly as printed in its Table 2.1.</p>
+
+      <h4>Training hyperparameters that are published</h4>
+      <ul class="notes">
+        <li><b>GPT-1:</b> Adam, max learning rate 2.5e-4, linear warm-up over 2000 updates then cosine annealing to 0; 100 epochs over minibatches of 64 contiguous 512-token sequences.</li>
+        <li><b>GPT-2:</b> context raised from 512 to 1024, batch size 512; each size's learning rate was "manually tuned for the best perplexity on a 5% held-out sample of WebText", and the values are not tabulated.</li>
+        <li><b>GPT-3:</b> Adam with β₁ = 0.9, β₂ = 0.95, ε = 1e-8; global gradient-norm clipping at 1.0; linear warm-up over the first 375M tokens; cosine decay to 10% of the peak over 260B tokens; batch size ramped linearly from 32k tokens to its full value over the first 4–12B tokens; weight decay 0.1; learning rate from 6.0e-4 (Small) down to 0.6e-4 (175B). Every size was trained for 300B tokens.</li>
+        <li>GPT-3 packs multiple short documents into each 2048-token sequence, separated by an end-of-text token, with no special attention masking across document boundaries.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> GPT-2 small, GPT-3 Small and GPT-1 share the same 12 × 768 shape, which makes them a rough — not controlled — comparison: they differ in data, context, tokeniser, norm placement and number of training tokens all at once. The larger the model, the smaller the learning rate and the larger the batch — a pattern the GPT-3 paper takes from the scaling-laws work.</div>
+    </section>
+
+    <!-- 12 ───────────────────────────────────────────── -->
+    <section class="topic" id="params" data-nav="Counting the parameters">
+      <h3><span class="idx">12</span> Counting the parameters: 12·L·d² + V·d</h3>
+      <p class="lede">A GPT's parameter count is almost a closed form in two numbers, depth and width. Deriving it once and checking it against the reported sizes is the fastest way to catch misremembered configurations — and it exposes the "117M" label as a rounding artefact.</p>
+      <div class="formula"><span class="lbl">per block (biases and LayerNorms included)</span><span class="eq">attention   Q, K, V, O:  4·d² + 4·d
+FFN         d→4d→d:      8·d² + 5·d
+two LNs     γ, β each:   4·d
+block total              12·d² + 13·d</span>
+<span class="lbl">whole model, tied output</span><span class="eq">N = L·(12·d² + 13·d) + V·d + n_ctx·d + 2·d  (final LN, GPT-2 on)</span>
+<span class="lbl">the rule of thumb</span><span class="eq">N ≈ 12·L·d²  (non-embedding)  +  V·d  (embedding)</span></div>
+
+      <h4>Checked against the papers</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>12·L·d²</th><th>V·d + n_ctx·d</th><th>Exact formula</th><th>Reported</th></tr>
+        <tr><td>GPT-1 (V 40,478, n 512, no final LN)</td><td>84.93M</td><td>31.48M</td><td>116.53M</td><td>≈117M (commonly cited)</td></tr>
+        <tr><td>GPT-2 small</td><td>84.93M</td><td>39.38M</td><td>124.44M</td><td>117M</td></tr>
+        <tr><td>GPT-2 medium</td><td>301.99M</td><td>52.51M</td><td>354.82M</td><td>345M</td></tr>
+        <tr><td>GPT-2 large</td><td>707.79M</td><td>65.64M</td><td>774.03M</td><td>762M</td></tr>
+        <tr><td>GPT-2 XL</td><td>1,474.56M</td><td>82.05M</td><td>1,557.61M</td><td>1542M</td></tr>
+        <tr><td>GPT-3 175B</td><td>173,946M</td><td>642.7M</td><td>174,604M</td><td>175.0B (174,600M in its Appendix D)</td></tr>
+      </table>
+      <ul class="notes">
+        <li>The GPT-3 check is close: the formula gives 174.60B and the paper's own compute appendix lists 174,600M. All eight GPT-3 sizes land within about 1% of their Appendix D values (the 13B row: formula 12.95B, appendix 12.85B).</li>
+        <li>The GPT-2 labels are systematically low, by 7.4M (small) to 15.6M (XL). The released GPT-2 small checkpoint has 124,439,808 parameters, matching the formula exactly; the model's public code repository later stated that the original counts in the paper and blog posts "were wrong due to an error", and the checkpoints are now named 124M, 355M, 774M and 1558M. The later GPT-3 paper labels the same 12 × 768 shape "125M", consistent with the full count.</li>
+        <li>Embeddings matter at small scale and vanish at large scale: V·d is 31% of GPT-2 small but 0.35% of GPT-3 175B. Scaling-law fits usually use non-embedding parameters for that reason.</li>
+      </ul>
+
+      <div class="viz" id="viz-params">
+        <div class="vhead">
+          <span class="vtitle">Parameter calculator</span>
+          <span class="vhint">pick a preset or drag the sliders · breakdown recomputed from the formula above</span>
+        </div>
+        <div class="controls">
+          <label>preset <select id="pc-preset">
+            <option value="gpt1">GPT-1</option>
+            <option value="g2s" selected>GPT-2 small</option>
+            <option value="g2m">GPT-2 medium</option>
+            <option value="g2l">GPT-2 large</option>
+            <option value="g2xl">GPT-2 XL</option>
+            <option value="g3xl">GPT-3 XL</option>
+            <option value="g313">GPT-3 13B</option>
+            <option value="g3">GPT-3 175B</option>
+          </select></label>
+          <label>L <input type="range" id="pc-L" min="1" max="128" step="1" value="12" /><span id="pc-Lv" style="min-width:28px;display:inline-block">12</span></label>
+          <label>d <input type="range" id="pc-d" min="128" max="16384" step="4" value="768" /><span id="pc-dv" style="min-width:44px;display:inline-block">768</span></label>
+          <label>V <input type="range" id="pc-V" min="1000" max="200000" step="1" value="50257" /><span id="pc-Vv" style="min-width:52px;display:inline-block">50257</span></label>
+          <label>n_ctx <input type="range" id="pc-n" min="128" max="8192" step="128" value="1024" /><span id="pc-nv" style="min-width:40px;display:inline-block">1024</span></label>
+        </div>
+        <svg id="pc-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Stacked bar breakdown of GPT parameters into attention, feed-forward, norms and embeddings"></svg>
+        <div class="readout" aria-live="polite" id="pc-read"></div>
+      </div>
+      <p>The same accounting, generalised to grouped-query attention, gated FFNs and untied heads, is in <a href="../../deep-learning/transformers/stacks-accounting.html#params">Transformers — parameter accounting</a>.</p>
+      <div class="callout"><b>Takeaway:</b> <code>12·L·d²</code> is two-thirds FFN and one-third attention, and it dominates once <code>d</code> is in the thousands. If a claimed configuration does not reproduce its parameter count to within a few percent under this formula, one of the numbers is wrong.</div>
+    </section>
+
+    <!-- 13 ───────────────────────────────────────────── -->
+    <section class="topic" id="compute" data-nav="Compute: 2N per token, 6ND to train">
+      <h3><span class="idx">13</span> Compute: 2N FLOPs per token, 6ND to train</h3>
+      <p class="lede">Each parameter takes part in one multiply and one add per token in the forward pass; the backward pass costs about twice the forward. That gives the two estimates every GPT-scale budget starts from. The derivation in multiply-accumulates is in <a href="../../deep-learning/transformers/stacks-accounting.html#flops">Transformers — 6·N·D, derived</a>; here it is applied to the family.</p>
+      <div class="formula"><span class="lbl">forward, per token (ignoring the attention n² term)</span><span class="eq">C_fwd ≈ 2 · N</span>
+<span class="lbl">training, over D tokens</span><span class="eq">C_train ≈ 6 · N · D      (2ND forward + 4ND backward)</span>
+<span class="lbl">attention correction per token, per layer</span><span class="eq">≈ 2 · n_ctx · d  (forward)   — small unless n_ctx approaches 12·d</span></div>
+
+      <h4>GPT-3 175B, worked</h4>
+      <ul class="notes">
+        <li><code>N = 174.6 × 10⁹</code>, <code>D = 300 × 10⁹</code> tokens. <code>6 · N · D = 6 × 1.746×10¹¹ × 3×10¹¹ = 3.14 × 10²³</code> FLOPs — the paper's own figure, 3.14E+23. That agreement checks the arithmetic, not the approximation: the paper's Appendix D computes its compute column the same way (one multiply and one add per active parameter per token forward, times 3 for the backward pass, ignoring attention).</li>
+        <li>A petaflop/s-day is <code>10¹⁵ × 86,400 = 8.64 × 10¹⁹</code> FLOPs, so the run is <code>3.14×10²³ / 8.64×10¹⁹ ≈ 3,640</code> petaflop/s-days, again matching the paper's 3.64E+03.</li>
+        <li>Per generated token at inference: <code>2N ≈ 3.5 × 10¹¹</code> FLOPs. The attention term, <code>2 · 2048 · 12,288 · 96 ≈ 4.8 × 10⁹</code> at full context, adds under 2%.</li>
+        <li>The GPT-3 paper notes that GPT-3 2.7B and RoBERTa-Large used roughly the same ~50 petaflop/s-days despite a ~10× difference in parameters — it trained larger models on fewer tokens, which is the choice later revisited in <a href="gpt1-to-gpt3.html#scaling">Scaling laws</a>.</li>
+      </ul>
+
+      <div class="viz" id="viz-compute">
+        <div class="vhead">
+          <span class="vtitle">Training-compute explorer: C ≈ 6·N·D</span>
+          <span class="vhint">choose model size and token count · compare with 20 tokens per parameter · wall-clock at an assumed sustained throughput</span>
+        </div>
+        <div class="controls">
+          <label>preset <select id="cx-preset">
+            <option value="g3s">GPT-3 Small</option><option value="g3xl">GPT-3 XL</option><option value="g313">GPT-3 13B</option><option value="g3" selected>GPT-3 175B</option><option value="chin">70B on 1.4T tokens (compute-optimal paper)</option>
+          </select></label>
+          <label>log₁₀ N <input type="range" id="cx-N" min="7" max="12" step="0.05" value="11.25" /><span id="cx-Nv" style="min-width:58px;display:inline-block"></span></label>
+          <label>log₁₀ D <input type="range" id="cx-D" min="9" max="13" step="0.05" value="11.5" /><span id="cx-Dv" style="min-width:58px;display:inline-block"></span></label>
+          <label>sustained PFLOP/s <input type="range" id="cx-T" min="0.1" max="100" step="0.1" value="10" /><span id="cx-Tv" style="min-width:36px;display:inline-block">10</span></label>
+        </div>
+        <svg id="cx-svg" width="640" height="280" viewBox="0 0 640 280" role="img" aria-label="Log-log map of parameters against tokens with iso-compute lines and the GPT-3 models marked"></svg>
+        <div class="readout" aria-live="polite" id="cx-read"></div>
+      </div>
+      <div class="callout"><b>Takeaway:</b> <code>6ND</code> is the same approximation the GPT-3 paper used for its published compute, so it reproduces that figure by construction; it is a good first estimate for a dense GPT whenever the attention term (<code>n_ctx</code> small next to <code>12·d</code>) and recomputation overheads are small. Inference is cheaper per token (<code>2N</code>) but runs forever; training is paid once.</div>
+    </section>
+
+    <!-- 14 ───────────────────────────────────────────── -->
+    <section class="topic" id="data" data-nav="Training data by generation">
+      <h3><span class="idx">14</span> Training data by generation</h3>
+      <p class="lede">Each generation's data choice was a deliberate argument: long contiguous books for GPT-1, human-curated web links for GPT-2, and a quality-weighted mixture dominated by filtered Common Crawl for GPT-3.</p>
+
+      <h4>GPT-1 and GPT-2</h4>
+      <ul class="notes">
+        <li><b>BooksCorpus</b> (GPT-1): over 7,000 unique unpublished books across genres. The paper chose it over the similar-sized 1B Word Benchmark because the latter is shuffled at sentence level, "destroying long-range structure". GPT-1 reached a token-level perplexity of 18.4 on it.</li>
+        <li><b>WebText</b> (GPT-2): all outbound Reddit links with at least 3 karma, as a cheap human quality filter — 45 million links; after de-duplication and cleaning, slightly over 8 million documents and 40 GB of text, with no links after December 2017. <b>All Wikipedia articles were removed</b> to reduce overlap with evaluation sets.</li>
+        <li>GPT-2's paper states only that the largest model "still underfits WebText"; the number of training tokens is not given.</li>
+      </ul>
+
+      <h4>GPT-3's weighted mixture</h4>
+      <table class="cmp">
+        <tr><th>Dataset</th><th>Tokens</th><th>Weight in mix</th><th>Epochs at 300B (reported)</th></tr>
+        <tr><td>Common Crawl (filtered)</td><td>410B</td><td>60%</td><td>0.44</td></tr>
+        <tr><td>WebText2</td><td>19B</td><td>22%</td><td>2.9</td></tr>
+        <tr><td>Books1</td><td>12B</td><td>8%</td><td>1.9</td></tr>
+        <tr><td>Books2</td><td>55B</td><td>8%</td><td>0.43</td></tr>
+        <tr><td>Wikipedia</td><td>3B</td><td>3%</td><td>3.4</td></tr>
+      </table>
+      <ul class="notes">
+        <li>Common Crawl came from 41 monthly shards (2016–2019): 45 TB of compressed plaintext before filtering, 570 GB after — roughly 400B BPE tokens. Filtering used a classifier trained to prefer documents resembling curated reference corpora, plus fuzzy MinHash de-duplication that removed about 10% of each dataset.</li>
+        <li>The weights deliberately oversample higher-quality sources: Wikipedia is seen about 3.4 times while Common Crawl is not seen once. The paper describes this as accepting "a small amount of overfitting in exchange for higher quality training data".</li>
+      </ul>
+
+      <div class="viz" id="viz-mix">
+        <div class="vhead">
+          <span class="vtitle">Share of tokens versus share of training — GPT-3 mixture</span>
+          <span class="vhint">implied epochs = weight × 300B ÷ dataset tokens, computed; compare with the paper's column</span>
+        </div>
+        <div class="controls">
+          <label>total training tokens (B) <input type="range" id="mix-D" min="100" max="1000" step="50" value="300" /><span id="mix-Dv" style="min-width:36px;display:inline-block">300</span></label>
+        </div>
+        <svg id="mix-svg" width="640" height="260" viewBox="0 0 640 260" role="img" aria-label="Bars comparing each GPT-3 dataset's share of available tokens with its sampling weight and implied epochs"></svg>
+        <div class="readout" aria-live="polite" id="mix-read"></div>
+      </div>
+      <ul class="notes">
+        <li><b>The table does not quite close.</b> Recomputing epochs as <code>weight × 300B ÷ tokens</code> gives 0.44, 3.47, 2.0, 0.44 and 3.0 against the reported 0.44, 2.9, 1.9, 0.43 and 3.4; the weights also sum to 101%. The reported column is presumably from the actual sampler with unrounded values; the rounded table cannot reproduce WebText2 or Wikipedia exactly.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> GPT-3 was trained on far fewer tokens (300B) than its largest source contained, and it chose repetition of clean data over coverage of noisy data. Data quality weighting was already a first-class design variable in 2020.</div>
+    </section>
+
+    <nav class="pager" aria-label="GPT series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="autoregressive-objective.html">← GPT: Autoregressive Objective &amp; Causal Masking</a>
+      <a href="../gpt.html" style="color:var(--muted)">GPT · overview</a>
+      <a href="gpt1-to-gpt3.html">GPT: GPT-1 to GPT-3 &amp; In-Context Learning →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../gpt.viz.js"></script>
+</body>
+</html>

@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · T5: v1.1, mT5, Flan-T5 &amp; Successors</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+.tokrow{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0;font-family:"SF Mono",Menlo,monospace;font-size:11.5px}
+.tokrow span{padding:2px 5px;border-radius:4px;background:rgba(91,156,255,.16);color:#cfe0ff}
+.tokrow span.sp{background:rgba(192,132,252,.2);color:#e9d5ff}
+.tokrow span.bad{background:rgba(248,113,113,.25);color:#fecaca}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../t5.html">T5</a> · part 4 of 4</p>
+      <h1>T5: v1.1, mT5, Flan-T5 &amp; Successors</h1>
+      <p>The T5 family and its practical use: the cleaned-up v1.1 checkpoints, multilingual mT5, byte-level ByT5, instruction-tuned Flan-T5, UL2's mixture of denoisers, T5Gemma adapted from decoder-only weights, the compute arithmetic of encoder–decoder against decoder-only models, and loading and generating with the Transformers library.</p>
+      <div style="margin-top:10px">
+        <span class="pill">T5</span>
+        <span class="pill">v1.1 · mT5 101 languages · ByT5 bytes · Flan-T5 instructions · UL2 denoisers · T5Gemma · encoder–decoder compute · Transformers usage</span>
+      </div>
+    </header>
+
+    <!-- 23 ───────────────────────────────────────────── -->
+    <section class="topic" id="v11" data-nav="T5 v1.1">
+      <h3><span class="idx">23</span> T5 v1.1: the cleaned-up checkpoints</h3>
+      <p class="lede">T5 v1.1, released in the T5 repository after the paper, changes five things: GEGLU instead of ReLU in the feed-forward layer; dropout turned off during pretraining (a "quality win"; it should be re-enabled for fine-tuning); pretraining on C4 only, with no supervised tasks mixed in; no parameter sharing between the input embedding and the output layer; and new XL and XXL shapes that replace 3B and 11B.</p>
+      <table class="cmp">
+        <tr><th>Change</th><th>v1.0</th><th>v1.1</th><th>What it means in practice</th></tr>
+        <tr><td>Feed-forward</td><td>ReLU, 2 matrices</td><td>GEGLU, 3 matrices</td><td>different module names (wi_0, wi_1, wo); d_ff narrower</td></tr>
+        <tr><td>Pretraining dropout</td><td>0.1</td><td>0</td><td>set dropout (0.1 in the configs) deliberately when fine-tuning</td></tr>
+        <tr><td>Pretraining data</td><td>C4 + supervised mixture</td><td>C4 only</td><td>must be fine-tuned; task prefixes have no special meaning for single-task fine-tuning</td></tr>
+        <tr><td>Output layer</td><td>tied to E, rescaled by d_model^(−1/2)</td><td>separate matrix, no rescale</td><td>+V·d parameters (65.8M for XL, 131.6M for XXL)</td></tr>
+        <tr><td>Large shapes</td><td>3B: d 1,024, 32 × 128, d_ff 16,384; 11B: 128 × 128, d_ff 65,536</td><td>XL: d 2,048, 32 × 64, d_ff 5,120; XXL: d 4,096, 64 × 64, d_ff 10,240</td><td>inner width = d_model again</td></tr>
+      </table>
+      <p>The LM-adapted variants (from the prompt-tuning work of Lester et al. 2021) continue v1.1 on a plain language-modelling objective for 100B additional C4 tokens so that the model can continue a prefix; the Flan paper uses them as its un-instruction-tuned T5 baselines.</p>
+      <div class="callout"><b>Takeaway:</b> v1.1 is the checkpoint to start from when you want a pretrained-only T5 for your own fine-tuning (and the architecture Flan-T5 and mT5 share); v1.0 is the checkpoint that already "knows" the paper's task prefixes.</div>
+    </section>
+
+    <!-- 24 ───────────────────────────────────────────── -->
+    <section class="topic" id="mt5" data-nav="mT5">
+      <h3><span class="idx">24</span> mT5: 101 languages</h3>
+      <p class="lede">mT5 ("mT5: A Massively Multilingual Pre-trained Text-to-Text Transformer", arXiv 2010.11934) applies the T5 v1.1 recipe to mC4, a Common Crawl corpus covering 101 languages, with a 250,000-piece SentencePiece vocabulary. Sizes run from Small (≈ 300M) through Base (580M), Large (1.2B) and XL (3.7B) to XXL (13B), each pretrained for 1M steps on batches of 1,024 length-1,024 inputs — about 1T input tokens, the same amount as T5.</p>
+      <div class="formula"><span class="lbl">language sampling during pretraining (|L| = examples in language L)</span><span class="eq">p(L) ∝ |L|^a,     a = 0.3   (tried 0.2, 0.3, 0.7; 0.3 balanced high- and low-resource languages)</span>
+<span class="lbl">vocabulary cost: two untied tables of 250,112 × d_model</span><span class="eq">mT5-Small: 2 · 250,112 · 512 = 256.1M of 300.2M
+mT5-Base:  2 · 250,112 · 768 = 384.2M of 582.4M (66%)</span></div>
+      <ul class="notes">
+        <li><b>The parameter jump over T5 is vocabulary.</b> mT5-Small's non-embedding weights are the same 44.1M as T5 v1.1 Small; the extra 223M are the larger input and output tables.</li>
+        <li><b>A slip in the ByT5 paper.</b> ByT5 describes mT5-Base's "vocabulary and softmax output matrices" as "256 million parameters, or about 66% of the total". Recounting from the released config gives 384.2M, and 384.2M / 582.4M = 66% — so the percentage is right and the 256M appears to be mT5-Small's figure.</li>
+        <li><b>Classification cost.</b> The mT5 paper points out that an encoder–decoder classifies at about the cost of T + 2 tokens (input, label, end) against T + 1 for an encoder-only model with a [CLS] token, despite twice the parameters.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> mT5 is T5 v1.1 with a multilingual corpus and a vocabulary eight times larger; at small sizes most of its parameters are embeddings.</div>
+    </section>
+
+    <!-- 25 ───────────────────────────────────────────── -->
+    <section class="topic" id="byt5" data-nav="ByT5">
+      <h3><span class="idx">25</span> ByT5: bytes instead of pieces</h3>
+      <p class="lede">ByT5 ("ByT5: Towards a Token-Free Future with Pre-trained Byte-to-Byte Models", arXiv 2105.13626) removes the tokenizer: text is fed as UTF-8 bytes, with 256 byte ids plus 3 special ids (padding, end-of-sequence, and an unused unknown). Sentinels reuse the final 100 byte ids, the mean masked span grows to 20 bytes, and the encoder is three times as deep as the decoder.</p>
+      <table class="cmp">
+        <tr><th></th><th>mT5-Small</th><th>ByT5-Small</th><th>mT5-XXL</th><th>ByT5-XXL</th></tr>
+        <tr><td>Layers (enc + dec)</td><td>8 + 8</td><td>12 + 4</td><td>24 + 24</td><td>36 + 12</td></tr>
+        <tr><td>d_model / d_ff</td><td>512 / 1,024</td><td>1,472 / 3,584</td><td>4,096 / 10,240</td><td>4,672 / 12,352</td></tr>
+        <tr><td>Vocabulary rows (config)</td><td>250,112</td><td>384</td><td>250,112</td><td>384</td></tr>
+        <tr><td>Parameters (recount)</td><td>300.2M</td><td>299.6M</td><td>12.92B</td><td>12.91B</td></tr>
+        <tr><td>Embedding share (input + output tables)</td><td>85.3%</td><td>0.38%</td><td>15.9%</td><td>0.03%</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Matched sizes, different allocations.</b> ByT5 spends the parameters mT5 put into vocabulary on wider and deeper layers, so the two families line up in total size while ByT5-Small's transformer blocks are almost seven times larger.</li>
+        <li><b>The price is sequence length:</b> a byte sequence is several times longer than a SentencePiece sequence for the same text, so compute per example rises even at equal parameters; the heavy-encoder, light-decoder split keeps decoding cheaper.</li>
+        <li><b>The payoff</b> is robustness to noise and spelling, and no out-of-vocabulary characters — the <code>{</code> and CJK problems of the <a href="c4-span-corruption.html#tokenizer">T5 tokenizer</a> disappear.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> ByT5 shows the T5 recipe works without a tokenizer if you rebalance the network toward the encoder and lengthen the masked spans to byte scale.</div>
+    </section>
+
+    <!-- 26 ───────────────────────────────────────────── -->
+    <section class="topic" id="flan" data-nav="Flan-T5">
+      <h3><span class="idx">26</span> Flan-T5: instruction-tuned T5</h3>
+      <p class="lede">Flan-T5 ("Scaling Instruction-Finetuned Language Models", arXiv 2210.11416) fine-tunes T5 models on 1,836 tasks (473 datasets, 146 task categories) phrased as instructions, with and without chain-of-thought exemplars, so that one checkpoint follows unseen instructions zero-shot. The released checkpoints share T5 v1.1's architecture (GEGLU, untied output layer) at five sizes: 80M, 250M, 780M, 3B and 11B.</p>
+      <table class="cmp">
+        <tr><th>Size</th><th>MMLU direct, T5 (LM-adapted)</th><th>MMLU direct, Flan-T5</th><th>Instruction-tuning compute (% of pretraining)</th></tr>
+        <tr><td>Large (780M)</td><td>25.1</td><td>45.1</td><td>1.1%</td></tr>
+        <tr><td>XL (3B)</td><td>25.7</td><td>52.4</td><td>0.6%</td></tr>
+        <tr><td>XXL (11B)</td><td>25.9</td><td>55.1</td><td>0.2%</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>From chance to useful.</b> The un-tuned T5 models are near MMLU's 25% chance level; instruction tuning lifts Flan-T5-XL to 52.4%, which the paper notes surpasses GPT-3 175B's 43.9%.</li>
+        <li><b>Cheap relative to pretraining:</b> 0.2% of the pretraining compute for XXL.</li>
+        <li><b>Training details:</b> constant learning rate, Adafactor, packing with masking across example boundaries, one checkpoint for all evaluations.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> Flan-T5 is the usual answer when someone wants "a T5 that works without fine-tuning": the architecture of v1.1 with instruction-following added for a fraction of a percent of the pretraining compute.</div>
+    </section>
+
+    <!-- 27 ───────────────────────────────────────────── -->
+    <section class="topic" id="ul2" data-nav="UL2: mixture of denoisers">
+      <h3><span class="idx">27</span> UL2: a mixture of denoisers</h3>
+      <p class="lede">UL2 ("UL2: Unifying Language Learning Paradigms", arXiv 2205.05131) keeps the T5 framework but pretrains on a mixture of seven denoising tasks in three families, each announced to the model by a mode token, [R], [S] or [X]. Its 20B encoder–decoder (19.5B parameters, 32 + 32 layers, d_model 4,096, d_ff 16,384, 16 heads of 256, the T5 32k vocabulary) was trained on 1T C4 tokens and later instruction-tuned as Flan-UL2.</p>
+      <table class="cmp">
+        <tr><th>Denoiser</th><th>Settings (mean span, corruption rate, spans)</th><th>What it trains</th></tr>
+        <tr><td>R — regular</td><td>(3, 0.15, n) ∪ (8, 0.15, n)</td><td>T5 span corruption: short spans, knowledge</td></tr>
+        <tr><td>S — sequential</td><td>(L/4, 0.25, 1): one span running to the end of the text</td><td>prefix language modelling: fluent continuation</td></tr>
+        <tr><td>X — extreme</td><td>(3, 0.5, n) ∪ (8, 0.5, n) ∪ (64, 0.15, n) ∪ (64, 0.5, n)</td><td>long spans or heavy corruption: long generation from little context</td></tr>
+      </table>
+      <p>The paper counts a task as extreme if its spans are at least 12 tokens long or its corruption rate at least 30%. Note that one of the X settings — mean span 3 at 50% — is close to the 50% corruption rate that performed poorly alone in T5's Table 6; UL2's claim is that such objectives help in a mixture, not by themselves. At fine-tuning time the mode token is chosen to match the task (for example [S] for generation).</p>
+      <div class="callout"><b>Takeaway:</b> UL2 is the T5 study's objective axis revisited: instead of picking one point on the denoising plateau, mix distant points — short spans, long spans, and prefix-LM — and let a mode token select the behaviour.</div>
+    </section>
+
+    <!-- 28 ───────────────────────────────────────────── -->
+    <section class="topic" id="t5gemma" data-nav="T5Gemma">
+      <h3><span class="idx">28</span> T5Gemma: encoder–decoders adapted from decoder-only models</h3>
+      <p class="lede">T5Gemma ("Encoder-Decoder Gemma: Improving the Quality-Efficiency Trade-Off via Adaptation", arXiv 2504.06225) builds encoder–decoder models by initialising both stacks from a pretrained decoder-only Gemma 2 model and continuing pretraining with prefix-LM (with distillation) or UL2 objectives, on up to 2T tokens. Despite the name, the blocks are Gemma 2's (rotary position embeddings and its other components), not T5's.</p>
+      <ul class="notes">
+        <li><b>Balanced and unbalanced pairs.</b> 2B-2B and 9B-9B pair an encoder and decoder of the same size; 9B-2B pairs a large encoder with a small decoder to keep generation cheap.</li>
+        <li><b>Reported results.</b> After instruction tuning, Gemma 2B-2B outperforms the decoder-only Gemma 2B by about 7%, and 9B-2B surpasses 2B-2B by more than 3%; adaptation reaches its decoder-only counterpart's quality after only tens of billions of tokens.</li>
+        <li><b>Why it connects to T5.</b> It revisits the T5 study's architecture finding under modern conditions: at similar inference cost, an encoder–decoder with a bidirectional encoder fine-tunes better.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the encoder–decoder idea survives into the decoder-only era by adaptation: reuse a strong decoder-only model's weights, then pay for bidirectional reading only where it helps.</div>
+    </section>
+
+    <!-- 29 ───────────────────────────────────────────── -->
+    <section class="topic" id="compute" data-nav="Encoder–decoder vs decoder-only compute">
+      <h3><span class="idx">29</span> Encoder–decoder versus decoder-only: the compute arithmetic</h3>
+      <p class="lede">An L + L encoder–decoder has roughly the parameters of a 2L-layer decoder-only model but the per-example compute of an L-layer one, because each token passes through only one stack. That is the equivalence the study used; it also has consequences at inference, where the encoder runs once and the decoder's cache holds only target tokens plus a fixed cross-attention cache.</p>
+      <div class="formula"><span class="lbl">forward multiply–accumulates per layer (inner = heads · d_kv, k = 2 or 3 feed-forward matrices)</span><span class="eq">encoder layer on n tokens:        n · (4 · d · inner + k · d · d_ff)  +  2 · n² · inner</span>
+<span class="lbl">decoder layer on m target tokens attending to n encoder states</span><span class="eq">m · (6 · d · inner + k · d · d_ff) + n · 2 · d · inner  +  2 · m² · inner + 2 · m · n · inner</span>
+<span class="lbl">decoder-only layer on the concatenated n + m tokens</span><span class="eq">(n + m) · (4 · d · inner + k · d · d_ff)  +  2 · (n + m)² · inner</span>
+<span class="lbl">key–value cache while generating the t-th target token</span><span class="eq">enc–dec: N_dec · 2 · (t + n) · inner   (the n part computed once)
+decoder-only: N · 2 · (n + t) · inner</span></div>
+      <h4>Worked example: T5-Base shapes, a 512-token input and a 128-token target</h4>
+      <p>One encoder layer processes 512 tokens: 512 · (4 · 768 · 768 + 2 · 768 · 3,072) = 3.62 × 10⁹ multiply–accumulates in its matrices plus 2 · 512² · 768 = 0.40 × 10⁹ in attention. One decoder-only layer of the same width on 640 tokens needs 640 · 7.08 × 10⁶ = 4.53 × 10⁹ plus 2 · 640² · 768 = 0.63 × 10⁹. The figure sums these over all layers for the three models of the paper's comparison.</p>
+      <div class="viz" id="viz-cc">
+        <div class="vhead">
+          <span class="vtitle">Compute and cache: L + L encoder–decoder against decoder-only</span>
+          <span class="vhint">set input and target lengths · pick a width</span>
+        </div>
+        <div class="controls">
+          <label>input tokens <input type="range" id="cc-in" min="16" max="2048" step="16" value="512" /> <span id="cc-inv"></span></label>
+          <label>target tokens <input type="range" id="cc-out" min="1" max="1024" step="1" value="128" /> <span id="cc-outv"></span></label>
+          <label>width <select id="cc-cfg"></select></label>
+        </div>
+        <svg id="cc-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Bars of forward compute and parameter count for the encoder–decoder, a decoder-only model with the same compute and one with the same parameters, and the key–value cache at the last generated token"></svg>
+        <div class="readout" aria-live="polite" id="cc-read"></div>
+        <p class="vcap">Compute counts the matrix multiplications and attention products of one forward pass over an (input, target) pair, as in training, and excludes the embedding and softmax layers, norms and the causal-mask saving (full n² products are counted, as a plain implementation computes them). The decoder-only models take the chosen config's block shape: N layers (same compute) or 2N layers (same parameters). The cache assumes 16-bit values.</p>
+      </div>
+      <ul class="notes">
+        <li><b>When the input is long and the output short</b> (classification, extraction, summarisation), the encoder–decoder does the bulk of its work once, bidirectionally, and decodes against a fixed cross-attention cache.</li>
+        <li><b>When outputs are long and inputs short</b> (open-ended generation, chat with growing context), the split buys less, and a single stack reuses one cache for the whole conversation — one reason decoder-only models took over general-purpose LLMs.</li>
+        <li><b>Parameters are not compute.</b> Matching an encoder–decoder by parameters (2N decoder layers) doubles the decoder-only model's compute; matching by compute halves its parameters. The study's Table 2 reports both.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> an encoder–decoder buys twice the parameters per FLOP and a bidirectional reading of the input; a decoder-only model buys one uniform stack and cache. Which is cheaper depends on the ratio of input to output length.</div>
+    </section>
+
+    <!-- 30 ───────────────────────────────────────────── -->
+    <section class="topic" id="usage" data-nav="Using T5 in Transformers">
+      <h3><span class="idx">30</span> Using T5 with the Hugging Face Transformers library</h3>
+      <p class="lede">All T5-family checkpoints load as <code>T5ForConditionalGeneration</code> (or through <code>AutoModelForSeq2SeqLM</code>) with a SentencePiece-based T5 tokenizer: google-t5/t5-small … t5-11b (v1.0), google/t5-v1_1-*, google/flan-t5-*, google/mt5-* and google/byt5-* (the last with a byte tokenizer). Correct use comes down to prefixes, the decoder start token, label masking, learning rate and precision.</p>
+      <h4>The steps</h4>
+      <ol class="notes">
+        <li><b>Inputs.</b> <code>tokenizer("translate English to French: The weather is nice today.", return_tensors="pt")</code>. For v1.0 checkpoints use the paper's prefixes; for v1.1 the documentation notes there is "no real advantage" to a prefix in single-task fine-tuning, but prefixes should be used for multi-task fine-tuning. Flan-T5 takes natural-language instructions.</li>
+        <li><b>Targets.</b> Tokenize the target text as <code>labels</code>; replace padding ids in the labels by −100 so the loss ignores them. The model builds <code>decoder_input_ids</code> by shifting the labels right and inserting the decoder start token, which for T5 is the pad token (id 0).</li>
+        <li><b>Loss.</b> <code>model(input_ids=…, attention_mask=…, labels=…).loss</code> is the mean token cross-entropy over non-ignored positions — the paper's objective.</li>
+        <li><b>Generation.</b> <code>model.generate(**inputs, max_new_tokens=…)</code>; greedy by default, beam 4 with length penalty 0.6 reproduces the paper's WMT and CNN/DM decoding.</li>
+        <li><b>Span-corruption inputs</b> use the sentinel strings directly: input <code>"The &lt;extra_id_0&gt; walks in &lt;extra_id_1&gt; park"</code>, labels <code>"&lt;extra_id_0&gt; cute dog &lt;extra_id_1&gt; the &lt;extra_id_2&gt;"</code> (the library's own example).</li>
+      </ol>
+      <h4>Settings that matter</h4>
+      <table class="cmp">
+        <tr><th>Setting</th><th>Recommendation</th><th>Why</th></tr>
+        <tr><td>Learning rate</td><td>about 1 × 10⁻⁴ to 3 × 10⁻⁴ with AdamW (library docs); or Adafactor at a constant 10⁻³ (the paper)</td><td>T5 needs a higher rate than the library's default</td></tr>
+        <tr><td>Precision</td><td>bf16 or fp32 — not fp16 — for v1.1, mT5 and Flan-T5 especially</td><td>activations can exceed fp16's maximum of 65,504 (see pitfalls)</td></tr>
+        <tr><td>Dropout (v1.1)</td><td>set dropout_rate for fine-tuning (configs ship 0.1)</td><td>pretraining used none</td></tr>
+        <tr><td>Padding side</td><td>either</td><td>relative position bias only</td></tr>
+        <tr><td>Input length</td><td>512 is the pretraining length; longer inputs run but cost O(n²) memory and are unvalidated</td><td>no absolute positions, but no length training beyond 512</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> T5 fine-tuning is plain sequence-to-sequence training with two T5-specific habits — labels padded with −100 and a pad token as decoder start — plus a higher learning rate than BERT and bf16 instead of fp16.</div>
+    </section>
+
+    <nav class="pager" aria-label="T5 series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="study-recipe-results.html">← T5: Transfer Study, Recipe &amp; Results</a>
+      <a href="../t5.html" style="color:var(--muted)">T5 · overview</a>
+      <a href="../t5.html">T5 · overview →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../t5.viz.js"></script>
+</body>
+</html>

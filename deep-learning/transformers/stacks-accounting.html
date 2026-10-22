@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Transformer Stacks &amp; Accounting</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to the other pages of the series */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../transformers.html">Transformers</a> · part 3 of 7</p>
+      <h1>Transformer Stacks &amp; Accounting</h1>
+      <p>How blocks become a model: encoder-only and decoder-only stacks, encoder–decoder with cross-attention, the token embedding and its √d scale, unembedding, weight tying and the vocabulary cost, whole-model parameter accounting, and 6·N·D derived in MACs and FLOPs.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Transformers</span>
+        <span class="pill">Encoder-only · decoder-only · cross-attention · tying · params · 6·N·D</span>
+      </div>
+    </header>
+
+    <!-- ═══ 18 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="stacks" data-nav="Encoder-only and decoder-only">
+      <h3><span class="idx">18</span> The stacks: encoder-only and decoder-only are the same block with a different mask</h3>
+      <p class="lede">Stack <code>L</code> of the blocks of §02 and there are two things to decide: what each position is allowed to see, and where the loss is read. Those two decisions are the entire difference between an encoder and a decoder. The block does not change; the mask does.</p>
+
+      <div class="formula"><span class="lbl">the two self-attention stacks, differing in ONE additive matrix</span><span class="eq">ENCODER-ONLY (bidirectional)
+   mask M[i][j] = 0 for every (i, j) (plus −∞ on padding KEYS)
+   position i's output depends on every input position, before and after
+   read-out: per token (tagging, span selection) or from one summary token (classification)
+   training objective: usually reconstruction of masked-out inputs — the model card is
+                       ../models/bert.html; the mechanism is the attention page's self-attention with no mask
+
+DECODER-ONLY (causal, "autoregressive": each token is predicted from the ones before it)
+   mask M[i][j] = 0 for j ≤ i,  −∞ for j > i         (DL.causalMask)
+   position i's output depends on positions 0 … i only — at EVERY layer, so the
+   restriction composes: nothing from the future leaks in through depth either
+   read-out: every position predicts the NEXT token, so one sequence gives n − 1 losses (§24)
+   training objective: next-token prediction — the model card is ../models/gpt.html
+
+PREFIX-LM (a hybrid)
+   mask = 0 on the prefix block (bidirectional among the first p tokens),
+          causal on the rest, and the suffix may read the whole prefix
+   the encoder–decoder of §19 without the second stack</span></div>
+
+      <h4>Why the mask composes through depth</h4>
+      <p>A single causal attention layer lets position <code>i</code> read <code>0 … i</code>. Stacking two does not widen that: at layer 2, position <code>i</code> reads layer-1 outputs at <code>0 … i</code>, each of which depended only on positions up to itself, so the union is still <code>0 … i</code>. The set of positions that can influence position <code>i</code> is therefore <code>{0, …, i}</code> at any depth — the figure computes that reachability set explicitly by propagating a Boolean matrix through <code>L</code> layers and shows it is the lower triangle at every depth. The same computation for the encoder gives the full square after one layer; there is nothing left to reach after that, which is why encoder depth is about refining representations, not widening context. For the prefix-LM the reachable set of a suffix position is the whole prefix plus its own causal past, and of a prefix position the whole prefix — the figure draws that too. Padding is orthogonal to all three: a padded key is masked out (<code>−∞</code> on its column) in every stack, and as <a href="../attention/multihead-masking.html#mask">the attention page's masking section</a> explained, never on its row.</p>
+
+      <h4>Which tasks want which</h4>
+      <table class="grid2">
+        <tr><th>stack</th><th>sees</th><th>loss read at</th><th>natural for</th><th>cost of one forward at length n</th><th>generation</th></tr>
+        <tr><td><b>encoder-only</b></td><td>everything, both directions</td><td>chosen positions (masked tokens, a [CLS] row, every token for tagging)</td><td>classification, tagging, retrieval embeddings, extractive QA, anything that consumes a whole input at once</td><td>L blocks × n tokens, one pass</td><td>not native: no causal structure, so text must be generated some other way</td></tr>
+        <tr><td><b>decoder-only</b></td><td>the past, at every layer</td><td>every position (next-token)</td><td>language modelling, generation, in-context learning, anything framed as continuation</td><td>the same, but half the score matrix is masked, and the KV cache (<a href="../attention/kv-cache-gqa-mla.html#kvcache">the attention page's KV-cache section</a>) makes each new token O(n) instead of O(n²)</td><td>native: one token per step from the cache</td></tr>
+        <tr><td><b>prefix-LM</b></td><td>prefix bidirectionally, suffix causally</td><td>the suffix positions</td><td>conditional generation with a fully-read input, without a second stack</td><td>same as the decoder</td><td>native for the suffix</td></tr>
+      </table>
+      <p>The taxonomy at the level of "which should I use" is <a href="../encoder-decoder-models.html">Encoder vs Decoder Models</a>'; the accounting that makes the table exact is §34. The <a href="../../models/bert.html">BERT</a> and <a href="../../models/gpt.html">GPT</a> cards are the canonical instance of each, and the reason the decoder-only stack has become the default for large models is in the last two columns: one objective that uses every position, and native generation.</p>
+
+      <div class="viz" id="viz-st">
+        <div class="vhead">
+          <span class="vtitle">Three masks, and the set of positions that can influence each output after L layers</span>
+          <span class="vhint">the reachability matrix is the mask's Boolean power — for the decoder it is the lower triangle at every depth, for the encoder the full square after one layer, for the prefix-LM a square on the prefix and a triangle below it; padding removes columns in all three</span>
+        </div>
+        <div class="controls">
+          <label>stack <select id="st-k"><option value="enc">encoder-only</option><option value="dec" selected>decoder-only</option><option value="prefix">prefix-LM</option></select></label>
+          <label>tokens n <input type="range" id="st-n" min="6" max="24" step="2" value="12" /><span id="st-nv" style="min-width:20px;display:inline-block">12</span></label>
+          <label>prefix p <input type="range" id="st-p" min="1" max="11" step="1" value="5" /><span id="st-pv" style="min-width:16px;display:inline-block">5</span></label>
+          <label>padded tail <input type="range" id="st-pad" min="0" max="6" step="1" value="2" /><span id="st-padv" style="min-width:16px;display:inline-block">2</span></label>
+          <label>layers L <input type="range" id="st-L" min="1" max="6" step="1" value="3" /><span id="st-Lv" style="min-width:16px;display:inline-block">3</span></label>
+        </div>
+        <svg id="st-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left: the additive attention mask of the chosen stack as an n by n grid, allowed pairs light and forbidden pairs dark, with padded key columns darkened in every row. At the default, decoder-only with twelve tokens and two padded, it is a lower triangle with the last two columns removed. Middle: the reachability matrix after L layers, computed by raising the Boolean mask to the L-th power, which for the decoder is the same lower triangle at every depth, for the encoder the full square, and for the prefix-LM a full square on the prefix positions and a triangle below. Right: for each output position, the count of input positions that can reach it, as a bar chart, rising linearly for the decoder and flat for the encoder. The readout prints the number of allowed pairs, the number of pairs masked by causality and by padding, and the mean reach per position."></svg>
+        <div class="readout" aria-live="polite" id="st-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 19 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="encdec" data-nav="Encoder–decoder and cross-attention">
+      <h3><span class="idx">19</span> The encoder–decoder stack: cross-attention wiring, shapes and cost</h3>
+      <p class="lede">The 2017 architecture had two stacks: an encoder over the source and a decoder over the target, joined by a third kind of attention in which the decoder's queries read the encoder's keys and values. This section writes that wiring exactly, counts it, and says what it buys over the single-stack alternatives.</p>
+
+      <div class="formula"><span class="lbl">the decoder block of an encoder–decoder model — THREE sub-layers, not two</span><span class="eq">encoder    Hₑ = EncoderStack(X_src)                       (n_src × d), computed ONCE per source
+
+decoder block, pre-norm form, on the target stream X (n_tgt × d):
+   X₁ = X  + SelfAttn( N₁(X) )                     causal, over the target — the "self" of <a href="../attention/query-key-value.html#selfcross">the attention page</a>
+   X₂ = X₁ + CrossAttn( N₂(X₁) , Hₑ )              queries from the target, keys and values from Hₑ
+   Y  = X₂ + FFN( N₃(X₂) )
+
+CrossAttn(U, Hₑ):   Q = U·W_Q  (n_tgt × h·dₖ)      K = Hₑ·W_K,  V = Hₑ·W_V  (n_src × …)
+                     A = softmax( Q Kᵀ/√dₖ + padding mask on SOURCE keys )   (n_tgt × n_src)
+                     Z = A·V,  concat,  ·W_O                                  (n_tgt × d)
+no causal mask here: every target position may read every source position.
+the score matrix is RECTANGULAR, n_tgt × n_src — the one place in the architecture
+where the two axes of an attention matrix index different sequences.</span>
+<span class="lbl">the count — what the third sub-layer adds</span><span class="eq">parameters per decoder block   attention 4d² (self) + 4d² (cross) + FFN 8d²  =  16d²
+                               against a decoder-only block's 12d²: cross-attention is +33%
+MACs per decoded token, cross-attention:
+   Q projection      d·d                     every step
+   K, V projections  2·n_src·d·d             ONCE per source (cached across every step and,
+                                             with one W_K, W_V per layer, once per layer)
+   scores + blend    2·n_src·d               every step, against the cached source
+so decoding one token reads the WHOLE source in O(n_src·d) per layer, and the
+source is never re-encoded: the encoder's cost is paid once per input.</span></div>
+
+      <h4>What the second stack buys, and what it costs</h4>
+      <p>Against a decoder-only model given the source as a prefix, the encoder–decoder has three real differences. First, the source is read <b>bidirectionally</b> — every source position's representation sees the whole source — while a causal prefix reads it left to right; for inputs whose meaning depends on later parts (most sentences) this is a genuine representational advantage, and it is the usual explanation for why the family has stayed competitive on translation and summarisation at equal parameter count. Second, the source is <b>encoded once</b> and its keys and values cached, so a long input costs its encoding once and then <code>O(n_src)</code> per output token, the same as a KV cache; a decoder-only model pays the same after the prefill, so this is a wash. Third, the source and target <b>live in separate streams</b>: the decoder's residual stream carries only the target, and the source enters only through cross-attention, which means the decoder's depth is spent on generation and none of its positions is "wasted" on re-representing the input. The costs are the third sub-layer's parameters, a second set of hyper-parameters (encoder depth against decoder depth), and — arguably the one that mattered most at scale — a training objective that supervises only the target positions, against a decoder-only objective that supervises every position of every document. §34 puts the three families side by side with the counts.</p>
+
+      <div class="viz" id="viz-xa">
+        <div class="vhead">
+          <span class="vtitle">Cross-attention: the rectangular score matrix, the shapes, and the per-token cost against source length</span>
+          <span class="vhint">n_src and n_tgt are independent — the score matrix is n_tgt × n_src and every row of it sums to one over the source; the right panel counts what one decoded token costs against the cached source</span>
+        </div>
+        <div class="controls">
+          <label>n_src <input type="range" id="xa-s" min="4" max="24" step="2" value="14" /><span id="xa-sv" style="min-width:20px;display:inline-block">14</span></label>
+          <label>n_tgt <input type="range" id="xa-t" min="4" max="24" step="2" value="8" /><span id="xa-tv" style="min-width:20px;display:inline-block">8</span></label>
+          <label>d_model <select id="xa-d"><option value="512" selected>512</option><option value="1024">1024</option><option value="4096">4096</option></select></label>
+          <label>source padding <input type="range" id="xa-pad" min="0" max="4" step="1" value="2" /><span id="xa-padv" style="min-width:16px;display:inline-block">2</span></label>
+        </div>
+        <svg id="xa-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left: a rectangular heat map of cross-attention weights with target positions as rows and source positions as columns, computed from seeded random projections through the shared attention routine with a padding mask on the last source columns, so that every row sums to one over the unpadded source and the padded columns are exactly zero. Above it the shapes of the query, key, value and output matrices are printed with the two sequence lengths. Right: the multiply–accumulate cost of one decoded token's cross-attention against source length on a logarithmic axis, split into the per-step query projection, the per-step scores and blend, and the once-per-source key and value projections divided by the target length, with the current source length marked. The readout prints the row sums, the mass on padded columns, and the three cost terms at the current setting."></svg>
+        <div class="readout" aria-live="polite" id="xa-readout"></div>
+      </div>
+
+      <div class="callout"><b>Where this wiring is used now.</b> Translation and summarisation models of the T5 and BART families; speech and vision–language systems in which a non-text encoder feeds a text decoder; and, in a different guise, the retrieval-augmented designs that read retrieved passages through cross-attention rather than by placing them in the prompt. The pure-text large decoders dropped the second stack for the training-objective reason above. <a href="../encoder-decoder-models.html#encdec">Encoder vs Decoder Models</a> is the decision guide; this section is the wiring it points at.</div>
+    </section>
+
+    <!-- ═══ 20 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="embed" data-nav="Embedding in, and the √d scale">
+      <h3><span class="idx">20</span> Embedding in: the token table, the <code>√d_model</code> scale, and what it is for</h3>
+      <p class="lede">The first thing the model does is look a row up in a table, <code>E[token]</code>, multiply it by <code>√d_model</code>, and add the position vector <code>P[i]</code>. The factor exists to make the token term and the position term comparable in size — a sinusoidal row has norm <code>√(d/2)</code>, an embedding row initialised at variance <code>1/d</code> has norm about 1 — and whether it is needed depends entirely on how the table was initialised. It is the one detail of the input that is routinely copied without being understood, and this section says what it is for.</p>
+
+      <div class="formula"><span class="lbl">the input, and the two scales that have to match</span><span class="eq">x⁰ᵢ = √d · E[tokenᵢ]  +  P[i]              E (V × d),  P (n_max × d)  or  RoPE and no P at all
+
+sinusoidal P:   entries in [−1, 1], half of them sin and half cos ⇒  ‖P[i]‖ ≈ √(d/2)
+E initialised like a weight matrix, N(0, 1/d) per entry (the 2017 convention, so that a
+TIED output projection has the right scale — §21):   ‖E[t]‖ ≈ 1
+
+without the factor:  ‖E[t]‖ ≈ 1  against  ‖P[i]‖ ≈ √(d/2)  =  16 at d = 512
+                     the position term is 16× the token term; the token is nearly invisible
+with the factor:     ‖√d·E[t]‖ ≈ √d = 22.6  against  16       comparable, token slightly larger</span>
+<span class="lbl">the OTHER convention, in which the factor must NOT be applied</span><span class="eq">E initialised N(0, 0.02²) per entry, P LEARNED and initialised similarly small (0.01 in
+the original 2019 decoder code): ‖E[t]‖ ≈ 0.02·√d = 0.55 at d = 768, ‖P[i]‖ about half (the figure
+uses 0.02 for both, which makes them equal) — already matched, and the norms are small
+on purpose: the first block's norm will rescale them.
+Multiplying by √d here does no harm to the ratio but changes the absolute scale the
+tied output head sees (§21). The rule is not "always scale"; it is "make the token
+and position terms the same size, and know what the output head expects".</span></div>
+
+      <p>The figure measures the two norms and the cosine of <code>x⁰</code> with each of its two components under each convention. It also shows the consequence for the <i>attention scores of the first layer</i>: with the position term dominating, the first block's queries and keys are functions of position almost alone, and the score matrix is nearly the same for every input — a banded pattern that depends on <code>|i − j|</code> and not on the tokens. The model can recover from this (the first block's <code>W_Q</code>, <code>W_K</code> can learn to ignore the position directions), but it starts with a handicap it need not have, and on a small budget it may never fully recover. This is the first of §35's bugs that does not crash.</p>
+
+      <div class="viz" id="viz-em">
+        <div class="vhead">
+          <span class="vtitle">The two components of x⁰ under each convention, and what the first layer's scores look like</span>
+          <span class="vhint">the norms are the whole story — pick a table initialisation and toggle the √d factor; when the position term dominates, the first-layer score matrix stops depending on the tokens</span>
+        </div>
+        <div class="controls">
+          <label>table init <select id="em-i"><option value="inv" selected>N(0, 1/d) — tied-output convention</option><option value="002">N(0, 0.02²) — learned-position convention</option></select></label>
+          <label><input type="checkbox" id="em-s" checked /> multiply E[token] by √d</label>
+          <label>position <select id="em-p"><option value="sin" selected>sinusoidal</option><option value="learned">learned N(0, 0.02²)</option></select></label>
+          <label>d_model <select id="em-d"><option value="64">64</option><option value="256" selected>256</option><option value="768">768</option></select></label>
+        </div>
+        <svg id="em-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left: two bars per convention giving the mean Euclidean norm of the scaled token embedding and of the position vector, with the ratio printed; at the defaults, the tied-output table with the square-root-of-d factor and sinusoidal positions, the two bars are comparable, and unticking the factor shrinks the token bar to a small fraction of the position bar. Middle: the cosine of the input row with its token component and with its position component, as two bars. Right: two first-layer attention score matrices from the same random projections, one on the actual input rows and one on the same input with every token replaced by a different random token, and the correlation between the two printed; when the position term dominates the two matrices are nearly identical and the correlation is near one, showing that the scores carry almost no token information. The readout prints the norms, the ratio, the cosines and the correlation."></svg>
+        <div class="readout" aria-live="polite" id="em-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 21 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="unembed" data-nav="Unembedding, tying, and the vocabulary cost">
+      <h3><span class="idx">21</span> Unembedding out: the vocabulary projection, weight tying, and what it costs in a small model</h3>
+      <p class="lede">The last thing the model does is turn a <code>d</code>-vector into <code>V</code> logits. That is one matrix, <code>(d × V)</code>, and in a small model it is a third of the parameters and a third of the arithmetic. Tying it to the input table halves that count and makes an assumption about geometry that the initialisation has to honour.</p>
+
+      <div class="formula"><span class="lbl">the output head</span><span class="eq">hᵢ = N_f( xᴸᵢ )                       (1 × d), the final norm of §11
+zᵢ = hᵢ · W_out  (+ b_out)             (1 × V) logits;  W_out (d × V) — the "unembedding", "output head" or "LM head"
+pᵢ = softmax(zᵢ)                       V exponentials per position — negligible against d·V MACs
+loss  −log pᵢ[targetᵢ]                 through DL.xent, from the logits, never from p (the training page)
+
+cost per token   d·V MACs   =  768 × 50 257  =  38.6 M   against  85 M for all twelve blocks of
+                               a 124M model: the head is 31% of the per-token arithmetic
+                            =  4096 × 32 000 = 131 M   against  6.5 B for the 32 blocks of a 7B model: 2.0%</span>
+<span class="lbl">weight tying — one matrix in both roles</span><span class="eq">W_out = Eᵀ            so  zᵢ = hᵢ · Eᵀ,   zᵢ[t] = ⟨hᵢ, E[t]⟩
+
+saves V·d parameters:  38.6 M that an untied head would add to the 124 M small model (the
+          tied table is 31% of its count), 131 M on top of the 6.7 B of the 7B (2%)
+assumes:  "the vector that REPRESENTS token t on input" and "the vector the output must
+          ALIGN WITH to predict t" are the same vector, up to the final norm's γ.
+          That is a reasonable prior for a small model. Most 7B+ decoders untie — the
+          extra V·d is cheap at that scale and separating the roles is reported to help
+          a little — but not all: some very large models keep the tie.
+requires: an initialisation in which ‖E[t]‖ makes ⟨hᵢ, E[t]⟩ the right size — the
+          same fact §20 needed, seen from the other end.</span></div>
+
+      <h4>What the initial loss says about the head</h4>
+      <p>A model at initialisation should be roughly uniform over the vocabulary, so its loss should be about <code>ln V</code> — <code>10.8</code> for a 50k vocabulary. Push random tokens through <code>DL.tfInit</code> under the conventions of §20 and read the loss: the untied head with unit-variance logits gives about <code>ln V + ½</code>, the expected cross-entropy of a Gaussian logit vector; the tied head with the <code>N(0, 0.02²)</code> table gives <code>ln V</code> almost exactly; the tied head with the <code>N(0, 1/d)</code> table <i>and</i> the <code>√d</code> factor gives noticeably more than <code>ln V</code>, and the reason is instructive — the residual stream still contains the input embedding at the top, the final norm scales it to norm <code>√d</code>, and tying makes <code>⟨hᵢ, E[tokenᵢ]⟩ ≈ √d</code>: <b>the untrained model confidently predicts its own input token</b>, which is the wrong answer for next-token prediction. And the tied head with a unit-variance table and no factor gives a loss in the hundreds: the logits are <code>√d</code> too large. The figure runs all four and prints them; the one in the hundreds is the bug, the one a few nats above <code>ln V</code> is a known cost of tying that training removes in the first steps.</p>
+
+      <div class="viz" id="viz-un">
+        <div class="vhead">
+          <span class="vtitle">The head's share of parameters and MACs against model size; and the initial loss under four head conventions</span>
+          <span class="vhint">the share falls as d and L grow because the head is one matrix and the blocks are 12·L of them; the initial-loss bars are fresh forward passes through untrained models — the one far above ln V is the bug</span>
+        </div>
+        <div class="controls">
+          <label>vocabulary V <select id="un-V"><option value="32000">32 000</option><option value="50257" selected>50 257</option><option value="128256">128 256</option></select></label>
+          <label>context n_max <select id="un-n"><option value="1024" selected>1024</option><option value="4096">4096</option></select></label>
+          <label>initial-loss test: V <select id="un-tv"><option value="50">50</option><option value="1000" selected>1000</option></select></label>
+          <label>seed <input type="range" id="un-seed" min="1" max="5" step="1" value="1" /><span id="un-seedv" style="min-width:16px;display:inline-block">1</span></label>
+        </div>
+        <svg id="un-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left: the vocabulary head's share of total parameters when untied and its share of per-token multiply–accumulates, plotted against model width for a family of configurations from width 768 with twelve blocks to width 8192 with eighty blocks, both falling from between a third and a half at the smallest configuration to about one percent at the largest, with the parameter share drawn twice — once for a tied head, where it is the input table's share, and once untied. Right: four bars giving the mean initial cross-entropy of untrained two-layer models under four head conventions — untied with a unit-scaled table, tied with a small-variance table, tied with an inverse-width table and the square-root factor, and tied with a unit-variance table and no factor — against a dashed line at the log of the vocabulary size; at the defaults the first three sit within a few nats of the line and the fourth is far above it. The readout prints the shares at the smallest and largest configuration and the four losses."></svg>
+        <div class="readout" aria-live="polite" id="un-readout"></div>
+      </div>
+
+      <div class="callout"><b>The logit lens, introduced here and used in §33.</b> Because the head is one linear map after one norm, it can be applied to the residual stream at <i>any</i> depth, not just the top: <code>softmax(N_f(xˡᵢ)·W_out)</code> is "what the model would predict if it stopped at layer <code>l</code>". It is a diagnostic, not a claim about how the model works — the head was trained only on <code>xᴸ</code> — but on a model whose blocks are near-identity (§11) the intermediate readings are meaningful, and §33 reads them off the page's trained model layer by layer.</div>
+    </section>
+
+    <!-- ═══ 22 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="params" data-nav="Parameter accounting, whole model">
+      <h3><span class="idx">22</span> Exact parameter accounting for a whole model, and five real configurations</h3>
+      <p class="lede">Every parameter in a decoder-only transformer is in one of six places, and five of the six are a closed form in <code>(V, d, L, h, g, d_ff, n_max)</code>. This section writes the form, evaluates it for five configurations spanning three orders of magnitude, and shows where the count moves as models grow.</p>
+
+      <div class="formula"><span class="lbl">the count, component by component — DL.modelParams evaluates exactly this</span><span class="eq">token embedding        V·d
+positions              n_max·d   (learned)   |   0   (sinusoidal, RoPE, ALiBi, none)
+per block
+   attention           d·(h·dₖ) + 2·d·(g·dₖ) + (h·dₖ)·d      [+ biases: h·dₖ + 2·g·dₖ + d]
+                       = 4d² when h·dₖ = d and g = h;  (2 + 2g/h)·d² under grouped-query
+   FFN                 2·d·d_ff + d_ff + d   (ungated, with biases)   |   3·d·d_ff   (gated)
+   norms               2 × (2d  LayerNorm  |  d  RMSNorm)
+final norm             2d | d
+unembedding            V·d  (untied)   |   0  (tied)
+
+total  =  V·d·(1 + [untied])  +  n_max·d·[learned]  +  L·(attention + FFN + norms)  +  final norm</span>
+<span class="lbl">the same count for five configurations (dₖ = d/h, n_max the trained context)</span><span class="eq">                    V       d      L   h   g   d_ff    FFN    pos      total        blocks   embed
+125M-class       50 257    768   12  12  12   3 072  GELU   learned   125 226 240   85.1 M   40.2 M
+350M-class       50 257  1 024   24  16  16   4 096  GELU   learned   355 871 744  302.3 M   53.6 M
+1.3B-class       50 257  2 048   24  16  16   8 192  GELU   learned 1 315 723 264 1 208.6 M  107.1 M
+7B-class         32 000  4 096   32  32  32  11 008  SwiGLU RoPE    6 738 415 616 6 476.3 M  262.1 M (untied)
+70B-class        32 000  8 192   80  64   8  28 672  SwiGLU RoPE   68 976 648 192 68 452.4 M  524.3 M (untied)
+
+the 125M model is 32% embeddings; the 70B model is 0.8%. Everything else is blocks,
+and two-thirds to four-fifths of the blocks is FFN (§14).
+
+the rows are the shapes of the 2020 decoder family (first three, n_max = 2048, tied head,
+biases everywhere) and of the 2023 family's 7B and 70B (no biases, untied). One liberty:
+the 2020 family lists 24 heads of 128 for its 1.3B model, which does not multiply out to
+d = 2048; this page keeps h·dₖ = d throughout and uses 16 heads of 128, which leaves
+every count unchanged.</span></div>
+
+      <h4>Reading the table</h4>
+      <ul class="notes">
+        <li><b>The block count is the model.</b> From 125M to 70B the block share of parameters goes from 68% to 99%; the embedding is a fixed cost that becomes invisible. This is why "non-embedding parameters" is the count scaling laws are written in (<a href="../../llm/large-language-models.html#scaling">Large Language Models</a>), and why §23's <code>6·N·D</code> rule is usually stated with <code>N</code> the non-embedding count.</li>
+        <li><b>The 70B row's attention is smaller than its shape suggests.</b> With <code>g = 8</code> key/value heads for <code>h = 64</code> query heads, the attention block is <code>(2 + 2·8/64)·d² = 2.25·d²</code> rather than <code>4d²</code>: 151M per block instead of 268M. The figure lets you set <code>g = h</code> and watch 9.4 billion parameters appear.</li>
+        <li><b>Untied heads cost exactly one more <code>V·d</code>.</b> 131M in the 7B model, 262M in the 70B — 2% and 0.4%. Once that share is this small, tying no longer pays much for its assumption (§21), which is one reading of why most large decoders untie.</li>
+        <li><b>Learned positions are the smallest line and the most consequential.</b> 1.6M parameters in the 125M model — 1.3% — and the reason its context is fixed at <code>n_max</code> for ever (§05).</li>
+      </ul>
+
+      <h4>The same count for the page's live model, line by line</h4>
+      <div class="formula"><span class="lbl">§32's model: V = 10, d = 16, L = 2, h = 2, d_ff = 32, n_max = 10, learned positions, LayerNorm, tied head</span><span class="eq">token embedding        10 × 16                              =   160
+positions              10 × 16                              =   160
+per block
+   attention           W_Q 16×16 + W_K 16×16 + W_V 16×16 + W_O 16×16   = 1 024
+   FFN                 W₁ 16×32 + b₁ 32 + W₂ 32×16 + b₂ 16               = 1 072
+   norms               2 × (γ 16 + β 16)                                  =    64
+   block total                                                            = 2 160
+two blocks             2 × 2 160                            = 4 320
+final norm             16 + 16                              =    32
+unembedding            tied                                 =     0
+total                                                        = 4 672        (DL.tfParamList sums to exactly this)
+
+shares: blocks 92.5% (of which FFN 49.6%, attention 47.4%, block norms 3.0%), embeddings 6.8%, final norm 0.7%
+— the same shape as the 350M row, scaled down by 76 000×.</span></div>
+
+      <div class="viz" id="viz-pc">
+        <div class="vhead">
+          <span class="vtitle">Parameters by component for the five configurations, and the same model with its knobs turned</span>
+          <span class="vhint">the bars are exact counts from the closed form; use the controls to untie the head, switch attention to grouped-query or the FFN to gated, and watch which bar moves — the readout prints the deltas</span>
+        </div>
+        <div class="controls">
+          <label>configuration <select id="pc-c"><option value="0">125M-class</option><option value="1">350M-class</option><option value="2">1.3B-class</option><option value="3" selected>7B-class</option><option value="4">70B-class</option></select></label>
+          <label>KV heads <select id="pc-g"><option value="cfg" selected>as configured</option><option value="h">g = h</option><option value="8">g = 8</option><option value="1">g = 1</option></select></label>
+          <label>head <select id="pc-t"><option value="cfg" selected>as configured</option><option value="tied">tied</option><option value="untied">untied</option></select></label>
+          <label>FFN <select id="pc-f"><option value="cfg" selected>as configured</option><option value="u">ungated 4d</option><option value="g">gated 8d/3</option></select></label>
+        </div>
+        <svg id="pc-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left: five stacked horizontal bars, one per configuration from 125M-class to 70B-class, on a logarithmic axis, each split into token embedding, learned positions, attention, feedforward, norms and unembedding, with the total printed at the end of each bar; the feedforward segment is the largest in every bar and the embedding segment shrinks from about a third of the smallest bar to under one percent of the largest. Right: the chosen configuration drawn as a single stacked bar with the modified settings beside the original, so that switching the key-value head count, the head tying or the feedforward type shows exactly which segment changes and by how much. The readout prints the exact totals, the per-block count, and the difference each modification makes."></svg>
+        <div class="readout" aria-live="polite" id="pc-readout"></div>
+      </div>
+
+      <h4>From the count to bytes: on disk, in memory, and beside the cache</h4>
+      <p>A parameter count becomes a memory requirement by one multiplication, and that product is the first number an implementation checks. The 7B-class row is 6 738 415 616 parameters: 26.95 GB in fp32, 13.48 GB in bf16, about 3.8 GB at 4 bits with group scales; the 70B-class row is 137.95 GB in bf16, more than one 80 GB device holds. How those bytes are split into files and indexed is §37, how they are placed on devices without being held twice is §38, and why the layout on disk can differ from the layout above is §39. At inference a second memory term sits beside the weights and, unlike them, grows with every token and every concurrent sequence: the KV cache, <code>2·L·g·dₖ</code> values per token — which is why the <code>g</code> column of the table matters more at deployment than its share of the parameters suggests (§45).</p>
+    </section>
+
+    <!-- ═══ 23 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="flops" data-nav="6·N·D, derived in MACs and FLOPs">
+      <h3><span class="idx">23</span> Training compute: the <code>6·N·D</code> rule derived from the MAC count, and exactly what it leaves out</h3>
+      <p class="lede">The rule of thumb says training a model of <code>N</code> parameters on <code>D</code> tokens costs <code>6·N·D</code> floating-point operations. It is true, it is a MAC count in disguise, and it omits one term that this page can put a number on. Derive it from the forward pass of §01 and the backward pass of <a href="../neural-network-training/loss-backprop.html#backprop">the training page</a>.</p>
+
+      <div class="formula"><span class="lbl">forward: one MAC per weight per token, plus the attention term</span><span class="eq">every weight matrix W (a × b) is applied as  x·W  once per token:  a·b MACs = one MAC per parameter
+   ⇒  forward weight MACs per token  =  N_weights  ≈  N_non-embedding + V·d  (the head is a matmul too;
+                                                       the input lookup is not — it costs nothing)
+the attention matrices are not weights:  Q·Kᵀ and A·V cost  2·n·(h·dₖ) MACs per token per layer
+   (causal kernels skip half:  n·(h·dₖ), plus a little)
+   ⇒  forward MACs per token  =  N_weights  +  L·n·d       (causal, h·dₖ = d)</span>
+<span class="lbl">backward: twice the forward, so training is three forwards — in MACs — and 6 in FLOPs</span><span class="eq">for each  y = x·W :   ∂L/∂W = xᵀ·(∂L/∂y)   and   ∂L/∂x = (∂L/∂y)·Wᵀ      two matmuls, same size
+   ⇒  backward MACs  =  2 × forward MACs        (<a href="../neural-network-training/loss-backprop.html#bp-cost">the training page's backprop-cost section</a> counted the same factor for an MLP)
+   ⇒  training MACs per token  =  3·N_weights + 3·L·n·d
+   ⇒  training FLOPs per token =  6·N_weights + 6·L·n·d           (1 MAC = 2 FLOPs)
+   ⇒  training FLOPs           =  6·N·D  +  6·L·n·d·D
+
+the rule keeps the first term. The second is the attention term, and its size RELATIVE
+to the weight term is  L·n·d / N_weights  ≈  n / (12·d)  for a standard block (12d² per layer):
+   d = 768,  n = 2048:  0.22      d = 4096, n = 4096:  0.083      d = 8192, n = 4096:  0.042
+   d = 4096, n = 32768: 0.67 — at long context the "negligible" term is two-fifths of the total.</span></div>
+
+      <h4>Three things the derivation makes exact</h4>
+      <p>First, <b>which <code>N</code></b>: the rule wants the parameters that are <i>multiplied</i>, so the input embedding is excluded (a lookup) and the output head is included (a matmul) — for a tied model that means <code>N_non-embedding + V·d</code>, which is why quoting the rule with the total count is slightly wrong in both directions and nearly right at scale. Second, <b>MACs against FLOPs</b>: the <code>6</code> is <code>3</code> in MACs; a hardware peak is quoted in FLOP/s, and a MAC count from <a href="../attention/cost-limits.html#cost">the attention page's cost section</a> or <code>DL.attnMacs</code> must be doubled before it is divided into a peak — this is the factor-of-two slip the box below names, and the figure prints both units on every bar. Third, <b>where the crossover is</b>: the attention term equals the weight term at <code>n ≈ 12·d</code>, which <a href="../attention/cost-limits.html#crossover">the attention page's crossover section</a> derived per layer as <code>n* = 2d + nmat·d_ff/2</code>; this section only reads that result at the model level. Everything else the rule omits — the norms, the softmax, the activation functions, the optimiser's own arithmetic — is a few percent. Activation recomputation, if it is used to save memory, is not a few percent: it repeats the forward pass during the backward pass and turns the 6 into 8. And <a href="../distributed-training.html">Distributed Training</a> owns what happens when the count has to be split across machines.</p>
+
+      <div class="viz" id="viz-fl">
+        <div class="vhead">
+          <span class="vtitle">Training FLOPs per token for the five configurations: the weight term against the attention term, as the context grows</span>
+          <span class="vhint">the weight term is flat in n and the attention term is linear in it; the crossing is at n ≈ 12·d — drag the context to see the term the rule omits become the majority</span>
+        </div>
+        <div class="controls">
+          <label>context n (log₂) <input type="range" id="fl-n" min="8" max="17" step="1" value="12" /><span id="fl-nv" style="min-width:60px;display:inline-block">4 096</span></label>
+          <label>units <select id="fl-u"><option value="flops" selected>FLOPs (2 per MAC)</option><option value="macs">MACs</option></select></label>
+          <label>attention kernel <select id="fl-c"><option value="causal" selected>causal (skips the masked half)</option><option value="full">full n² (no skipping)</option></select></label>
+        </div>
+        <svg id="fl-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left: for each of the five configurations, a stacked bar of training cost per token on a logarithmic axis, split into six times the weight parameters and six times the attention term at the chosen context, with the attention share printed; at the default context of 4096 the attention share ranges from about a fifth for the smallest model to a few percent for the largest. Right: for the 7B-class configuration, the two terms plotted against context length on logarithmic axes, the weight term flat and the attention term rising linearly, crossing at a context of about twelve times the width, with the current context marked. The readout prints the per-token cost in the chosen unit for every configuration, the attention share, and the number of tokens per second a device with a stated peak would train at if it ran at full utilisation."></svg>
+        <div class="readout" aria-live="polite" id="fl-readout"></div>
+      </div>
+
+      <div class="wrong"><span class="say">The unit slip to avoid.</span> "The 7B model does 7 GFLOPs per token in the forward pass." <span class="fix">It does 7 G<i>MACs</i>, which is 14 GFLOPs, and 42 GFLOPs per token in training.</span> Every count on this page and on the attention page is a MAC count unless it says FLOPs; the conversion is a factor of two and it is the difference between a training-time estimate that is right and one that is off by half.</div>
+    </section>
+
+    <nav class="pager" aria-label="Transformers series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="residual-norms-ffn.html">← Residual Stream, Norms &amp; FFN</a>
+      <a href="../transformers.html" style="color:var(--muted)">Transformers · overview</a>
+      <a href="training-decoding.html">Transformer Training &amp; Decoding →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../transformers.viz.js"></script>
+</body>
+</html>

@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · CLIP: Zero-Shot Transfer &amp; Robustness</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../clip.html">CLIP</a> · part 3 of 5</p>
+      <h1>CLIP: Zero-Shot Transfer &amp; Robustness</h1>
+      <p>Using the trained space as a classifier: class-name sentences embedded into a linear head, prompt templates and ensembling, results over 27 datasets, zero-shot against few-shot and linear probes, robustness under ImageNet distribution shifts and how adaptation erodes it, and the train–test data-overlap analysis.</p>
+      <div style="margin-top:10px">
+        <span class="pill">CLIP</span>
+        <span class="pill">Text-as-classifier · prompt ensembles · 27 datasets · few-shot & linear probe · distribution shift · overlap</span>
+      </div>
+    </header>
+
+    <!-- 17 ───────────────────────────────────────────── -->
+    <section class="topic" id="zero-shot" data-nav="Zero-shot classification">
+      <h3><span class="idx">17</span> Zero-shot classification: a classifier written in text</h3>
+      <p class="lede">To classify into K classes, write a sentence for each class, embed the K sentences once, and use the resulting K unit vectors as the weight matrix of a linear classifier over image embeddings. The paper calls the text encoder a hypernetwork that "generates the weights of a linear classifier based on the text".</p>
+
+      <div class="viz" id="viz-zs">
+        <div class="vhead">
+          <span class="vtitle">Build a zero-shot classifier on a toy 2-D embedding space</span>
+          <span class="vhint">tick the classes in the label set · rotate the image embedding · logits = 100 · cosine, then softmax</span>
+        </div>
+        <div class="controls" id="zs-classes"></div>
+        <div class="controls">
+          <label>image embedding angle <input type="range" id="zs-ang" min="0" max="359" step="1" value="40" /><span id="zs-angv" style="min-width:40px;display:inline-block"></span></label>
+          <label>scale <select id="zs-scale"><option value="100">100 (released models)</option><option value="14.29">14.29 (initial)</option><option value="1">1 (raw cosines)</option></select></label>
+        </div>
+        <svg id="zs-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Unit circle with class text embeddings and an image embedding, beside the resulting class probabilities"></svg>
+        <div class="readout" aria-live="polite" id="zs-read"></div>
+      </div>
+
+      <div class="formula"><span class="lbl">the classifier: K class embeddings as rows of W</span><span class="eq">wₖ = normalize( f_txt("a photo of a {classₖ}.") )        k = 1 … K</span>
+<span class="lbl">prediction for image x</span><span class="eq">P(k | x) = softmaxₖ( s · wₖ · u(x) )        ŷ = argmaxₖ  wₖ · u(x)</span>
+<span class="lbl">the paper's description of the same thing</span><span class="eq">multinomial logistic regression with L2-normalised inputs,
+L2-normalised weights, no bias, and temperature scaling</span></div>
+
+      <h4>A hand-worked example with realistic cosines</h4>
+      <ul class="notes">
+        <li>Three classes; an image of a cat. Suppose the cosines to "a photo of a cat.", "a photo of a dog." and "a photo of a car." are <b>0.31, 0.27 and 0.12</b> — values in the range CLIP actually produces.</li>
+        <li>Logits at <code>s = 100</code>: 31, 27, 12. Softmax: <code>e⁰ : e⁻⁴ : e⁻¹⁹</code> → <b>0.982, 0.018, 0.000</b>. Prediction: cat.</li>
+        <li>At <code>s = 14.29</code>: logits 4.43, 3.86, 1.71 → 0.613, 0.346, 0.041. Same argmax, far less confident. At <code>s = 1</code> the three probabilities would be 0.36, 0.34, 0.30.</li>
+        <li>A cosine gap of only 0.04 between cat and dog becomes a 55 : 1 probability ratio at scale 100 (<code>e⁴ ≈ 54.6</code>). Small cosine differences carry the whole decision.</li>
+      </ul>
+
+      <h4>Properties that follow</h4>
+      <ul class="notes">
+        <li><b>The label set is part of the model.</b> Removing the correct class does not produce "none of the above"; the softmax redistributes over what remains. Adding a class can change predictions for images of other classes (the <a href="limits-downstream.html#bias">bias section</a> shows this changing harmful outcomes).</li>
+        <li><b>Amortised cost.</b> The K text embeddings are computed once and cached; per image, zero-shot inference is one image forward pass and a K × d_e product.</li>
+        <li><b>Zero-shot in the paper's sense</b> means zero examples from the evaluation <i>dataset</i>, not necessarily unseen <i>concepts</i> — the pretraining data may well contain the categories. The paper is explicit that it uses the term for generalisation to unseen datasets.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> CLIP's zero-shot classifier is an ordinary linear classifier whose weights were written in English instead of learned from labelled images. Its accuracy depends on the image encoder, the class names, the prompt wording and the chosen label set.</div>
+    </section>
+
+    <!-- 18 ───────────────────────────────────────────── -->
+    <section class="topic" id="prompts" data-nav="Prompt engineering and ensembling">
+      <h3><span class="idx">18</span> Prompt engineering and ensembling</h3>
+      <p class="lede">A bare class name is a poor caption: CLIP was trained on sentences, and many labels are ambiguous. Wrapping the name in a template, tailoring the template to the dataset, and averaging the embeddings of many templates each add accuracy — on ImageNet, 1.3 points for the default template and a further 3.5 for an 80-template ensemble.</p>
+
+      <div class="viz" id="viz-ens">
+        <div class="vhead">
+          <span class="vtitle">Averaging template embeddings on a toy problem</span>
+          <span class="vhint">each template embeds a class slightly off its "true" direction · averaging K unit vectors and renormalising cancels the noise · seeded toy data, not CLIP outputs</span>
+        </div>
+        <div class="controls">
+          <label>templates K <input type="range" id="ens-k" min="1" max="80" step="1" value="1" /><span id="ens-kv" style="min-width:30px;display:inline-block"></span></label>
+          <label>template noise <input type="range" id="ens-noise" min="5" max="60" step="5" value="35" /><span id="ens-noisev" style="min-width:40px;display:inline-block"></span></label>
+          <button class="btn ghost" id="ens-seed">New toy draw</button>
+        </div>
+        <svg id="ens-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Class prototypes built from averaged template embeddings and toy accuracy as the number of templates grows"></svg>
+        <div class="readout" aria-live="polite" id="ens-read"></div>
+      </div>
+
+      <h4>Three problems with bare labels, and the fixes the paper reports</h4>
+      <ul class="notes">
+        <li><b>Distribution gap.</b> "It's relatively rare in our pre-training dataset for the text paired with the image to be just a single word." The template <code>"A photo of a {label}."</code> "improves accuracy on ImageNet by 1.3%".</li>
+        <li><b>Polysemy.</b> ImageNet contains both "construction cranes and cranes that fly"; in Oxford-IIIT Pets "boxer" is a dog breed but could be an athlete. Task-specific context helps: <code>"A photo of a {label}, a type of pet."</code> for Pets, "a type of food" for Food101, "a type of aircraft" for FGVC Aircraft, quotes around the text for OCR datasets, <code>"a satellite photo of a {label}."</code> for satellite imagery.</li>
+        <li><b>Bad class names.</b> The released ImageNet notebook also rewrites names by trial and error: "nail" became "metal nail" (CLIP read it as fingernail), "kite" became "kite (bird of prey)", "red wolf" became "red wolf or maned wolf". The notebook reports these edits add 1.5% top-1 on ViT-B/32.</li>
+      </ul>
+
+      <h4>Ensembling in embedding space</h4>
+      <div class="formula"><span class="lbl">class prototype from M templates (reference notebook)</span><span class="eq">eₖ,ₘ = normalize( f_txt( templateₘ(classₖ) ) )        m = 1 … M
+wₖ = normalize( (1/M) ∑ₘ eₖ,ₘ )</span>
+<span class="lbl">cost at inference is unchanged: still one vector per class</span><span class="eq">K × d_e weights, cached once</span></div>
+      <ul class="notes">
+        <li>The paper ensembles "over the embedding space instead of probability space", so the ensemble costs nothing extra per image. On ImageNet, <b>80 context prompts</b> add <b>3.5%</b> over the single default; with the template, "almost 5%" in total.</li>
+        <li>Across 36 datasets, prompt engineering plus ensembling improves zero-shot accuracy "by almost 5 points on average", which the paper equates to the gain from "4 times more compute with the baseline zero-shot method".</li>
+        <li>The 80 templates mix quality and style: "a bad photo of a {}.", "a sculpture of a {}.", "a tattoo of a {}.", "itap of a {}." ("I took a picture"), "a {} in a video game.". The notebook notes that templates added for renditions (aimed at ImageNet-R) "improved standard ImageNet accuracy too".</li>
+        <li>After the paper, sequential forward selection over the 80 found 7 templates — "itap of a {}.", "a bad photo of the {}.", "a origami {}.", "a photo of the large {}.", "a {} in a video game.", "art of the {}.", "a photo of the small {}." — which "performs a bit better than the full 80 ensemble", especially for smaller models.</li>
+      </ul>
+
+      <h4>Why averaging works (and its limits)</h4>
+      <p>Each template embeds the class plus template-specific noise (style words, the word "photo", article choice). Averaging many unit vectors keeps the shared class direction and partially cancels the rest — the toy figure shows accuracy rising and then flattening as K grows. The limit is correlated error: if every template shares a misreading (say, the fingernail sense of "nail"), averaging cannot remove it, which is why the class-name edits exist.</p>
+      <div class="callout"><b>Takeaway:</b> write labels as captions, disambiguate with task context, and average many template embeddings into one prototype per class. These are free at inference time and worth about as much as 4× more model compute, but they were tuned against labelled validation data — a caveat the paper itself raises.</div>
+    </section>
+
+    <!-- 19 ───────────────────────────────────────────── -->
+    <section class="topic" id="benchmarks" data-nav="Results across 27 datasets">
+      <h3><span class="idx">19</span> Zero-shot results across the 27-dataset suite</h3>
+      <p class="lede">The paper's main evaluation suite is 27 image-classification datasets: the 12 from a standard transfer study plus 15 chosen for breadth (MNIST, FER2013, STL-10, EuroSAT, RESISC45, GTSRB, KITTI, PatchCamelyon, UCF101, Kinetics-700, CLEVR counts, Hateful Memes, ImageNet, and two new ones, Country211 and Rendered SST2). Zero-shot CLIP beat a fully supervised linear classifier on ResNet-50 features on 16 of them.</p>
+
+      <div class="viz" id="viz-bench">
+        <div class="vhead">
+          <span class="vtitle">Per-dataset zero-shot CLIP, two comparisons</span>
+          <span class="vhint">sorted bars · Figure 5 deltas, or ViT-L/14@336px zero-shot (Table 11) minus its own linear probe (Table 10)</span>
+        </div>
+        <div class="controls">
+          <label>compare <select id="bench-mode"><option value="rn50">zero-shot CLIP − linear probe on ResNet-50 (Fig. 5)</option><option value="self">zero-shot CLIP − linear probe on CLIP's own features</option></select></label>
+        </div>
+        <svg id="bench-svg" width="640" height="440" viewBox="0 0 640 440" role="img" aria-label="Sorted horizontal bar chart of accuracy differences on 27 datasets"></svg>
+        <div class="readout" aria-live="polite" id="bench-read"></div>
+      </div>
+
+      <h4>Where zero-shot CLIP is strong</h4>
+      <ul class="notes">
+        <li><b>General objects:</b> slight wins on ImageNet, CIFAR-10/100, STL-10 and Pascal VOC. On STL-10 zero-shot CLIP scored 99.3%, which the paper notes "appears to be a new state of the art despite not using any training examples".</li>
+        <li><b>Actions in video</b> (middle frame only): +14.5 on Kinetics-700 and +7.7 on UCF101 over the ResNet-50 probe, which the paper attributes to language supervising verbs, where ImageNet supervises nouns.</li>
+        <li><b>Some fine-grained sets:</b> +28.9 on Stanford Cars and +22.5 on Food101 — but not all (next list).</li>
+        <li><b>Rendered text and geography:</b> +23.2 on Country211 and +12.4 on Rendered SST2.</li>
+      </ul>
+
+      <h4>Where it is weak</h4>
+      <ul class="notes">
+        <li>Specialised, abstract or unusual tasks: EuroSAT −37.1, KITTI distance −34.0, PatchCamelyon −19.5, GTSRB −18.4, CLEVR counts −18.2, DTD −16.6, Flowers102 −12.5, RESISC45 −11.9, FGVC Aircraft −11.3, MNIST −10.0.</li>
+        <li>The paper cautions that for tasks "a learner has no prior experience with, such as lymph node tumor classification", it is unclear zero-shot is even a meaningful evaluation.</li>
+      </ul>
+
+      <h4>Zero-shot versus the same features with labels</h4>
+      <ul class="notes">
+        <li>Against a linear probe on CLIP's own features, zero-shot is mostly 10 to 25 points lower, approaching it (≤ 3 points, by the paper's count) on only five datasets — STL10, CIFAR10, Food101, OxfordPets, Caltech101 — all above 90% in both settings. Recomputing from Tables 10 and 11 for ViT-L/14@336px puts Caltech101 at 3.2, so the figure below counts four; the paper's plot may use rounded or differently-sourced values.</li>
+        <li>Across datasets the two are correlated at <b>r = 0.82</b>; a regression suggests each point of linear-probe accuracy brings 1.28 points of zero-shot accuracy, though the 95% interval (0.93–1.79) includes values below 1.</li>
+        <li>Averaged error over 39 evaluations on 36 datasets follows a smooth log-log trend across the five ResNets' 44× compute range, while individual evaluations are "much noisier".</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> zero-shot CLIP is competitive with a supervised ResNet-50 probe on common categories, actions, some fine-grained sets and rendered text, and far behind on specialised imagery (satellite, medical, synthetic counting, driving). The suite was assembled during development, which the paper concedes makes it "undeniably co-adapted" with CLIP.</div>
+    </section>
+
+    <!-- 20 ───────────────────────────────────────────── -->
+    <section class="topic" id="few-shot" data-nav="Zero-shot vs few-shot vs linear probe">
+      <h3><span class="idx">20</span> Zero-shot versus few-shot versus linear probe</h3>
+      <p class="lede">The obvious expectation — one labelled example beats zero — fails for CLIP: its zero-shot classifier matches a 4-shot logistic regression trained on its own features, averaged over 20 datasets. With enough labels the probe wins by a wide margin, and CLIP's features then beat the best ImageNet model of the time.</p>
+
+      <h4>Few-shot parity</h4>
+      <ul class="notes">
+        <li>On the 20 datasets with at least 16 examples per class, zero-shot CLIP "matches the average performance of a 4-shot linear classifier trained on the same feature space" and "nearly matches the best results of a 16-shot linear classifier across publicly available models" (a BiT-M ResNet-152x2 trained on ImageNet-21K).</li>
+        <li>The paper's explanation: a zero-shot classifier is <i>told</i> the concept in words, while a one-shot learner must infer it from an image that contains many concepts, so "many different hypotheses can be consistent with the data".</li>
+        <li>Per dataset, the labelled examples a probe needs to match zero-shot range from under 1 (Flowers102 and EuroSAT, where zero-shot loses even to one-shot) to an estimated <b>184</b> (FER2013); <b>median 5.4, mean 20.8</b>. On ImageNet, zero-shot matches a <b>16-shot</b> probe.</li>
+      </ul>
+
+      <h4>The counter-intuitive drop</h4>
+      <p>Moving from zero-shot to a 1- or 2-shot probe <i>lowers</i> accuracy, because the probe discards the text prior. The authors tried an L2 penalty pulling the probe toward the zero-shot weights, but hyper-parameter search "would often select for such a large value of this regularizer that the resulting few-shot classifier was 'just' the zero-shot classifier". Humans behave oppositely: on Oxford-IIIT Pets, human accuracy rose from 53.7% zero-shot to 75.7% with one example per class (zero-shot CLIP: 93.5%), with the gain concentrated on images the people had been unsure about.</p>
+
+      <h4>Linear-probe representation quality</h4>
+      <table class="cmp">
+        <tr><th>Comparison</th><th>Result (paper)</th></tr>
+        <tr><td>Best CLIP vs best prior model, 12-dataset suite</td><td>+2.6 points average (ViT-L/14@336px)</td></tr>
+        <tr><td>Same, 27-dataset suite</td><td>+5 points average</td></tr>
+        <tr><td>Versus Noisy Student EfficientNet-L2, per dataset</td><td>CLIP better on 21 of 27; worse on ImageNet (−3.0), CIFAR-10/100, PatchCamelyon, CLEVR, OxfordPets</td></tr>
+        <tr><td>ImageNet linear probe, ViT-L/14@336px</td><td>85.4% (zero-shot: 76.2%)</td></tr>
+        <tr><td>Compute efficiency on the 27-dataset suite</td><td>"All CLIP models, regardless of scale, outperform all evaluated systems"</td></tr>
+      </table>
+      <ul class="notes">
+        <li>The biggest linear-probe gains over EfficientNet-L2 are on OCR-dependent sets (Rendered SST2 +23.6, Hateful Memes +18.8), geolocation (Country211 +22.7), cars (+15.9) and traffic signs (GTSRB +14.7). The paper suggests ImageNet's single "street sign" label may teach supervised models to collapse such distinctions.</li>
+        <li>The protocol is L-BFGS logistic regression with an L2 penalty tuned over 10⁻⁶ to 10⁶; the paper deliberately avoids fine-tuning in these comparisons because fine-tuning "can compensate for and potentially mask failures" of the pretrained representation.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> text is worth about four labelled images per class on average (and sixteen on ImageNet) — but CLIP has no good way to add a few labels on top of that prior, and its full-data linear probe is where its representation quality shows.</div>
+    </section>
+
+    <!-- 21 ───────────────────────────────────────────── -->
+    <section class="topic" id="robustness" data-nav="Distribution-shift robustness">
+      <h3><span class="idx">21</span> Distribution-shift robustness and "effective robustness"</h3>
+      <p class="lede">ImageNet models lose much of their accuracy on natural variations of ImageNet — new photos, sketches, renditions, adversarially filtered images, unusual viewpoints. Zero-shot CLIP, never trained on ImageNet's distribution, loses far less. The paper measures this with the "effective robustness" framework of Taori et al.</p>
+
+      <div class="viz" id="viz-rob">
+        <div class="vhead">
+          <span class="vtitle">Three models with ImageNet accuracy near CLIP's, on six test sets</span>
+          <span class="vhint">ResNet-101 and zero-shot CLIP ViT-L/14@336px share 76.2% on ImageNet (both from Fig. 13) · add CLIP's ImageNet-adapted linear probe (Table 16)</span>
+        </div>
+        <div class="controls">
+          <label><input type="checkbox" id="rob-lp" /> show CLIP + logistic regression fitted on ImageNet</label>
+          <label>sort by <select id="rob-sort"><option value="paper">paper order</option><option value="gap">ResNet-101 → CLIP gain</option></select></label>
+        </div>
+        <svg id="rob-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Grouped bar chart of accuracy on ImageNet and five natural distribution shifts for ResNet-101 and CLIP"></svg>
+        <div class="readout" aria-live="polite" id="rob-read"></div>
+      </div>
+
+      <h4>The framework</h4>
+      <ul class="notes">
+        <li>Taori et al. found that across many ImageNet models, accuracy under natural shift is "well modeled as a linear function of logit-transformed accuracy" on ImageNet. A model that simply sits on that line is not "more robust"; it is just more accurate.</li>
+        <li><b>Effective robustness</b> is accuracy under shift <i>above</i> that line's prediction; <b>relative robustness</b> is any improvement in shifted accuracy. The paper uses 7 shifts: ImageNetV2, ImageNet-Sketch, Youtube-BB, ImageNet-Vid, ObjectNet, ImageNet-A and ImageNet-R.</li>
+        <li>A ResNet-101 "makes 5 times as many mistakes" on these shifts as on the ImageNet validation set.</li>
+      </ul>
+
+      <h4>What zero-shot CLIP does</h4>
+      <ul class="notes">
+        <li>"All zero-shot CLIP models improve effective robustness by a large amount and reduce the size of the gap between ImageNet accuracy and accuracy under distribution shift by up to 75%."</li>
+        <li>Against a ResNet-101 with the same 76.2% ImageNet accuracy (Figure 13): ImageNetV2 64.3 → 70.1, ImageNet-R 37.7 → 88.9, ObjectNet 32.6 → 72.3, ImageNet-Sketch 25.2 → 60.2, ImageNet-A 2.7 → 77.1.</li>
+        <li>Averaged over those five shifted sets (computed here), ResNet-101 scores 32.5 and CLIP 73.7: a drop from ImageNet of 43.7 points versus 2.5. This five-set average leaves out Youtube-BB and ImageNet-Vid and is not the paper's fitted "up to 75%" statistic.</li>
+        <li>Zero-shot CLIP set a new state of the art on 5 of the 7 shifts (ImageNet-R, ObjectNet, ImageNet-Sketch, ImageNet-Vid, Youtube-BB), with the paper attributing the ImageNet-R gain partly to "significant amounts of creative content" in WIT.</li>
+      </ul>
+
+      <h4>What it does not show</h4>
+      <p>The paper is careful: these results "do not necessarily mean that supervised learning on ImageNet causes a robustness gap". CLIP differs in data size, data diversity and supervision type all at once. A footnote adds that a zero-shot model "can still exploit spurious correlations that are shared between the pre-training and evaluation distributions". A later controlled study, "Data Determines Distributional Robustness in Contrastive Language Image Pre-training", compared five candidate causes and found "the more diverse training distribution is the main cause for the robustness gains", with dataset size, language supervision and the contrastive loss contributing little. That is one study's conclusion on its experimental scale, but it points away from the loss and toward the data.</p>
+      <div class="callout"><b>Takeaway:</b> at equal ImageNet accuracy, zero-shot CLIP is dramatically better on sketches, renditions, ObjectNet and ImageNet-A. That is effective robustness — being above the line that ImageNet-trained models sit on — and it is a property of the zero-shot model, as the next section shows.</div>
+    </section>
+
+    <!-- 22 ───────────────────────────────────────────── -->
+    <section class="topic" id="adaptation" data-nav="Robustness after adaptation">
+      <h3><span class="idx">22</span> Robustness after adapting to ImageNet</h3>
+      <p class="lede">Fit a logistic-regression head on CLIP features using ImageNet's training set and ImageNet accuracy jumps 9.2 points, to 85.4% — yet average accuracy across the shifts slightly falls. The robustness advantage mostly belongs to not having trained on the target distribution.</p>
+
+      <h4>Per-dataset changes when adapting to ImageNet (paper Figure 14)</h4>
+      <table class="cmp">
+        <tr><th>Test set</th><th>Change from zero-shot</th></tr>
+        <tr><td>ImageNet</td><td>+9.2</td></tr>
+        <tr><td>ImageNetV2</td><td>+5.8</td></tr>
+        <tr><td>Youtube-BB</td><td>+0.6</td></tr>
+        <tr><td>ImageNet-Vid</td><td>−0.5</td></tr>
+        <tr><td>ImageNet-A</td><td>−1.9</td></tr>
+        <tr><td>ImageNet-Sketch</td><td>−2.8</td></tr>
+        <tr><td>ObjectNet</td><td>−3.8</td></tr>
+        <tr><td>ImageNet-R</td><td>−4.7</td></tr>
+      </table>
+      <ul class="notes">
+        <li>The one clear gain besides ImageNet is ImageNetV2, which "closely followed the creation process of the original ImageNet dataset" — gains from supervised adaptation "are closely concentrated around the ImageNet distribution".</li>
+        <li>These are the Figure 14 bars. Table 16's linear-probe row agrees with them for every set except ObjectNet: 72.3 zero-shot and 66.2 probed imply −6.1, not −3.8 (and the ImageNet-A delta matches only if zero-shot ImageNet-A is Table 16's 77.2 rather than Figure 13's 77.1). The paper does not explain the ObjectNet mismatch.</li>
+        <li>The paper calls the 9.2-point gain "roughly 3 years of improvement in SOTA" and says it has no confident explanation for why it does not transfer.</li>
+      </ul>
+
+      <h4>The continuum from zero-shot to fully supervised</h4>
+      <ul class="notes">
+        <li>Few-shot probes (1 to 128 shots) on CLIP features also show higher effective robustness than ImageNet models, but "this benefit fades as in-distribution performance increases with more training data and is mostly, though not entirely, gone for the fully supervised model."</li>
+        <li>A 16-shot probe matches zero-shot CLIP on ImageNet but is less robust. The authors' summary: "high effective robustness seems to result from minimizing the amount of distribution specific training data a model has access to, but this comes at a cost of reducing dataset-specific performance."</li>
+        <li><b>Adaptive zero-shot</b> goes the other way: writing classifiers from each shifted dataset's own class names (instead of pooling ImageNet's 1,000 predictions) improves average effective robustness by 5%, concentrated on Youtube-BB (+26.9) and ImageNet-Vid (+8.3), with ObjectNet +2.3.</li>
+      </ul>
+
+      <h4>What later work did about it</h4>
+      <p>This finding motivated robust fine-tuning methods. WiSE-FT interpolates the weights of the zero-shot and fine-tuned models and reports 4 to 6 points better accuracy under distribution shift than prior work on ImageNet's shifts while also raising ImageNet accuracy by 1.6 points. LP-FT (linear probe first, then fine-tune) argues that full fine-tuning with a random head "distorts" pretrained features, reporting on average 2% higher in-distribution but 7% lower out-of-distribution accuracy for plain fine-tuning versus linear probing. General fine-tuning strategies are in <a href="../../deep-learning/fine-tuning-transfer-learning.html">Fine-Tuning &amp; Transfer Learning</a>.</p>
+      <div class="callout"><b>Takeaway:</b> CLIP's robustness is fragile under adaptation. If you fine-tune or probe on a target distribution, expect in-distribution gains and some out-of-distribution losses; weight interpolation or linear-probe-then-fine-tune are the standard mitigations.</div>
+    </section>
+
+    <!-- 23 ───────────────────────────────────────────── -->
+    <section class="topic" id="overlap" data-nav="Data-overlap analysis">
+      <h3><span class="idx">23</span> Data-overlap (contamination) analysis</h3>
+      <p class="lede">With 400M web images, some evaluation images are bound to be in the training set. Rather than de-duplicate against every possible benchmark in advance, the paper measured the overlap for 35 datasets and estimated how much it inflated accuracy. The answer: rarely more than 0.1 points.</p>
+
+      <div class="viz" id="viz-ovl">
+        <div class="vhead">
+          <span class="vtitle">How much can contamination inflate a score?</span>
+          <span class="vhint">inflation = overlap fraction × (accuracy on overlapping − accuracy on clean) · pick a dataset from the paper or set your own</span>
+        </div>
+        <div class="controls">
+          <label>preset <select id="ovl-preset"><option value="custom">custom</option><option value="bird">Birdsnap (paper)</option><option value="c211">Country211 (paper)</option></select></label>
+          <label>overlap f (%) <input type="range" id="ovl-f" min="0" max="250" step="1" value="32" /><span id="ovl-fv" style="min-width:50px;display:inline-block"></span></label>
+          <label>Overlap − Clean (points) <input type="range" id="ovl-d" min="-200" max="200" step="1" value="50" /><span id="ovl-dv" style="min-width:50px;display:inline-block"></span></label>
+        </div>
+        <svg id="ovl-svg" width="640" height="260" viewBox="0 0 640 260" role="img" aria-label="Diagram splitting a test set into overlapping and clean parts and the resulting accuracy inflation"></svg>
+        <div class="readout" aria-live="polite" id="ovl-read"></div>
+      </div>
+
+      <div class="formula"><span class="lbl">the paper's metric: All − Clean</span><span class="eq">acc(All) = f · acc(Overlap) + (1 − f) · acc(Clean)
+acc(All) − acc(Clean) = f · ( acc(Overlap) − acc(Clean) )</span>
+<span class="lbl">Birdsnap: 12.1% overlap, +0.6 points overall</span><span class="eq">0.6 = 0.121 · Δ   →   Δ ≈ 5.0 points better on the overlapping images</span></div>
+
+      <h4>The procedure</h4>
+      <ul class="notes">
+        <li>A purpose-built near-duplicate detector (below) finds nearest neighbours of each test image in the training set; the authors inspect them and set a per-dataset threshold "to keep high precision while maximizing recall".</li>
+        <li>Each test set is split into <b>Overlap</b> (above threshold) and <b>Clean</b>. Zero-shot RN50x64 is evaluated on All, Overlap and Clean; <b>All − Clean</b> is the estimated inflation. A one-tailed binomial test and 99.5% Clopper–Pearson intervals check significance.</li>
+      </ul>
+
+      <h4>The findings</h4>
+      <ul class="notes">
+        <li>Of 35 datasets, <b>9 had no detected overlap</b> — synthetic or specialised sets (MNIST, CLEVR, GTSRB) and sets created after WIT (ObjectNet, Hateful Memes). Median overlap <b>2.2%</b>, mean <b>3.2%</b>.</li>
+        <li>Overall accuracy shifted by more than 0.1 points on only <b>7</b> datasets, of which only <b>2</b> were significant after Bonferroni correction. The largest estimated gain was <b>0.6</b> on Birdsnap (12.1% overlap).</li>
+        <li>The largest overlap was Country211 at <b>21.5%</b> (it was built from YFCC100M, part of WIT), yet accuracy rose only 0.2 — the duplicates' captions usually did not mention the location the task asks for.</li>
+        <li>Caveats the paper raises: detector recall over 400M images cannot be checked, and Overlap and Clean can differ in difficulty (on Kinetics-700 many "overlaps" were black transition frames, producing an apparent 20% <i>drop</i>).</li>
+      </ul>
+
+      <h4>The duplicate detector</h4>
+      <p>CLIP's own embeddings were unsuitable — too semantic (different soccer balls look "identical") and sometimes blind to real duplicates resized with different interpolation. The authors trained a separate ResNet-50 (anti-aliased, weight norm instead of batch norm to avoid leaking information through batch statistics, GELU) with the same InfoNCE loss at a fixed temperature of 0.07, on augmented copies of about 30M WIT images at batch size 1,712.</p>
+      <div class="callout"><b>Takeaway:</b> inflation is overlap fraction times the accuracy advantage on overlapping items, and both factors were small for CLIP. The method — split, re-evaluate, test — is reusable for any web-scale model.</div>
+    </section>
+
+    <nav class="pager" aria-label="CLIP series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="data-encoders.html">← CLIP: Data, Encoders &amp; Training</a>
+      <a href="../clip.html" style="color:var(--muted)">CLIP · overview</a>
+      <a href="limits-downstream.html">CLIP: Limitations, Geometry &amp; Downstream Use →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../clip.viz.js"></script>
+</body>
+</html>

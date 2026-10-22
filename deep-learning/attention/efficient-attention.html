@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Sparse, Linear &amp; Flash Attention</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to the other pages of the series */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../attention.html">Attention</a> · part 6 of 6</p>
+      <h1>Sparse, Linear &amp; Flash Attention</h1>
+      <p>The ways around the n² wall: sliding-window and sparse patterns, linear attention through the kernel view and what it gives up, FlashAttention's IO argument with tiling and the online softmax, and what breaks in the softmax itself as context grows.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Attention</span>
+        <span class="pill">Sliding windows · sparsity · kernel view · FlashAttention · long context</span>
+      </div>
+    </header>
+
+    <!-- ═══ 29 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="window" data-nav="Sliding windows and sparsity">
+      <h3><span class="idx">29</span> Sliding windows, dilation and sinks: capping <code>n</code> instead of shrinking the per-token cost</h3>
+      <p class="lede">MQA, GQA and MLA reduce the bytes <i>per token</i>. The other lever is to reduce the number of <i>tokens</i> each query reads. That is a mask (§15), it costs nothing to implement, and depth quietly gives most of the range back.</p>
+
+      <div class="formula"><span class="lbl">the mask, and the receptive field it leaves</span><span class="eq">   sliding window   position i reads j ∈ [i − w + 1, i]        w keys, not i
+   cost             O(n·w) instead of O(n²)          scores per layer
+   cache            capped at w tokens — a ROLLING BUFFER of fixed size,
+                    written at index (t mod w), never growing
+
+and the reason it is not as restrictive as it looks: stacking.
+
+   after 1 layer   position i has seen  w    positions
+   after 2 layers  position i has seen  2w−1  (its window's windows)
+   after k layers                       k(w−1) + 1
+
+   so a stack of L layers has an effective span of  L·(w−1) + 1.
+
+   w = 4096, L = 32   →   32 × 4095 + 1  =  131 041     ≈ 131 072 = 32 × 4096
+
+That is exactly the argument a 4096-window, 32-layer model makes for
+having a 131k "theoretical attention span" while every individual layer
+looks 4096 tokens back.</span></div>
+
+      <p>The word doing the work is "effective". Information <i>can</i> travel <code>L·w</code> tokens, in the same sense that a stack of 3×3 convolutions has a receptive field that grows with depth — and with the same caveat <a href="../convolutional-networks/arithmetic-receptive-fields.html#rf">the convolution page measured</a>: the <b>effective</b> receptive field is much smaller than the theoretical one, because the influence of a distant token has been averaged through <code>L</code> attention rows on the way. A token 100 000 positions back is <i>reachable</i>; whether any of it survives is an empirical question and the answer is usually "much less than the arithmetic suggests".</p>
+
+      <table class="grid2">
+        <tr><th style="width:150px">pattern</th><th>who each query reads</th><th>scores per layer</th><th>what it is for</th></tr>
+        <tr><td><b>sliding window</b></td><td>the last <code>w</code></td><td class="mono">n·w</td><td>local syntax; a fixed-size rolling cache</td></tr>
+        <tr><td><b>dilated / strided</b></td><td>every <code>r</code>-th of the last <code>w·r</code></td><td class="mono">n·w</td><td>a wider span at the same cost, at the price of gaps; different layers use different <code>r</code> so the gaps do not line up</td></tr>
+        <tr><td><b>global tokens</b></td><td>everything, for a chosen few positions</td><td class="mono">n·w + 2·n·k</td><td>a small number of positions that everyone can read and that read everything — a deliberate information bus</td></tr>
+        <tr><td><b>block-sparse</b></td><td>a chosen set of <code>b × b</code> blocks</td><td class="mono">n·w</td><td>the same idea in a shape the hardware likes; a mask at block granularity costs nothing extra to skip</td></tr>
+        <tr class="tot"><td><b>attention sinks</b></td><td>the window <b>plus the first few tokens, always</b></td><td class="mono">n·(w+k)</td><td>not a capacity mechanism — a <b>numerical</b> one. See below.</td></tr>
+      </table>
+
+      <h4>Attention sinks: why the first token has to stay</h4>
+      <p>This is the most useful non-obvious fact about windowed attention, and it follows directly from §07's observation that a softmax has no "no match" output.</p>
+      <div class="callout"><b>The argument — an observation plus the explanation that fits it best.</b> The observation: in trained causal models, a large share of many rows' weight lands on the first token (or the first few), positions whose content is semantically nearly empty. The explanation: a softmax row sums to one <i>whatever</i> the scores are, so a query with nothing relevant to attend to must still put its full unit of weight somewhere, and the model learns to use a <b>sink</b> — a position that everyone can reach and that carries little value — to absorb the leftover mass. In a causal model the natural candidate is the <b>first token</b>, because it is visible to every subsequent position. Evict it — which a naive rolling window does the moment the sequence exceeds <code>w</code> — and every row's spare mass has nowhere to go, so it is redistributed onto genuinely irrelevant recent tokens, and perplexity blows up at exactly the point where the window first slides past position 0. <b>Keeping a handful of tokens (four is the usual number) from the very beginning, permanently, restores it.</b> That is a change of four entries in a mask, and it is the difference between a model that streams indefinitely and one that degrades the instant its buffer wraps. What it does <i>not</i> do is extend the model's memory: a window-plus-sinks model still only sees the last <code>w</code> tokens, and the sinks fix the arithmetic of the softmax, not the reach of the model.</div>
+
+      <div class="viz" id="viz-sw">
+        <div class="vhead">
+          <span class="vtitle">Windows, dilation and sinks: the mask, the cost, and the span depth buys back</span>
+          <span class="vhint">the receptive-field panel is measured by propagating an indicator through the stack, not by evaluating the formula</span>
+        </div>
+        <div class="controls">
+          <label>sequence n <input type="range" id="sw-n" min="16" max="64" step="4" value="40" /><span id="sw-nv" style="min-width:20px;display:inline-block">40</span></label>
+          <label>window w <input type="range" id="sw-w" min="1" max="16" step="1" value="5" /><span id="sw-wv" style="min-width:20px;display:inline-block">5</span></label>
+          <label>dilation r <input type="range" id="sw-r" min="1" max="4" step="1" value="1" /><span id="sw-rv" style="min-width:16px;display:inline-block">1</span></label>
+          <label>sink tokens <input type="range" id="sw-s" min="0" max="4" step="1" value="0" /><span id="sw-sv" style="min-width:16px;display:inline-block">0</span></label>
+          <label>layers L <input type="range" id="sw-L" min="1" max="16" step="1" value="6" /><span id="sw-Lv" style="min-width:20px;display:inline-block">6</span></label>
+          <label>preset <select id="sw-p">
+            <option value="custom" selected>custom — use the sliders</option>
+            <option value="full">no window at all (full causal)</option>
+            <option value="slide">a plain sliding window</option>
+            <option value="dil">dilated, stride 2</option>
+            <option value="sink">window + 2 attention sinks (streaming)</option>
+          </select></label>
+        </div>
+        <svg id="sw-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Left: the attention mask for the selected pattern drawn as a lower-triangular grid, with permitted entries filled and forbidden ones left dark; a plain window is a band parallel to the diagonal, dilation punches regular holes in the band, and sink tokens add a solid leftmost column that reaches every row. Beneath it the number of permitted entries is printed alongside the full causal count and the ratio between them. Middle: the effective receptive field, computed by marking one input position and propagating the mask's reachability through the stack layer by layer, drawn as one row per layer so the widening cone is visible; the measured span after the selected number of layers is printed and compared against the closed form, layers times window minus one plus one, which it matches exactly for a plain window and exceeds when sinks are present. Right: scores per layer plotted against sequence length for full attention and for the current windowed pattern on logarithmic axes, showing the slope dropping from two to one, together with the cache size, which is capped at the window for a rolling buffer and grows without bound for full attention. The readout gives the permitted entries, the cost ratio, the measured and predicted spans, and the rolling-buffer size."></svg>
+        <div class="readout" aria-live="polite" id="sw-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 30 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="linear" data-nav="Linear attention and the kernel view">
+      <h3><span class="idx">30</span> Linear attention: what re-associating buys, and what it gives back</h3>
+      <p class="lede"><b>Linear attention replaces the softmax with a feature map applied to queries and keys separately, so the weights are <code>φ(q)·φ(k)ᵀ</code>. Then the brackets can be moved — <code>φ(Q)(φ(K)ᵀV)</code> instead of <code>(φ(Q)φ(K)ᵀ)V</code> — and the cost falls from <code>O(n²d)</code> to <code>O(nd²)</code>, with a fixed-size state instead of a growing cache.</b> The <code>n²</code> term existed only because the softmax sat between <code>QKᵀ</code> and <code>V</code> and stopped the re-association. What it gives up is not an approximation error; it is a <b>rank</b>, and it is the same rank argument this page opened with.</p>
+
+      <div class="formula"><span class="lbl">the observation</span><span class="eq">   softmax attention   Z = softmax(QKᵀ/√dₖ) · V         (QKᵀ) is (n × n) and
+                                                        MUST be formed
+
+   drop the softmax and write the score as a KERNEL:
+
+       Aᵢⱼ  ∝  φ(qᵢ) · φ(kⱼ)ᵀ         φ: a feature map, e.g. elu(x) + 1
+                                       (chosen to be positive, so the
+                                        weights stay non-negative)
+
+       zᵢ  =  ∑ⱼ φ(qᵢ)φ(kⱼ)ᵀ vⱼ  /  ∑ⱼ φ(qᵢ)φ(kⱼ)ᵀ
+
+            =  φ(qᵢ) ( ∑ⱼ φ(kⱼ)ᵀ vⱼ )  /  φ(qᵢ) ( ∑ⱼ φ(kⱼ)ᵀ )
+                      └──────┬──────┘             └────┬────┘
+                       a (d′ × d_v) MATRIX,        a d′ vector,
+                       computed ONCE                computed ONCE
+
+   cost   2·n·d′·d_v   instead of   2·n²·d_v        LINEAR in n
+   the (n × n) matrix is never formed, so the memory is linear too.</span>
+<span class="lbl">and with a causal mask it becomes a recurrence — literally an RNN</span><span class="eq">   Sₜ = Sₜ₋₁ + φ(kₜ)ᵀ vₜ        a (d′ × d_v) STATE
+   zₜ = φ(qₜ) Sₜ / (φ(qₜ) uₜ)   uₜ = uₜ₋₁ + φ(kₜ)ᵀ
+
+   O(1) work and O(d′·d_v) memory per generated token, at ANY length.
+   No cache that grows. This is the property that makes linear attention
+   attractive for generation, and it is exactly the property of
+   the recurrent cell on the RNN page.</span></div>
+
+      <h4>What it gives back, stated as the same counting argument as §01</h4>
+      <div class="formula"><span class="lbl">two ways to say the same thing</span><span class="eq">RANK.  The mixing matrix is  A ∝ φ(Q) φ(K)ᵀ, a product of an (n × d′) and
+       a (d′ × n) matrix, so
+
+              rank(A)  ≤  d′
+
+       Softmax attention's A is not so constrained — exponentiating a
+       rank-dₖ score matrix generally produces a FULL-RANK weight matrix,
+       because eˣ applied elementwise is not a low-rank operation. With
+       d′ = 128 and n = 8192, linear attention can express mixing matrices
+       of rank 128 and softmax attention can express rank 8192.
+
+CAPACITY.  The recurrence stores a fixed (d′ × d_v) state. The input it
+       has to summarise is n·d_v numbers. By exactly the RNN page's
+       bottleneck argument,
+       the average recoverable fraction is
+
+              d′·d_v / (n·d_v)  =  d′ / n
+
+       which falls with the sequence length. THE BOTTLENECK OF §01 IS
+       BACK, with dₕ replaced by d′. That is not a coincidence and it is
+       not a defect of one particular feature map: any mechanism whose
+       per-token state does not grow with n obeys it.</span></div>
+
+      <p>So the honest summary of why linear attention has not displaced softmax attention is not "it is a bit less accurate". It is that <b>softmax attention's advantage is precisely the thing that makes it expensive</b>: it keeps every key and value and so has no fixed-capacity summary to overflow. The <code>O(n²)</code> cost and the exact-recall ability are the same property seen from two sides, and every linear-time method trades one for the other. <a href="../state-space-models.html">State Space Models</a> is the same trade made with a differently designed recurrence — one built to keep more of the input within the same fixed state — and it is worth reading against this section.</p>
+
+      <table class="grid2">
+        <tr><th style="width:150px"></th><th>softmax attention</th><th>linear attention</th></tr>
+        <tr><td><b>compute, prefill</b></td><td class="mono">2n²·d</td><td class="mono">2n·d′·d_v</td></tr>
+        <tr><td><b>crossover</b></td><td colspan="2">linear wins once <code>n &gt; d′</code> — which is essentially always, since <code>d′</code> is a head width</td></tr>
+        <tr><td><b>memory, prefill</b></td><td class="mono">h·n²</td><td class="mono">h·d′·d_v</td></tr>
+        <tr><td><b>per generated token</b></td><td>read a cache of <code>2·g·dₖ·n</code></td><td>read a state of <code>d′·d_v</code>, <b>independent of <code>n</code></b></td></tr>
+        <tr><td><b>rank of the mixing</b></td><td>up to <code>n</code></td><td>at most <code>d′</code></td></tr>
+        <tr class="tot"><td><b>exact recall of an arbitrary earlier token</b></td><td>yes, at any distance</td><td>only within the state's capacity</td></tr>
+      </table>
+
+      <div class="viz" id="viz-la">
+        <div class="vhead">
+          <span class="vtitle">Re-associating the brackets, and the rank it costs</span>
+          <span class="vhint">the left panel is the same computation twice — the right panel is what the second one cannot represent</span>
+        </div>
+        <div class="controls">
+          <label>sequence n <input type="range" id="la-n" min="8" max="64" step="4" value="32" /><span id="la-nv" style="min-width:20px;display:inline-block">32</span></label>
+          <label>feature width d′ <input type="range" id="la-d" min="1" max="32" step="1" value="8" /><span id="la-dv" style="min-width:20px;display:inline-block">8</span></label>
+          <label>feature map <select id="la-f">
+            <option value="elu" selected>elu(x) + 1 — positive, the standard choice</option>
+            <option value="relu">relu(x) — positive, but zeroes half the features</option>
+            <option value="exp">exp(x/2) — closest to softmax, and it overflows</option>
+          </select></label>
+          <label>order <select id="la-o">
+            <option value="qk" selected>(QKᵀ)V — the quadratic bracketing</option>
+            <option value="kv">Q(KᵀV) — the linear bracketing</option>
+          </select></label>
+        </div>
+        <svg id="la-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Left: the two bracketings drawn as chains of boxes sized by the number of elements each intermediate holds. The quadratic bracketing forms an n by n matrix, which is drawn as a large square; the linear bracketing forms a small feature-width by value-width matrix instead, drawn to the same scale, so the difference is a visible area. Beneath both, the multiply-accumulate count and the peak intermediate size, and the maximum absolute difference between the two results, which is at floating-point round-off, confirming that the re-association is exact and not an approximation. Right: the singular-value spectrum of the resulting mixing matrix for the linear map, truncated hard at the feature width, drawn against the spectrum of the softmax mixing matrix on the same axes, which continues past it; beneath, the relative residual of the best rank-d-prime approximation to the softmax matrix is printed, which is what a linear attention layer of that feature width would have to give up to imitate it. A third readout line applies the capacity argument of section one to the recurrent form, giving the fraction of the input a fixed feature-width-by-value-width state can retain at the current sequence length. The readout prints the multiply-accumulate counts under both bracketings, their ratio, the round-off agreement, both ranks, and the retained fraction."></svg>
+        <div class="readout" aria-live="polite" id="la-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 31 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="flash" data-nav="FlashAttention: the IO argument">
+      <h3><span class="idx">31</span> FlashAttention: the same answer, the same arithmetic, a different amount of memory traffic</h3>
+      <p class="lede">This is the one entry in the efficiency literature that changes <b>nothing</b> about the mathematics. Same output, bit-comparable up to reassociation, same MAC count. What changes is how many times the data crosses the gap between the chip and its memory — §20 showed that the <code>n²</code> matrix is what binds at training time, and §26 showed why bytes rather than operations are the binding resource in general.</p>
+
+      <div class="formula"><span class="lbl">the memory hierarchy the argument is about (the A100 numbers the design was made for)</span><span class="eq">   on-chip SRAM      ~192 KB per streaming multiprocessor, 108 of them
+                     (~20 MB in total), bandwidth on the order of 19 TB/s
+   HBM               40–80 GB,  1.5–2.0 TB/s
+
+   a factor of ~10 in bandwidth and ~10³ in capacity. An operation that
+   touches HBM once per element is roughly ten times slower than one that
+   keeps its working set on chip, whatever its FLOP count.</span>
+<span class="lbl">what a naive attention kernel does to HBM</span><span class="eq">   1  read Q, K       write S = QKᵀ            n² elements OUT
+   2  read S          write A = softmax(S)     n² IN, n² OUT
+   3  read A, V       write Z = A·V            n² IN
+                                               ─────────────
+   at least 3n² HBM round-trips on an object that is n² in the first place.
+   Total:  Θ(n·d + n²)   HBM accesses.</span>
+<span class="lbl">what a fused, tiled kernel does instead</span><span class="eq">   Split K and V into blocks that FIT IN SRAM. For each block, load it
+   once, compute that block's partial scores and partial output, and
+   COMBINE it into a running result — never writing S or A to HBM at all.
+
+   block sizes:   B_c = ⌈M / 4d⌉ ,   B_r = min(⌈M / 4d⌉, d)     M = SRAM size
+
+   Total:  Θ( n²·d² / M )   HBM accesses.
+
+   The tiled kernel's traffic is a FRACTION d²/M of the naive kernel's n²
+   term. With a head width of 64 and 192 KB of SRAM — 49 152 fp32 elements —
+   that fraction is 1/12, and counting the three passes the naive kernel
+   makes through the n² object it is a factor of 36 in the figure below;
+   the reported measured saving on a real kernel is up to about 9× fewer
+   accesses, because the n·d terms and the recompute in the backward pass
+   are not free.</span></div>
+
+      <h4>The one piece of mathematics it needs: an online softmax</h4>
+      <p>You cannot normalise a softmax until you have seen every score, and the whole point is not to hold every score. The resolution is a running rescaling, and it is exact:</p>
+
+      <div class="formula"><span class="lbl">combining a running result with one new block, exactly</span><span class="eq">   state after some blocks:   m (running max),  ℓ (running sum),  O (running output)
+   new block gives:           m̃ (its max),      ℓ̃ (its sum),      Õ (its output)
+
+   m′  =  max(m, m̃)
+   ℓ′  =  e⁽ᵐ⁻ᵐ′⁾·ℓ  +  e⁽ᵐ̃⁻ᵐ′⁾·ℓ̃
+   O′  =  ( e⁽ᵐ⁻ᵐ′⁾·ℓ·O  +  e⁽ᵐ̃⁻ᵐ′⁾·ℓ̃·Õ ) / ℓ′
+
+   Every term is bounded by 1 because both exponents are ≤ 0, so this is
+   as overflow-safe as the ordinary max-subtracting softmax — it IS the
+   ordinary max-subtracting softmax, applied incrementally. The result is
+   EXACT: not an approximation, not a low-rank sketch, not a sparsity
+   pattern. The same numbers, in a different order.</span></div>
+
+      <div class="callout"><b>Why the backward pass is the interesting half.</b> The backward pass needs <code>A</code> (§17), and <code>A</code> was never stored. The fix is to <b>recompute</b> it, block by block, from <code>Q</code>, <code>K</code> and the saved row statistics <code>(m, ℓ)</code> — which costs extra arithmetic and saves the same quadratic memory traffic. It is gradient checkpointing applied to one operation, and it wins for exactly the reason §26 gives: the arithmetic was never the binding resource. This is also why the reported end-to-end speedups vary so much by sequence length — 15% on a 512-token model, 3× at 1K, more at longer — since the fraction of time spent in attention is itself a function of §19's crossover.</p></div>
+
+      <div class="viz" id="viz-fa">
+        <div class="vhead">
+          <span class="vtitle">Tiled attention with an online softmax: the running state, and the traffic it avoids</span>
+          <span class="vhint">step through the key blocks and watch the running max, sum and output update — the final result is checked against the direct computation</span>
+        </div>
+        <div class="controls">
+          <label>sequence n <input type="range" id="fa-n" min="8" max="64" step="4" value="24" /><span id="fa-nv" style="min-width:20px;display:inline-block">24</span></label>
+          <label>block size B_c <input type="range" id="fa-b" min="1" max="16" step="1" value="4" /><span id="fa-bv" style="min-width:20px;display:inline-block">4</span></label>
+          <label>blocks processed <input type="range" id="fa-k" min="0" max="16" step="1" value="6" /><span id="fa-kv" style="min-width:20px;display:inline-block">6</span></label>
+          <label>SRAM M, KB <input type="range" id="fa-m" min="16" max="256" step="16" value="192" /><span id="fa-mv" style="min-width:26px;display:inline-block">192</span></label>
+          <label>head width d <select id="fa-d"><option value="64" selected>64</option><option value="128">128</option><option value="256">256</option></select></label>
+        </div>
+        <svg id="fa-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Left: one query row's score vector drawn as bars, split into blocks by vertical dividers, with the blocks already processed shaded and the rest dimmed. Beneath it three running quantities are printed and drawn as they update block by block: the running maximum, the running exponential sum, and the running output vector, together with the rescaling factor applied to the previous state when a new block raises the maximum. When the last block has been processed the running output is compared against the output computed directly in one shot, and the maximum absolute difference is printed and is at floating-point round-off, which is the claim that the tiling is exact. Right: HBM traffic in elements plotted against sequence length on logarithmic axes for the naive kernel, whose curve has slope two, and for the tiled kernel at the selected on-chip memory size, whose curve also has slope two but sits a large constant factor below, with the ratio d squared over M annotated; a second line shows the tiled kernel at a different on-chip size so the dependence on M is visible. A small inset gives the block sizes the standard rule chooses for the current on-chip size and head width. The readout prints the running state, the exactness check, the traffic under both kernels at the current length, and the ratio."></svg>
+        <div class="readout" aria-live="polite" id="fa-readout"></div>
+      </div>
+
+      <div class="wrong"><span class="say">Two things it is not.</span> It is <b>not</b> an approximation — the output is the same function, and any difference from a one-shot computation is floating-point reassociation at the level of round-off. And it does <b>not</b> reduce the <code>O(n²)</code> arithmetic — <span class="fix">§18's MAC count is unchanged, to the operation.</span> What it removes is the <code>n²</code> <i>materialisation</i>, which is why its headline effect is on the maximum sequence length that fits (§20) at least as much as on speed.</div>
+    </section>
+
+    <!-- ═══ 32 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="longctx" data-nav="What breaks at long context">
+      <h3><span class="idx">32</span> Long context: what breaks in the mechanism itself</h3>
+      <p class="lede">Two distinct things fail as <code>n</code> grows, and they are usually conflated. One is about <b>positions the model has never seen</b>, which is a positional-encoding question and belongs elsewhere. The other is about <b>the softmax itself</b>, is independent of the positional scheme, and has a closed form.</p>
+
+      <div class="callout"><b>Scope, stated before the argument.</b> Position interpolation, NTK-aware scaling, YaRN, needle-in-a-haystack evaluation and the lost-in-the-middle effect are owned by <a href="../../llm/context-length-extension.html">Context-Length Extension</a>, and the positional schemes themselves by <a href="../transformers/positional-encodings.html#positional">the Transformer page</a>. This section owns only the part that would still be true if positions were free: <b>a softmax over more keys is a harder softmax</b>.</div>
+
+      <div class="formula"><span class="lbl">the model: one right key with a logit margin m, n−1 distractors with logits ~ N(0, <span class="keep">σ</span>²)</span><span class="eq">   p(right key)  =  exp(m) / ( exp(m) + ∑ⱼ exp(sⱼ) )
+
+   E[ ∑ⱼ exp(sⱼ) ]  =  (n−1) · exp(σ²/2)          (a log-normal mean)
+
+   so     p  ≈  1 / ( 1 + (n−1)·exp(σ²/2 − m) )
+
+   and holding p fixed as n grows requires
+
+              m*(n)  =  ln(n−1)  +  σ²/2   +   const
+
+   THE MARGIN MUST GROW LIKE ln n. Not like a constant, not like √n —
+   logarithmically, which is the good news and the bad news at once.</span></div>
+
+      <div class="formula"><span class="lbl">measured, 4000 draws per point (600 beyond n = 2048), <span class="keep">σ</span> = 1</span><span class="eq">  p(right key) at a FIXED margin m:
+
+       n         m=2       m=4       m=6       m=8      m=10      ln n
+       8     0.41481   0.83319   0.97291   0.99610   0.99947     2.079
+      32     0.13141   0.52365   0.88869   0.98313   0.99769     3.466
+     128     0.03443   0.20859   0.65894   0.93436   0.99057     4.852
+    2048     0.00219   0.01594   0.10685   0.46918   0.86708     7.625
+   32768     0.00014   0.00101   0.00742   0.05230   0.28970    10.397
+  131072     0.00003   0.00025   0.00186   0.01361   0.09250    11.784
+
+  the margin needed to hold p = 0.5, closed form against measurement:
+
+       n     ln(n−1) + σ²/2      measured      measured − ln n
+       8            2.4459        2.3425               0.2630
+      64            4.6431        4.6309               0.4721
+     512            6.7364        6.7349               0.4965
+    4096            8.8175        8.8172               0.4995
+   32768           10.8972       10.8971               0.4999
+  131072           12.2835       12.2836               0.5001
+                                                       ───────
+                                       → σ²/2 = 0.5 exactly, as derived</span></div>
+
+      <p>The measured column matches the closed form to four decimal places at every length past 512, and the residual converges to <code>σ²/2 = 0.5</code> exactly. So the mechanism-level statement is precise: <b>a head that could reliably find its key among 512 candidates needs about <code>ln(131072/512) = 5.5</code> more nats of margin to do it among 131 072</b>. Whether it has them is an empirical question about what training produced, not about the architecture.</p>
+
+      <p>The same effect seen from the entropy side (§23): at a <i>fixed</i> logit scale, a row's entropy grows almost exactly like <code>ln n</code> — measured <code>H/ln n</code> rises from 0.829 at <code>n = 8</code> to 0.958 at <code>n = 131 072</code> for <code>σ = 1</code>. The row keeps reading a roughly constant <i>fraction</i> of an ever-larger set, which is the same statement as the margin one: <b>nothing in the mechanism sharpens automatically as the context grows.</b></p>
+
+      <div class="viz" id="viz-lc">
+        <div class="vhead">
+          <span class="vtitle">Finding one key among <code>n</code>: the probability, and the margin the softmax demands</span>
+          <span class="vhint">the fitted intercept in the readout is the derivation checked — it should land on σ²/2, and it does to within the sampling error</span>
+        </div>
+        <div class="controls">
+          <label>logit margin m <input type="range" id="lc-m" min="0" max="16" step="0.5" value="8" /><span id="lc-mv" style="min-width:28px;display:inline-block">8.0</span></label>
+          <label>distractor spread σ <input type="range" id="lc-s" min="0.2" max="3" step="0.1" value="1" /><span id="lc-sv" style="min-width:28px;display:inline-block">1.0</span></label>
+          <label>draws per point <select id="lc-t">
+            <option value="300">300</option><option value="1200" selected>1 200</option><option value="4000">4 000</option>
+          </select></label>
+          <label>target p <select id="lc-p">
+            <option value="0.5" selected>0.5</option><option value="0.9">0.9</option><option value="0.99">0.99</option>
+          </select></label>
+        </div>
+        <svg id="lc-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Left panel: the probability that the softmax puts on the one correct key, plotted against the number of candidate keys on a logarithmic horizontal axis, with one curve per logit margin and the selected margin emphasised. Every curve falls, and at a fixed margin the fall is close to inverse in the number of keys once the number of keys exceeds the exponential of the margin. A dashed prediction curve from the closed form, one over one plus n minus one times the exponential of half the squared spread minus the margin, lies on top of the measured points. Right panel: the margin needed to hold the selected target probability, plotted against the number of keys with a logarithmic horizontal axis and a linear vertical one, so the closed form is a straight line of slope one in the logarithm; the measured points lie on it, and the fitted intercept is printed and compared against half the squared spread, which it matches. A second annotation gives the extra margin required to go from a short context to a long one, which is simply the logarithm of the ratio between them. The readout prints the probability at the current setting, the closed-form prediction, the fitted slope and intercept of the margin law, and the additional margin needed to extend from four thousand to one hundred and thirty thousand keys."></svg>
+        <div class="readout" aria-live="polite" id="lc-readout"></div>
+      </div>
+
+      <div class="callout"><b>Why the news is mostly good.</b> <code>ln n</code> is a very forgiving growth rate: going from 4 096 to 131 072 tokens — a 32-fold extension — requires only <code>ln 32 = 3.47</code> extra nats of margin, and a logit is a dot product of two <code>dₖ</code>-dimensional vectors, so there is plenty of room. This is part of why long-context extension works at all. It is also why it is not free: the margin has to be <i>learned</i>, the training data has to contain examples that require it, and a model fine-tuned only on short documents has no reason to have produced it. That is the mechanism behind the empirical finding that a big context window is necessary and not sufficient.</div>
+    </section>
+
+    <nav class="pager" aria-label="Attention series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="kv-cache-gqa-mla.html">← KV Cache, GQA &amp; MLA</a>
+      <a href="../attention.html" style="color:var(--muted)">Attention · overview</a>
+      <a href="../attention.html">Attention · overview →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../attention.viz.js"></script>
+</body>
+</html>

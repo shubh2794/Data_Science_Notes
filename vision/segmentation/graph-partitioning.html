@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Normalised Cuts, Graph Cuts &amp; Superpixels</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses, carried over from part 1 */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  table.grid2 tr.hit td{background:rgba(74,222,128,.09)}
+  .steps{counter-reset:st;margin:12px 0;padding:0;list-style:none}
+  .steps li{counter-increment:st;position:relative;padding-left:34px;margin-bottom:9px;font-size:13.5px}
+  .steps li:before{content:counter(st);position:absolute;left:0;top:0;width:22px;height:22px;border-radius:50%;
+    border:1px solid var(--accent);color:var(--accent);font-size:11.5px;display:flex;align-items:center;justify-content:center}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../segmentation.html">Segmentation</a> · part 5 of 5</p>
+      <h1>Normalised Cuts, Graph Cuts &amp; Superpixels</h1>
+      <p>The image as a weighted pixel graph: affinity design, the normalised cut and its generalised eigenvalue relaxation, why the Fiedler vector bisects, exactly optimal binary labelling by s–t min-cut, interactive seeded segmentation, and superpixels as a deliberate over-segmentation for later stages.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Segmentation</span>
+        <span class="pill">Affinity graph · Ncut · Fiedler vector · s–t min-cut · interactive · SLIC</span>
+      </div>
+    </header>
+
+    <!-- ═══ 20 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="affinity" data-nav="The image as a graph">
+      <h3><span class="idx">20</span> The image as a weighted graph</h3>
+      <p class="lede">Every remaining method on this page starts by throwing away the grid and keeping a graph. One node per pixel — or, much more often, one node per superpixel — an edge between pairs that are close enough to compare, and a weight on each edge saying how much they belong together. Segmentation is then a question about cutting a graph, and graph theory has answers.</p>
+
+      <div class="formula"><span class="lbl">the affinity, in the form the normalised-cuts literature uses</span><span class="eq">w_ij = exp( −‖Fᵢ − Fⱼ‖² / σ_F²  −  ‖xᵢ − xⱼ‖² / σ_s² )     if ‖xᵢ − xⱼ‖ &lt; r,   and 0 otherwise</span>
+<span class="eq">F = a feature vector: intensity, colour, or a vector of oriented filter responses</span>
+<span class="eq">x = pixel position          r = the connection radius, in pixels</span></div>
+
+      <p>Three details in that line carry all the weight.</p>
+      <ul class="notes">
+        <li><b>It is the negative exponential of the joint-domain distance of §19.</b> Same two bandwidths, same product structure, same trade-off between spatial and feature proximity — written as a similarity in <code>[0, 1]</code> rather than as a kernel. If §19's <code>h_s</code> and <code>h_r</code> made sense to you, <code>σ_s</code> and <code>σ_F</code> are the same two numbers.</li>
+        <li><b>The radius <code>r</code> makes <code>W</code> sparse, and sparsity is the entire reason this is computable.</b> A dense affinity matrix for a one-megapixel image has <code>10¹²</code> entries. With <code>r = 5</code> each node has about eighty neighbours, so <code>W</code> has <code>8 × 10⁷</code> non-zeros — large but ordinary, and every algorithm below works on sparse matrices.</li>
+        <li><b>The exponential is not innocent.</b> Because <code>w</code> decays as a Gaussian in the feature difference, <code>σ_F</code> sets a hard scale: differences much larger than <code>σ_F</code> are all equally "zero", and differences much smaller than it are all equally "one". Set <code>σ_F</code> too small and the graph disconnects into pixels; too large and it becomes a uniform blob with no structure. The interesting range is narrow and it is image-dependent.</li>
+      </ul>
+
+      <h4>Better weights than a colour difference</h4>
+      <p>The affinity is where all the domain knowledge goes, and improving it usually beats improving the algorithm.</p>
+      <div class="cards">
+        <div class="box plain">
+          <div class="n">texture</div>
+          <div class="t">Filter-bank histograms</div>
+          <div class="g">Replace <code>F</code> by a histogram of oriented filter responses over a small window and use a histogram distance. Two patches of the same fabric then have high affinity even though their pixels differ wildly — which is the fix for §10's checkerboard.</div>
+        </div>
+        <div class="box plain">
+          <div class="n">intervening contour</div>
+          <div class="t">Look at what is between</div>
+          <div class="g">Set <code>w_ij = 1 − max_{x on the segment ij} p_boundary(x)</code>: two pixels are dissimilar if a strong boundary lies <i>between</i> them, however similar they are themselves. This is the single most effective affinity improvement in the literature, and it needs a boundary detector — <a href="../index.html">Part 4</a>'s.</div>
+        </div>
+        <div class="box plain">
+          <div class="n">motion</div>
+          <div class="t">Common fate</div>
+          <div class="g">Two pixels that move together over a video belong together. The affinity becomes a distance between motion vectors — <a href="../index.html">Part 6</a>'s.</div>
+        </div>
+        <div class="box warn">
+          <div class="n">the honest caveat</div>
+          <div class="t">Everything downstream inherits the affinity</div>
+          <div class="g">A spectral method cannot recover a boundary the affinity did not encode. When a graph-based segmentation looks wrong, the graph is nearly always the reason and the eigenvector nearly never is.</div>
+        </div>
+      </div>
+
+      <h4>The three matrices everything is written in</h4>
+      <div class="formula"><span class="lbl">from the weights, two derived matrices and one combination</span><span class="eq">W = [w_ij]           the affinity matrix, symmetric, non-negative, zero diagonal by convention</span>
+<span class="eq">d = W·1,  D = diag(d)   the degree matrix; dᵢ is how strongly node i is attached to everything</span>
+<span class="eq">L = D − W              the graph Laplacian</span>
+<span class="lbl">and the identity that makes the Laplacian useful — for any vector y</span><span class="eq">yᵀLy = ½ ∑_{i,j} w_ij (yᵢ − yⱼ)²   ≥ 0</span></div>
+      <p>That last identity is the reason the Laplacian appears in every spectral method. It says <code>yᵀLy</code> is a <b>weighted measure of how much <code>y</code> disagrees across edges</b>: it is small when <code>y</code> is nearly constant on strongly connected groups and large when <code>y</code> changes across heavy edges. Minimising it, subject to not being constant, is asking for a labelling that respects the graph — which is exactly what §21 does.</p>
+
+      <div class="viz" id="viz-graph">
+        <div class="vhead">
+          <span class="vtitle">A small image, the graph it becomes, and the affinity matrix that graph is</span>
+          <span class="vhint">turn <span class="keep">σ_F</span> down until the matrix goes black outside the diagonal blocks — that is the graph falling apart</span>
+        </div>
+        <div class="controls">
+          <label>feature bandwidth <span class="keep">σ_F</span> <input type="range" id="gr-sf" min="4" max="80" step="1" value="22" /><span id="gr-sfv" style="min-width:24px;display:inline-block">22</span></label>
+          <label>spatial bandwidth <span class="keep">σ_s</span> <input type="range" id="gr-ss" min="0.6" max="6" step="0.1" value="2" /><span id="gr-ssv" style="min-width:30px;display:inline-block">2.0</span></label>
+          <label>connection radius <span class="keep">r</span> <input type="range" id="gr-r" min="1" max="5" step="0.5" value="2.5" /><span id="gr-rv" style="min-width:30px;display:inline-block">2.5</span></label>
+          <label><input type="checkbox" id="gr-sort" checked /> order the matrix by true region</label>
+        </div>
+        <svg id="graph-svg" width="760" height="430" viewBox="0 0 760 430" role="img" aria-label="Left: a tiny nine by seven image containing three regions of different brightness, drawn large enough that individual pixels are visible, with the graph edges superimposed — a line between every pair of pixels within the connection radius, its thickness proportional to the affinity, so the edges inside a region are thick and those crossing a boundary are hair-thin. Middle: the sixty-three by sixty-three affinity matrix drawn as a heat map with its rows and columns ordered so that pixels of the same true region are adjacent, which makes the block structure explicit: three bright blocks on the diagonal and near-black everywhere else. Right: the degree of every node drawn as a bar chart, showing that pixels in the interior of a region have high degree and pixels on a boundary have low degree, and a readout giving the number of non-zero entries, the sparsity, the total edge weight, and the ratio of the average within-region weight to the average across-region weight."></svg>
+        <div class="readout" aria-live="polite" id="graph-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>The block structure is the segmentation, before any algorithm has run.</b> With the rows ordered by region the matrix is three bright diagonal blocks and almost nothing off them. Every method in §21 to §23 is a way of finding that ordering without being told it.</li>
+        <li><b>Turn off the ordering.</b> The same matrix, in raster order, looks like a banded mess with no visible structure — and it is the identical matrix. Spectral clustering's real job is to recover the permutation, and the second eigenvector of §21 is a continuous relaxation of exactly that.</li>
+        <li><b>Watch the degrees on a boundary.</b> A pixel in the interior of a region has a high degree; one sitting on a boundary has a low degree, because half its neighbours disagree with it. Normalising by degree — which is what "normalised" means in normalised cuts — is what stops the algorithm from simply lopping off the low-degree pixels.</li>
+        <li><b>Push the feature bandwidth to 60.</b> The within-to-across ratio collapses from <b>35.6</b> to <b>2.5</b>. At that scale a step of 45 grey levels is a small difference, the block structure fades out of the matrix, and no spectral method downstream can recover a boundary the affinity has stopped encoding.</li><li><b>Push the radius to 5 and the spatial bandwidth to 6 instead.</b> The matrix fills from <b>23.4%</b> dense to <b>65.3%</b> and the ratio actually <i>improves</i> slightly, to 50.2 — but every eigenvector computation in §21 now costs proportionally more, and on a real image with a boundary that is not a clean straight line the long-range edges do start to carry affinity across it. Bigger neighbourhoods buy robustness and cost time; they are not free either way.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 21 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ncut" data-nav="Normalised cuts">
+      <h3><span class="idx">21</span> Normalised cuts: the right criterion, an NP-hard problem, and an honest relaxation</h3>
+      <p class="lede">Cutting a graph into two pieces has an obvious cost — the total weight of the edges you severed. Minimising that cost is a classical, polynomial-time problem. It is also completely useless for segmentation, and understanding why produces the correct criterion in one step.</p>
+
+      <h4>Why the minimum cut is the wrong objective</h4>
+      <div class="formula"><span class="lbl">the cut between two groups</span><span class="eq">cut(A, B) = ∑_{i ∈ A, j ∈ B} w_ij</span></div>
+      <p>The cheapest way to sever a graph is to lop off <b>one node</b>: the cut is then that node's degree, which for a boundary pixel is small. Minimum cut therefore returns a single pixel and the rest of the image, every time, and it does so <i>optimally</i>. The objective has no notion of a balanced partition, so it buys cheapness by making one side tiny.</p>
+
+      <h4>The fix: normalise by how much each side is attached to everything</h4>
+      <div class="formula"><span class="lbl">association: all the weight touching a group</span><span class="eq">assoc(A, V) = ∑_{i ∈ A, j ∈ V} w_ij = ∑_{i ∈ A} dᵢ          assoc(A, A) = ∑_{i ∈ A, j ∈ A} w_ij</span>
+<span class="lbl">the normalised cut</span><span class="eq">Ncut(A, B) = cut(A, B)/assoc(A, V)  +  cut(A, B)/assoc(B, V)</span>
+<span class="lbl">and the normalised association, which is the same statement upside down</span><span class="eq">Nassoc(A, B) = assoc(A, A)/assoc(A, V)  +  assoc(B, B)/assoc(B, V)</span>
+<span class="eq">Ncut(A, B) + Nassoc(A, B) = 2        exactly, for every partition</span></div>
+      <p>The identity in the last line is worth checking rather than remembering: <code>assoc(A,A) + cut(A,B) = assoc(A,V)</code> by definition, so the two ratios for group <code>A</code> sum to 1, and likewise for <code>B</code>. <b>So minimising the disassociation between the groups is exactly the same as maximising the association within them.</b> The criterion does not have to be told to prefer balanced groups — cutting off a single node makes <code>assoc(A,V)</code> tiny, the first term goes to 1, and the total is close to its maximum instead of its minimum. Both failure modes are excluded by one normalisation.</p>
+
+      <div class="wrong"><span class="say">The bad news, stated first.</span> <span class="fix">Minimising <code>Ncut</code> exactly over all partitions of a general graph is NP-complete.</span> Everything below is a <b>relaxation</b>, not a solution, and the page will keep saying so.</div>
+
+      <h4>Rewriting <code>Ncut</code> as a Rayleigh quotient</h4>
+      <p>Let <code>x</code> be the <code>±1</code> indicator of the partition, <code>d = W·1</code>, <code>D = diag(d)</code> and <code>L = D − W</code>. Define</p>
+      <div class="formula"><span class="lbl">the two-valued vector the criterion turns out to be about</span><span class="eq">y = ((1 + x) − b(1 − x)) / 2      so   yᵢ = 1 for i ∈ A   and   yᵢ = −b for i ∈ B</span>
+<span class="eq">with   b = k/(1 − k),   k = (∑_{i ∈ A} dᵢ)/(∑_i dᵢ)      chosen so that   yᵀd = 0</span>
+<span class="lbl">then, and this is an identity rather than an approximation</span><span class="eq">Ncut(A, B) = yᵀ(D − W)y / (yᵀDy)</span></div>
+      <p>That equality is exact for every partition. It was checked here by brute force: on the eight-node graph in the figure, over all <b>254</b> non-trivial bipartitions, the largest disagreement between <code>Ncut(A,B)</code> and the Rayleigh quotient of its own <code>y</code> is <code>4.4 × 10⁻¹⁶</code> — floating point, and nothing else.</p>
+
+      <p>So the discrete problem is:</p>
+      <div class="formula"><span class="lbl">the exact problem — hard because of the last line</span><span class="eq">minimise    yᵀLy / yᵀDy</span>
+<span class="eq">subject to  yᵀd = 0</span>
+<span class="eq">and         yᵢ ∈ {1, −b}      ← this constraint is what makes it NP-complete</span></div>
+
+      <h4>The relaxation</h4>
+      <p><b>Drop the last line.</b> Let <code>y</code> be any real vector. The minimum of a Rayleigh quotient over a subspace is an eigenvalue, so the relaxed problem is solved by the generalised eigenvector belonging to the second-smallest generalised eigenvalue:</p>
+      <div class="formula"><span class="lbl">the relaxed problem is a generalised eigenproblem</span><span class="eq">(D − W)·y = λ·D·y</span>
+<span class="lbl">which becomes an ordinary symmetric eigenproblem by the substitution z = D^{1/2}y</span><span class="eq">(I − N)·z = λ·z,      N = D^{−1/2}·W·D^{−1/2}      the normalised affinity matrix</span>
+<span class="lbl">and the answer is read off the second-smallest eigenvalue</span><span class="eq">λ₁ = 0 always, with y = 1 — the useless solution "everything in one group"</span>
+<span class="eq">λ₂ and its eigenvector y₂ — the relaxed optimum, automatically satisfying y₂ᵀd = 0</span></div>
+
+      <p>Then <b>round</b>: split the nodes by the sign of <code>y₂</code>, or better, sort the nodes by <code>y₂</code> and try all <code>n−1</code> splits of that ordering, keeping the one with the best actual <code>Ncut</code>.</p>
+
+      <div class="callout"><b>Exactly what is and is not guaranteed.</b> Three separate claims, only two of which are true.
+      <br>· <b>True.</b> <code>λ₂</code> is a <b>lower bound</b> on the minimum discrete <code>Ncut</code>, because the relaxed feasible set contains the discrete one. On the figure's default graph <code>λ₂ = 0.028708</code> and the true discrete minimum, found by brute force over all 254 bipartitions, is <code>0.029557</code>. The gap is small here and is not small in general.
+      <br>· <b>True.</b> The eigenvector is the exact solution of the relaxed problem, computed to machine precision by a standard eigensolver.
+      <br>· <b>False, and often stated.</b> "Normalised cuts solves the normalised cut problem." It does not. <b>The rounding step has no approximation guarantee</b> — there is no theorem bounding the <code>Ncut</code> of the thresholded eigenvector by any constant times the optimum, and examples exist where it is far off. What the eigenvector supplies is a one-dimensional ordering of the nodes that is usually excellent, and the sweep over that ordering supplies a partition that is usually excellent. "Usually excellent" is the honest claim, and it is worth a great deal — but it is not optimality, and the figure lets you hunt for a setting where the sign cut and the brute-force optimum disagree.</div>
+
+      <h4>More than two regions</h4>
+      <ul class="notes">
+        <li><b>Recursive bisection.</b> Cut, then recurse on each half, stopping when the <code>Ncut</code> value exceeds a threshold. Cheap, and it can only produce partitions that are nested — a genuine limitation, as §02's ladder argument predicts.</li>
+        <li><b>Use <code>k</code> eigenvectors at once.</b> Take the eigenvectors for <code>λ₂ … λ_{k+1}</code>, treat each node's coordinates in that <code>k</code>-dimensional space as a feature vector, and run k-means on them. This is <b>spectral clustering</b> proper, and it is what the general-purpose implementations do. It replaces the ill-posed "where do I threshold this eigenvector" with the ill-posed "what is <code>k</code>", which is §02 again.</li>
+        <li><b>Cost.</b> The matrices are sparse and only the bottom few eigenvectors are needed, so a Lanczos-type solver is used rather than a dense decomposition. It is still the expensive part of the pipeline, and it is the reason normalised cuts is almost always run on superpixels (§25) rather than pixels.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 22 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="fiedler" data-nav="Why the second eigenvector">
+      <h3><span class="idx">22</span> Why <i>that</i> eigenvector — three ways to see it</h3>
+      <p class="lede">"Take the second-smallest eigenvector" is the kind of instruction that gets memorised rather than understood. Here are three independent reasons it is the right one, each of which makes a different part of the behaviour obvious.</p>
+
+      <h4>1 · Algebraically: the first one is trivial, so the second is the first useful one</h4>
+      <p>Since every row of <code>L = D − W</code> sums to zero, <code>L·1 = 0</code>: the all-ones vector is an eigenvector with eigenvalue <b>zero</b>, always, for every graph. In the generalised problem it is the same vector. It is a perfectly valid minimiser of <code>yᵀLy/yᵀDy</code> — it just says "put everything in one group", which achieves a cut of zero by not cutting.</p>
+      <p>The constraint <code>yᵀd = 0</code> is precisely the statement <b>"be <code>D</code>-orthogonal to that trivial solution"</b>. Under that constraint the minimum of the Rayleigh quotient is the <i>next</i> eigenvalue, by the standard variational characterisation of eigenvalues — see <a href="../../math/linear-algebra-eigen-svd.html#eigendecomposition">Eigendecomposition &amp; the SVD</a> for the Courant–Fischer statement and <a href="../../math/linear-algebra-quadratic-pca.html#quadratic-form">Quadratic Forms</a> for the Rayleigh quotient itself. So <code>λ₂</code> is not a choice; it is what "the best non-trivial answer" means.</p>
+
+      <h4>2 · Analytically: it is the quietest way to disagree</h4>
+      <p>Recall <code>yᵀLy = ½∑_{ij} w_ij(yᵢ − yⱼ)²</code>. Minimising it wants <code>y</code> constant; the constraint forbids that. So the eigenvector is <b>the least-varying non-constant function on the graph</b> — it must change somewhere, and the cheapest place to change is across the weakest edges. <b>The eigenvector's steepest transition is the cut.</b> That is why thresholding it works at all.</p>
+
+      <h4>3 · Physically: it is the fundamental mode of vibration</h4>
+      <p>Read <code>L</code> as a stiffness matrix and <code>D</code> as a mass matrix, so <code>Ly = λDy</code> is the free-vibration equation of a network of masses joined by springs, with spring constants <code>w_ij</code> and masses <code>dᵢ</code>. Then:</p>
+      <ul class="notes">
+        <li><code>λ₁ = 0</code> with <code>y = 1</code> is the <b>rigid-body mode</b>: everything moves together, nothing stretches, no energy.</li>
+        <li><code>λ₂</code> is the <b>fundamental mode</b> — the lowest-frequency real vibration. Its eigenvector has exactly one <b>nodal line</b>, where the displacement passes through zero, and the parts on either side move in opposite directions. Two heavy sub-networks joined by weak springs will oscillate against each other about the weak springs, so the nodal line falls on the weak connection. <b>That nodal line is the cut</b>, and the sign of the eigenvector is which side you are on.</li>
+        <li>Higher eigenvectors are higher harmonics with more nodal lines, which is exactly why using <code>k</code> of them gives <code>k</code> groups.</li>
+      </ul>
+
+      <div class="callout"><b>One theorem worth knowing, because it is checkable.</b> The number of eigenvalues of <code>L</code> equal to zero is exactly the number of <b>connected components</b> of the graph, and the corresponding eigenvectors are the indicators of those components. So <code>λ₂ = 0</code> if and only if the graph is disconnected — which is why <code>λ₂</code> is called the <b>algebraic connectivity</b>, and why a small <code>λ₂</code> means "nearly disconnected", which is exactly what a good cut is looking for. In the figure below, drive the bridge weights to zero and watch <code>λ₂</code> go to zero with them.</div>
+
+      <div class="viz" id="viz-ncut">
+        <div class="vhead">
+          <span class="vtitle">Eight nodes, two clusters, one bridge — the eigenvector, the cut it implies, and the true optimum beside it</span>
+          <span class="vhint">the relaxed value <span class="keep">λ₂</span> is always <i>below</i> the true discrete minimum; that gap is the price of the relaxation</span>
+        </div>
+        <div class="controls">
+          <label>bridge weight <input type="range" id="nc-b" min="0.01" max="1.4" step="0.01" value="0.1" /><span id="nc-bv" style="min-width:36px;display:inline-block">0.10</span></label>
+          <label>second bridge <input type="range" id="nc-b2" min="0" max="1.4" step="0.01" value="0.05" /><span id="nc-b2v" style="min-width:36px;display:inline-block">0.05</span></label>
+          <label>asymmetry <input type="range" id="nc-as" min="0.2" max="2.4" step="0.02" value="1" /><span id="nc-asv" style="min-width:36px;display:inline-block">1.00</span></label>
+          <label><input type="checkbox" id="nc-sweep" checked /> also try every split of the sorted eigenvector</label>
+        </div>
+        <svg id="ncut-svg" width="760" height="486" viewBox="0 0 760 486" role="img" aria-label="Left: an eight-node weighted graph drawn with two tightly connected groups of four joined by two adjustable weak bridges, each edge's thickness proportional to its weight and each node coloured by the sign of the second eigenvector. The edges that the chosen cut severs are drawn dashed and red. Middle: the eight entries of the second generalised eigenvector as a bar chart, sorted in value order, with the threshold that the sign rule uses drawn at zero and the threshold that the sweep chooses drawn where it falls; the bars form two flat groups separated by a visible gap. Right: the eight generalised eigenvalues as a small bar chart with the first at exactly zero and the second highlighted, and a numeric panel giving the relaxed value lambda two, the normalised cut of the sign split, the normalised cut of the best sweep split, the normalised cut found by exhaustive search over all one hundred and twenty-seven bipartitions, the gap between the relaxed value and that optimum, a check that the normalised cut and the normalised association sum to two, and the minimum unnormalised cut together with the size of the group it isolates."></svg>
+        <div class="readout" aria-live="polite" id="ncut-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>The relaxed value sits below the true minimum, always.</b> At the default, <code>λ₂ = 0.028708</code> and the exhaustive minimum <code>Ncut</code> is <code>0.029557</code>. The relaxation cannot be an equality, because its feasible set strictly contains the discrete one — so the number the eigensolver returns is a <b>certificate</b> that no partition can do better than <code>λ₂</code>, and nothing more.</li>
+        <li><b>Watch the minimum unnormalised cut.</b> At the default it is <code>0.1500</code> and it happens to split the two groups four against four. Now set the bridge to <code>0.02</code>, the second bridge to <code>0.60</code> and the asymmetry to <code>0.20</code>. The panel turns red: the cheapest cut is now <code>0.4800</code> and it <b>isolates node 0 alone</b>, whose degree has been shrunk to exactly <code>0.480</code>. The normalised cut in the same configuration still splits four against four, at <code>0.295</code>, because isolating one node drives its own <code>assoc(A,V)</code> to that same tiny <code>0.48</code> and the first term of <code>Ncut</code> to nearly 1. <b>That single substitution is the entire content of the word "normalised".</b></li>
+        <li><b>Drive both bridges toward zero.</b> <code>λ₂ → 0</code>, and at exactly zero the graph is disconnected and the theorem says <code>λ₂</code> must be zero. Algebraic connectivity is not an analogy here; it is the same number.</li>
+        <li><b>Hunt for a rounding failure, and fail to find one.</b> The panel reports whether the sweep found the exhaustive optimum. Sweeping the three sliders over 7 084 combinations, <b>it found it every single time</b> — the rounded partition and the true optimum agreed at every setting this figure can reach. That is worth knowing precisely: <b>on small, well-structured graphs the relaxation is empirically excellent, and there is still no theorem saying it must be.</b> The counterexamples that break the rounding step are adversarially constructed, not typical. What is <i>always</i> present, at every setting, is the gap between <code>λ₂</code> and the optimum: <code>0.000849</code> at the default and as much as <code>0.244</code> elsewhere on the sliders. The relaxed value is a lower bound and never an answer.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 23 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="graphcuts" data-nav="Graph cuts &amp; max-flow">
+      <h3><span class="idx">23</span> Graph cuts: the one place on this page where the answer is provably optimal</h3>
+      <p class="lede">Everything so far has been a heuristic, a relaxation or a local minimum. This section is different, and the difference is worth stating up front: <b>for a two-label problem with the right kind of smoothness term, the global minimum of the energy is found exactly, in polynomial time.</b> The conditions on "the right kind" are narrow and precise, and the rest of the section is mostly about them.</p>
+
+      <h4>The energy</h4>
+      <div class="formula"><span class="lbl">a binary labelling energy, f_p ∈ {0, 1}</span><span class="eq">E(f) = ∑_p D_p(f_p)  +  ∑_{(p,q) ∈ N} V_pq(f_p, f_q)</span>
+<span class="lbl">the data term — how badly pixel p fits the model of the region it was assigned to</span><span class="eq">D_p(1) = −log Pr( I_p | foreground )        D_p(0) = −log Pr( I_p | background )</span>
+<span class="eq">   simplest useful choice:  D_p(k) = (I_p − μ_k)²        richer:  a colour histogram, or a Gaussian mixture</span>
+<span class="lbl">the smoothness term — pay to place a boundary, and pay less where the image already has one</span><span class="eq">V_pq(a, b) = λ · exp( −(I_p − I_q)² / (2σ²) ) · [a ≠ b]</span></div>
+      <p>The contrast-sensitive weight is the important detail. A constant penalty <code>λ·[a ≠ b]</code> minimises boundary <i>length</i>, which shrinks objects and rounds off their corners for the same reason a snake shrinks (§14). Multiplying by <code>exp(−Δ²/2σ²)</code> makes the boundary cheap exactly where the image has a step, so the energy prefers to cut along edges it did not have to invent.</p>
+
+      <h4>The construction</h4>
+      <p>Build a directed graph with one node per pixel plus two terminals — a <b>source</b> <code>S</code> standing for label 1 and a <b>sink</b> <code>T</code> standing for label 0 — and these capacities:</p>
+      <div class="formula"><span class="lbl">terminal (t-link) capacities</span><span class="eq">cap(S → p) = D_p(0)        cutting it means p ends up on the sink side, labelled 0</span>
+<span class="eq">cap(p → T) = D_p(1)        cutting it means p ends up on the source side, labelled 1</span>
+<span class="lbl">neighbour (n-link) capacities, both directions</span><span class="eq">cap(p → q) = cap(q → p) = V_pq(0, 1)</span>
+<span class="lbl">then, for any S–T cut, the capacity severed is exactly the energy of the corresponding labelling</span><span class="eq">capacity of the cut  =  E(f)  +  const</span></div>
+      <p>Every <code>S</code>–<code>T</code> cut corresponds to a labelling and vice versa, and their costs agree. So <b>the minimum cut is the minimum-energy labelling</b>, and the minimum cut is computable because of the theorem below.</p>
+
+      <div class="callout"><b>The max-flow min-cut theorem.</b> In any flow network, the value of a <b>maximum flow</b> from <code>S</code> to <code>T</code> equals the capacity of a <b>minimum</b> <code>S</code>–<code>T</code> <b>cut</b>. This is a genuine theorem, not a heuristic. It also hands you the cut for free: at maximum flow, the source side of the minimum cut is exactly the set of nodes still reachable from <code>S</code> along edges with residual capacity left. So one max-flow computation both produces the optimal labelling and <i>certifies</i> it, and the certificate is the flow itself — any labelling with a lower energy would be a cut with capacity below the flow value, which is impossible.</div>
+
+      <h4>The condition, stated exactly</h4>
+      <p>Not every energy can be built this way. A pairwise term is representable as a set of non-negative capacities if and only if it is <b>submodular</b>:</p>
+      <div class="formula"><span class="lbl">the submodularity condition for a binary pairwise term</span><span class="eq">V_pq(0, 0) + V_pq(1, 1)  ≤  V_pq(0, 1) + V_pq(1, 0)</span>
+<span class="lbl">for the contrast-sensitive term above, with any <span class="keep">λ</span> ≥ 0</span><span class="eq">0 + 0  ≤  λ·w_pq + λ·w_pq        which holds for every λ ≥ 0 and every w_pq ≥ 0 ✓</span></div>
+      <p>In words: <b>agreeing must never cost more than disagreeing.</b> Any smoothness term that prefers neighbours to be the same is submodular; a term that rewarded neighbours for differing would not be, and no non-negative capacity assignment can represent it. In practice this condition is satisfied by essentially every smoothness term anyone actually wants, which is why the restriction is easy to forget — but it is the hypothesis the whole guarantee rests on.</p>
+
+      <div class="wrong"><span class="say">The overclaim to avoid.</span> "Graph cuts finds the global optimum of segmentation energies." <span class="fix">It finds the global optimum of a <b>two-label</b> energy with <b>submodular</b> pairwise terms.</span> Change either condition and the guarantee is gone:
+      <br>· <b>More than two labels</b> is <b>NP-hard</b> in general. The standard algorithms, <code>α</code>-expansion and <code>α</code>-swap, are iterated binary graph cuts and are <b>approximations</b>. <code>α</code>-expansion carries a factor-of-two bound on the energy, and only when the pairwise term is a <b>metric</b>; <code>α</code>-swap carries no bound at all.
+      <br>· <b>Non-submodular binary terms</b> cannot be represented. Roof duality (QPBO) handles them by returning a <i>partial</i> labelling — provably optimal on the pixels it does label, and silent on the rest.
+      <br>· <b>The energy is still a model.</b> A global optimum of the wrong energy is a wrong answer computed exactly. This is a real and common outcome, and it is the reason the data term — the region model — is where the engineering effort actually goes.</div>
+
+      <div class="viz" id="viz-mincut">
+        <div class="vhead">
+          <span class="vtitle">Nine pixels, one flow network — the flow saturates, the cut appears, and brute force agrees</span>
+          <span class="vhint">every one of the 512 labellings is evaluated beside it, so "global optimum" is checked rather than asserted</span>
+        </div>
+        <div class="controls">
+          <label>smoothness <span class="keep">λ</span> <input type="range" id="mc-l" min="0" max="12" step="0.25" value="2" /><span id="mc-lv" style="min-width:34px;display:inline-block">2.00</span></label>
+          <label>contrast <span class="keep">σ</span> <input type="range" id="mc-s" min="0.5" max="8" step="0.1" value="3" /><span id="mc-sv" style="min-width:30px;display:inline-block">3.0</span></label>
+          <label>foreground model <span class="keep">μ_F</span> <input type="range" id="mc-f" min="3" max="10" step="0.5" value="8.5" /><span id="mc-fv" style="min-width:30px;display:inline-block">8.5</span></label>
+          <label>background model <span class="keep">μ_B</span> <input type="range" id="mc-b" min="0" max="7" step="0.5" value="2.5" /><span id="mc-bv" style="min-width:30px;display:inline-block">2.5</span></label>
+        </div>
+        <svg id="mincut-svg" width="760" height="486" viewBox="0 0 760 486" role="img" aria-label="Left: a three by three grid of pixels with their integer grey values printed, coloured by the label the minimum cut assigns, with the cut drawn as a thick line running between the labelled and unlabelled pixels. Middle: the same nine pixels drawn as a flow network with a source terminal above and a sink terminal below; every terminal edge and every neighbour edge is labelled with its flow and its capacity, and edges carrying their full capacity are drawn in red as saturated, so the set of saturated edges visibly forms a barrier separating source from sink. Right: a bar chart of the energy of all five hundred and twelve possible labellings, sorted, with the one the minimum cut found marked at the far left, and a numeric panel giving the maximum flow value, the capacity of the minimum cut, the energy of the cut labelling, the brute-force minimum energy over all five hundred and twelve labellings, and an explicit check of the submodularity condition on every neighbour pair."></svg>
+        <div class="readout" aria-live="polite" id="mincut-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Four numbers that are always equal.</b> The maximum flow, the capacity of the minimum cut, the energy of the labelling the cut induces, and the brute-force minimum over all 512 labellings. At the default they are all <code>5.692173</code>. Move any slider and they stay equal — the panel would turn red if they ever did not, and it never does, because the theorem is a theorem.</li>
+        <li><b>Look at the middle pixel at the default.</b> Its value is 3, so the foreground model fits it terribly — <code>D(1) = 30.25</code> against <code>D(0) = 0.25</code> — and it stays background even though it is surrounded on three sides by foreground. A greedy or region-growing method would have swallowed it. The global optimum keeps it, because the arithmetic says keeping it is cheaper, and there is nothing to argue with.</li>
+        <li><b>Turn the smoothness all the way up to 12, and watch nothing happen.</b> The labelling is unchanged at every <code>λ</code> up to 80. On this image the data terms are enormous — the middle pixel pays <code>30.25</code> to be called foreground — while the boundary cost is at most <code>2λ</code> per edge, so the smoothness never becomes decisive. That is worth seeing rather than assuming: <b><code>λ</code> is not a granularity dial that always works.</b> Whether it bites depends entirely on the scale of the data term, and the two are in different units unless somebody normalises them, which is a large part of what tuning a segmentation energy actually consists of.</li><li><b>The region models decide this, not the smoothness.</b> Drag the foreground mean down to <code>3</code>: every pixel is now closer to the foreground model than to the background one, the optimum flips to <b>all nine foreground</b>, and there is no boundary at all. Drag the background mean up to <code>7</code> and two pixels defect the other way. This is the general case, and it is why the whole contribution of the best-known interactive graph-cut system is a better way of <i>estimating</i> the two models rather than a better way of cutting.</li>
+        <li><b>Set the smoothness to zero.</b> Every pixel independently takes whichever label fits it better, and the energy becomes <code>∑_p min(D_p(0), D_p(1)) = 4.25</code>. The pairwise term is the only thing making this a <i>segmentation</i> rather than nine separate decisions, which is the same observation §04 made about thresholding.</li>
+        <li><b>Watch the saturated edges.</b> At maximum flow they form a complete barrier between source and sink: you cannot get from <code>S</code> to <code>T</code> without crossing one. That barrier <b>is</b> the cut, and finding it is why max-flow returns the segmentation rather than just a number.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 24 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="interactive" data-nav="Interactive segmentation">
+      <h3><span class="idx">24</span> Interactive segmentation: letting the user supply the missing question</h3>
+      <p class="lede">§02 argued that no algorithm can know which partition is wanted. The most honest response to that argument is not a cleverer algorithm; it is an interface. A few strokes from a user carry exactly the information the pixels do not, and the methods built around that idea are the ones that actually get deployed.</p>
+
+      <h4>Seeds into an energy</h4>
+      <p>A user paints a few strokes marked <i>object</i> and a few marked <i>background</i>. Those pixels do two jobs at once, and the second is the important one:</p>
+      <ol class="steps">
+        <li><b>Hard constraints.</b> Seeded pixels are tied to their terminal with infinite capacity, so no cut can ever separate them from it. The optimum is then the best labelling <i>consistent with</i> what the user said.</li>
+        <li><b>Training data.</b> The seeded pixels are a labelled sample of the two region models. Estimate a colour histogram or a Gaussian mixture from each, and the data term <code>D_p</code> in §23 stops being a guess.</li>
+      </ol>
+
+      <h4>Iterating the estimate: the bounding-box trick</h4>
+      <p>The best-known refinement removes even the strokes. The user drags one rectangle; everything outside it is definitely background, everything inside is <i>probably</i> foreground. Then:</p>
+      <ol class="steps">
+        <li>Fit a background colour mixture to the pixels outside the box and a foreground mixture to those inside.</li>
+        <li>Solve the binary graph cut with those models — a global optimum, by §23.</li>
+        <li><b>Re-estimate</b> both mixtures from the labelling just produced.</li>
+        <li>Repeat until the labelling stops changing. Optionally accept a few corrective strokes and re-solve.</li>
+      </ol>
+      <p>Each individual cut is globally optimal; <b>the loop is not</b>. It is coordinate descent alternating between the labelling and the model parameters — the same structure as expectation–maximisation and with the same guarantee, which is that the energy decreases monotonically and converges to a local minimum. Starting from a bounding box rather than from nothing is what makes that local minimum a good one, and the initialisation is doing more work than the optimiser.</p>
+
+      <h4>The continuous relaxation, and what it buys</h4>
+      <p>Replace the binary labels by real numbers in <code>[0, 1]</code> and the discontinuity penalty by a quadratic one. The energy becomes a quadratic form, its minimum is the solution of a sparse linear system, and thresholding that solution at <code>0.5</code> gives a segmentation.</p>
+      <div class="formula"><span class="lbl">the relaxed problem — a weighted Laplacian system with the seeds as boundary conditions</span><span class="eq">minimise  ∑_{(p,q)} w_pq · (u_p − u_q)²      subject to  u = 1 on the object seeds,  u = 0 on the background seeds</span>
+<span class="eq">⇔   L_U · u_U = −B · u_seeds        one sparse symmetric positive-definite solve</span></div>
+      <p>The solution has three readings that are all the same computation, and each is illuminating:</p>
+      <ul class="notes">
+        <li><b>A random walk.</b> <code>u_p</code> is the probability that a random walker starting at pixel <code>p</code>, stepping to neighbours with probability proportional to <code>w</code>, reaches an object seed before a background seed.</li>
+        <li><b>An electrical network.</b> Treat each <code>w_pq</code> as a conductance, tie the object seeds to 1 volt and the background seeds to 0. Then <code>u</code> is the <b>potential</b> at every node. Boundaries are resistive, interiors are conductive, and the voltage drop happens across the boundary.</li>
+        <li><b>A diffusion.</b> The solution is the steady state of heat spreading from the seeds through a medium whose conductivity is the affinity.</li>
+      </ul>
+      <p>Compared with graph cuts, the relaxation gives a <b>soft</b> answer — useful directly for matting, where a pixel really is part object — and it extends to <code>k</code> labels by solving one system per label and taking the largest, which graph cuts cannot do exactly. It gives up the exactness: thresholding at <code>0.5</code> has no optimality guarantee for the original binary energy, and the quadratic penalty smooths boundaries that the discontinuity penalty would have kept sharp.</p>
+
+      <div class="callout"><b>The other family: geodesic distance.</b> Faster still, and worth knowing because it is a completely different trade. Define a length for a path through the image that is large where the image changes, and label each pixel by whichever seed set is <b>geodesically nearer</b>. One pass of a fast-marching or raster-scan distance transform per label, and it is effectively instantaneous. It is far more sensitive to seed placement than a cut is — the answer is decided by the single cheapest path, so one weak spot in a boundary loses the whole region — but at interactive rates that sensitivity is arguably a feature, because the user sees it immediately and adds a stroke.</div>
+
+      <h4>Constraints worth adding, and what each costs</h4>
+      <table class="grid2">
+        <tr><th style="width:24%">Prior</th><th style="width:36%">What it expresses</th><th>What it costs</th></tr>
+        <tr><td><b>Connectivity</b></td><td>The foreground must be a single piece — usually true, and cheap graph cuts will happily return a scattering of blobs.</td><td>The constrained problem is <b>NP-hard</b>. Practical methods add the constraint lazily, cutting and then forbidding the disconnected pieces, and lose the optimality guarantee in the process.</td></tr>
+        <tr><td><b>Shape</b></td><td>The object is roughly a known template, as in §15's point distribution model.</td><td>Turns the energy into a joint optimisation over labelling <i>and</i> pose, which is no longer a single cut.</td></tr>
+        <tr><td><b>Direction (flux)</b></td><td>The boundary should be a light-to-dark transition rather than dark-to-light — which distinguishes an object from a hole in one.</td><td>Almost nothing: use <b>directed</b> edges with asymmetric capacities. Max-flow never assumed the graph was undirected, so the guarantee survives intact. This is the cheapest useful prior on the list.</td></tr>
+        <tr><td><b>Star-convexity</b></td><td>Every ray from a user-clicked centre enters the object once and leaves once.</td><td>Expressible as extra infinite-capacity edges along the rays, so it too keeps the global optimum. Strong when it is true and disastrous when it is not.</td></tr>
+      </table>
+    </section>
+
+    <!-- ═══ 25 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="superpixels" data-nav="Superpixels &amp; SLIC">
+      <h3><span class="idx">25</span> Superpixels: deliberately over-segmenting, on purpose, as a first move</h3>
+      <p class="lede">§02 concluded that if you cannot know the right level of granularity, the safe move is to produce something <b>finer</b> than any level you might want, and let a later stage group it. That is the whole idea. A superpixel is not meant to be an object; it is meant to be an atom that no object boundary passes through.</p>
+
+      <h4>What superpixels are for</h4>
+      <ul class="notes">
+        <li><b>They collapse the problem size.</b> The figure's image has <code>96 × 72 = 6 912</code> pixels and comes out as <b>54</b> superpixels at the default settings — a factor of <b>128</b>. Normalised cuts on 6 912 nodes is a large sparse eigenproblem; on 60 nodes it is a dense <code>60 × 60</code> decomposition that finishes instantly. <b>This is why every graph method in §20 to §23 is run on superpixels in practice.</b></li>
+        <li><b>They give you a region to compute statistics over.</b> A single pixel has one value; a superpixel has a colour histogram, a texture descriptor, a shape and a size. Features that are meaningless per-pixel become usable, which is exactly what the affinities of §20 want.</li>
+        <li><b>They are conservative.</b> A merging algorithm can undo a superpixel boundary that should not have been there. Nothing can undo a superpixel that straddled a real boundary — the error is permanent. So the design target is <b>boundary recall</b>: never miss a true boundary, and do not much care how many false ones you introduce.</li>
+      </ul>
+
+      <h4>SLIC, and the two changes that turn k-means into a superpixel algorithm</h4>
+      <p>SLIC is <a href="../../machine-learning/clustering.html#kmeans">k-means</a> in the five-dimensional joint space of §19 — <code>(L*, a*, b*, x, y)</code> — with two modifications, and everything that page says about k-means applies unchanged apart from these.</p>
+      <ol class="steps">
+        <li><b>Initialise on a regular grid</b> of spacing <code>S = √(N/k)</code>, then nudge each centre to the lowest-gradient pixel in its <code>3 × 3</code> neighbourhood, so no centre begins its life sitting on an edge or on a noise spike.</li>
+        <li><b>Restrict the search to a <code>2S × 2S</code> window</b> around each centre. This is the change that matters computationally: standard k-means compares every pixel to every centre, at cost <code>O(NkI)</code>; SLIC compares each pixel to the handful of centres whose windows contain it, at cost <code>O(NI)</code> <b>independent of <code>k</code></b>.</li>
+        <li><b>Use a distance that puts the two halves on a common scale.</b> Spatial distance is divided by <code>S</code> so it is in units of "grid cells", and the compactness constant <code>m</code> says how many units of colour one grid cell is worth.</li>
+        <li><b>Enforce connectivity afterwards.</b> Nothing in the k-means step guarantees a cluster is connected, so a final pass splits each label into its connected pieces and absorbs the small ones into a neighbour. This pass is not cosmetic — it changes the superpixel count, sometimes substantially.</li>
+      </ol>
+
+      <div class="formula"><span class="lbl">the SLIC distance</span><span class="eq">S = √(N / k)          the nominal grid interval, in pixels</span>
+<span class="eq">d_c = ‖colourᵢ − colour_centre‖          d_s = ‖xᵢ − x_centre‖</span>
+<span class="eq">D = √( d_c²  +  (d_s / S)² · m² )</span>
+<span class="lbl">so m is the exchange rate: one grid interval of distance costs the same as m units of colour</span><span class="eq">m small  →  colour dominates: superpixels follow the image, and become long and stringy</span>
+<span class="eq">m large  →  position dominates: superpixels become a rigid grid that ignores the image</span></div>
+
+      <div class="viz" id="viz-slic">
+        <div class="vhead">
+          <span class="vtitle">SLIC, and the three numbers that measure whether a superpixel map is any good</span>
+          <span class="vhint">the compactness slider does not trade monotonically against boundary adherence — the optimum is interior</span>
+        </div>
+        <div class="controls">
+          <label>superpixels <span class="keep">k</span> <input type="range" id="sl-k" min="20" max="400" step="10" value="60" /><span id="sl-kv" style="min-width:28px;display:inline-block">60</span></label>
+          <label>compactness <span class="keep">m</span> <input type="range" id="sl-m" min="2" max="40" step="1" value="10" /><span id="sl-mv" style="min-width:22px;display:inline-block">10</span></label>
+          <label>iterations <input type="range" id="sl-it" min="1" max="14" step="1" value="10" /><span id="sl-itv" style="min-width:20px;display:inline-block">10</span></label>
+          <label><input type="checkbox" id="sl-mean" /> paint each superpixel with its mean value</label>
+        </div>
+        <svg id="slic-svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-label="Left: a synthetic image with a shaded background, a diagonal band, a bright disc, a dark ellipse and a two-pixel-wide bright wire, with the superpixel boundaries drawn over it in a bright colour. Middle: the same superpixels, each painted with its own mean value, so that the image is visibly reconstructed from a hundredth as many numbers, with the true region boundaries drawn over the top in a contrasting colour so that any superpixel straddling a real boundary is obvious. Right: the true region map, for comparison. Bottom left: three curves plotted against the compactness parameter — boundary recall within one pixel, under-segmentation error, and mean compactness — with the current setting marked, showing that boundary recall rises and then falls as compactness increases rather than falling monotonically. Bottom right: numbers giving the requested and the actual superpixel count, the reduction factor against the pixel count, and the three metrics."></svg>
+        <div class="readout" aria-live="polite" id="slic-readout"></div>
+      </div>
+
+      <h4>What the three metrics mean, and what they measure here</h4>
+      <table class="grid2">
+        <tr><th style="width:26%">Metric</th><th style="width:34%">Definition</th><th>Reading</th></tr>
+        <tr><td><b>Boundary recall</b></td><td>The fraction of true boundary pixels that have a superpixel boundary within one pixel. Higher is better; this is the metric that matters most.</td><td>A recall below 1 means some real boundary has been crossed by a superpixel, and no downstream stage can recover it.</td></tr>
+        <tr><td><b>Under-segmentation error</b></td><td>For each superpixel, the fraction of it that falls outside its own majority region, averaged over the image. Lower is better.</td><td>Measures <i>how badly</i> the boundaries are crossed, not merely whether. A superpixel that pokes one pixel over a boundary is nearly free; one that straddles it evenly is a disaster.</td></tr>
+        <tr><td><b>Compactness</b></td><td>The area-weighted mean of <code>4πA/P²</code>, which is 1 for a disc and small for a stringy shape.</td><td>Not a quality measure on its own — it is what you are <i>spending</i>. Compact superpixels are easier to build features on and easier to draw a regular graph over; they are not more correct.</td></tr>
+      </table>
+
+      <ul class="notes">
+        <li><b>The trade is not monotone, and the figure measures it.</b> At <code>k = 60</code>, boundary recall is <b>0.884</b> at <code>m = 2</code>, rises to <b>0.998</b> at <code>m = 20</code>, and falls back to <b>0.951</b> at <code>m = 40</code>. The textbook expectation — that a small <code>m</code> hugs boundaries best — is <b>wrong here</b>, and the picture shows why: with colour dominating, the superpixels become long stringy things, the connectivity pass then absorbs the fragments, and only <b>39</b> superpixels survive out of a nominal 63. Larger superpixels have less boundary available to place. Good boundary adherence needs cells that are both small and image-shaped; a colour-only distance buys the second by giving up the first.</li>
+        <li><b>The actual count is not the requested count.</b> Ask for 60 and you get between 39 and 64 depending on <code>m</code>, because the connectivity pass merges and splits. Any pipeline that assumes a fixed superpixel count is making an assumption the algorithm does not honour.</li>
+        <li><b>Watch the thin bright wire.</b> It is two pixels wide, and it is the structure superpixels lose first. At small <code>k</code> and large <code>m</code> the rigid cells drive straight across it and it disappears into their means — visible immediately in the mean-painted panel. Thin structures are the standard failure of every superpixel method, and the reason detectors that need them do not use superpixels.</li>
+        <li><b>Turn the iteration count to 1.</b> The result is already recognisable: SLIC converges in a handful of iterations because the initialisation is a grid and the search window keeps every point near its own centre. Ten iterations is the usual recommendation and four is usually enough, which is the other half of why it is fast.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Segmentation series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="mean-shift.html">← Mean Shift Segmentation</a>
+      <a href="../segmentation.html" style="color:var(--muted)">Segmentation · overview</a>
+      <a href="../segmentation.html">Segmentation · overview →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../vision-viz.js"></script>
+<script src="../segmentation.viz.js"></script>
+</body>
+</html>

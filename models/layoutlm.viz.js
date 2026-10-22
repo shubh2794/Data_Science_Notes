@@ -8,7 +8,9 @@ const LV = (function(){
   const P = Object.assign({}, (typeof C !== "undefined" ? C : {A:"#5b9cff",B:"#ffb454",good:"#4ade80",bad:"#f87171",ink:"#e6e9ef",muted:"#9aa3b2",line:"#2a2f3a"}),
     { panel:"#15181f", paper:"#e9e4d8", paperInk:"#2b2b2b", teal:"#2dd4bf", purple:"#c084fc", pink:"#f472b6", grey:"#6b7280" });
 
-  function safe(name, fn){ try { fn(); } catch(e){ if (typeof console !== "undefined") console.error("[layoutlm.viz] "+name+" failed:", e); } }
+  // figures are spread across the hub and its sub-pages; skip any whose svg is not on this page
+  const SVG_ID = { boxes:"box", bucket:"bk", params:"par", bench:"bench", budget:"bud" };
+  function safe(name, fn){ if (!document.getElementById((SVG_ID[name] || name) + "-svg")) return; try { fn(); } catch(e){ if (typeof console !== "undefined") console.error("[layoutlm.viz] "+name+" failed:", e); } }
   function txt(g, x, y, s, o){
     o = o || {};
     return g.append("text").attr("x",x).attr("y",y).attr("font-size",o.size||11).attr("fill",o.fill||P.ink)

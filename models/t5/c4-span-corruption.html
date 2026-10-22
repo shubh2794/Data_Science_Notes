@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · T5: C4, SentencePiece &amp; Span Corruption</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+.tokrow{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0;font-family:"SF Mono",Menlo,monospace;font-size:11.5px}
+.tokrow span{padding:2px 5px;border-radius:4px;background:rgba(91,156,255,.16);color:#cfe0ff}
+.tokrow span.sp{background:rgba(192,132,252,.2);color:#e9d5ff}
+.tokrow span.bad{background:rgba(248,113,113,.25);color:#fecaca}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../t5.html">T5</a> · part 2 of 4</p>
+      <h1>T5: C4, SentencePiece &amp; Span Corruption</h1>
+      <p>What T5 is pretrained on and how: the 32,000-piece SentencePiece vocabulary with 100 sentinel tokens, the Colossal Clean Crawled Corpus and its line- and page-level filters, span corruption with sentinels worked by hand, and the length arithmetic that turns 568 raw tokens into 512 inputs and 114 targets.</p>
+      <div style="margin-top:10px">
+        <span class="pill">T5</span>
+        <span class="pill">32,000 pieces · 100 sentinels · C4 filters · 750 GB · span corruption by hand · 568 → 512 in, 114 out</span>
+      </div>
+    </header>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="tokenizer" data-nav="SentencePiece vocabulary and sentinels">
+      <h3><span class="idx">10</span> The SentencePiece vocabulary: 32,000 pieces and 100 sentinels</h3>
+      <p class="lede">T5 uses one SentencePiece model of 32,000 pieces for inputs and outputs, trained on 10 parts English C4 to 1 part each of German, French and Romanian Common Crawl text so that the translation targets can be spelled. The released tokenizer adds 100 sentinel tokens for span corruption, for 32,100 ids; the checkpoints' embedding tables have 32,128 rows, the last 28 unused.</p>
+      <div class="formula"><span class="lbl">ids in the released tokenizer</span><span class="eq">&lt;pad&gt; = 0 (also the decoder start token),   &lt;/s&gt; = 1,   &lt;unk&gt; = 2,   pieces 3 … 31,999</span>
+<span class="lbl">sentinels count down from the top of the id range</span><span class="eq">&lt;extra_id_0&gt; = 32,099,   &lt;extra_id_1&gt; = 32,098,   …,   &lt;extra_id_99&gt; = 32,000
+id(&lt;extra_id_k&gt;) = 32,099 − k</span>
+<span class="lbl">embedding rows</span><span class="eq">32,128 = 251 · 128  ≥  32,100      (28 rows padding)</span></div>
+      <h4>What the vocabulary cannot represent</h4>
+      <p>The piece inventory was learned mostly from C4 (whose cleaning removed pages with a curly brace in their prose lines) plus some German, French and Romanian, so some common characters are not in it and become <code>&lt;unk&gt;</code> (id 2): <code>{</code>, <code>}</code>, <code>~</code>, <code>&lt;</code> (although <code>&gt;</code> is in the vocabulary), most CJK characters, and some accented letters such as <code>ï</code>. The normaliser also collapses runs of whitespace and turns newlines into spaces. A fine-tuned T5 therefore cannot copy code or JSON braces from its input to its output, and it cannot preserve line structure.</p>
+      <div class="viz" id="viz-tok">
+        <div class="vhead">
+          <span class="vtitle">What the tokenizer sees</span>
+          <span class="vhint">pick a string · red pieces became &lt;unk&gt;</span>
+        </div>
+        <div class="controls">
+          <label>string <select id="tok-pick"></select></label>
+        </div>
+        <svg id="tok-svg" width="660" height="150" viewBox="0 0 660 150" role="img" aria-label="The chosen string split into SentencePiece pieces with their ids; unknown pieces are highlighted and summary counts are shown"></svg>
+        <div class="readout" aria-live="polite" id="tok-read"></div>
+        <p class="vcap">Pieces and ids were produced once with the released google-t5/t5-small tokenizer.json (the same vocabulary serves every v1.0 and v1.1 English checkpoint) and are stored in the figure's data; <code>&lt;/s&gt;</code> is not shown. Counts, the unknown share and characters per piece are computed from those pieces.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> the vocabulary is English-centred with just enough German, French and Romanian for WMT. Anything else — code, braces, CJK, line breaks — loses information before the model sees it; mT5's 250k vocabulary and ByT5's bytes exist to fix exactly this.</div>
+    </section>
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="c4" data-nav="C4 and its filters">
+      <h3><span class="idx">11</span> C4: the Colossal Clean Crawled Corpus and its filters</h3>
+      <p class="lede">C4 is the April 2019 Common Crawl "web extracted text" after a set of line- and page-level heuristics, English-language detection and deduplication — about 750 GB of text (745 GB in the paper's Table 8), released through TensorFlow Datasets. The paper describes it as "reasonably clean and natural English text", large enough that the study's 34B-token pretraining never repeats data.</p>
+      <h4>The filters, as the paper lists them</h4>
+      <ol class="notes">
+        <li>Keep only lines that end in a terminal punctuation mark (period, exclamation mark, question mark, end quotation mark).</li>
+        <li>Discard pages with fewer than 3 sentences; keep only lines with at least 5 words.</li>
+        <li>Remove any page containing a word from the "List of Dirty, Naughty, Obscene or Otherwise Bad Words".</li>
+        <li>Remove any line containing the word "Javascript".</li>
+        <li>Remove any page containing "lorem ipsum".</li>
+        <li>Remove any page containing a curly bracket "{".</li>
+        <li>Remove citation markers such as [1] and [citation needed].</li>
+        <li>Remove lines containing "terms of use", "privacy policy", "cookie policy", "uses cookies", "use of cookies" or "use cookies".</li>
+        <li>Deduplicate: "discarded all but one of any three-sentence span occurring more than once".</li>
+        <li>Keep pages that langdetect classifies as English with probability at least 0.99.</li>
+      </ol>
+      <h4>What the released code does differently</h4>
+      <p>The TensorFlow Datasets implementation (<code>c4_utils.py</code>) applies the line rules in a fixed order, and three details differ from the paper's description:</p>
+      <ul class="notes">
+        <li><b>Page-killing tests only see surviving lines.</b> The "lorem ipsum" and "{" checks run inside the line loop after the terminal-punctuation and five-word checks, so a brace in a short or unpunctuated line (a code fragment, a menu) is dropped with that line and does not remove the page. The paper says any page containing a brace is removed.</li>
+        <li><b>Extra line rules.</b> The code also drops lines ending in an ellipsis "…" (three periods) and lines containing any "word" longer than 1,000 characters; neither is in the paper.</li>
+        <li><b>Deduplication is by line, not three-sentence span.</b> The code hashes each lower-cased line, keeps it in one page only, and then re-applies the 3-sentence minimum to the page that remains.</li>
+      </ul>
+      <div class="viz" id="viz-c4">
+        <div class="vhead">
+          <span class="vtitle">Cleaning one page, rule by rule</span>
+          <span class="vhint">pick a mock page · toggle rules · see which lines survive and whether the page does</span>
+        </div>
+        <div class="controls">
+          <label>page <select id="c4-page">
+            <option value="blog">recipe blog post</option>
+            <option value="code">tutorial with a code snippet</option>
+            <option value="shop">shop page with boilerplate</option>
+            <option value="wiki">encyclopedia extract</option>
+          </select></label>
+          <label><input type="checkbox" id="c4-end" checked /> terminal punctuation</label>
+          <label><input type="checkbox" id="c4-words" checked /> ≥ 5 words</label>
+          <label><input type="checkbox" id="c4-js" checked /> "javascript" lines</label>
+          <label><input type="checkbox" id="c4-brace" checked /> "{" kills page</label>
+          <label><input type="checkbox" id="c4-policy" checked /> policy lines</label>
+          <label><input type="checkbox" id="c4-cite" checked /> strip citations</label>
+          <label><input type="checkbox" id="c4-sent" checked /> ≥ 3 sentences</label>
+        </div>
+        <svg id="c4-svg" width="660" height="330" viewBox="0 0 660 330" role="img" aria-label="The mock page's lines listed with a kept or dropped mark and the rule responsible, and the page-level verdict"></svg>
+        <div class="readout" aria-live="polite" id="c4-read"></div>
+        <p class="vcap">The pages are invented for this note. The rules are a port of <code>clean_page</code> in TensorFlow Datasets' c4_utils.py in its order: too-long word, citation removal, terminal punctuation (and ellipsis), five words, lorem ipsum (page), javascript (line), "{" (page), policy substrings (line), then the sentence count. Sentences are counted with a simple end-mark splitter instead of the NLTK tokenizer the code uses; the bad-words list, language detection and cross-page deduplication are not simulated.</p>
+      </div>
+      <h4>What the study found about C4 itself</h4>
+      <p>Pretraining the baseline on "C4, unfiltered" (6.1 TB, language detection only) was worse on every task — GLUE 81.46 against 83.28, SuperGLUE 68.04 against 71.36 (<a href="study-recipe-results.html#data-study">data study</a>). Later audits of C4 (not part of the T5 paper) found that the bad-words filter disproportionately removed text about and by some minority groups and that benchmark text leaked into the corpus, which is worth remembering when C4 is used as "clean" data.</p>
+      <div class="callout"><b>Takeaway:</b> C4 is a handful of cheap, transparent heuristics applied at web scale. They helped measurably, but the code is the specification — and the code's order of operations makes the "{" and "lorem ipsum" rules weaker than the paper's wording.</div>
+    </section>
+
+    <!-- 12 ───────────────────────────────────────────── -->
+    <section class="topic" id="span" data-nav="Span corruption by hand">
+      <h3><span class="idx">12</span> Span corruption, worked by hand</h3>
+      <p class="lede">T5's pretraining objective removes about 15% of the tokens of a text in contiguous spans averaging 3 tokens, replaces each span with a unique sentinel token, and trains the decoder to output only the removed spans, each introduced by its sentinel (plus a closing sentinel when the text ends with kept tokens, as in the paper's example). Only the corrupted tokens are predicted, which keeps targets short.</p>
+      <div class="formula"><span class="lbl">for a text of T tokens, noise density r = 0.15, mean span length m = 3 (the released random_spans_noise_mask)</span><span class="eq">noise = round(r · T),    spans S = round(noise / m),    non-noise = T − noise</span>
+<span class="lbl">span lengths: a random split of the noise tokens into S non-empty parts, and of the rest into S parts; the text alternates kept / dropped, starting with kept</span><span class="eq">T = k₁ + n₁ + k₂ + n₂ + … + k_S + n_S,     Σ nᵢ = noise,   kᵢ, nᵢ ≥ 1</span>
+<span class="lbl">sequence lengths, counting one sentinel per span and the end-of-sequence token</span><span class="eq">|input| = (T − noise) + S + 1,          |target| = noise + S + 1</span></div>
+      <h4>Worked example: the paper's sentence</h4>
+      <p>"Thank you for inviting me to your party last week." is 11 pieces for the T5 tokenizer (every word one piece, plus "."). Suppose "for inviting" and "last" are dropped (the paper's Figure 2):</p>
+      <table class="cmp">
+        <tr><th></th><th>Sequence</th><th>Length</th></tr>
+        <tr><td>original</td><td><code>Thank you for inviting me to your party last week .</code></td><td>11</td></tr>
+        <tr><td>input</td><td><code>Thank you &lt;extra_id_0&gt; me to your party &lt;extra_id_1&gt; week . &lt;/s&gt;</code></td><td>11 − 3 + 2 + 1 = 11</td></tr>
+        <tr><td>target</td><td><code>&lt;extra_id_0&gt; for inviting &lt;extra_id_1&gt; last &lt;extra_id_2&gt; &lt;/s&gt;</code></td><td>3 + 2 + 1 + 1 = 7</td></tr>
+      </table>
+      <p>The final sentinel <code>&lt;extra_id_2&gt;</code> marks the end of the last span (the paper's &lt;Z&gt;); it appears because the sentence ends with kept tokens ("week ."). In the released pipeline the mask always ends with a dropped span (spans alternate kept, dropped, starting with kept, and are not rolled), so real pretraining inputs end with a sentinel and real targets have none trailing — which is why the length formula above has exactly S sentinels on each side. The same sentence under the BERT-style objective would need an 11-token target — the whole text — and under "drop corrupted tokens" an input with no sentinels.</p>
+      <h4>Baseline objective versus final objective</h4>
+      <ul class="notes">
+        <li><b>The study's baseline (Section 3.1.4)</b> chooses tokens i.i.d. with probability 0.15 and merges consecutive dropped tokens into one sentinel. Spans are then usually length 1: with independent choices the expected run length is 1/(1 − 0.15) ≈ 1.18.</li>
+        <li><b>The released models (Section 3.7)</b> use explicit span corruption with mean span length 3, which Table 7 found "slightly (but significantly)" better than i.i.d. on most non-translation benchmarks, and slightly cheaper because there are fewer sentinels.</li>
+      </ul>
+      <div class="viz" id="viz-span">
+        <div class="vhead">
+          <span class="vtitle">Span-corruption sampler</span>
+          <span class="vhint">set the noise density and mean span · resample · read off input and target</span>
+        </div>
+        <div class="controls">
+          <label>text length T <input type="range" id="sp-len" min="20" max="60" step="1" value="40" /> <span id="sp-lenv"></span></label>
+          <label>noise density <input type="range" id="sp-rate" min="5" max="50" step="5" value="15" /> <span id="sp-ratev"></span></label>
+          <label>mean span <input type="range" id="sp-mu" min="1" max="10" step="1" value="3" /> <span id="sp-muv"></span></label>
+          <button id="sp-seed">resample</button>
+        </div>
+        <svg id="sp-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="The original token row with dropped spans highlighted, the encoder input with sentinels in place of spans, and the decoder target listing the spans"></svg>
+        <div class="readout" aria-live="polite" id="sp-read"></div>
+        <p class="vcap">A port of the released <code>random_spans_noise_mask</code> (t5/data/preprocessors.py, without random roll): noise and span counts are rounded as in the code, and span lengths are a uniformly random split into non-empty segments. Tokens are the words of the paper's abstract, one word per token for readability; sentinels are numbered in order as in the released <code>span_corruption</code> preprocessor. Because the mask ends with a dropped span, the input ends with a sentinel and the target has no trailing one.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> span corruption turns any text into an (input, target) pair whose target is about a fifth of the text's length. It teaches the decoder to generate multi-token fills conditioned on bidirectional context, at a fraction of the decoding cost of reconstructing the whole input.</div>
+    </section>
+
+    <!-- 13 ───────────────────────────────────────────── -->
+    <section class="topic" id="lengths" data-nav="Target-length arithmetic">
+      <h3><span class="idx">13</span> Target-length arithmetic: 568 tokens → 512 in, 114 out</h3>
+      <p class="lede">Because corruption shortens the input, the pipeline cuts raw text into chunks longer than the encoder's 512 positions so that, after corruption, inputs fill 512 exactly with no padding. The released helper <code>random_spans_helper</code> finds the largest raw length whose corrupted input fits, and the matching target length.</p>
+      <div class="formula"><span class="lbl">find the largest raw length T whose input fits in L = 512</span><span class="eq">T* = max { T :  T − round(0.15T) + round(round(0.15T) / 3) + 1  ≤  512 }</span>
+<span class="lbl">at T = 568</span><span class="eq">noise = round(85.2) = 85,    S = round(85 / 3) = 28</span>
+<span class="lbl">lengths at T = 568</span><span class="eq">input = 568 − 85 + 28 + 1 = 512,     target = 85 + 28 + 1 = 114</span>
+<span class="lbl">at T = 569 the input is one token too long</span><span class="eq">noise = round(85.35) = 85,  S = 28,  input = 569 − 85 + 28 + 1 = 513 &gt; 512</span>
+<span class="lbl">ratios</span><span class="eq">target / input = 114 / 512 = 22.3%,     target / raw = 114 / 568 = 20.1%</span>
+<span class="lbl">target tokens per dropped token (before the end token)</span><span class="eq">1 + 1/m = 1.33   at m = 3</span></div>
+      <h4>Compared with the alternatives</h4>
+      <table class="cmp">
+        <tr><th>Objective (all at 15%)</th><th>Encoder input</th><th>Decoder target</th><th>Decoder positions per 512 input positions</th></tr>
+        <tr><td>BERT-style / MASS-style (reconstruct everything)</td><td>512 (masks in place)</td><td>512</td><td>512</td></tr>
+        <tr><td>i.i.d. noise, replace spans (study baseline)</td><td>512 from ≈ 524 raw (expected)</td><td>≈ 146 (15% of the text + one sentinel per run of ≈ 1.18 tokens)</td><td>≈ 28.6%</td></tr>
+        <tr><td>span corruption, mean 2</td><td>512 from 552 raw</td><td>126</td><td>24.6%</td></tr>
+        <tr><td>span corruption, mean 3 (T5)</td><td>512 from 568 raw</td><td>114</td><td>22.3%</td></tr>
+        <tr><td>span corruption, mean 10</td><td>512 from 591 raw</td><td>99</td><td>19.3%</td></tr>
+      </table>
+      <p>The saving over full reconstruction is in the decoder: its self-attention and feed-forward work scale with the target length, and its cross-attention with target × input. The <a href="../nlp-models.html#objectives">NLP Models hub</a>'s summary that "the target is about 20% of the input length" corresponds to the raw-text ratio (20.1%); measured against the 512-token corrupted input it is 22.3%.</p>
+      <div class="viz" id="viz-len">
+        <div class="vhead">
+          <span class="vtitle">The length helper</span>
+          <span class="vhint">change the encoder length, noise density and mean span · the curve shows target/input across densities</span>
+        </div>
+        <div class="controls">
+          <label>input length <input type="range" id="len-in" min="64" max="2048" step="64" value="512" /> <span id="len-inv"></span></label>
+          <label>noise density <input type="range" id="len-rate" min="5" max="50" step="5" value="15" /> <span id="len-ratev"></span></label>
+          <label>mean span <input type="range" id="len-mu" min="1" max="20" step="1" value="3" /> <span id="len-muv"></span></label>
+        </div>
+        <svg id="len-svg" width="660" height="290" viewBox="0 0 660 290" role="img" aria-label="Bars for raw text length, encoder input and decoder target, and a curve of target-to-input ratio against noise density for the chosen mean span"></svg>
+        <div class="readout" aria-live="polite" id="len-read"></div>
+        <p class="vcap">A port of <code>random_spans_helper</code> with one sentinel per span in inputs and targets and an end-of-sequence token on each; it includes the code's small adjustment at noise density 0.5 that keeps the target no longer than the input.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> T5's pretraining examples are 568 raw tokens that become a 512-token input and a 114-token target. If you pretrain or continue pretraining with span corruption, compute the lengths with the helper; mismatched lengths waste positions on padding or truncate targets.</div>
+    </section>
+
+    <nav class="pager" aria-label="T5 series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="text-to-text-architecture.html">← T5: Text-to-Text Format &amp; Architecture</a>
+      <a href="../t5.html" style="color:var(--muted)">T5 · overview</a>
+      <a href="study-recipe-results.html">T5: Transfer Study, Recipe &amp; Results →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../t5.viz.js"></script>
+</body>
+</html>

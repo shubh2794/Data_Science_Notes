@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Backpropagation Through Time</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to parts 1, 2 and 3 */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../rnns-lstms.html">RNNs &amp; LSTMs</a> · part 2 of 5</p>
+      <h1>Backpropagation Through Time</h1>
+      <p>Backpropagation through time derived weight by weight: the easy output gradient, ∂L/∂W as a sum over paths, the input and bias gradients, the O(T) recursion that computes them, a worked numeric example checked by finite differences, the memory and compute cost, and truncated BPTT with its bias measured.</p>
+      <div style="margin-top:10px">
+        <span class="pill">RNNs &amp; LSTMs</span>
+        <span class="pill">∂L/∂V · ∂L/∂W over paths · O(T) recursion · audit · truncation</span>
+      </div>
+    </header>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="bptt-v" data-nav="BPTT · the easy gradient">
+      <h3><span class="idx">08</span> Backpropagation through time, part 1: <code>∂L/∂V</code>, the gradient that is not special</h3>
+      <p class="lede">The next four sections derive every gradient of the vanilla recurrent network from the unrolled graph. <a href="../neural-network-training/loss-backprop.html#backprop">Part 2</a> owns backpropagation as an algorithm and is not repeated; what is derived here is the one thing recurrence changes, which is what happens when the <i>same</i> parameter appears at every one of <code>T</code> places in the graph. <code>V</code> is the warm-up, because it is the one matrix for which nothing changes at all.</p>
+
+      <div class="formula"><span class="lbl">the model, restated so the next four sections need nothing else</span><span class="eq">z<span class="keep">ₜ</span> = h<span class="keep">ₜ₋₁</span>W + x<span class="keep">ₜ</span>U + b     h<span class="keep">ₜ</span> = tanh(z<span class="keep">ₜ</span>)     s<span class="keep">ₜ</span> = h<span class="keep">ₜ</span>V + c     a<span class="keep">ₜ</span> = out(s<span class="keep">ₜ</span>)
+
+L = <span class="keep">∑</span><span class="keep">ₜ</span> L<span class="keep">ₜ</span>        <span class="keep">δ</span><span class="keep">ₜ</span> <span class="keep">≡</span> <span class="keep">∂</span>L<span class="keep">ₜ</span>/<span class="keep">∂</span>s<span class="keep">ₜ</span> = a<span class="keep">ₜ</span> − y<span class="keep">ₜ</span>       (<span class="keep">§</span>07 — all three read-outs)
+
+D<span class="keep">ₜ</span> <span class="keep">≡</span> diag( 1 − h<span class="keep">ₜ</span> <span class="keep">⊙</span> h<span class="keep">ₜ</span> )       the tanh Jacobian at step t, diagonal, entries in (0, 1]</span></div>
+
+      <h4>Why <code>V</code> is easy: it is outside the loop</h4>
+      <p>Look at the unrolled graph and ask which nodes <code>V</code> touches. It appears in <code>sₜ</code> for every <code>t</code> — so it is still a shared parameter and its gradient is still a sum over <code>T</code> terms — but <code>sₜ</code> is a <b>leaf</b> of the recurrence. Nothing downstream of <code>sₜ</code> feeds back into any <code>hₖ</code>. Changing <code>V</code> changes the outputs and does not change a single hidden state. The graph below the read-out is untouched.</p>
+
+      <div class="formula"><span class="lbl">the sum over the T places V appears, and nothing more</span><span class="eq"><span class="keep">∂</span>L        <span class="keep">∑</span>     <span class="keep">∂</span>L<span class="keep">ₜ</span>       <span class="keep">∂</span>s<span class="keep">ₜ</span>
+──────  =        ─────  ·  ──────
+<span class="keep">∂</span>V[a][j]    t   <span class="keep">∂</span>s<span class="keep">ₜ</span>[j]   <span class="keep">∂</span>V[a][j]
+
+and from  s<span class="keep">ₜ</span>[j] = <span class="keep">∑</span><span class="keep">ₐ</span> h<span class="keep">ₜ</span>[a]·V[a][j] + c[j],  the second factor is h<span class="keep">ₜ</span>[a].</span>
+<span class="lbl">so, in matrix form</span><span class="eq"><span class="keep">∂</span>L/<span class="keep">∂</span>V  =  <span class="keep">∑</span><span class="keep">ₜ</span>  h<span class="keep">ₜ</span><span class="keep">ᵀ</span> <span class="keep">δ</span><span class="keep">ₜ</span>              (d<span class="keep">ₕ</span> × 1)(1 × d_y)  =  (d<span class="keep">ₕ</span> × d_y)  <span class="keep">✓</span>
+
+<span class="keep">∂</span>L/<span class="keep">∂</span>c  =  <span class="keep">∑</span><span class="keep">ₜ</span>  <span class="keep">δ</span><span class="keep">ₜ</span>                                            (1 × d_y)  <span class="keep">✓</span>
+
+An OUTER PRODUCT per time step, accumulated. Exactly what part 2's dense
+layer gives — the only recurrent feature is the <span class="keep">∑</span><span class="keep">ₜ</span>.</span></div>
+
+      <div class="wrong"><span class="say">A shape slip worth naming, because it appears in print.</span> A common presentation gives this gradient as <code>∂Lᵢ/∂V = (aᵢ − yᵢ) hᵢ</code>, with the two vectors simply written next to each other. <span class="fix">As written that expression has no defined shape.</span> <code>(aᵢ − yᵢ)</code> is <code>d_y</code>-dimensional and <code>hᵢ</code> is <code>dₕ</code>-dimensional; their juxtaposition is neither an inner product (the dimensions do not match) nor a scalar multiple. The intended object is the <b>outer product</b> — <code>hᵢᵀ(aᵢ − yᵢ)</code> in the row convention, <code>(aᵢ − yᵢ)hᵢᵀ</code> in the column convention — and the missing transpose is exactly the kind of thing that is harmless on a slide and fatal in code, because <code>dₕ</code> and <code>d_y</code> are often accidentally equal in a toy example.</div>
+
+      <h4>The gradient arriving at the state, which is where the interesting part starts</h4>
+      <p>While we are here, record what the read-out <i>hands to</i> the recurrence. This is the only channel by which the loss reaches any hidden state, and everything in §09 onwards routes it backwards:</p>
+
+      <div class="formula"><span class="lbl">the gradient the read-out delivers to h<span class="keep">ₜ</span>, from ITS OWN loss only</span><span class="eq">(<span class="keep">∂</span>L<span class="keep">ₜ</span>/<span class="keep">∂</span>h<span class="keep">ₜ</span>)[a]  =  <span class="keep">∑</span><span class="keep">ⱼ</span> <span class="keep">δ</span><span class="keep">ₜ</span>[j] · V[a][j]        i.e.   <span class="keep">∂</span>L<span class="keep">ₜ</span>/<span class="keep">∂</span>h<span class="keep">ₜ</span>  =  <span class="keep">δ</span><span class="keep">ₜ</span> V<span class="keep">ᵀ</span>
+
+Row-convention rule, used everywhere below: if a row covector u is the
+gradient with respect to the OUTPUT of the map v <span class="keep">↦</span> v·M, then the
+gradient with respect to the INPUT is u·M<span class="keep">ᵀ</span>, and the gradient with
+respect to M is v<span class="keep">ᵀ</span>u. Those two lines are the whole of the chain rule
+in this convention.</span></div>
+
+      <div class="viz" id="viz-dv">
+        <div class="vhead">
+          <span class="vtitle"><code>∂L/∂V</code>: the sum of <code>T</code> outer products, accumulated one step at a time</span>
+          <span class="vhint">step the slider forward and the accumulator fills in; the finite-difference column is recomputed live and never hard-coded</span>
+        </div>
+        <div class="controls">
+          <label>accumulate up to step <input type="range" id="dv-t" min="1" max="12" step="1" value="12" /><span id="dv-tv" style="min-width:18px;display:inline-block">12</span></label>
+          <label>T <input type="range" id="dv-T" min="3" max="12" step="1" value="12" /><span id="dv-Tv" style="min-width:18px;display:inline-block">12</span></label>
+          <label>read-out <select id="dv-out">
+            <option value="sigmoid" selected>σ + binary cross-entropy</option>
+            <option value="softmax">softmax + cross-entropy</option>
+            <option value="linear">identity + squared error</option>
+          </select></label>
+          <label>seed <input type="range" id="dv-s" min="1" max="20" step="1" value="7" /><span id="dv-sv" style="min-width:18px;display:inline-block">7</span></label>
+        </div>
+        <svg id="dv-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left column: for each time step up to the chosen cut-off, the state row vector and the read-out error row vector are drawn as small numeric strips, and the outer product they form is drawn as a small grid, so that the shape of the operation is visible — one grid per step. Centre: the running accumulator, the same grid shape, filled in as the steps are added, with each cell's value printed and coloured on a signed scale; stepping the accumulation slider adds one term at a time and the cells visibly change. Right: the same matrix computed instead by central differences on the actual loss, perturbing each entry of the read-out matrix and re-running the whole forward pass twice, drawn on the identical colour scale, and beneath it the difference of the two, whose largest absolute and largest relative entries are printed. The two agree to floating-point round-off, which is the audit. Switching the read-out control changes the loss and the error vector but not the structure of the accumulation, which is the point that the same expression covers all three read-outs. The readout line gives the number of terms accumulated so far, the Frobenius norm of the partial sum, the worst relative disagreement with central differences, and the derivative of the loss with respect to the output bias, which is the same sum without the state factor."></svg>
+        <div class="readout" aria-live="polite" id="dv-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="bptt-w" data-nav="BPTT · ∂L/∂W, the sum over paths">
+      <h3><span class="idx">09</span> Backpropagation through time, part 2: <code>∂L/∂W</code>, the sum over every path</h3>
+      <p class="lede">This is the derivation the page exists for. <code>W</code> is used at every step, and — unlike <code>V</code> — every use of it feeds the <i>next</i> use. So a change in <code>W</code> changes <code>h₁</code>, which changes <code>h₂</code> both directly through <code>W</code> and indirectly through <code>h₁</code>, and so on. The gradient is a sum over every route from every loss back to every use.</p>
+
+      <h4>Step 1 · Give every use of <code>W</code> its own name</h4>
+      <p>The clean way to handle a parameter that appears many times is the standard one: pretend it does not. Introduce <code>T</code> dummy matrices <code>W⁽¹⁾, …, W⁽ᵀ⁾</code>, all numerically equal to <code>W</code>, with <code>W⁽ᵗ⁾</code> used only at step <code>t</code>. Now every dummy appears exactly once, the graph is an ordinary feedforward graph, and the total derivative is recovered by summing:</p>
+
+      <div class="formula"><span class="lbl">the tied-parameter rule, which is the ONLY thing recurrence adds</span><span class="eq"><span class="keep">∂</span>L        <span class="keep">∑</span><span class="keep">ᵀ</span>      <span class="keep">∂</span>L
+────  =        ────────                one term per USE of the matrix
+<span class="keep">∂</span>W       i=1   <span class="keep">∂</span>W<span class="keep">⁽</span><span class="keep">ⁱ</span><span class="keep">⁾</span>
+
+Same rule as a convolution's shared kernel (part 3 <span class="keep">§</span>25), same rule as
+a weight-tied autoencoder. Nothing recurrent about it yet.</span></div>
+
+      <h4>Step 2 · One loss, one use: the chain from <code>Lₜ</code> back to <code>W⁽ⁱ⁾</code></h4>
+      <p>Fix a loss at step <code>t</code> and a use at step <code>i ≤ t</code>. Read the path off the unrolled graph, right to left:</p>
+
+      <div class="formula"><span class="lbl">the chain, with every factor named and its shape given</span><span class="eq">L<span class="keep">ₜ</span>  <span class="keep">←</span>  a<span class="keep">ₜ</span>  <span class="keep">←</span>  s<span class="keep">ₜ</span>  <span class="keep">←</span>  h<span class="keep">ₜ</span>  <span class="keep">←</span>  z<span class="keep">ₜ</span>  <span class="keep">←</span>  h<span class="keep">ₜ₋₁</span>  <span class="keep">←</span>  <span class="keep">⋯</span>  <span class="keep">←</span>  h<span class="keep">ᵢ</span>  <span class="keep">←</span>  z<span class="keep">ᵢ</span>  <span class="keep">←</span>  W<span class="keep">⁽</span><span class="keep">ⁱ</span><span class="keep">⁾</span>
+
+  <span class="keep">∂</span>L<span class="keep">ₜ</span>/<span class="keep">∂</span>s<span class="keep">ₜ</span>       =  <span class="keep">δ</span><span class="keep">ₜ</span>  =  a<span class="keep">ₜ</span> − y<span class="keep">ₜ</span>                       (1 × d_y)
+  <span class="keep">∂</span>s<span class="keep">ₜ</span>/<span class="keep">∂</span>h<span class="keep">ₜ</span>       =  V<span class="keep">ᵀ</span>  as a right-multiplication         (d_y × d<span class="keep">ₕ</span>)
+  <span class="keep">∂</span>h<span class="keep">ⱼ</span>/<span class="keep">∂</span>z<span class="keep">ⱼ</span>       =  D<span class="keep">ⱼ</span>  =  diag(1 − h<span class="keep">ⱼ</span> <span class="keep">⊙</span> h<span class="keep">ⱼ</span>)              (d<span class="keep">ₕ</span> × d<span class="keep">ₕ</span>)
+  <span class="keep">∂</span>z<span class="keep">ⱼ</span>/<span class="keep">∂</span>h<span class="keep">ⱼ₋₁</span>     =  W<span class="keep">ᵀ</span>  as a right-multiplication         (d<span class="keep">ₕ</span> × d<span class="keep">ₕ</span>)
+  <span class="keep">∂</span>z<span class="keep">ᵢ</span>/<span class="keep">∂</span>W<span class="keep">⁽</span><span class="keep">ⁱ</span><span class="keep">⁾</span>     =  h<span class="keep">ᵢ₋₁</span>  as an outer-product factor      (d<span class="keep">ₕ</span> × 1)</span>
+<span class="lbl">multiplied out, one loss and one use</span><span class="eq"><span class="keep">∂</span>L<span class="keep">ₜ</span>                       ⎡ j = t <span class="keep">↓</span> i+1  ⎤
+────────  =  h<span class="keep">ᵢ₋₁</span><span class="keep">ᵀ</span> <span class="keep">·</span>  <span class="keep">δ</span><span class="keep">ₜ</span> V<span class="keep">ᵀ</span>  <span class="keep">·</span>  ⎢    D<span class="keep">ⱼ</span> W<span class="keep">ᵀ</span>       ⎥  <span class="keep">·</span>  D<span class="keep">ᵢ</span>
+<span class="keep">∂</span>W<span class="keep">⁽</span><span class="keep">ⁱ</span><span class="keep">⁾</span>                       ⎣ <span class="keep">∏</span> in THAT order ⎦
+              └───┬──┘   └──┬───┘     └──────┬──────┘    └┬┘
+              the use    the loss      the TRAVEL back    the tanh
+              site       enters        through t − i      gate at
+                         here          recurrent steps    the use
+
+The bracket is EMPTY when i = t (a product over an empty range is the
+identity), which is the term where the loss and the use are at the same
+step and no travel is needed.
+
+ORDER MATTERS and the arrow means it: the factors are written left to
+right with j DECREASING, D<span class="keep">ₜ</span>W<span class="keep">ᵀ</span> first and D<span class="keep">ᵢ₊₁</span>W<span class="keep">ᵀ</span> last, because the
+gradient travels backwards through the graph. Reversing them gives a
+different matrix, and the T = 3 expansion below is the unambiguous form.</span></div>
+
+      <h4>Step 3 · Sum over both</h4>
+      <div class="formula"><span class="lbl">the complete gradient of the recurrent matrix</span><span class="eq"><span class="keep">∂</span>L      T    t                ⎡ j = t <span class="keep">↓</span> i+1  ⎤
+────  =  <span class="keep">∑</span>    <span class="keep">∑</span>   h<span class="keep">ᵢ₋₁</span><span class="keep">ᵀ</span>  <span class="keep">δ</span><span class="keep">ₜ</span> V<span class="keep">ᵀ</span>  ⎢    D<span class="keep">ⱼ</span> W<span class="keep">ᵀ</span>       ⎥  D<span class="keep">ᵢ</span>
+<span class="keep">∂</span>W      t=1  i=1              ⎣ <span class="keep">∏</span> in THAT order ⎦
+
+T(T+1)/2 terms. At T = 100 that is 5 050 matrix chains — which is why
+nobody computes it this way, and <span class="keep">§</span>11 turns it into T terms instead.</span>
+<span class="lbl">the three smallest cases, written out — this is the whole derivation</span><span class="eq">T = 1   <span class="keep">∂</span>L<span class="keep">₁</span>/<span class="keep">∂</span>W  =  h<span class="keep">₀</span><span class="keep">ᵀ</span> <span class="keep">δ</span><span class="keep">₁</span>V<span class="keep">ᵀ</span> D<span class="keep">₁</span>
+
+T = 2   <span class="keep">∂</span>L<span class="keep">₂</span>/<span class="keep">∂</span>W  =  h<span class="keep">₁</span><span class="keep">ᵀ</span> <span class="keep">δ</span><span class="keep">₂</span>V<span class="keep">ᵀ</span> D<span class="keep">₂</span>                        (i = 2)
+                    +  h<span class="keep">₀</span><span class="keep">ᵀ</span> <span class="keep">δ</span><span class="keep">₂</span>V<span class="keep">ᵀ</span> D<span class="keep">₂</span>W<span class="keep">ᵀ</span> D<span class="keep">₁</span>                 (i = 1)
+
+T = 3   <span class="keep">∂</span>L<span class="keep">₃</span>/<span class="keep">∂</span>W  =  h<span class="keep">₂</span><span class="keep">ᵀ</span> <span class="keep">δ</span><span class="keep">₃</span>V<span class="keep">ᵀ</span> D<span class="keep">₃</span>                        (i = 3)
+                    +  h<span class="keep">₁</span><span class="keep">ᵀ</span> <span class="keep">δ</span><span class="keep">₃</span>V<span class="keep">ᵀ</span> D<span class="keep">₃</span>W<span class="keep">ᵀ</span> D<span class="keep">₂</span>                 (i = 2)
+                    +  h<span class="keep">₀</span><span class="keep">ᵀ</span> <span class="keep">δ</span><span class="keep">₃</span>V<span class="keep">ᵀ</span> D<span class="keep">₃</span>W<span class="keep">ᵀ</span> D<span class="keep">₂</span>W<span class="keep">ᵀ</span> D<span class="keep">₁</span>          (i = 1)
+
+and <span class="keep">∂</span>L/<span class="keep">∂</span>W is the sum of all six of those lines.</span></div>
+
+      <p><b>Look at the last line of the <code>T = 3</code> block, because it is the entire second half of this page.</b> The route from the loss at step 3 back to the use of <code>W</code> at step 1 contains <code>Wᵀ</code> twice. From step <code>t</code> back to step <code>i</code> it contains <code>Wᵀ</code> exactly <code>t − i</code> times, interleaved with tanh gates. That is a <b>power</b> of a single matrix, and §17 is about what powers of a matrix do.</p>
+
+      <div class="callout"><b>A notational hazard in the standard presentation, worth flagging precisely.</b> The compact form of this result is usually written with a single symbol <code>∂zₜ/∂hᵢ</code> standing in for the whole travel bracket:
+      <div class="formula" style="margin-top:8px"><span class="lbl">the compact form, as it is normally printed</span><span class="eq"><span class="keep">∂</span>L<span class="keep">ₜ</span>/<span class="keep">∂</span>W  =  <span class="keep">∑</span><span class="keep">ᵢ</span>  (<span class="keep">∂</span>L<span class="keep">ₜ</span>/<span class="keep">∂</span>a<span class="keep">ₜ</span>)(<span class="keep">∂</span>a<span class="keep">ₜ</span>/<span class="keep">∂</span>s<span class="keep">ₜ</span>)(<span class="keep">∂</span>s<span class="keep">ₜ</span>/<span class="keep">∂</span>h<span class="keep">ₜ</span>)(<span class="keep">∂</span>h<span class="keep">ₜ</span>/<span class="keep">∂</span>z<span class="keep">ₜ</span>)(<span class="keep">∂</span>z<span class="keep">ₜ</span>/<span class="keep">∂</span>h<span class="keep">ᵢ</span>)(<span class="keep">∂</span>h<span class="keep">ᵢ</span>/<span class="keep">∂</span>z<span class="keep">ᵢ</span>)(<span class="keep">∂</span>z<span class="keep">ᵢ</span>/<span class="keep">∂</span>W)</span></div>
+      Two things about it. First, <code>∂zₜ/∂hᵢ</code> must be read as a <b>total</b> derivative — it is <code>Wᵀ Dₜ₋₁ Wᵀ ⋯ D_{i+1} Wᵀ</code>, not the single graph edge <code>W</code>, which only exists when <code>i = t − 1</code>. Read as an edge, every term with <code>i &lt; t − 1</code> is zero and the formula collapses to nonsense. Second, the <code>i = t</code> term of that sum contains the factors <code>(∂zₜ/∂hₜ)(∂hₜ/∂zₜ)</code>, and <code>∂zₜ/∂hₜ</code> <b>does not exist</b>: <code>zₜ</code> is computed from <code>hₜ₋₁</code>, and <code>hₜ</code> is computed from <code>zₜ</code>, so the compact formula is ill-formed at its own first term. The expanded three-line versions above are unambiguous and correct; the compact one needs both repairs before it means anything. This page verified that the repaired expansion reproduces the recursion of §11 to <b>3.6 × 10⁻¹⁵</b>, so the underlying chain is right — it is the abbreviation that is broken.</div>
+
+      <div class="viz" id="viz-paths">
+        <div class="vhead">
+          <span class="vtitle">Every path from a loss to a use of <code>W</code>, drawn on the unrolled graph and weighed</span>
+          <span class="vhint">pick a loss step and a use step and the figure highlights that single term, prints its factors in order, and shows what fraction of the total gradient it contributes</span>
+        </div>
+        <div class="controls">
+          <label>T <input type="range" id="pt-T" min="2" max="10" step="1" value="6" /><span id="pt-Tv" style="min-width:16px;display:inline-block">6</span></label>
+          <label>loss at step t <input type="range" id="pt-t" min="1" max="10" step="1" value="6" /><span id="pt-tv" style="min-width:16px;display:inline-block">6</span></label>
+          <label>use of W at step i <input type="range" id="pt-i" min="1" max="10" step="1" value="2" /><span id="pt-iv" style="min-width:16px;display:inline-block">2</span></label>
+          <label>ρ(W) <input type="range" id="pt-rho" min="0.3" max="1.6" step="0.05" value="0.9" /><span id="pt-rhov" style="min-width:32px;display:inline-block">0.90</span></label>
+          <label><input type="checkbox" id="pt-all" /> show every term at once</label>
+        </div>
+        <svg id="pt-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Upper panel: the unfolded graph with one column per time step, input, state, output and loss nodes, and all edges drawn faintly. The single chosen term is highlighted: the loss node at the selected loss step, the edge down into its state, every recurrent edge travelled backwards to the selected use step, and the parameter-use marker at that step, so that the length of the travel is visible as the number of highlighted recurrent edges. Beneath the graph the factors of that term are printed in order as a product, with the number of repetitions of the recurrent matrix stated explicitly. Lower panel: a matrix of coloured squares, rows indexed by loss step and columns by use step, whose lower triangle is filled and whose colour is the Frobenius norm of that individual term, on a logarithmic scale, computed from the actual states of a real forward pass. The selected term is outlined. The entire first column is empty because the initial state is zero, so every term that uses the recurrent matrix at step 1 is exactly zero, and the readout says so when that column is selected. Rows fade towards the left, which is the vanishing gradient shown as a picture rather than an inequality, and the rate at which they fade tracks the recurrent spectral radius set by the slider. Turning on the show-every-term control replaces the single highlight with all paths drawn at an opacity proportional to their contribution. The readout gives the norm of the selected term, its share of the total gradient of the recurrent matrix, the number of recurrent factors it contains, and the total number of terms in the double sum."></svg>
+        <div class="readout" aria-live="polite" id="pt-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="bptt-u" data-nav="BPTT · ∂L/∂U and the biases">
+      <h3><span class="idx">10</span> Backpropagation through time, part 3: <code>∂L/∂U</code>, <code>∂L/∂b</code>, and what changes (nothing)</h3>
+      <p class="lede"><code>U</code> also feeds the recurrence — it contributes to <code>zₜ</code>, hence to <code>hₜ</code>, hence to everything after. So its gradient has exactly the same structure as <code>W</code>'s, and differs in precisely one factor: the last one.</p>
+
+      <div class="formula"><span class="lbl">the same chain, with the final factor swapped</span><span class="eq"><span class="keep">∂</span>z<span class="keep">ᵢ</span>/<span class="keep">∂</span>W<span class="keep">⁽</span><span class="keep">ⁱ</span><span class="keep">⁾</span>  =  h<span class="keep">ᵢ₋₁</span>        the PREVIOUS STATE was what W multiplied
+<span class="keep">∂</span>z<span class="keep">ᵢ</span>/<span class="keep">∂</span>U<span class="keep">⁽</span><span class="keep">ⁱ</span><span class="keep">⁾</span>  =  x<span class="keep">ᵢ</span>          the INPUT is what U multiplied
+<span class="keep">∂</span>z<span class="keep">ᵢ</span>/<span class="keep">∂</span>b<span class="keep">⁽</span><span class="keep">ⁱ</span><span class="keep">⁾</span>  =  1           the bias multiplied nothing</span>
+<span class="lbl">so, term for term</span><span class="eq"><span class="keep">∂</span>L      T    t                ⎡ j = t <span class="keep">↓</span> i+1  ⎤
+────  =  <span class="keep">∑</span>    <span class="keep">∑</span>   x<span class="keep">ᵢ</span><span class="keep">ᵀ</span>   <span class="keep">δ</span><span class="keep">ₜ</span> V<span class="keep">ᵀ</span>  ⎢    D<span class="keep">ⱼ</span> W<span class="keep">ᵀ</span>       ⎥  D<span class="keep">ᵢ</span>          (d<span class="keep">ₓ</span> × d<span class="keep">ₕ</span>)
+<span class="keep">∂</span>U      t=1  i=1              ⎣ <span class="keep">∏</span> in THAT order ⎦
+
+<span class="keep">∂</span>L      T    t                ⎡ j = t <span class="keep">↓</span> i+1  ⎤
+────  =  <span class="keep">∑</span>    <span class="keep">∑</span>         <span class="keep">δ</span><span class="keep">ₜ</span> V<span class="keep">ᵀ</span>  ⎢    D<span class="keep">ⱼ</span> W<span class="keep">ᵀ</span>       ⎥  D<span class="keep">ᵢ</span>              (1 × d<span class="keep">ₕ</span>)
+<span class="keep">∂</span>b      t=1  i=1              ⎣ <span class="keep">∏</span> in THAT order ⎦</span></div>
+
+      <p>Note what is <b>identical</b> in all three: the entire middle — <code>δₜVᵀ ∏(DⱼWᵀ) Dᵢ</code> — does not mention <code>U</code>, <code>W</code> or <code>b</code>. It is the gradient of the loss with respect to the pre-activation <code>zᵢ</code>, and it is computed once and reused three times. That observation is not an optimisation; it is the whole content of §11.</p>
+
+      <div class="callout"><b>Three consequences that decide how a recurrent network behaves in practice.</b>
+      <ul class="notes" style="margin-top:8px">
+        <li><b>Every parameter gradient is a sum of <code>T</code> terms, so its magnitude scales with the sequence length.</b> A batch that mixes a 10-step sequence with a 500-step one delivers gradients differing by roughly fifty times before any dynamics enter. This is the same effect <a href="../convolutional-networks/blocks-backprop-features.html#backprop">part 3 §25</a> noted for a shared kernel over a feature map, and it is why the learning rate that worked at one sequence length often does not survive a change of length.</li>
+        <li><b><code>U</code>'s gradient is exactly as long-ranged as <code>W</code>'s.</b> It is tempting to think the input matrix is "closer to the data" and therefore safe. It is not: the term reaching <code>x₁</code> from <code>L_T</code> travels the same <code>T − 1</code> recurrent factors. If <code>W</code>'s gradient vanishes then so does <code>U</code>'s, and the early inputs stop mattering.</li>
+        <li><b>The bias gradient is the same chain with the outer-product factor removed</b>, so it is a sum of <code>T</code> row vectors rather than <code>T</code> matrices. It is usually the largest-magnitude gradient in the model, because it is the one term with no small multiplier in front of it.</li>
+      </ul></div>
+
+      <div class="viz" id="viz-du">
+        <div class="vhead">
+          <span class="vtitle">The three parameter gradients, side by side, with the shared middle factored out</span>
+          <span class="vhint">toggle the shared factor on and off to see that the only difference between the three is the last multiplication</span>
+        </div>
+        <div class="controls">
+          <label>T <input type="range" id="du-T" min="3" max="30" step="1" value="12" /><span id="du-Tv" style="min-width:18px;display:inline-block">12</span></label>
+          <label>ρ(W) <input type="range" id="du-rho" min="0.3" max="1.6" step="0.05" value="0.95" /><span id="du-rhov" style="min-width:32px;display:inline-block">0.95</span></label>
+          <label>show <select id="du-w">
+            <option value="all" selected>all three, per step</option>
+            <option value="U">∂L/∂U only</option>
+            <option value="W">∂L/∂W only</option>
+            <option value="b">∂L/∂b only</option>
+          </select></label>
+          <label><input type="checkbox" id="du-share" checked /> draw the shared factor ∂L/∂zᵢ</label>
+        </div>
+        <svg id="du-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Main panel: three series of bars sharing one horizontal time axis, giving for each step the Frobenius norm of that step's contribution to the input matrix gradient, to the recurrent matrix gradient and to the bias gradient, all computed from a real backward pass. A fourth series, drawn as a line, is the norm of the shared pre-activation gradient at that step, which is the factor common to all three; the three bar series are visibly proportional to it, scaled by the norm of the input row, the norm of the previous state row and one respectively. Turning off the shared-factor control removes that line. A side panel prints the three total gradient norms, the ratio between the largest and smallest per-step contribution within each, and the step index beyond which contributions have fallen below one per cent of the maximum, which is a direct measure of how far back the model is actually learning from."></svg>
+        <div class="readout" aria-live="polite" id="du-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="bptt-rec" data-nav="The O(T) recursion">
+      <h3><span class="idx">11</span> The whole thing as one <code>O(T)</code> recursion — and why it is the same numbers</h3>
+      <p class="lede">§09's double sum has <code>T(T+1)/2</code> terms and each contains a matrix chain, which makes the naive cost <code>O(T³dₕ³)</code>. The actual algorithm is <code>O(T dₕ²)</code>, and getting from one to the other is a single observation: <b>the inner travel bracket for <code>i</code> is the bracket for <code>i+1</code> with one more factor on the end.</b> Compute it once, going backwards, and carry it.</p>
+
+      <div class="formula"><span class="lbl">the recursion — six lines, and this is what every framework runs</span><span class="eq">initialise    g<span class="keep">ₜ₊₁</span> <span class="keep">←</span> 0                                 (1 × d<span class="keep">ₕ</span>)
+              <span class="keep">∂</span>L/<span class="keep">∂</span>U, <span class="keep">∂</span>L/<span class="keep">∂</span>W, <span class="keep">∂</span>L/<span class="keep">∂</span>V, <span class="keep">∂</span>L/<span class="keep">∂</span>b, <span class="keep">∂</span>L/<span class="keep">∂</span>c  <span class="keep">←</span> 0
+
+for t = T down to 1:
+
+  <span class="keep">δ</span><span class="keep">ₜ</span>  =  a<span class="keep">ₜ</span> − y<span class="keep">ₜ</span>                                  the read-out error
+  <span class="keep">∂</span>L/<span class="keep">∂</span>V  +=  h<span class="keep">ₜ</span><span class="keep">ᵀ</span> <span class="keep">δ</span><span class="keep">ₜ</span>        <span class="keep">∂</span>L/<span class="keep">∂</span>c  +=  <span class="keep">δ</span><span class="keep">ₜ</span>
+
+  <span class="keep">∂</span>L/<span class="keep">∂</span>h<span class="keep">ₜ</span>  =  <span class="keep">δ</span><span class="keep">ₜ</span> V<span class="keep">ᵀ</span>   +   g<span class="keep">ₜ₊₁</span> W<span class="keep">ᵀ</span>          <span class="keep">←</span> the ONLY recurrent line
+                 ─────      ────────
+                 from its   from the FUTURE, arriving
+                 own loss   through the shared matrix
+
+  g<span class="keep">ₜ</span>  =  <span class="keep">∂</span>L/<span class="keep">∂</span>z<span class="keep">ₜ</span>  =  (<span class="keep">∂</span>L/<span class="keep">∂</span>h<span class="keep">ₜ</span>) <span class="keep">⊙</span> (1 − h<span class="keep">ₜ</span> <span class="keep">⊙</span> h<span class="keep">ₜ</span>)
+
+  <span class="keep">∂</span>L/<span class="keep">∂</span>W  +=  h<span class="keep">ₜ₋₁</span><span class="keep">ᵀ</span> g<span class="keep">ₜ</span>      <span class="keep">∂</span>L/<span class="keep">∂</span>U  +=  x<span class="keep">ₜ</span><span class="keep">ᵀ</span> g<span class="keep">ₜ</span>      <span class="keep">∂</span>L/<span class="keep">∂</span>b  +=  g<span class="keep">ₜ</span>
+
+finally       <span class="keep">∂</span>L/<span class="keep">∂</span>h<span class="keep">₀</span>  =  g<span class="keep">₁</span> W<span class="keep">ᵀ</span>    (needed only if h<span class="keep">₀</span> is learned, or if
+                                    the sequence is a continuation)</span></div>
+
+      <h4>Why this is the same thing</h4>
+      <p>Unrolling the recursion by hand for <code>T = 3</code> gives back §09's six lines exactly. Expand <code>∂L/∂h₁</code>:</p>
+      <div class="formula"><span class="lbl">the recursion, unrolled at t = 1 for a T = 3 sequence</span><span class="eq"><span class="keep">∂</span>L/<span class="keep">∂</span>h<span class="keep">₁</span>  =  <span class="keep">δ</span><span class="keep">₁</span>V<span class="keep">ᵀ</span>  +  g<span class="keep">₂</span>W<span class="keep">ᵀ</span>
+        =  <span class="keep">δ</span><span class="keep">₁</span>V<span class="keep">ᵀ</span>  +  ( <span class="keep">∂</span>L/<span class="keep">∂</span>h<span class="keep">₂</span> ) D<span class="keep">₂</span> W<span class="keep">ᵀ</span>
+        =  <span class="keep">δ</span><span class="keep">₁</span>V<span class="keep">ᵀ</span>  +  ( <span class="keep">δ</span><span class="keep">₂</span>V<span class="keep">ᵀ</span> + g<span class="keep">₃</span>W<span class="keep">ᵀ</span> ) D<span class="keep">₂</span> W<span class="keep">ᵀ</span>
+        =  <span class="keep">δ</span><span class="keep">₁</span>V<span class="keep">ᵀ</span>  +  <span class="keep">δ</span><span class="keep">₂</span>V<span class="keep">ᵀ</span> D<span class="keep">₂</span>W<span class="keep">ᵀ</span>  +  <span class="keep">δ</span><span class="keep">₃</span>V<span class="keep">ᵀ</span> D<span class="keep">₃</span>W<span class="keep">ᵀ</span> D<span class="keep">₂</span>W<span class="keep">ᵀ</span>
+           └──┬──┘     └──────┬──────┘     └───────────┬───────────┘
+           t = 1, no      t = 2, one          t = 3, two travels
+           travel         travel
+
+which are precisely the i = 1 terms of the three losses in <span class="keep">§</span>09. The
+double sum was never wrong; it was just being computed in the expensive
+order.</span></div>
+
+      <p>Reassurance is not evidence, so this page implemented <b>both</b> — the literal double sum with its explicit matrix chains, and the recursion — and ran them against each other. Over sequences of length 3, 7, 12 and 20 with hidden widths 3 to 6, the largest disagreement in any entry of any of the five gradients was:</p>
+
+      <div class="formula"><span class="lbl">the path-sum expansion against the O(T) recursion, max absolute difference</span><span class="eq">T =  3, d<span class="keep">ₕ</span> = 3     <span class="keep">∂</span>L/<span class="keep">∂</span>U 5.55e−17   <span class="keep">∂</span>L/<span class="keep">∂</span>W 2.78e−17   <span class="keep">∂</span>L/<span class="keep">∂</span>V 0.00e+00
+T =  7, d<span class="keep">ₕ</span> = 4     <span class="keep">∂</span>L/<span class="keep">∂</span>U 4.44e−16   <span class="keep">∂</span>L/<span class="keep">∂</span>W 2.22e−16   <span class="keep">∂</span>L/<span class="keep">∂</span>V 0.00e+00
+T = 12, d<span class="keep">ₕ</span> = 5     <span class="keep">∂</span>L/<span class="keep">∂</span>U 7.77e−16   <span class="keep">∂</span>L/<span class="keep">∂</span>W 4.44e−16   <span class="keep">∂</span>L/<span class="keep">∂</span>V 0.00e+00
+T = 20, d<span class="keep">ₕ</span> = 6     <span class="keep">∂</span>L/<span class="keep">∂</span>U 3.55e−15   <span class="keep">∂</span>L/<span class="keep">∂</span>W 1.78e−15   <span class="keep">∂</span>L/<span class="keep">∂</span>V 0.00e+00
+                                                 ──────────────────
+                                     WORST        3.55e−15
+
+That is the accumulated rounding of a few thousand double-precision
+multiplications, and nothing else. The two computations are the same
+computation. <span class="keep">∂</span>L/<span class="keep">∂</span>V is EXACTLY equal because it involves no travel at all.</span></div>
+
+      <h4>The cost, exactly</h4>
+      <table class="grid2">
+        <tr><th style="width:230px">Way of computing it</th><th>Time</th><th>Memory</th><th>Notes</th></tr>
+        <tr><td><b>The double sum, literally</b></td><td class="mono">O(T² dₕ³)</td><td class="mono">O(T dₕ)</td><td>Re-multiplies the same chains once per term. Never used; it exists to be derived from.</td></tr>
+        <tr class="tot"><td><b>The recursion</b></td><td class="mono">O(T dₕ²)</td><td class="mono">O(T dₕ)</td><td>One backward sweep, the same cost as the forward pass up to a factor of two. What every framework runs.</td></tr>
+        <tr><td><b>Recomputation (activation checkpointing)</b></td><td class="mono">O(T dₕ²) · ~1.5</td><td class="mono">O(√T dₕ)</td><td>Store every <code>√T</code>-th state and recompute the rest during the backward sweep. Buys sequence length with arithmetic.</td></tr>
+        <tr><td><b>Truncation</b> (§15)</td><td class="mono">O(T k dₕ²)</td><td class="mono">O(k dₕ)</td><td>Bounds both — and changes the gradient, which is the subject of §16.</td></tr>
+      </table>
+
+      <div class="viz" id="viz-rec">
+        <div class="vhead">
+          <span class="vtitle">The double sum against the recursion: the same numbers, and the cost that separates them</span>
+          <span class="vhint">both are computed live from the same forward pass — the difference panel is a real subtraction, and the operation counters are real counters</span>
+        </div>
+        <div class="controls">
+          <label>T <input type="range" id="rc-T" min="2" max="24" step="1" value="8" /><span id="rc-Tv" style="min-width:18px;display:inline-block">8</span></label>
+          <label>dₕ <input type="range" id="rc-dh" min="2" max="10" step="1" value="4" /><span id="rc-dhv" style="min-width:16px;display:inline-block">4</span></label>
+          <label>show <select id="rc-w">
+            <option value="W" selected>∂L/∂W</option>
+            <option value="U">∂L/∂U</option>
+            <option value="b">∂L/∂b</option>
+          </select></label>
+          <label>seed <input type="range" id="rc-s" min="1" max="20" step="1" value="4" /><span id="rc-sv" style="min-width:18px;display:inline-block">4</span></label>
+        </div>
+        <svg id="rc-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left: the selected gradient matrix as computed by the literal double sum over every loss and every use, each entry printed and shaded on a signed colour scale. Centre: the same matrix as computed by the single backward recursion, on the identical scale. Right: their difference, with the largest absolute entry printed in scientific notation, which sits at the level of double-precision round-off. Beneath the three matrices, two counters give the number of scalar multiply-accumulate operations each method actually performed, tallied by the code as it ran rather than estimated from a formula, together with their ratio; increasing the sequence length grows the double sum's counter quadratically and the recursion's linearly, and the two counts and the ratio are printed. A small line chart plots both counts against sequence length on a logarithmic axis with the current length marked. The readout states the largest difference between the two matrices, the two operation counts, their ratio at the current length, and the length at which the ratio would reach one hundred."></svg>
+        <div class="readout" aria-live="polite" id="rc-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="bptt-numbers" data-nav="BPTT · a worked example">
+      <h3><span class="idx">12</span> A complete BPTT, in numbers, small enough to check by hand</h3>
+      <p class="lede">Derivations hide sign errors. This section runs the whole thing on a network with <code>dₓ = 2</code>, <code>dₕ = 2</code>, <code>d_y = 1</code> and <code>T = 3</code>, with weights chosen so that every intermediate can be recomputed with a calculator. Every number below was produced by the same library the figures call, and then checked against central differences.</p>
+
+      <div class="formula"><span class="lbl">the network, complete</span><span class="eq">U = ⎡ 0.5  −0.3 ⎤     W = ⎡ 0.6   0.4 ⎤     V = ⎡  0.9 ⎤
+    ⎣ 0.2   0.8 ⎦         ⎣−0.5   0.7 ⎦         ⎣ −0.6 ⎦
+
+b = [ 0.1  −0.2 ]     c = [ 0.05 ]     h<span class="keep">₀</span> = [ 0  0 ]
+
+X = ⎡ 1  0 ⎤   y = ⎡ 1 ⎤        read-out: <span class="keep">σ</span>, loss: binary cross-entropy
+    ⎢ 0  1 ⎥       ⎢ 0 ⎥
+    ⎣ 1  1 ⎦       ⎣ 1 ⎦</span></div>
+
+      <h4>Forward</h4>
+      <table class="grid2">
+        <tr><th style="width:44px">t</th><th>zₜ = hₜ₋₁W + xₜU + b</th><th>hₜ = tanh(zₜ)</th><th>sₜ = hₜV + c</th><th class="num">aₜ = σ(sₜ)</th><th class="num">yₜ</th><th class="num">Lₜ</th></tr>
+        <tr><td class="num">1</td><td class="mono">[ 0.600000, −0.500000]</td><td class="mono">[ 0.537050, −0.462117]</td><td class="mono">[ 0.810615]</td><td class="num">0.692241</td><td class="num">1</td><td class="num">0.367822</td></tr>
+        <tr><td class="num">2</td><td class="mono">[ 0.853288, 0.491338]</td><td class="mono">[ 0.692783, 0.455278]</td><td class="mono">[ 0.400339]</td><td class="num">0.598769</td><td class="num">0</td><td class="num">0.913218</td></tr>
+        <tr><td class="num">3</td><td class="mono">[ 0.988031, 0.895808]</td><td class="mono">[ 0.756522, 0.714250]</td><td class="mono">[ 0.302319]</td><td class="num">0.575009</td><td class="num">1</td><td class="num">0.553369</td></tr>
+        <tr class="tot"><td colspan="6"><b>L = L₁ + L₂ + L₃</b></td><td class="num"><b>1.834409</b></td></tr>
+      </table>
+
+      <p>Check one of them by hand. At <code>t = 1</code> the state is zero, so <code>z₁ = x₁U + b</code> = the first row of <code>U</code> plus <code>b</code> = <code>[0.5, −0.3] + [0.1, −0.2] = [0.6, −0.5]</code>. Then <code>s₁ = 0.537050·0.9 + (−0.462117)·(−0.6) + 0.05 = 0.483345 + 0.277270 + 0.05 = 0.810615</code>.</p>
+
+      <h4>Backward, one step at a time</h4>
+      <table class="grid2">
+        <tr><th style="width:44px">t</th><th>δₜ = aₜ − yₜ</th><th>∂L/∂hₜ = δₜVᵀ + gₜ₊₁Wᵀ</th><th>1 − hₜ⊙hₜ</th><th>gₜ = ∂L/∂zₜ</th><th>gₜWᵀ, passed back</th></tr>
+        <tr><td class="num">3</td><td class="mono">−0.424991</td><td class="mono">[−0.382492, 0.254994]</td><td class="mono">[0.427675, 0.489846]</td><td class="mono">[−0.163582, 0.124908]</td><td class="mono">[−0.048186, 0.169227]</td></tr>
+        <tr><td class="num">2</td><td class="mono">0.598769</td><td class="mono">[ 0.490706, −0.190035]</td><td class="mono">[0.520051, 0.792722]</td><td class="mono">[ 0.255192, −0.150645]</td><td class="mono">[ 0.092857, −0.233047]</td></tr>
+        <tr><td class="num">1</td><td class="mono">−0.307759</td><td class="mono">[−0.184126, −0.048392]</td><td class="mono">[0.711578, 0.786448]</td><td class="mono">[−0.131020, −0.038058]</td><td class="mono">[−0.093835, 0.038870]</td></tr>
+      </table>
+
+      <p>The middle column is the only recurrent line and it is worth tracing once. At <code>t = 2</code> the state's own loss delivers <code>δ₂Vᵀ = 0.598769·[0.9, −0.6] = [0.538892, −0.359261]</code>, and the future delivers <code>g₃Wᵀ = [−0.048186, 0.169227]</code>. Their sum is <code>[0.490706, −0.190034]</code>, which is the row in the table. <b>Everything the model learns about long-range structure lives in that second term.</b></p>
+
+      <h4>The five gradients, and the audit</h4>
+      <div class="formula"><span class="lbl">accumulated over the three steps</span><span class="eq"><span class="keep">∂</span>L/<span class="keep">∂</span>U = ⎡ −0.294602    0.086850 ⎤        = x<span class="keep">₁</span><span class="keep">ᵀ</span>g<span class="keep">₁</span> + x<span class="keep">₂</span><span class="keep">ᵀ</span>g<span class="keep">₂</span> + x<span class="keep">₃</span><span class="keep">ᵀ</span>g<span class="keep">₃</span>
+          ⎣  0.091610   −0.025737 ⎦
+
+<span class="keep">∂</span>L/<span class="keep">∂</span>W = ⎡  0.023724    0.005631 ⎤        = h<span class="keep">₀</span><span class="keep">ᵀ</span>g<span class="keep">₁</span> + h<span class="keep">₁</span><span class="keep">ᵀ</span>g<span class="keep">₂</span> + h<span class="keep">₂</span><span class="keep">ᵀ</span>g<span class="keep">₃</span>
+          ⎣ −0.192404    0.126483 ⎦
+
+<span class="keep">∂</span>L/<span class="keep">∂</span>V = ⎡ −0.071979 ⎤   <span class="keep">∂</span>L/<span class="keep">∂</span>b = [ −0.039410  −0.063794 ]
+          ⎣  0.111277 ⎦   <span class="keep">∂</span>L/<span class="keep">∂</span>c = [ −0.133981 ]</span>
+<span class="lbl">the three easy ones, verifiable in one line each</span><span class="eq"><span class="keep">∂</span>L/<span class="keep">∂</span>b = g<span class="keep">₁</span> + g<span class="keep">₂</span> + g<span class="keep">₃</span>
+       = [−0.131020 + 0.255192 − 0.163582,  −0.038058 − 0.150645 + 0.124908]
+       = [−0.039410, −0.063795]                                  <span class="keep">✓</span>
+
+<span class="keep">∂</span>L/<span class="keep">∂</span>c = <span class="keep">δ</span><span class="keep">₁</span> + <span class="keep">δ</span><span class="keep">₂</span> + <span class="keep">δ</span><span class="keep">₃</span> = −0.307759 + 0.598769 − 0.424991 = −0.133981  <span class="keep">✓</span>
+
+<span class="keep">∂</span>L/<span class="keep">∂</span>U row 0 = g<span class="keep">₁</span> + g<span class="keep">₃</span>   because x<span class="keep">₁</span> and x<span class="keep">₃</span> are the steps whose input
+                          has a 1 in coordinate 0
+              = [−0.294602, 0.086850]                            <span class="keep">✓</span></span>
+<span class="lbl">against central differences, h = 10<span class="keep">⁻</span><span class="keep">⁵</span>, every one of the 11 parameters</span><span class="eq">WORST RELATIVE ERROR   1.770e−09      at W[0][1]
+
+Every other entry agrees more closely. The audit re-runs the forward pass
+twice per parameter and never touches the backward code, so it tests the
+DERIVATION and not just the implementation.</span></div>
+
+      <div class="callout"><b>The zero that teaches something.</b> <code>h₀ = 0</code>, so the <code>t = 1</code> contribution to <code>∂L/∂W</code> is the outer product of a zero vector — <b>exactly zero</b>. The first step's use of <code>W</code> contributes nothing to <code>W</code>'s gradient, whatever the loss is. That is not an artefact of this example: with a zero initial state it is always true, and it means a length-1 sequence carries <i>no</i> information about the recurrent matrix at all. The recurrent matrix is only ever learned from steps 2 onwards, which is one more reason a sequence-to-vector model on short inputs is a hard place to learn recurrence.</div>
+
+      <div class="viz" id="viz-worked">
+        <div class="vhead">
+          <span class="vtitle">The worked example, live: change any weight and every number follows</span>
+          <span class="vhint">the entries are editable number boxes — set <code>W</code> to zero and watch the recurrent contribution to the gradient vanish while the rest survives</span>
+        </div>
+        <div class="controls">
+          <label>W₀₀ <input type="number" id="wk-w00" value="0.6" step="0.1" /></label>
+          <label>W₀₁ <input type="number" id="wk-w01" value="0.4" step="0.1" /></label>
+          <label>W₁₀ <input type="number" id="wk-w10" value="-0.5" step="0.1" /></label>
+          <label>W₁₁ <input type="number" id="wk-w11" value="0.7" step="0.1" /></label>
+          <label>show <select id="wk-w">
+            <option value="fwd" selected>the forward pass</option>
+            <option value="bwd">the backward sweep</option>
+            <option value="grad">the five gradients, against central differences</option>
+          </select></label>
+          <label><button id="wk-reset">reset to the printed example</button></label>
+        </div>
+        <svg id="wk-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="A table-style figure recomputed from the four editable entries of the recurrent matrix. In forward mode it shows, for each of the three time steps, the pre-activation row, the state row, the read-out scalar, the predicted probability, the target and the per-step loss, with the total loss printed below, every value drawn as a numeric cell shaded on a signed colour scale. In backward mode it shows for each step, taken in reverse order, the read-out error, the gradient arriving at the state split visibly into the part from its own loss and the part arriving from the future, the tanh derivative, the pre-activation gradient, and the row that is passed further back, so that the recurrent line of the algorithm is legible as two addends. In gradient mode it shows the five accumulated gradients as small matrices next to the same five quantities computed by central differences on the live weights, and the difference between them, with the worst relative error printed. Setting the recurrent matrix to all zeros collapses the future contribution to zero in backward mode and leaves the read-out gradients unchanged, which the readout states explicitly. The readout gives the total loss, the largest relative disagreement with central differences over all eleven parameters, and the fraction of the recurrent matrix gradient that came from steps other than the last."></svg>
+        <div class="readout" aria-live="polite" id="wk-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="bptt-audit" data-nav="The finite-difference audit">
+      <h3><span class="idx">13</span> The audit: all five gradients against central differences</h3>
+      <p class="lede">§12 checked one small network. This section checks the derivation across sequence lengths, hidden widths, read-outs and cell types, because a BPTT derivation can be correct at <code>T = 3</code> and wrong at <code>T = 40</code> — a transposed <code>W</code>, for instance, is invisible in a symmetric toy and fatal in general.</p>
+
+      <div class="formula"><span class="lbl">the test</span><span class="eq">For every parameter <span class="keep">θ</span> in the model, compare
+
+    analytic     the value the derivation produces
+    numeric      ( L(<span class="keep">θ</span> + h) − L(<span class="keep">θ</span> − h) ) / 2h,  from two extra FORWARD passes
+
+The numeric side never executes a line of the backward code, so agreement
+is evidence about the DERIVATION rather than about consistency.</span>
+<span class="lbl">the vanilla RNN, the three matrices this page derived, worst RELATIVE error per matrix</span><span class="eq">T    d<span class="keep">ₓ</span> d<span class="keep">ₕ</span> d_y      <span class="keep">∂</span>L/<span class="keep">∂</span>U      <span class="keep">∂</span>L/<span class="keep">∂</span>W      <span class="keep">∂</span>L/<span class="keep">∂</span>V      <span class="keep">∂</span>L/<span class="keep">∂</span>b      <span class="keep">∂</span>L/<span class="keep">∂</span>c
+ 3    2  3   2      3.09e−10   2.03e−09   3.87e−11   1.06e−10   2.48e−11
+ 5    3  4   2      1.54e−10   1.27e−09   9.76e−11   2.87e−11   1.42e−11
+ 7    3  4   2      3.31e−10   4.36e−10   6.55e−10   4.86e−10   6.59e−11
+12    2  5   3      2.99e−08   3.04e−09   1.80e−10   1.02e−10   4.57e−11
+20    4  6   4      6.39e−10   8.99e−10   1.61e−09   5.04e−09   1.20e−10
+40    3  8   3      1.21e−09   3.29e−08   4.26e−09   1.14e−09   7.23e−10
+                    ──────────────────────────────────────────────────
+WORST OVERALL                          3.29e−08</span>
+<span class="lbl">the same audit run over all three cells and all three read-outs, 27 configurations</span><span class="eq">vanilla / GRU / LSTM  <span class="keep">×</span>  <span class="keep">σ</span>+BCE / softmax+CE / identity+MSE  <span class="keep">×</span>  T = 7, 12, 20
+
+WORST OVERALL over all 27                    1.04e−06   (GRU, <span class="keep">σ</span>, T = 20)
+worst for the VANILLA cell alone             2.99e−08
+worst for the LSTM alone                     7.28e−07
+worst for the GRU alone                      1.04e−06</span></div>
+
+      <h4>Why these numbers are bigger than part 3's, and why that is not a red flag</h4>
+      <p><a href="../convolutional-networks/blocks-backprop-features.html#backprop">Part 3's convolution audit</a> reported a worst relative error of <code>2.9 × 10⁻⁹</code>, two orders of magnitude tighter than this page's. The difference is real and it is not a defect in either derivation. It is a property of the <i>test</i>, not of the code under test:</p>
+
+      <div class="formula"><span class="lbl">the error budget of a central difference</span><span class="eq">total error   <span class="keep">≈</span>   (h²/6)·|L<span class="keep">‴</span>|      +      <span class="keep">ε</span>·|L| / h
+                  ────────           ────────
+                  truncation         cancellation
+                  shrinks with h     GROWS as h shrinks</span>
+<span class="lbl">and here is the difference between the two pages</span><span class="eq">A convolution layer's loss is a LOW-degree polynomial in its kernel
+entries — for <span class="keep">∂</span>L/<span class="keep">∂</span>K the output is LINEAR in K — so |L<span class="keep">‴</span>| is tiny and the
+truncation term nearly vanishes. Both terms can be made small at once.
+
+A T-step recurrent loss is a composition of T tanh layers through the
+SAME matrix. Its third derivative with respect to a recurrent weight is
+large and grows with T. The truncation term dominates, and no choice of
+h removes it. Richardson extrapolation — combining h and h/2 to cancel
+the h² term — buys back roughly two decades, and the table above is the
+EXTRAPOLATED figure. Plain central differences at h = 10<span class="keep">⁻</span><span class="keep">⁵</span>, which is what
+the live figure computes, give a worst relative error of 8.88e−06 and a
+worst normalised residual <span class="keep">‖</span><span class="keep">Δ</span>g<span class="keep">‖</span>/<span class="keep">‖</span>g<span class="keep">‖</span> of 2.74e−08.</span></div>
+
+      <p>The right reading of a gradient check is therefore not "is it below <code>10⁻⁹</code>" but <b>"is it at the level the finite-difference formula can achieve on this function"</b>. A genuine bug does not produce <code>10⁻⁶</code>; it produces <code>10⁻¹</code> or <code>10⁰</code>. There is no ambiguous middle ground in practice, which is why the check is worth running even when its own precision is modest.</p>
+
+      <div class="wrong"><span class="say">A gradient check that passes for the wrong reason.</span> Test with <code>dₓ = dₕ = d_y</code> and a symmetric <code>W</code>, and a transposed recurrent matrix, a swapped <code>U</code> and <code>V</code>, and several sign errors all pass. <span class="fix">Use three different dimensions and an asymmetric matrix.</span> Every configuration in the table above has <code>dₓ ≠ dₕ ≠ d_y</code> for exactly this reason, and the interactive figure below lets you turn the transpose bug on deliberately to see how loudly it fails.</div>
+
+      <div class="viz" id="viz-audit">
+        <div class="vhead">
+          <span class="vtitle">Every parameter, analytic against numeric — and three bugs you can switch on</span>
+          <span class="vhint">the scatter is one point per parameter; introduce a bug and the points leave the diagonal immediately, while the shapes and the code path stay identical</span>
+        </div>
+        <div class="controls">
+          <label>cell <select id="au-c">
+            <option value="vanilla" selected>vanilla RNN</option>
+            <option value="gru">GRU</option>
+            <option value="lstm">LSTM</option>
+          </select></label>
+          <label>read-out <select id="au-o">
+            <option value="sigmoid" selected>σ + BCE</option>
+            <option value="softmax">softmax + CE</option>
+            <option value="linear">identity + MSE</option>
+          </select></label>
+          <label>T <input type="range" id="au-T" min="3" max="30" step="1" value="12" /><span id="au-Tv" style="min-width:18px;display:inline-block">12</span></label>
+          <label>bug <select id="au-b">
+            <option value="none" selected>none — as derived</option>
+            <option value="wt">use W instead of Wᵀ when travelling back</option>
+            <option value="notanh">forget the tanh derivative</option>
+            <option value="last">only the last step contributes to ∂L/∂W</option>
+          </select></label>
+          <label>seed <input type="range" id="au-s" min="1" max="20" step="1" value="11" /><span id="au-sv" style="min-width:18px;display:inline-block">11</span></label>
+        </div>
+        <svg id="au-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Main panel: a scatter plot with the analytic gradient of every parameter on the horizontal axis and the same quantity obtained by central differences on the vertical axis, both on symmetric logarithmic scales, with the identity line drawn. When the derivation is correct every point lies on that line to within plotting precision. Points are coloured by which parameter group they belong to, so a bug confined to one matrix is immediately identifiable by colour. Right panel: a bar chart of the worst relative error within each parameter group, on a logarithmic axis, with reference lines at the level achievable by the finite-difference formula and at the level that indicates a genuine error. Selecting one of the three deliberate bugs recomputes only the analytic side, leaving the numeric side untouched, so the scatter breaks apart while every shape in the computation stays valid; the transpose bug moves only the recurrent matrix group, forgetting the tanh derivative moves everything that travels, and restricting the accumulation to the last step leaves the recurrent group short by the contributions of all earlier steps. The readout names the active bug, gives the worst relative error overall and per group, gives the fraction of parameters that agree to better than one part in a thousand, and states whether the check would be judged a pass."></svg>
+        <div class="readout" aria-live="polite" id="au-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="bptt-cost" data-nav="What BPTT costs">
+      <h3><span class="idx">14</span> What BPTT costs: time, memory, and the parallelism that is not there</h3>
+      <p class="lede">Two of the three costs are ordinary. The third is the one that shaped the field: the forward pass is <b>inherently serial</b>, and no amount of hardware removes that.</p>
+
+      <table class="grid2">
+        <tr><th style="width:130px">Resource</th><th>Cost</th><th>Compared with a feedforward network of the same width</th></tr>
+        <tr><td><b>Arithmetic, forward</b></td><td class="mono">T · (dₓdₕ + dₕ² + dₕd_y) MACs</td><td>Identical to <code>T</code> dense layers. Nothing is saved and nothing extra is spent.</td></tr>
+        <tr><td><b>Arithmetic, backward</b></td><td class="mono">≈ 2× the forward</td><td><a href="../neural-network-training/loss-backprop.html#bp-cost">Part 2's 1 : 2 : 3 rule</a> holds exactly, for the same reason: every step is a dense layer, and a dense layer's backward pass is two matrix products of the same size as its forward one.</td></tr>
+        <tr class="tot"><td><b>Memory</b></td><td class="mono">O(N · T · dₕ) states</td><td><b>This is the binding constraint.</b> Every <code>hₜ</code> must survive until the backward sweep reaches it. A gated cell stores its gates too, which multiplies the figure by five or six.</td></tr>
+        <tr><td><b>Parallelism over time</b></td><td class="mono">none</td><td>A feedforward stack is also serial in depth, but its depth is a constant you chose. Here the serial chain is as long as the data. This is the entire reason attention replaced recurrence at scale, and §39 quantifies it.</td></tr>
+        <tr><td><b>Parallelism over the batch</b></td><td class="mono">full</td><td>All <code>N</code> sequences advance one step together, which is why recurrent training uses large batches and why a batch of very unequal lengths wastes most of its work on padding.</td></tr>
+      </table>
+
+      <div class="formula"><span class="lbl">the memory arithmetic that actually decides your maximum sequence length</span><span class="eq">stored activations per layer  =  N <span class="keep">·</span> T <span class="keep">·</span> d<span class="keep">ₕ</span> <span class="keep">·</span> (bytes) <span class="keep">·</span> k
+
+     k = 1  vanilla cell (h only)
+     k = 6  LSTM (f, i, g, o, c, h — all six are needed by <span class="keep">§</span>26's backward)
+     k = 5  GRU (z, r, the reset-gated state, the candidate, h)
+
+At N = 64, T = 200, d<span class="keep">ₕ</span> = 1024, float32 (4 bytes), 2 stacked layers:
+
+   vanilla   64 <span class="keep">·</span> 200 <span class="keep">·</span> 1024 <span class="keep">·</span> 4 <span class="keep">·</span> 1 <span class="keep">·</span> 2  =    104.9 MB
+   GRU                        <span class="keep">·</span> 5      =    524.3 MB
+   LSTM                       <span class="keep">·</span> 6      =    629.1 MB
+
+Double T and every figure doubles. That is why truncation (<span class="keep">§</span>15) exists,
+and it is a MEMORY argument before it is a gradient argument.</span></div>
+
+      <div class="callout"><b>The serial chain, made concrete.</b> Take a 200-step sequence and a hidden width of 1024. The forward pass is 200 dependent matrix products, each of which must finish before the next begins. On a device that can do the <code>1024 × 1024</code> product in a microsecond, the sequence still takes 200 microseconds of <i>latency</i> no matter how many such products the device could have done in parallel — and it will not be doing anything else while it waits. A transformer layer computes all 200 positions in one batched product. That is not a constant factor; it is a different shape of computation, and it is the reason the same accuracy became reachable in a fraction of the wall-clock time. <a href="../transformers.html">Transformers</a> owns the other side of this comparison, and §39 puts numbers on it.</div>
+
+      <div class="viz" id="viz-cost">
+        <div class="vhead">
+          <span class="vtitle">Time, memory and latency against sequence length, for the three cells</span>
+          <span class="vhint">every count is computed from the shapes, and the memory panel marks where a given device budget is exhausted</span>
+        </div>
+        <div class="controls">
+          <label>T <input type="range" id="ct-T" min="8" max="2000" step="8" value="200" /><span id="ct-Tv" style="min-width:34px;display:inline-block">200</span></label>
+          <label>batch N <input type="range" id="ct-N" min="1" max="256" step="1" value="64" /><span id="ct-Nv" style="min-width:26px;display:inline-block">64</span></label>
+          <label>dₕ <input type="range" id="ct-dh" min="64" max="2048" step="64" value="1024" /><span id="ct-dhv" style="min-width:34px;display:inline-block">1024</span></label>
+          <label>layers <input type="range" id="ct-L" min="1" max="8" step="1" value="2" /><span id="ct-Lv" style="min-width:14px;display:inline-block">2</span></label>
+          <label>strategy <select id="ct-st">
+            <option value="full" selected>store every state</option>
+            <option value="ckpt">checkpoint every √T steps</option>
+            <option value="trunc">truncate the backward pass</option>
+          </select></label>
+          <label>memory budget GB <input type="range" id="ct-b" min="1" max="80" step="1" value="16" /><span id="ct-bv" style="min-width:20px;display:inline-block">16</span></label>
+        </div>
+        <svg id="ct-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left panel: activation memory in gigabytes against sequence length on logarithmic axes, one curve per cell type, with a horizontal line at the chosen device budget and a marker at the sequence length where each curve crosses it, so the maximum trainable length can be read directly. Switching the strategy control replaces the linear memory curve with a square-root curve for checkpointing or a flat one for truncation, and the crossing points move accordingly. Middle panel: the multiply-accumulate count per training step, split into forward and backward contributions as a stacked bar for each cell, with the exact totals printed and the backward-to-forward ratio stated. Right panel: the serial dependency chain, drawn as the number of matrix products that must happen one after another, compared for a recurrent layer, whose chain is as long as the sequence, and for an attention layer, whose chain is a small constant, with both numbers printed at the current sequence length. The readout gives the exact activation memory for the selected configuration, the maximum sequence length that fits the budget for each cell, the total operation count per step, and the length of the serial chain."></svg>
+        <div class="readout" aria-live="polite" id="ct-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="trunc" data-nav="Truncated BPTT">
+      <h3><span class="idx">15</span> Truncated BPTT — and the two different algorithms that share the name</h3>
+      <p class="lede">§14's memory table says the honest algorithm does not fit. The universal response is to cut the backward pass short after <code>k</code> steps. That is called truncated BPTT, and the phrase names <b>two genuinely different algorithms</b> with different costs and different biases. Conflating them is common and it matters, because one of them is much worse than the other and it is the one the frameworks implement.</p>
+
+      <div class="cards">
+        <div class="box"><div class="n">form A</div><div class="t">Per-loss truncation</div><div class="g">Each loss <code>Lₜ</code> is back-propagated through the <code>k</code> most recent steps and stopped. <b>Every</b> loss gets the same <code>k</code> steps of history. Cost <code>O(T·k)</code>, memory <code>O(k)</code>. This is the form textbooks derive, and it is what the notation <code>TBPTT(k)</code> usually means in a paper.</div></div>
+        <div class="box warn"><div class="n">form B</div><div class="t">Chunked truncation</div><div class="g">The sequence is cut into non-overlapping windows of <code>k</code>. Within a window, full BPTT. At a boundary the <b>state</b> is carried forward but the <b>gradient</b> is not — the state is "detached". Cost <code>O(T)</code>, memory <code>O(k)</code>. <b>This is what every framework's tutorial does</b>, because it is one line of code.</div></div>
+        <div class="box bad"><div class="n">the asymmetry</div><div class="t">Form B is unfair by position</div><div class="g">A loss that lands at the <i>end</i> of a window sees <code>k</code> steps of history; a loss that lands at the <i>start</i> of one sees <b>one</b>. Averaged over a sequence a loss sees <code>(k+1)/2</code> steps, not <code>k</code>, and the amount of history it gets depends on where the window boundaries happened to fall.</div></div>
+      </div>
+
+      <div class="formula"><span class="lbl">form A, exactly</span><span class="eq"><span class="keep">∂</span>L      T      t                ⎡ j = t <span class="keep">↓</span> i+1  ⎤
+────  <span class="keep">≈</span>  <span class="keep">∑</span>      <span class="keep">∑</span>     h<span class="keep">ᵢ₋₁</span><span class="keep">ᵀ</span> <span class="keep">δ</span><span class="keep">ₜ</span> V<span class="keep">ᵀ</span> ⎢    D<span class="keep">ⱼ</span> W<span class="keep">ᵀ</span>       ⎥ D<span class="keep">ᵢ</span>
+<span class="keep">∂</span>W      t=1  i=t−k+1              ⎣ <span class="keep">∏</span> in THAT order ⎦
+
+<span class="keep">§</span>09's double sum with the INNER range clipped. Every term with i <span class="keep">≤</span> t − k
+is simply dropped. Nothing else changes.</span>
+<span class="lbl">form B, exactly</span><span class="eq">for each window [w, w+k):
+    forward from h<span class="keep">₍</span><span class="keep">w</span><span class="keep">₋</span><span class="keep">₁</span><span class="keep">₎</span> as usual — the STATE crosses the boundary
+    backward with <span class="keep">∂</span>L/<span class="keep">∂</span>h<span class="keep">₍</span><span class="keep">w</span><span class="keep">₋</span><span class="keep">₁</span><span class="keep">₎</span> DISCARDED — the GRADIENT does not
+
+so a loss at step t reaches back only to the start of ITS OWN window:
+    history available  =  t − w + 1,   which ranges over 1 … k</span></div>
+
+      <h4>What truncation is, and is not, an approximation of</h4>
+      <p>Both forms leave the <b>forward pass exact</b>. The model computes the same states and the same loss; the sequence is not shortened. What is approximated is only the gradient, and the approximation is not a small perturbation — it is the deliberate deletion of every term whose travel exceeds <code>k</code>. That means truncation makes a substantive modelling commitment: <b>the model will not learn any dependency longer than <code>k</code>.</b> It can still <i>represent</i> one, and if it somehow acquired one it would still <i>use</i> it, but gradient descent will never build one, because no gradient ever tells it to.</p>
+
+      <div class="wrong"><span class="say">The claim to be careful with.</span> "Truncation is fine, because the terms you dropped were vanishing anyway." <span class="fix">That is circular, and it is exactly backwards for the model you are trying to train.</span> If the recurrence is contracting then the dropped terms really are negligible and truncation costs nothing — but then the model has no long-range memory to learn with in the first place. If the recurrence is near the edge of stability, which is where a model that <i>can</i> remember has to sit (§18), the dropped terms are the same order as the kept ones and truncation removes real signal. The two cases are exactly the ones you cannot distinguish without measuring, so §16 measures.</div>
+
+      <div class="viz" id="viz-trunc">
+        <div class="vhead">
+          <span class="vtitle">Which terms survive: the same double sum, with form A and form B drawn on it</span>
+          <span class="vhint">the triangle is §09's term matrix — pick a form and a window and watch which cells are kept, and how uneven form B's coverage is</span>
+        </div>
+        <div class="controls">
+          <label>T <input type="range" id="tc-T" min="6" max="40" step="1" value="20" /><span id="tc-Tv" style="min-width:20px;display:inline-block">20</span></label>
+          <label>window k <input type="range" id="tc-k" min="1" max="40" step="1" value="5" /><span id="tc-kv" style="min-width:20px;display:inline-block">5</span></label>
+          <label>form <select id="tc-f">
+            <option value="full">full BPTT — keep everything</option>
+            <option value="A" selected>form A — per-loss truncation</option>
+            <option value="B">form B — chunked, state carried, gradient cut</option>
+          </select></label>
+          <label>ρ(W) <input type="range" id="tc-rho" min="0.3" max="1.4" step="0.05" value="0.95" /><span id="tc-rhov" style="min-width:32px;display:inline-block">0.95</span></label>
+        </div>
+        <svg id="tc-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Main panel: a lower-triangular grid of cells, rows indexed by the step at which a loss occurs and columns by the step at which the recurrent matrix is used, so each cell is one term of the double sum. Every cell is shaded by the magnitude of that term, computed from a real forward pass, on a logarithmic colour scale. Kept terms are drawn fully saturated and dropped terms are drawn greyed out, so the shape of each truncation form is immediately visible: full backpropagation keeps the whole triangle, per-loss truncation keeps a diagonal band of constant width, and chunked truncation keeps a staircase of triangular blocks whose lower rows are much shorter than their upper ones. Window boundaries are drawn as vertical rules in the chunked form. A side bar chart gives, for each loss step, the number of history steps that loss actually receives, which is flat at the window size for form A except over the first few steps, where a loss simply has less history than the window allows, and sawtoothed for form B, with the mean and the minimum printed. The readout gives the number of terms kept out of the total, the fraction of the total gradient magnitude those terms carry, the mean and minimum history depth per loss, and the memory saving relative to full backpropagation."></svg>
+        <div class="readout" aria-live="polite" id="tc-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 16 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="trunc-bias" data-nav="The truncation bias, measured">
+      <h3><span class="idx">16</span> The truncation bias, measured rather than asserted</h3>
+      <p class="lede">"Truncated BPTT gives a biased gradient" is a true sentence that carries no information until someone says <i>how</i> biased. Here is the measurement: a 40-step sequence, a vanilla cell with <code>ρ(W) = 0.95</code>, and the truncated <code>∂L/∂W</code> compared with the exact one at every window size, for both forms.</p>
+
+      <div class="formula"><span class="lbl">what is measured, for g<span class="keep">ₖ</span> = the truncated gradient and g = the exact one</span><span class="eq">relative error   <span class="keep">‖</span>g<span class="keep">ₖ</span> − g<span class="keep">‖</span> / <span class="keep">‖</span>g<span class="keep">‖</span>       how far off it is, in total
+direction        cos(g<span class="keep">ₖ</span>, g)              whether it still points the right way
+magnitude        <span class="keep">‖</span>g<span class="keep">ₖ</span><span class="keep">‖</span> / <span class="keep">‖</span>g<span class="keep">‖</span>              whether it is short or long
+
+The DIRECTION is the one that decides whether the optimiser converges to
+a different place. The magnitude is absorbed by the learning rate.</span>
+<span class="lbl">T = 40, d<span class="keep">ₕ</span> = 8, <span class="keep">ρ</span>(W) = 0.95, <span class="keep">σ</span> read-out with a target at every step</span><span class="eq">          FORM A — per-loss                 FORM B — chunked
+  k    rel err   cos      angle      rel err   cos      angle
+  1    0.5479    0.8366   33.22<span class="keep">°</span>     0.5479    0.8366   33.22<span class="keep">°</span>
+  2    0.3783    0.9257   22.23<span class="keep">°</span>     0.4856    0.8746   29.00<span class="keep">°</span>
+  3    0.2841    0.9590   16.46<span class="keep">°</span>     0.3358    0.9421   19.59<span class="keep">°</span>
+  5    0.0811    0.9970    4.46<span class="keep">°</span>     0.4088    0.9128   24.11<span class="keep">°</span>
+  8    0.0299    0.9996    1.71<span class="keep">°</span>     0.2728    0.9653   15.14<span class="keep">°</span>
+ 12    0.0054    1.0000    0.30<span class="keep">°</span>     0.2029    0.9793   11.68<span class="keep">°</span>
+ 20    0.000017  1.0000    0.00<span class="keep">°</span>     0.2251    0.9753   12.77<span class="keep">°</span>
+ 30    0.0000    1.0000    0.00<span class="keep">°</span>     0.1292    0.9916    7.42<span class="keep">°</span>
+ 40    0.0000    1.0000    0.00<span class="keep">°</span>     0.0000    1.0000    0.00<span class="keep">°</span>
+
+k = 1 is the same algorithm in both forms, so the two rows agree exactly.
+k = T is full BPTT in both forms, so both rows are zero. Everything in
+between is the bias.</span></div>
+
+      <h4>Three things that table says, and one that surprises</h4>
+      <div class="cards">
+        <div class="box bad"><div class="n">1</div><div class="t">The bias is not small at small <code>k</code></div><div class="g">At <code>k = 1</code> the truncated gradient is <b>33 degrees</b> away from the true one and misses more than half its magnitude. That is not a perturbation; it is a different descent direction, and a model trained on it converges somewhere else.</div></div>
+        <div class="box good"><div class="n">2</div><div class="t">Form A converges fast, and the rate is <code>ρᵏ</code></div><div class="g">At <code>ρ = 0.95</code> the error falls by roughly a factor of three per doubling of <code>k</code> and reaches <code>10⁻⁵</code> by <code>k = 20</code>. That is exactly the geometric decay of the dropped terms: what truncation deletes is what the recurrence was going to attenuate anyway, <i>at this spectral radius</i>.</div></div>
+        <div class="box warn"><div class="n">3 — the surprise</div><div class="t">Form B is not monotone in <code>k</code></div><div class="g"><code>k = 5</code> is <b>worse</b> than <code>k = 3</code> (0.409 against 0.336), and <code>k = 20</code> is worse than <code>k = 12</code>. Increasing the window in the chunked form moves the boundaries as well as widening them, and a boundary that lands in a bad place costs more than the extra width buys. There is no guarantee that a larger window gives a better gradient.</div></div>
+      </div>
+
+      <p>That third point is worth being blunt about because it contradicts the intuition everyone brings: <b>with chunked truncation, doubling the window is not guaranteed to improve anything.</b> The bias does trend downwards, but it is noisy in <code>k</code>, and it stays an order of magnitude worse than form A at the same window for every <code>k</code> in the table. The reason is structural, not statistical: form A gives every loss <code>k</code> steps of history; form B gives the average loss <code>(k+1)/2</code> and gives the unlucky ones one.</p>
+
+      <div class="callout"><b>What to do about it, and what practitioners actually do.</b> Two mitigations are cheap and both are standard. <b>Random offsets</b>: shift the window boundaries by a random amount each epoch, so that no step is permanently unlucky and the bias averages out over training rather than accumulating in one direction. <b>Overlapping windows</b>: run windows of length <code>k</code> that start every <code>k/2</code> steps and only take the gradient from the second half — the first half is a warm-up whose only job is to give the second half a real state and a real gradient path. Overlapping doubles the arithmetic and recovers most of form A's accuracy. Neither is exotic and neither is in the tutorial version.</div>
+
+      <div class="viz" id="viz-bias">
+        <div class="vhead">
+          <span class="vtitle">The truncation bias against the window, for both forms and any spectral radius</span>
+          <span class="vhint">every point is a real truncated backward sweep compared against a real full one — including the non-monotone dips, which are reproducible and not noise</span>
+        </div>
+        <div class="controls">
+          <label>T <input type="range" id="tb-T" min="10" max="60" step="1" value="40" /><span id="tb-Tv" style="min-width:20px;display:inline-block">40</span></label>
+          <label>ρ(W) <input type="range" id="tb-rho" min="0.3" max="1.4" step="0.05" value="0.95" /><span id="tb-rhov" style="min-width:32px;display:inline-block">0.95</span></label>
+          <label>measure <select id="tb-m">
+            <option value="rel" selected>relative error ‖gₖ − g‖ / ‖g‖</option>
+            <option value="cos">direction error, in degrees</option>
+            <option value="mag">magnitude ratio ‖gₖ‖ / ‖g‖</option>
+          </select></label>
+          <label>which gradient <select id="tb-g">
+            <option value="W" selected>∂L/∂W</option>
+            <option value="U">∂L/∂U</option>
+            <option value="b">∂L/∂b</option>
+          </select></label>
+          <label>targets at <select id="tb-y">
+            <option value="all" selected>every step</option>
+            <option value="last">the last step only</option>
+          </select></label>
+        </div>
+        <svg id="tb-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Main panel: the chosen error measure plotted against the truncation window on a logarithmic vertical axis, with one curve for per-loss truncation and one for chunked truncation, each point obtained by actually running that truncated backward sweep and comparing it with the full one. A dashed reference curve gives the spectral radius raised to the window size, which the per-loss curve tracks closely whenever the recurrence is contracting. The chunked curve lies above the per-loss curve everywhere and is visibly non-monotone, with local increases at windows whose boundaries fall badly. Both curves meet zero at a window equal to the sequence length, which is a correctness check on the measurement itself. Right panel: for the currently selected window, a bar chart of how many steps of history each individual loss actually receives, flat for the per-loss form and sawtoothed for the chunked form, with the mean marked. Selecting a target placement of the final step only removes all but one loss and the history bar chart collapses to a single bar, while the error curves become far steeper because there is now only one gradient path. The readout gives the error at the current window for both forms, their ratio, the window at which the per-loss form first falls below one per cent, and the mean history depth of the chunked form."></svg>
+        <div class="readout" aria-live="polite" id="tb-readout"></div>
+      </div>
+    </section>
+
+    <nav class="pager" aria-label="RNNs &amp; LSTMs series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="recurrent-cells.html">← Recurrent Cells &amp; Unrolling</a>
+      <a href="../rnns-lstms.html" style="color:var(--muted)">RNNs &amp; LSTMs · overview</a>
+      <a href="vanishing-exploding.html">Vanishing &amp; Exploding Gradients →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../rnns-lstms.viz.js"></script>
+</body>
+</html>

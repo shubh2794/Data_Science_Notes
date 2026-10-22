@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Tensor, Sequence &amp; Context Parallelism</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  .tablewrap{overflow-x:auto;max-width:100%}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  pre.code{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:10px 0;overflow-x:auto;font-size:12.5px;line-height:1.5;white-space:pre}
+  pre.code code{background:none;padding:0;border-radius:0;color:var(--ink);font-size:inherit}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../distributed-training.html">Distributed Training</a> · part 3 of 5</p>
+      <h1>Tensor, Sequence &amp; Context Parallelism</h1>
+      <p>Splitting work inside a layer: Megatron's column- and row-parallel matmuls and why their activation-sized traffic keeps tensor parallelism inside a node, sequence parallelism for the norm and dropout regions it missed, and context parallelism for long sequences through ring attention or DeepSpeed-Ulysses head all-to-all.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Distributed Training</span>
+        <span class="pill">Megatron column/row split · TP traffic & NVLink · sequence parallelism · ring attention · Ulysses all-to-all · which to use</span>
+      </div>
+    </header>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="model" data-nav="Tensor parallelism: the Megatron split">
+      <h3><span class="idx">10</span> Model parallelism I — tensor parallelism: the Megatron split</h3>
+      <p class="lede">Data parallelism, even fully sharded, needs every layer to fit on one GPU at the moment it runs and keeps per-GPU activations at a full layer's width. Model parallelism splits the model itself. <b>Tensor parallelism</b> does it inside each layer (this section and the next two), and <b>pipeline parallelism</b> does it across layers (§15–§16).</p>
+      <ul class="notes">
+        <li><b>Tensor (intra-layer):</b> split a single layer's matrices across GPUs. Each computes part of every layer, then the parts are combined. Heavy, frequent communication, so it needs a fast interconnect.</li>
+        <li><b>Pipeline (inter-layer):</b> put different <i>layers</i> on different GPUs, and micro-batches flow through the stages like an assembly line. Watch out for the idle "bubble" at the ends.</li>
+      </ul>
+
+      <h4>The MLP: column split, then row split</h4>
+      <p>The construction in "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism" (arXiv 1909.08053) rests on one observation about the transformer MLP <code>Z = GeLU(X·A)·B</code>. Split the first matrix <code>A</code> (h × 4h) by <b>columns</b> across <code>t</code> GPUs. Then each GPU computes <code>X·Aᵢ</code>, a slice of the hidden activation, from the full input <code>X</code>. The nonlinearity is applied element-wise, so <code>GeLU(X·Aᵢ)</code> is exactly the corresponding slice of <code>GeLU(X·A)</code> and no communication is needed. Split the second matrix <code>B</code> (4h × h) by <b>rows</b> to match. Each GPU now computes a full-width partial product <code>Zᵢ = GeLU(X·Aᵢ)·Bᵢ</code>, and the output is their sum.</p>
+      <div class="formula"><span class="lbl">tensor-parallel MLP, t GPUs</span><span class="eq">A = [A₁ A₂ … A_t]           (columns, h × 4h/t each)
+B = [B₁; B₂; … ; B_t]        (rows,    4h/t × h each)
+Z = Σᵢ GeLU(X·Aᵢ)·Bᵢ          one all-reduce produces Z on every GPU
+had we split A by rows:      GeLU(X₁A₁ + X₂A₂) ≠ GeLU(X₁A₁) + GeLU(X₂A₂)  → a sync before the GeLU</span></div>
+      <p>The last line is why the order matters. A row split of <code>A</code> would put a sum <i>inside</i> the nonlinearity and cost a second synchronisation per MLP.</p>
+
+      <h4>Attention: split by heads</h4>
+      <p>Attention is already parallel over heads. The Q, K and V projections are split by columns so that each GPU owns <code>a/t</code> complete heads. It computes those heads' attention locally with any kernel, then applies its row-slice of the output projection. That again produces a partial sum and one all-reduce. The head count must be divisible by <code>t</code>. With grouped-query attention the key/value head count is the tighter limit, and KV heads are replicated when <code>t</code> exceeds it.</p>
+
+      <h4>The conjugate operators f and g</h4>
+      <div class="formula"><span class="lbl">the two operators Megatron inserts around each block</span><span class="eq">f : forward = identity      backward = all-reduce of ∂L/∂X   (before the column-split matmul)
+g : forward = all-reduce    backward = identity              (after the row-split matmul)
+per transformer layer (attention + MLP):  2 all-reduces forward + 2 all-reduces backward</span></div>
+      <p>The backward all-reduce in <code>f</code> is needed because each GPU computes only its share of the input gradient, <code>∂L/∂X = Σᵢ ∂L/∂(XAᵢ) · Aᵢᵀ</code>. It is a sum over the column slices, so the pieces must be summed exactly as the outputs were in the forward pass. The two operators are conjugates: whatever one does forward, the other does backward.</p>
+
+      <h4>Embeddings and the loss</h4>
+      <p>The input embedding is split along the vocabulary, and each GPU looks up the tokens in its range, contributing zeros elsewhere. An all-reduce assembles the result. The output layer is the same matrix, split the same way. Gathering <code>b·s·V</code> logits to compute the cross-entropy would be expensive, so Megatron-LM fuses the parallel output GEMM with the loss. Each GPU reduces its logits to per-token partial statistics (its local max and sum of exponentials, and the target logit if it owns it), and only those <code>b·s</code>-sized quantities are communicated. The paper reports 15.1 PetaFLOPs sustained on 512 GPUs for an 8.3 B-parameter model, 76% scaling efficiency against a single-GPU baseline of 39 TeraFLOPs (30% of peak).</p>
+
+      <div class="viz" id="viz-tp">
+        <div class="vhead">
+          <span class="vtitle">The Megatron MLP split, and what it costs to communicate</span>
+          <span class="vhint">left: the partition for the chosen t; right: communication ÷ compute for t = 1…32 at this width and link</span>
+        </div>
+        <div class="controls">
+          <label>TP degree t <select id="tp-t"><option>1</option><option>2</option><option>4</option><option selected>8</option><option>16</option></select></label>
+          <label>model <select id="tp-model"><option value="7">7 B (h 4096)</option><option value="13">13 B (h 5120)</option><option value="70" selected>70 B (h 8192)</option><option value="175">175 B (h 12288)</option><option value="405">405 B (h 16384)</option></select></label>
+          <label>tokens per micro-batch <select id="tp-tok"><option value="2048">2,048</option><option value="4096" selected>4,096</option><option value="16384">16,384</option></select></label>
+          <label>link <select id="tp-link"><option value="450" selected>NVLink 4 · 450 GB/s</option><option value="900">NVLink 5 · 900 GB/s</option><option value="64">PCIe 5.0 · 64 GB/s</option><option value="50">InfiniBand NDR · 50 GB/s</option></select></label>
+          <label>achieved TFLOP/s <select id="tp-tf"><option value="200">200</option><option value="400" selected>400</option><option value="800">800</option></select></label>
+        </div>
+        <svg id="tp-svg" width="760" height="340" viewBox="0 0 760 340" role="img" aria-label="Left: the input X passes through operator f to t parallel lanes, each computing GeLU of X times a column slice of A and then multiplying by a row slice of B, and the lanes meet at operator g which all-reduces them into Z. Right: bar chart of tensor-parallel communication time divided by compute time per layer for t from 1 to 32, with a dashed line where communication equals compute."></svg>
+        <div class="readout" aria-live="polite" id="tp-read"></div>
+        <p class="vcap">Communication counts four all-reduces of the 16-bit block output (b·s × h) per layer, forward and backward, at the ring cost of §07. Compute is 6 × 12h² FLOP per token per layer, divided by t. The ratio on the right is the closed form of §11, 2(t−1)·F/(9·h·<span class="keep">β</span>), and the readout evaluates the same quantity from bytes and FLOPs.</p>
+      </div>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="tp-cost" data-nav="TP cost and the NVLink domain">
+      <h3><span class="idx">11</span> What tensor parallelism costs, and why it stays inside a node</h3>
+      <p class="lede">Tensor parallelism's traffic is a different kind from data parallelism's. It scales with activations, not parameters, it happens inside every layer, and it sits on the critical path. One formula says where it fits.</p>
+      <div class="formula"><span class="lbl">per layer, per micro-batch of b·s tokens, 16-bit activations</span><span class="eq">bytes sent per rank   4 all-reduces × 2·(t−1)/t × 2·b·s·h   = 16·b·s·h·(t−1)/t
+FLOP per rank         6 × 12h² × b·s / t                     = 72·b·s·h² / t
+comm ÷ compute        [16·b·s·h·(t−1)/t / β] ÷ [72·b·s·h² / (t·F)]  =  2·(t−1)·F / (9·h·β)</span></div>
+      <p>Three things follow from the last line. First, <b>b and s cancel</b>: unlike data parallelism, you cannot hide tensor-parallel communication by giving each GPU more tokens. Second, the ratio <b>grows with t</b>, since each doubling of <code>t</code> halves compute per GPU while the bytes per rank stay nearly constant. Third, it <b>falls with h</b>: wide models tolerate more tensor parallelism than narrow ones.</p>
+      <div class="formula"><span class="lbl">worked: F = 400 TFLOP/s achieved</span><span class="eq">h = 8192,  t = 8,  NVLink 450 GB/s : 2·7·400e12 / (9·8192·450e9) = 0.17
+h = 4096,  t = 8,  NVLink 450 GB/s :                             = 0.34
+h = 16384, t = 16, InfiniBand 50 GB/s: 2·15·400e12 / (9·16384·50e9) = 1.63   → slower than the compute it splits</span></div>
+      <p>This is why tensor parallelism stays inside the NVLink domain, 8 GPUs on a standard HGX/DGX node or up to a rack-scale NVLink system. "Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM" (arXiv 2104.04473) states the rule as its first takeaway: use tensor model parallelism up to the number of GPUs in a server, and pipeline parallelism beyond that. And because the all-reduces sit between dependent matmuls, they are exposed unless the implementation splits the GEMM into chunks and overlaps each chunk's collective with the next chunk's compute. Some frameworks do this, often called asynchronous or collective-matmul tensor parallelism.</p>
+      <div class="tablewrap"><table class="grid2">
+        <tr><th></th><th>data parallel (DDP / ZeRO)</th><th>tensor parallel</th></tr>
+        <tr><td><b>what is communicated</b></td><td>gradients (and ZeRO-3 weights), ∝ Ψ</td><td>activations, ∝ b·s·h per layer</td></tr>
+        <tr><td><b>how often</b></td><td>once per step (per layer for ZeRO-3)</td><td>4× per layer per micro-batch</td></tr>
+        <tr><td><b>can it overlap?</b></td><td>yes, with the rest of backward</td><td>only with chunked GEMM tricks</td></tr>
+        <tr><td><b>fix for a bad ratio</b></td><td>more tokens per GPU</td><td>smaller t or a faster link; tokens do not help</td></tr>
+        <tr><td><b>what it saves</b></td><td>ZeRO: model state; nothing for activations</td><td>weights, gradients, optimiser <i>and</i> most activations ÷ t</td></tr>
+      </table></div>
+      <p><b>The inference angle.</b> Autoregressive decoding reads every weight once per generated token, so it is memory-bandwidth-bound. Tensor parallelism divides the bytes each GPU reads by <code>t</code>, which directly cuts per-token latency. That is why serving systems use it even for models that would fit on one GPU. Serving-side details live in <a href="../../mlops/model-acceleration.html">Model Acceleration</a>.</p>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="seqpar" data-nav="Sequence parallelism and activation memory">
+      <h3><span class="idx">12</span> Sequence parallelism: the activations tensor parallelism missed</h3>
+      <p class="lede">Tensor parallelism splits the matmuls, but LayerNorm, dropout and the residual adds run on the full <code>b·s·h</code> activation on every TP rank. "Reducing Activation Recomputation in Large Transformer Models" (arXiv 2205.05198) counts exactly what that costs and removes it with no extra communication.</p>
+
+      <h4>Counting activation bytes per layer</h4>
+      <p>With 16-bit activations and one-byte dropout masks, a standard transformer layer stores, for the backward pass:</p>
+      <div class="formula"><span class="lbl">stored activations per layer, bytes (s tokens, b sequences, h width, a heads)</span><span class="eq">attention block   11·s·b·h + 5·a·s²·b    (QKV input 2, Q and K 4, V 2, out-proj input 2, dropout mask 1;
+                                          softmax 2·a·s²·b, its dropout mask a·s²·b, dropout output 2·a·s²·b)
+MLP block         19·s·b·h               (input 2, GeLU input 8, second matmul input 8, dropout mask 1)
+two LayerNorms     4·s·b·h
+total             s·b·h · (34 + 5·a·s/h)</span></div>
+      <p>The paper then gives the per-GPU figure under each scheme:</p>
+      <div class="formula"><span class="lbl">per layer per GPU, t-way tensor parallelism</span><span class="eq">no parallelism                         s·b·h · (34 + 5·a·s/h)
+tensor parallel                        s·b·h · (10 + 24/t + 5·a·s/(h·t))
+tensor + sequence parallel             s·b·h · (34 + 5·a·s/h) / t
++ selective recompute (attention core) s·b·h · 34 / t
+full recompute (keep layer input)      2·s·b·h / t   with sequence parallelism</span></div>
+      <p>The 10 is the part tensor parallelism leaves replicated: both LayerNorm inputs (4), the QKV input (2), the MLP input (2) and the two dropout masks (2). <b>Sequence parallelism</b> splits those regions along the sequence dimension instead. LayerNorm and dropout act on each token independently, so each TP rank can process <code>s/t</code> of the tokens. The only change is at the boundaries: entering a tensor-parallel region needs the full sequence (an all-gather instead of <code>f</code>'s identity), and leaving it needs only this rank's tokens of the sum (a reduce-scatter instead of <code>g</code>'s all-reduce). Since an all-reduce <i>is</i> a reduce-scatter plus an all-gather (§07), the bytes are unchanged.</p>
+      <p><b>Selective recomputation</b> handles the <code>5·a·s/h</code> term: the <code>a·s²</code> attention scores and softmax. They are large but cheap to recompute, so they are dropped and recomputed in backward, while the expensive-to-recompute matmul inputs are kept. A fused attention kernel does this by construction. The paper reports that together these cut activation memory 5× and eliminate over 90% of the time overhead of full recomputation. Its example is a 530 B GPT-3-style model on 2240 A100s at 54.2% model-FLOP utilisation, 29% faster than the 42.1% it achieved with full recomputation.</p>
+      <div class="formula"><span class="lbl">worked: h = 8192, a = 64, s = 4096, b = 1, t = 8 (a 70 B-class layer)</span><span class="eq">s·b·h = 33.6 M,   5·a·s/h = 160
+no parallelism               33.6 M × 194       = 6.51 GB per layer
+tensor parallel              33.6 M × (10+3+20) = 1.11 GB
+tensor + sequence parallel   33.6 M × 194 / 8   = 0.81 GB
++ selective recompute        33.6 M × 34 / 8    = 0.14 GB   → × 80 layers = 11.4 GB</span></div>
+
+      <div class="viz" id="viz-act">
+        <div class="vhead">
+          <span class="vtitle">Activation memory per layer per GPU under each scheme</span>
+          <span class="vhint">the attention-score term grows with s²; sequence parallelism and selective recompute remove what tensor parallelism leaves</span>
+        </div>
+        <div class="controls">
+          <label>model <select id="ac-model"><option value="7">7 B (h 4096, 32 heads)</option><option value="70" selected>70 B (h 8192, 64 heads)</option><option value="175">175 B (h 12288, 96 heads)</option></select></label>
+          <label>sequence s <input type="range" id="ac-s" min="11" max="17" step="1" value="12" /><span id="ac-sv" style="min-width:60px;display:inline-block">4096</span></label>
+          <label>micro-batch b <select id="ac-b"><option selected>1</option><option>2</option><option>4</option></select></label>
+          <label>TP degree t <select id="ac-t"><option>1</option><option>2</option><option>4</option><option selected>8</option></select></label>
+        </div>
+        <svg id="ac-svg" width="760" height="300" viewBox="0 0 760 300" role="img" aria-label="Five horizontal bars of stored activation bytes per transformer layer per GPU: no parallelism, tensor parallelism, tensor plus sequence parallelism, plus selective recomputation, and full recomputation, each labelled in gigabytes per layer and for the whole model."></svg>
+        <div class="readout" aria-live="polite" id="ac-read"></div>
+        <p class="vcap">Bars evaluate the five formulas above for the chosen configuration. Totals multiply by the layer count and assume no pipeline parallelism and one micro-batch in flight. §16 shows how pipeline schedules multiply this by the micro-batches a stage holds at once.</p>
+      </div>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="context" data-nav="Context parallelism: ring attention">
+      <h3><span class="idx">13</span> Context parallelism I — ring attention</h3>
+      <p class="lede">Sequence parallelism splits the token-local regions across the tensor-parallel group, but attention itself still sees the whole sequence on every GPU. At 128 K tokens and beyond, one sequence's activations do not fit even with everything in §12. <b>Context parallelism</b> splits the sequence for the whole layer, attention included.</p>
+      <p>Every operation except attention acts on each token independently, so with the sequence cut into <code>C</code> chunks each rank runs projections, MLP and norms on its own <code>s/C</code> tokens with no communication at all. Attention needs every query to see every earlier key. <b>Ring attention</b> ("Ring Attention with Blockwise Transformers for Near-Infinite Context", arXiv 2310.01889) keeps each rank's queries in place and passes the key/value blocks round a ring. At each of <code>C</code> steps a rank computes attention of its queries against the K/V block it currently holds, while it sends that block on and receives the next one.</p>
+
+      <h4>Why the result is exact: online softmax</h4>
+      <p>A softmax over keys that arrive in blocks can be accumulated exactly by carrying three running quantities per query row: the running maximum <code>m</code>, the running denominator <code>ℓ</code>, and the unnormalised output <code>o</code>. The same identity underlies fused attention kernels, applied here across devices instead of across on-chip tiles.</p>
+      <div class="formula"><span class="lbl">absorbing K/V block j into the running state (per query row)</span><span class="eq">Sⱼ  = Q·Kⱼᵀ / √d
+m'  = max(m, rowmax(Sⱼ))
+ℓ'  = e^(m − m')·ℓ + rowsum(e^(Sⱼ − m'))
+o'  = e^(m − m')·o + e^(Sⱼ − m')·Vⱼ
+after the last block:  output = o / ℓ          (identical to softmax(QKᵀ/√d)·V)</span></div>
+      <p>The backward pass runs the ring again, circulating K/V together with their gradient accumulators. Memory per rank is proportional to <code>s/C</code>: the paper counts six blocks of <code>b·c·h</code> (query, the current K and V, the incoming K and V, and the output), independent of the total sequence length.</p>
+
+      <h4>When the ring hides its own communication</h4>
+      <p>Per step a rank computes about <code>4·d·c²</code> FLOPs on a block of <code>c</code> tokens and sends about <code>4·c·d</code> bytes, so compute hides the transfer when <code>c ≥ F/B</code>, the device's FLOP rate over its link bandwidth. That is the paper's condition. Its Table 2 puts the minimum block at about 1 K tokens for A100s on NVLink (312 TFLOP/s ÷ 300 GB/s ≈ 1,040) and about 25 K over InfiniBand at 12.5 GB/s. It requires each device's sequence to be about six blocks, between roughly 6 K and 10 K tokens on fast interconnects. The paper states the ring allows sequences "up to device count times longer" than prior memory-efficient transformers, without approximation.</p>
+
+      <h4>The causal-mask imbalance, and the zig-zag fix</h4>
+      <p>With a causal mask, cut the sequence into contiguous chunks. Rank 0's queries attend only to its own keys, while the last rank's queries attend to everything. At most ring steps some ranks have nothing to compute while others do a full block, and the slowest rank sets the pace. The figure measures the result: with contiguous chunks the pass takes <code>2C − 1</code> block-times of the busiest rank's work instead of <code>C</code>, for a utilisation of <code>C/(2C−1)</code>. That is 57% at <code>C = 4</code>, tending to 50%. The standard fix cuts the sequence into <code>2C</code> chunks and gives rank <i>r</i> chunks <i>r</i> and <code>2C−1−r</code>, pairing an early chunk with a late one. Every rank then does the same work at every step. The Llama 3 paper ("The Llama 3 Herd of Models", arXiv 2407.21783) describes exactly this split into <code>2×CP</code> chunks. Its implementation all-gathers K and V instead of passing them round a ring, which it motivates by easier support for arbitrary attention masks (such as document masks) and by K and V being much smaller than Q under grouped-query attention. Striped attention (arXiv 2311.09431) reaches the same balance by assigning tokens round-robin.</p>
+
+      <div class="viz" id="viz-cp">
+        <div class="vhead">
+          <span class="vtitle">Ring attention: who computes which block, and when</span>
+          <span class="vhint">grid: query chunks × key/value chunks, coloured by the rank that owns the queries; bars: work per rank per ring step</span>
+        </div>
+        <div class="controls">
+          <label>ranks C <select id="cp-c"><option>2</option><option selected>4</option><option>8</option></select></label>
+          <label>layout <select id="cp-layout"><option value="contig" selected>contiguous chunks</option><option value="zig">zig-zag (r and 2C−1−r)</option></select></label>
+          <label>mask <select id="cp-mask"><option value="causal" selected>causal</option><option value="full">bidirectional</option></select></label>
+          <label>ring step <input type="range" id="cp-step" min="0" max="3" step="1" value="0" /><span id="cp-stepv" style="min-width:40px;display:inline-block">0 / 3</span></label>
+          <label>total sequence <input type="range" id="cp-seq" min="14" max="20" step="1" value="17" /><span id="cp-seqv" style="min-width:70px;display:inline-block">131072</span></label>
+          <label>link <select id="cp-bw"><option value="300" selected>A100 NVLink · 300 GB/s</option><option value="12.5">InfiniBand · 12.5 GB/s</option></select></label>
+        </div>
+        <svg id="cp-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Left: a square grid of query chunks by key-value chunks; blocks above the causal diagonal are empty, diagonal blocks are half filled, and blocks computed at the selected ring step are highlighted in the colour of the rank that computes them. Right: grouped bars of the work each rank does at each ring step."></svg>
+        <div class="readout" aria-live="polite" id="cp-read"></div>
+        <p class="vcap">The sequence is always cut into 2C chunks so both layouts are drawn at the same granularity. At step j rank r holds the K/V of rank (r − j) mod C. Work counts a full chunk-by-chunk block as 1 and a diagonal block as ½. Utilisation is total work ÷ (C × the sum over steps of the busiest rank's work). The overlap check uses the paper's condition c ≥ F/B at 312 TFLOP/s, scaled up when the busiest rank's step does less than a full block of work.</p>
+      </div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ulysses" data-nav="Ulysses, and which to use">
+      <h3><span class="idx">14</span> Context parallelism II — Ulysses head all-to-all, and which to use</h3>
+      <p class="lede">Ring attention keeps the sequence split and moves keys and values. The other design switches which dimension is split: around attention, turn a sequence-sharded tensor into a head-sharded one, run ordinary full-sequence attention on a subset of heads, and switch back.</p>
+      <p>"DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models" (arXiv 2309.14509) does this with two all-to-alls per layer. Before attention, each rank holds Q, K and V for <code>N/P</code> tokens and all heads. An all-to-all regroups them so each rank holds <b>all</b> <code>N</code> tokens for <code>a/P</code> heads. Attention is then entirely local, and any kernel works because every head sees its whole sequence. A second all-to-all on the output restores the sequence split for the rest of the layer.</p>
+      <div class="formula"><span class="lbl">communication per layer (paper's analysis, forward, N tokens, width h, degree P)</span><span class="eq">Ulysses                all-to-all of Q,K,V (3Nh) + all-to-all of output (Nh)
+                       per link: 4Nh / P          → constant when N and P grow together
+Megatron-style SP      2 all-gathers + 2 reduce-scatters of Nh
+                       per link: 4Nh              (the paper's count, independent of P)
+ring attention         K and V (2Nh_kv) pass once round the ring, overlapped with compute</span></div>
+      <p>The paper reports training 2.5× faster with 4× longer sequences than the existing state-of-the-art baseline. Two limits come with the design. The degree <code>P</code> cannot exceed the number of heads, and with grouped-query attention the KV-head count is the binding one unless K/V are replicated. An all-to-all is also only as fast as the worst pair of ranks, so it wants all-to-all bandwidth, the kind a node's NVLink switch provides and a cross-node fabric may not.</p>
+      <div class="tablewrap"><table class="grid2">
+        <tr><th></th><th>ring attention</th><th>Ulysses</th></tr>
+        <tr><td><b>what moves</b></td><td>K/V blocks, point-to-point, C−1 hops</td><td>Q, K, V and output, two all-to-alls</td></tr>
+        <tr><td><b>overlap</b></td><td>yes, if blocks are large enough (c ≥ F/B)</td><td>no; the all-to-alls sit on the critical path</td></tr>
+        <tr><td><b>max degree</b></td><td>unbounded by the model (bounded by c ≥ F/B)</td><td>≤ attention heads (KV heads with GQA)</td></tr>
+        <tr><td><b>attention kernel</b></td><td>must support the online-softmax merge and masks per block</td><td>unchanged; any kernel</td></tr>
+        <tr><td><b>causal masks</b></td><td>need a balanced layout (§13)</td><td>balanced automatically: every rank does full-sequence attention on its heads</td></tr>
+        <tr><td><b>best fit</b></td><td>very long sequences, across nodes</td><td>inside a fast all-to-all domain, when heads ≥ degree</td></tr>
+      </table></div>
+      <p>The two compose. A unified scheme ("USP: A Unified Sequence Parallelism Approach for Long Context Generative AI", arXiv 2405.07719) runs Ulysses inside a node, where all-to-all is cheap and the head limit is not reached, and a ring across nodes, where point-to-point with overlap is what the fabric does well. The same "match the collective to the link" rule reappears in §18.</p>
+      <div class="wrong"><span class="say">Tempting:</span> "Context parallelism reduces the attention FLOPs."<br /><span class="fix">Better:</span> it divides them across ranks; the total is still quadratic in the sequence length (<a href="../attention/cost-limits.html#cost">Attention</a>). What it removes is the per-GPU <i>memory</i> ceiling, and with a balanced layout it keeps every rank equally busy.</div>
+    </section>
+
+    <nav class="pager" aria-label="Distributed Training series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="collectives-ddp.html">← Collectives, Ring All-Reduce &amp; DDP</a>
+      <a href="../distributed-training.html" style="color:var(--muted)">Distributed Training · overview</a>
+      <a href="pipeline-expert.html">Pipeline &amp; Expert Parallelism →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../distributed-training.viz.js"></script>
+</body>
+</html>

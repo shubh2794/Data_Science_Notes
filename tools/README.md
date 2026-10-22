@@ -1,5 +1,30 @@
 # tools/ — knowledge-base auditing
 
+## split_page.py
+
+Splits one oversized notes page into a hub + child pages one level deeper, from
+a JSON manifest (see the module docstring for the schema). The human/agent
+decides the logical grouping; the script moves the markup, generates each
+child's chrome (head, breadcrumb header, pager), rewrites the parent into a hub
+with a `.lamap` parts grid, re-targets every anchor — `#id` links inside the
+split pages and `parent.html#id` links site-wide — and registers the child
+nodes + `subtree` entry in `data.js`. Children land in a subfolder named after
+the parent page; the parent keeps its URL, so inbound links never break.
+
+```
+python3 tools/split_page.py manifest.json --dry   # report only
+python3 tools/split_page.py manifest.json         # do it
+```
+
+It refuses to run on an existing child dir, a child id that collides with an
+existing node id, or a manifest that does not cover every section exactly once.
+Not done for you (by design): hub pill counts, and 2–3 `cross` edges per new
+child — add those by hand, then gate with `verify_page.py`, `figure_harness.js`
+and `hierarchy_audit.py`. Levels nest: a level-2 parent gets level-3 children,
+a level-3 parent level-4 children (`subtree` in data.js is recursive since the
+2026-10 restructure; sidebars, graph rings and the depth filter all handle
+level 4).
+
 ## hierarchy_audit.py
 
 A read-only structural & connectivity auditor for the ml-notes knowledge base.

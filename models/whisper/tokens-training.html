@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Whisper: Multitask Tokens, Sizes &amp; Training</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+.tokrow{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0;font-family:"SF Mono",Menlo,monospace;font-size:11.5px}
+.tokrow span{padding:2px 5px;border-radius:4px;background:rgba(91,156,255,.16);color:#cfe0ff}
+.tokrow span.sp{background:rgba(192,132,252,.2);color:#e9d5ff}
+.tokrow span.ts{background:rgba(255,180,84,.2);color:#ffd9a3}
+.tokrow span.ctl{background:rgba(45,212,191,.18);color:#b5f5e8}
+.tokrow span.prev{background:rgba(107,114,128,.25);color:#cbd5e1;font-style:italic}
+.tokrow span.bad{background:rgba(248,113,113,.25);color:#fecaca}
+textarea.win{width:100%;min-height:54px;background:#10131a;color:#e6e9ef;border:1px solid #2a2f3a;border-radius:8px;font-family:"SF Mono",Menlo,monospace;font-size:12px;padding:8px;box-sizing:border-box;margin:4px 0}
+pre.code{background:#10131a;border:1px solid #2a2f3a;border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.5;white-space:pre-wrap;color:#cbd5e1;overflow-x:auto;margin:10px 0}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../whisper.html">Whisper</a> · part 2 of 4</p>
+      <h1>Whisper: Multitask Tokens, Sizes &amp; Training</h1>
+      <p>How one decoder does every task and how it was trained: the byte-level BPE vocabularies, the multitask grammar of language, task and timestamp tokens, timestamps as relative-time tokens, the logit filters that constrain decoding, five sizes recounted from the checkpoints, where per-window compute goes, the AdamW schedule, and multitask transfer.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Whisper</span>
+        <span class="pill">Byte-level BPE · multitask token grammar · timestamp tokens · logit filters · five sizes · encoder vs decoder compute · AdamW recipe · transfer</span>
+      </div>
+    </header>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="tokenizer" data-nav="Tokenizer and vocabulary">
+      <h3><span class="idx">10</span> Tokenizer and vocabulary layout</h3>
+      <p class="lede">English-only checkpoints use GPT-2's byte-level BPE unchanged. The multilingual checkpoints use a vocabulary refitted on multilingual text but kept the same size, "to avoid excessive fragmentation on other languages since the GPT-2 BPE vocabulary is English only". Special tokens are appended after the BPE ranks in a fixed order, so every id is predictable from the family.</p>
+      <table class="cmp">
+        <tr><th>Block (in order)</th><th>English-only</th><th>Multilingual (tiny … large-v2)</th><th>large-v3, turbo</th></tr>
+        <tr><td>BPE text tokens</td><td>0 – 50,255</td><td>0 – 50,256</td><td>0 – 50,256</td></tr>
+        <tr><td><code>&lt;|endoftext|&gt;</code>, <code>&lt;|startoftranscript|&gt;</code></td><td>50,256, 50,257</td><td>50,257, 50,258</td><td>50,257, 50,258</td></tr>
+        <tr><td>language tags</td><td>99 (unused)</td><td>99: 50,259 – 50,357</td><td>100: 50,259 – 50,358 (adds <code>&lt;|yue|&gt;</code>)</td></tr>
+        <tr><td>translate, transcribe, startoflm, startofprev, no-speech, notimestamps</td><td>50,357 – 50,362</td><td>50,358 – 50,363</td><td>50,359 – 50,364</td></tr>
+        <tr><td>1,501 timestamps <code>&lt;|0.00|&gt;</code> … <code>&lt;|30.00|&gt;</code></td><td>50,363 – 51,863</td><td>50,364 – 51,864</td><td>50,365 – 51,865</td></tr>
+        <tr><td>vocabulary size (config)</td><td>51,864</td><td>51,865</td><td>51,866</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Why the ids shift.</b> Adding one language token in large-v3 moves every later special token by one. Code that hard-codes, say, 50,364 as the first timestamp is correct for large-v2 and off by one for large-v3.</li>
+        <li><b>The no-speech token has two names.</b> The paper and the current code call it <code>&lt;|nospeech|&gt;</code>; the vocabulary files published with the original checkpoints (and on the Hub for tiny … large-v2) call the same id <code>&lt;|nocaptions|&gt;</code>. The paper's <code>&lt;|endoftranscript|&gt;</code> is <code>&lt;|endoftext|&gt;</code> in the code.</li>
+        <li><b>Fragmentation still differs by script.</b> The paper lists Hebrew, Telugu, Chinese and Korean among the worst outliers relative to their data and suggests the byte-level BPE may be "a poor match for these languages" as one possible cause.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> read special-token ids from the tokenizer, never from memory; the three families disagree by one position in several places.</div>
+    </section>
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="format" data-nav="Multitask token format">
+      <h3><span class="idx">11</span> The multitask token format</h3>
+      <p class="lede">Every training target, and every inference prompt, starts with the same small grammar: an optional block of previous text, the start-of-transcript token, a language tag, a task token, and optionally a flag that turns timestamps off. After that the output begins. Language identification, voice-activity detection, transcription and translation are all positions in this one sequence.</p>
+      <div class="formula"><span class="lbl">the grammar (paper Figure 1)</span><span class="eq">[ &lt;|startofprev|&gt; previous text ]  &lt;|startoftranscript|&gt;  ( &lt;|lang|&gt;  ( &lt;|transcribe|&gt; | &lt;|translate|&gt; )  [ &lt;|notimestamps|&gt; ]  output  |  &lt;|nospeech|&gt; )  &lt;|endoftext|&gt;</span>
+<span class="lbl">language identification = the decoder's distribution at the position after the start token, restricted to language tags</span><span class="eq">lang* = argmax over ℓ ∈ languages of  p(&lt;|ℓ|&gt; | &lt;|startoftranscript|&gt;, H)</span></div>
+      <div class="viz" id="viz-tokens">
+        <div class="vhead">
+          <span class="vtitle">Build a decoder sequence</span>
+          <span class="vhint">choose family, language and task · toggle timestamps, previous text, no speech</span>
+        </div>
+        <div class="controls">
+          <label>family <select id="tok-model"><option value="multi">multilingual tiny … large-v2</option><option value="v3">large-v3 / turbo</option><option value="en">English-only (.en)</option></select></label>
+          <label>language <select id="tok-lang"><option value="en">en</option><option value="es" selected>es</option><option value="fr">fr</option><option value="de">de</option><option value="ja">ja</option><option value="hi">hi</option><option value="yue">yue</option></select></label>
+          <label>task <select id="tok-task"><option value="transcribe">transcribe</option><option value="translate">translate</option></select></label>
+          <label><input type="checkbox" id="tok-ts" /> timestamps</label>
+          <label><input type="checkbox" id="tok-prev" /> previous text</label>
+          <label><input type="checkbox" id="tok-silent" /> no speech</label>
+        </div>
+        <div class="tokrow" id="tok-row"></div>
+        <svg id="tok-svg" width="660" height="124" viewBox="0 0 660 124" role="img" aria-label="Vocabulary layout bar showing BPE tokens, language tags, control tokens and timestamps, with a zoomed view marking the special tokens used in the sequence"></svg>
+        <div class="readout" aria-live="polite" id="tok-read"></div>
+        <p class="vcap">Token ids are computed from the order in which <code>get_encoding</code> in the released <code>tokenizer.py</code> appends special tokens after the BPE ranks (EOT, SOT, the language list, six control tokens, 1,501 timestamps), which reproduces the <code>added_tokens.json</code> files on the Hub. Text is shown as words, not BPE ids. The example sentences are for display.</p>
+      </div>
+      <h4>Details that matter</h4>
+      <ul class="notes">
+        <li><b>Loss masking.</b> Only the previous-text block is excluded from the loss; the language tag, the task token, timestamps and the end token are all predicted and trained. The language targets came from the VoxLingua107-tuned language detector used in filtering.</li>
+        <li><b>Previous text</b> was added "with some probability" during training — 50% according to the hyperparameter table — so the model learns both to use context and to work without it. At inference it is how long-form transcription carries context across windows, and how a user can prompt vocabulary or style (<code>initial_prompt</code>, <code>prompt_ids</code>).</li>
+        <li><b>English-only checkpoints</b> take no language or task token: the released tokenizer sets both to None, so their prompt is <code>&lt;|startoftranscript|&gt;</code> (plus <code>&lt;|notimestamps|&gt;</code>). They cannot translate.</li>
+        <li><b>No-speech detection</b> reads the probability of the no-speech token at the first position after the start token — the same position where the language is predicted.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> Whisper's "tasks" are prefixes. Forcing a prefix fixes the task; leaving a slot open lets the model classify (language, speech versus silence) by predicting it. The same idea — task as tokens — is what later instruction-following language models generalised.</div>
+    </section>
+
+    <!-- 12 ───────────────────────────────────────────── -->
+    <section class="topic" id="timestamps" data-nav="Timestamps as tokens">
+      <h3><span class="idx">12</span> Timestamps as tokens</h3>
+      <p class="lede">When timestamps are on, the decoder writes a start-time token before each caption segment and an end-time token after it. Times are relative to the start of the current 30-second window and quantised to the nearest 20 ms — the encoder's native resolution — giving 1,501 tokens from <code>&lt;|0.00|&gt;</code> to <code>&lt;|30.00|&gt;</code>.</p>
+      <div class="formula"><span class="lbl">quantisation and id</span><span class="eq">k = round(t / 0.02),   token = &lt;|0.02·k|&gt;,   id = timestamp_begin + k,   k = 0 … 1,500</span>
+<span class="lbl">a segment that runs past the window end: only its start is emitted, and the next window begins there</span><span class="eq">… &lt;|t_a|&gt; text &lt;|t_b|&gt; &lt;|t_c|&gt; &lt;|endoftext|&gt;     →   next window starts at t_c</span></div>
+      <div class="viz" id="viz-ts">
+        <div class="vhead">
+          <span class="vtitle">Quantising time and writing the target</span>
+          <span class="vhint">drag a time · toggle a segment that crosses 30 s</span>
+        </div>
+        <div class="controls">
+          <label>time <input type="range" id="ts-t" min="0" max="31" step="0.001" value="4.613" /><span id="ts-tv" style="min-width:60px;display:inline-block"></span></label>
+          <label>family <select id="ts-model"><option value="multi">multilingual tiny … large-v2</option><option value="v3">large-v3 / turbo</option><option value="en">English-only</option></select></label>
+          <label><input type="checkbox" id="ts-cross" checked /> last segment crosses 30 s</label>
+        </div>
+        <svg id="ts-svg" width="660" height="200" viewBox="0 0 660 200" role="img" aria-label="A 30-second window with speech segments, a zoomed 20-millisecond grid around the chosen time, and a marker where the next window starts"></svg>
+        <div class="tokrow" id="ts-row"></div>
+        <div class="readout" aria-live="polite" id="ts-read"></div>
+        <p class="vcap">Segment boundaries are an example. Token strings, ids and rounding errors are computed with the 20 ms step and the family's first timestamp id (<a href="#tokenizer">tokenizer</a>). The rule for a segment that runs past the window is the paper's Section 2.3: in timestamp mode only its start time is predicted, "to indicate that the subsequent decoding should be performed on an audio window aligned with that time".</p>
+      </div>
+      <h4>Why tokens rather than a regression head</h4>
+      <ul class="notes">
+        <li>Timestamps come from the same softmax as text, so the model decides <i>when</i> a segment ends jointly with <i>what</i> it says, and no separate aligner is needed for segment-level times.</li>
+        <li>The price is resolution and reliability: times are segment boundaries on a 20 ms grid, predicted by a language model, and they can drift, overlap or be skipped. Word-level times come from a separate mechanism (cross-attention alignment heads with dynamic time warping), and precise alignment still usually calls for a forced aligner.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> timestamp tokens do two jobs: they give users segment times, and they tell the long-form algorithm how far to move the window. A wrong timestamp is therefore not just a wrong time — it can make the next window skip or repeat audio.</div>
+    </section>
+
+    <!-- 13 ───────────────────────────────────────────── -->
+    <section class="topic" id="constraints" data-nav="Decoding constraints">
+      <h3><span class="idx">13</span> Decoding constraints: suppression and timestamp rules</h3>
+      <p class="lede">The released decoder does not sample from the raw softmax. A chain of logit filters removes tokens that are grammatically impossible or known to be harmful, and enforces the timestamp grammar. These rules are part of how Whisper behaves in practice, even though the paper mentions only one of them.</p>
+      <table class="cmp">
+        <tr><th>Filter (released <code>decoding.py</code>)</th><th>What it does</th><th>Why</th></tr>
+        <tr><td>SuppressBlank</td><td>at the first sampled position, forbids a bare space and <code>&lt;|endoftext|&gt;</code></td><td>prevents empty outputs</td></tr>
+        <tr><td>SuppressTokens <code>"-1"</code></td><td>forbids a list of symbol tokens (brackets, ♪, <code>&gt;&gt;</code>, …) plus the transcribe, translate, start, start-of-previous, start-of-LM and no-speech tokens</td><td>stops speaker tags and non-speech annotations such as "( SPEAKING FOREIGN LANGUAGE )" or "♪♪♪"</td></tr>
+        <tr><td>Timestamp pairing</td><td>after one timestamp either another timestamp or text must follow in the right pattern; timestamps come in pairs except just before the end</td><td>keeps the output parseable into segments</td></tr>
+        <tr><td>Monotonic time</td><td>forbids a timestamp earlier than the last one, and forces non-zero segment length</td><td>prevents going back in time and infinite loops</td></tr>
+        <tr><td>Initial timestamp</td><td>the first token must be a timestamp ≤ 1.0 s (<code>max_initial_timestamp</code>)</td><td>the paper's fix for a failure where the model ignores the first words of a window</td></tr>
+        <tr><td>Probability-mass rule</td><td>if the total probability of all timestamp tokens exceeds that of the single most likely text token, only timestamps are allowed</td><td>stops a spread-out timestamp distribution losing to one text token</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">the probability-mass rule at each step</span><span class="eq">if  log Σ over k of p(&lt;|0.02k|&gt;)  &gt;  max over text tokens v of log p(v)   then   forbid all text tokens</span>
+<span class="lbl">beam ranking (length_penalty = None): mean log-probability per token</span><span class="eq">score(y) = ( Σₜ log p(yₜ) ) / |y|</span></div>
+      <div class="callout"><b>Takeaway:</b> "the model's output" in practice is the model plus these filters. Reimplementations that skip them — a plain <code>generate()</code> without the timestamp processor, or without suppression — produce different and usually worse transcripts from the same weights.</div>
+    </section>
+
+    <!-- 14 ───────────────────────────────────────────── -->
+    <section class="topic" id="sizes" data-nav="Sizes and parameters">
+      <h3><span class="idx">14</span> Sizes and parameter counts, recomputed</h3>
+      <p class="lede">The paper's Table 1 lists five sizes whose encoder and decoder share width and depth. Counting the tensors of the released Hugging Face checkpoints gives totals 0.4–3.2% below the paper's rounded labels for the five original sizes; the formula below reproduces the Hub's totals exactly for every checkpoint, including turbo and the Distil-Whisper models.</p>
+      <table class="cmp">
+        <tr><th>Model</th><th>Layers (enc / dec)</th><th>Width d</th><th>Heads</th><th>Mel bins</th><th>Label (paper / README)</th><th>Tensor count</th></tr>
+        <tr><td>tiny</td><td>4 / 4</td><td>384</td><td>6</td><td>80</td><td>39M</td><td>37,760,640</td></tr>
+        <tr><td>base</td><td>6 / 6</td><td>512</td><td>8</td><td>80</td><td>74M</td><td>72,593,920</td></tr>
+        <tr><td>small</td><td>12 / 12</td><td>768</td><td>12</td><td>80</td><td>244M</td><td>241,734,912</td></tr>
+        <tr><td>medium</td><td>24 / 24</td><td>1,024</td><td>16</td><td>80</td><td>769M</td><td>763,857,920</td></tr>
+        <tr><td>large, large-v2</td><td>32 / 32</td><td>1,280</td><td>20</td><td>80</td><td>1,550M</td><td>1,543,304,960</td></tr>
+        <tr><td>large-v3</td><td>32 / 32</td><td>1,280</td><td>20</td><td>128</td><td>1,550M</td><td>1,543,490,560</td></tr>
+        <tr><td>large-v3-turbo</td><td>32 / 4</td><td>1,280</td><td>20</td><td>128</td><td>809M (README; model card 798M)</td><td>808,878,080</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">parameter count of one checkpoint (d = width, V = vocabulary, Le / Ld = encoder / decoder layers)</span><span class="eq">P = [3·mels·d + d + 3d² + d]  +  Le(12d² + 12d) + 2d  +  1500·d  +  Ld(16d² + 17d) + 2d  +  V·d  +  448·d</span>
+<span class="lbl">the terms</span><span class="eq">conv stem   ·   encoder blocks + final LN   ·   sinusoid table   ·   decoder blocks (with cross-attention) + final LN   ·   tied embedding   ·   decoder positions</span></div>
+      <div class="viz" id="viz-params">
+        <div class="vhead">
+          <span class="vtitle">Where the parameters are</span>
+          <span class="vhint">pick a checkpoint · drag the decoder depth</span>
+        </div>
+        <div class="controls">
+          <label>checkpoint <select id="par-model">
+            <option value="tiny">tiny</option><option value="tinyen">tiny.en</option><option value="base">base</option><option value="small">small</option><option value="medium">medium</option>
+            <option value="large2">large-v2</option><option value="large3" selected>large-v3</option><option value="turbo">large-v3-turbo</option><option value="dl3">distil-large-v3</option><option value="dmen">distil-medium.en</option><option value="dsen">distil-small.en</option>
+          </select></label>
+          <label>decoder layers <input type="range" id="par-dec" min="1" max="32" step="1" value="32" /><span id="par-decv" style="min-width:24px;display:inline-block"></span></label>
+        </div>
+        <svg id="par-svg" width="660" height="260" viewBox="0 0 660 260" role="img" aria-label="Stacked bar of the chosen checkpoint's parameters by component, and a ladder of all released checkpoints' totals with their published labels"></svg>
+        <div class="readout" aria-live="polite" id="par-read"></div>
+        <p class="vcap">Shapes come from each checkpoint's <code>config.json</code>; the formula counts every tensor of the Transformers <code>WhisperForConditionalGeneration</code> layout (the key projection has no bias; the output layer is tied). The readout compares the formula with the parameter total the Hub reports for each checkpoint's safetensors file — they agree exactly — and with the published label. The original repository keeps the sinusoid table as a buffer rather than a parameter, so counting there gives 1,500 · d fewer; neither convention reaches the paper's labels, whose rounding the paper does not explain (its Figure 8 labels the same models 38M, 73M, 244M, 768M and 1549M).</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> half of a large Whisper is decoder. With d = 1,280, each decoder block (26.2M) is a third larger than an encoder block (19.7M) because of cross-attention, and 32 of them hold 54% of large-v3's weights. That single fact explains turbo and Distil-Whisper.</div>
+    </section>
+
+    <!-- 15 ───────────────────────────────────────────── -->
+    <section class="topic" id="compute" data-nav="Where the compute goes">
+      <h3><span class="idx">15</span> Where the compute goes: one encoder pass, many decoder passes</h3>
+      <p class="lede">Per 30-second window the encoder runs once over 1,500 positions; the decoder runs once per generated token (times the beam width). Counting operations shows the encoder dominating the FLOPs for short outputs, but the decoder's passes are sequential and small, which makes them slow on accelerators out of proportion to their FLOPs.</p>
+      <div class="formula"><span class="lbl">encoder, per window (multiply–accumulates)</span><span class="eq">MAC_enc ≈ stem + Le · (12·1500·d² + 2·1500²·d)</span>
+<span class="lbl">decoder, per generated token at position t, per beam</span><span class="eq">MAC_tok ≈ Ld · (14d² + 2td + 2·1500·d) + V·d        (+ once per window: Ld · 2·1500·d² for cross-attention K and V)</span></div>
+      <div class="viz" id="viz-cost">
+        <div class="vhead">
+          <span class="vtitle">FLOPs per window: encoder versus decoder</span>
+          <span class="vhint">drag the number of output tokens · switch greedy / beam 5</span>
+        </div>
+        <div class="controls">
+          <label>output tokens <input type="range" id="cost-tok" min="1" max="224" step="1" value="100" /><span id="cost-tokv" style="min-width:32px;display:inline-block"></span></label>
+          <label>beams <select id="cost-beam"><option value="1">1 (greedy)</option><option value="5">5 (beam search)</option></select></label>
+        </div>
+        <svg id="cost-svg" width="660" height="220" viewBox="0 0 660 220" role="img" aria-label="Stacked horizontal bars of encoder, cross-attention key-value and decoder FLOPs per window for each model size"></svg>
+        <div class="readout" aria-live="polite" id="cost-read"></div>
+        <p class="vcap">Counts are computed layer by layer from each checkpoint's configuration: attention projections, attention scores and mixing, the MLP, the vocabulary projection, and the conv stem; LayerNorms, softmax and GELU are ignored; FLOPs = 2 × multiply–accumulates. The beam setting multiplies decoder work only. About 100 tokens is typical for 30 s of fluent English; the released decoder stops at 224 sampled tokens per window. FLOPs are not latency — measure on your hardware.</p>
+      </div>
+      <ul class="notes">
+        <li><b>Why the decoder is slow anyway.</b> Each decoder step reads all decoder weights and caches to produce one token; at batch size 1 that is memory-bandwidth bound. A 32-layer decoder does this 32 layers deep, sequentially, for every token. Cutting the decoder to 4 layers (turbo) or 2 (Distil-Whisper) removes most of that serial work while leaving the encoder untouched.</li>
+        <li><b>README speeds.</b> OpenAI's README reports relative transcription speeds on an A100 of about 10× (tiny), 7× (base), 4× (small), 2× (medium), 1× (large) and 8× (turbo), with approximate VRAM of 1, 1, 2, 5, 10 and 6 GB — turbo is rated faster than base despite keeping the whole large-v3 encoder.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> Whisper's cost has two shapes: a fixed, parallel encoder cost per window, and a serial decoder cost per token. Batching many windows helps the first; shrinking the decoder, speculative decoding or fewer beams help the second.</div>
+    </section>
+
+    <!-- 16 ───────────────────────────────────────────── -->
+    <section class="topic" id="training" data-nav="Training recipe">
+      <h3><span class="idx">16</span> Training recipe</h3>
+      <p class="lede">All sizes were trained with the same schedule: AdamW, a 2,048-update linear warm-up then linear decay to zero, batches of 256 30-second segments, and 2²⁰ = 1,048,576 updates — "between two and three passes over the dataset". Because training runs for so few epochs, the original models used no data augmentation and no regularisation.</p>
+      <table class="cmp">
+        <tr><th>Hyperparameter (paper Table 17)</th><th>Value</th><th>Hyperparameter</th><th>Value</th></tr>
+        <tr><td>Updates</td><td>1,048,576</td><td>Optimizer</td><td>AdamW, β₁ 0.9, β₂ 0.98, ε 10⁻⁶</td></tr>
+        <tr><td>Batch size</td><td>256 segments</td><td>Weight decay</td><td>0.1</td></tr>
+        <tr><td>Warm-up</td><td>2,048 updates</td><td>Max grad norm</td><td>1.0</td></tr>
+        <tr><td>Schedule</td><td>linear decay</td><td>Initialisation</td><td>Gaussian fan-in</td></tr>
+        <tr><td>Speechless audio</td><td>sub-sampled 10×</td><td>Condition on prior text</td><td>50% of examples</td></tr>
+        <tr><td>Precision</td><td>FP16, dynamic loss scaling, activation checkpointing</td><td>Parallelism</td><td>data parallel</td></tr>
+      </table>
+      <table class="cmp">
+        <tr><th>Max learning rate (Table 19)</th><th>tiny</th><th>base</th><th>small</th><th>medium</th><th>large</th><th>large-v2</th></tr>
+        <tr><td></td><td>1.5 × 10⁻³</td><td>1 × 10⁻³</td><td>5 × 10⁻⁴</td><td>2.5 × 10⁻⁴</td><td>1.75 × 10⁻⁴</td><td>2.0 × 10⁻⁴</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">large-v2 (Table 18): fewer, larger updates</span><span class="eq">1,048,576 × 256 = 268,435,456 segments   vs   655,360 × 1,024 = 671,088,640 segments   →   ratio 2.5  ("2.5× more epochs")</span>
+<span class="lbl">passes over the data for the original schedule (30-s segments, 681,070 h)</span><span class="eq">268,435,456 × 30 s ≈ 2,237,000 h  ≈  3.3 × 681,070 h   (upper bound: padded and speechless segments are shorter than 30 s of content)</span></div>
+      <ul class="notes">
+        <li><b>large-v2</b> (December 2022) is the same architecture trained for 2.5× more epochs with SpecAugment (the "LibriSpeech Basic" policy), stochastic depth 0.1 and BPE dropout 0.1. The paper's reported results were updated to large-v2 "unless otherwise specified".</li>
+        <li><b>Speaker-name fine-tune.</b> All models were briefly fine-tuned on transcripts without speaker annotations to stop them guessing names (<a href="data-architecture.html#filtering">filtering</a>).</li>
+        <li><b>The pass count is approximate.</b> The paper's "two to three passes" and the 3.3 computed above differ because many training segments contain less than 30 s of labelled speech; the paper does not give the number of segments.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> nothing in the recipe is unusual. The one design decision that looks surprising — no regularisation — is a consequence of scale: with fewer than four epochs of highly diverse data, over-fitting was not the constraint, until large-v2 trained longer and added it back.</div>
+    </section>
+
+    <!-- 17 ───────────────────────────────────────────── -->
+    <section class="topic" id="transfer" data-nav="Multitask transfer, .en models">
+      <h3><span class="idx">17</span> Multitask and multilingual transfer; the English-only models</h3>
+      <p class="lede">Does training on 99 languages and two tasks hurt English? The paper compares English-only models with multitask multilingual ones at matched compute spent on English (only 65% of a joint model's compute goes to English transcription). Small models show negative transfer; the largest show positive transfer.</p>
+      <ul class="notes">
+        <li><b>Figure 9's result.</b> At low training compute, joint models are worse on English than English-only models given the same English FLOPs; the curves cross as compute grows, and for the largest experiments joint models are better "even when not adjusting for compute spent per task".</li>
+        <li><b>The released .en models</b> follow the same pattern. The README says English-only models "tend to perform better, especially for the tiny.en and base.en models", with the difference becoming "less significant" for small.en and medium.en. Table 8's greedy WERs agree: tiny.en beats tiny on LibriSpeech test-clean (5.6 vs 7.6), medium beats medium.en (2.9 vs 3.1). There is no large.en.</li>
+        <li><b>What the tasks share.</b> Translation data is non-English audio, so it trains the encoder on those languages even when the target is English — one reason the paper sees benefits from joint training at scale.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> capacity decides whether multitask training helps. For a small model on English only, pick the .en checkpoint; at medium size and above, the multilingual model gives up little or nothing on English.</div>
+    </section>
+
+    <nav class="pager" aria-label="Whisper series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="data-architecture.html">← Whisper: Weak-Supervision Data &amp; Architecture</a>
+      <a href="../whisper.html" style="color:var(--muted)">Whisper · overview</a>
+      <a href="evaluation-robustness.html">Whisper: WER, Robustness &amp; Multilingual Results →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../whisper.viz.js"></script>
+</body>
+</html>

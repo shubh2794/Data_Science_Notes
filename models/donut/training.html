@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Donut: Pretraining, SynthDoG &amp; Fine-Tuning</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+.tokrow{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0;font-family:"SF Mono",Menlo,monospace;font-size:11.5px}
+.tokrow span{padding:2px 5px;border-radius:4px;background:rgba(91,156,255,.16);color:#cfe0ff}
+.tokrow span.sp{background:rgba(255,180,84,.2);color:#ffd9a3}
+.tokrow span.ctl{background:rgba(192,132,252,.2);color:#e9d5ff}
+.tokrow span.bad{background:rgba(248,113,113,.25);color:#fecaca}
+textarea.jsin{width:100%;min-height:92px;background:#10131a;color:#e6e9ef;border:1px solid #2a2f3a;border-radius:8px;font-family:"SF Mono",Menlo,monospace;font-size:12px;padding:8px;box-sizing:border-box}
+pre.jsout{background:#10131a;border:1px solid #2a2f3a;border-radius:8px;padding:8px;font-size:11.5px;white-space:pre-wrap;margin:6px 0 0;color:#cbd5e1}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../donut.html">Donut</a> · part 3 of 5</p>
+      <h1>Donut: Pretraining, SynthDoG &amp; Fine-Tuning</h1>
+      <p>One loss for every stage of Donut's training: next-token negative log-likelihood under teacher forcing, pretraining as pseudo-OCR that reads a page top-left to bottom-right, SynthDoG's layered synthetic document renderer, and the per-task canvas, output-length, schedule and special-token choices of fine-tuning.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Donut</span>
+        <span class="pill">Next-token loss · teacher forcing · pseudo-OCR pretraining · SynthDoG · fine-tuning recipes</span>
+      </div>
+    </header>
+
+    <!-- 13 ───────────────────────────────────────────── -->
+    <section class="topic" id="objective" data-nav="Objective and teacher forcing">
+      <h3><span class="idx">13</span> The objective, teacher forcing and decoding</h3>
+      <p class="lede">Pretraining and every fine-tuning task use the same loss: at each target position, the negative log-probability the decoder assigns to the correct next token, given the image and the correct previous tokens (teacher forcing). All positions are computed in parallel in one forward pass; at inference the model must instead condition on its own previous outputs.</p>
+      <div class="formula"><span class="lbl">sequence loss over target positions t (prompt and padding positions masked with −100)</span><span class="eq">L = − (1 / m) Σₜ log p_θ(yₜ | y₁ … yₜ₋₁, z)          (PyTorch cross-entropy averages over unmasked positions)</span>
+<span class="lbl">derived quantities</span><span class="eq">perplexity = exp(L)          sequence probability = Πₜ p(yₜ | …) = exp(−m · L)</span></div>
+      <h4>Worked example: the loss on a short record</h4>
+      <p>Take the 17 target tokens from <a href="decoder-output.html#json">the previous section</a> and suppose the model assigns the probabilities below to the correct token at each step (illustrative values, chosen to show the typical pattern: structure tokens near-certain, text pieces less so).</p>
+      <table class="cmp">
+        <tr><th>t</th><th>Target</th><th>p(target)</th><th>−ln p</th><th>t</th><th>Target</th><th>p(target)</th><th>−ln p</th></tr>
+        <tr><td>1</td><td><code>&lt;s_menu&gt;</code></td><td>0.97</td><td>0.0305</td><td>10</td><td><code>&lt;s_total&gt;</code></td><td>0.96</td><td>0.0408</td></tr>
+        <tr><td>2</td><td><code>&lt;s_nm&gt;</code></td><td>0.99</td><td>0.0101</td><td>11</td><td><code>&lt;s_total_price&gt;</code></td><td>0.97</td><td>0.0305</td></tr>
+        <tr><td>3</td><td><code>▁La</code></td><td>0.62</td><td>0.4780</td><td>12</td><td><code>▁9</code></td><td>0.70</td><td>0.3567</td></tr>
+        <tr><td>4</td><td><code>tte</code></td><td>0.91</td><td>0.0943</td><td>13</td><td><code>,</code></td><td>0.94</td><td>0.0619</td></tr>
+        <tr><td>5</td><td><code>&lt;/s_nm&gt;</code></td><td>0.98</td><td>0.0202</td><td>14</td><td><code>000</code></td><td>0.97</td><td>0.0305</td></tr>
+        <tr><td>6</td><td><code>&lt;s_cnt&gt;</code></td><td>0.95</td><td>0.0513</td><td>15</td><td><code>&lt;/s_total_price&gt;</code></td><td>0.99</td><td>0.0101</td></tr>
+        <tr><td>7</td><td><code>▁2</code></td><td>0.80</td><td>0.2231</td><td>16</td><td><code>&lt;/s_total&gt;</code></td><td>0.99</td><td>0.0101</td></tr>
+        <tr><td>8</td><td><code>&lt;/s_cnt&gt;</code></td><td>0.99</td><td>0.0101</td><td>17</td><td><code>&lt;/s&gt;</code></td><td>0.98</td><td>0.0202</td></tr>
+        <tr><td>9</td><td><code>&lt;/s_menu&gt;</code></td><td>0.93</td><td>0.0726</td><td></td><td></td><td></td><td></td></tr>
+      </table>
+      <p>The summed negative log-likelihood is 1.5507, so the mean loss is L = 1.5507 / 17 = 0.0912, the perplexity exp(0.0912) = 1.096, and the probability of the whole sequence exp(−1.5507) = 0.212. The three text-bearing first pieces (▁La, ▁2, ▁9) contribute 1.058 of the 1.551 — two-thirds of the loss from 3 of 17 positions. That imbalance is typical of structured targets: a low average loss can hide a model that is fluent in structure but still misreads the values that matter.</p>
+      <h4>Teacher forcing versus inference</h4>
+      <p>During training, step 4 conditions on the true "▁La" even if the model would have produced "▁Le". At inference it conditions on its own output, so an early misread changes everything after it — including, possibly, the structure. The mismatch between the two regimes is known as exposure bias. The paper's fine-tuning monitors edit distance of generated sequences on validation data rather than the teacher-forced loss, which measures the inference regime directly.</p>
+      <div class="viz" id="viz-decode">
+        <div class="vhead">
+          <span class="vtitle">Decoding a record one token at a time</span>
+          <span class="vhint">step or run · switch between teacher forcing and free-running with an injected misread</span>
+        </div>
+        <div class="controls">
+          <label>mode <select id="dec-mode">
+            <option value="tf">training: teacher forcing</option>
+            <option value="free">inference: greedy, no errors</option>
+            <option value="err">inference: misread at step 3</option>
+          </select></label>
+          <button class="btn" id="dec-step">step</button>
+          <button class="btn ghost" id="dec-run">run to end</button>
+          <button class="btn ghost" id="dec-reset">reset</button>
+        </div>
+        <svg id="dec-svg" width="660" height="280" viewBox="0 0 660 280" role="img" aria-label="Token-by-token decoding: the decoder input, the top candidate tokens with probabilities at the current step, and the running loss"></svg>
+        <div class="readout" aria-live="polite" id="dec-read"></div>
+        <p class="vcap">The target tokens are the real tokenization of the worked record; the per-step candidate probabilities are illustrative values listed in the script (the correct token's probability matches the table above). In the misread mode the model's top choice at step 3 is "▁Le", and the following steps use a second illustrative table conditioned on that prefix, ending with "Lette" in the parsed JSON. The running loss is only defined under teacher forcing, where the target is known at every step.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> one loss trains every task, and teacher forcing makes it cheap. What it measures is not what is deployed: evaluate generated sequences (edit distance, field F1, TED accuracy), not the training loss, and expect a single early misread to propagate through the rest of the output.</div>
+    </section>
+
+    <!-- 14 ───────────────────────────────────────────── -->
+    <section class="topic" id="pretrain" data-nav="Pretraining: learning to read">
+      <h3><span class="idx">14</span> Pretraining: learning to read</h3>
+      <p class="lede">Donut is pretrained to read: given a page image, generate all of its text in reading order, "from top-left to bottom-right, basically". The paper calls this a pseudo-OCR task and describes the model during pretraining as "a visual language model over the visual corpora". The corpora are 11M real scanned pages from IIT-CDIP and 2M synthetic pages from SynthDoG in four languages.</p>
+      <h4>The data</h4>
+      <ul class="notes">
+        <li><b>IIT-CDIP</b> — 11M scanned English document images (the same collection LayoutLM pretrains on). It has no reliable transcription, so the authors ran the commercial CLOVA OCR API over it to produce pseudo text labels. Donut is therefore OCR-free at inference, but its largest pretraining set was labelled by an OCR engine — its reading ability on real scans is learned partly from OCR outputs, errors included.</li>
+        <li><b>SynthDoG</b> — 0.5M synthetic pages per language for English, Chinese, Japanese and Korean, rendered from Wikipedia text, where the transcription is exact by construction. The paper's argument for synthetic data is that real scanned corpora with transcriptions are not always available, "especially for languages other than English".</li>
+      </ul>
+      <h4>The recipe</h4>
+      <table class="cmp">
+        <tr><th>Setting</th><th>Value</th></tr>
+        <tr><td>Steps, batch, hardware</td><td>200K steps, mini-batch 196, 64 NVIDIA A100 GPUs</td></tr>
+        <tr><td>Optimiser, learning rate</td><td>Adam, initial 1 × 10⁻⁴, decreasing during training</td></tr>
+        <tr><td>Precision, clipping</td><td>fp16; gradient-norm clipping with a maximum chosen between 0.05 and 1.0</td></tr>
+        <tr><td>Input, output length</td><td>2560 × 1920 canvas; decoder max length 1,536</td></tr>
+        <tr><td>Duration</td><td>"about 2–3 GPU days" in the appendix; the repository README says about 2.5 days on 64 A100s</td></tr>
+        <tr><td>Initialisation</td><td>Encoder from timm's ImageNet-pretrained <code>swin_base_patch4_window12_384</code> (in the released code; the first 14 of its 18 stage-3 blocks are kept, and the 23 × 23 relative-bias tables are bicubically resized to 19 × 19 for window 10); decoder from asian-bart-ecjk</td></tr>
+      </table>
+      <p>Worked arithmetic: 200,000 steps × 196 pages = 39.2M page presentations, about 3.0 passes over the 13M-page corpus. The appendix's "GPU days" is most plausibly wall-clock days on the 64-GPU cluster (the README's phrasing); 2.5 days × 64 GPUs would be about 160 A100-days.</p>
+      <h4>What the pretraining ablation found</h4>
+      <p>The paper's Figure 7(a) compares, on CORD accuracy and DocVQA ANLS, no pretraining, an image classification pretraining task, image captioning, and text reading on SynthDoG only, IIT-CDIP only, and both. Reading was "the most simple yet effective approach"; the tasks that impose general image and text knowledge, such as captioning, gave little gain. Synthetic images alone were enough for the IE task (CORD), but DocVQA needed the real IIT-CDIP images, which the authors attribute to IIT-CDIP and DocVQA having similar image distributions. The figure is a bar chart without printed values, so it is described here rather than reproduced.</p>
+      <h4>A smaller first attempt</h4>
+      <p>The appendix reports a preliminary model, DonutProto, pretrained on SynthDoG only (1.2M pages; the README lists English, Japanese and Korean at 0.4M each) with 8 V100 GPUs for 5 days, at 2048 × 1536 with depths {2, 2, 18, 2} and window 8. It reached 94.5 accuracy on RVL-CDIP and 85.4 on CORD, which the paper calls comparable to the full model. The appendix does not say which CORD metric 85.4 is: as TED accuracy it would be 5.5 points below the full model's 90.9, as field F1 1.3 points above its 84.1.</p>
+      <div class="callout"><b>Takeaway:</b> Donut learns to read from a mix of OCR-labelled real scans and perfectly-labelled synthetic pages, with a plain next-token loss. Reading, not general vision–language pretraining, is what transfers to document tasks — and real scans matter for tasks whose test images look like real scans.</div>
+    </section>
+
+    <!-- 15 ───────────────────────────────────────────── -->
+    <section class="topic" id="synthdog" data-nav="SynthDoG">
+      <h3><span class="idx">15</span> SynthDoG: the synthetic document generator</h3>
+      <p class="lede">SynthDoG (Synthetic Document Generator) renders a fake document photo in four layers — a background image, a paper texture, a rule-based text layout, and text content in a chosen language and font — then degrades the result with photographic effects. Because the text is placed by the generator, its transcription is known exactly, so in principle any language with a text corpus, fonts and tokenizer coverage can be pretrained on without a single real labelled page.</p>
+      <h4>The layers, as the appendix describes them</h4>
+      <ul class="notes">
+        <li><b>Background:</b> an ImageNet image, randomly Gaussian-blurred to mimic out-of-focus capture.</li>
+        <li><b>Document:</b> a paper texture sampled from photos the authors collected, applied on white, with random elastic distortion and Gaussian noise, then a random perspective transform to mimic camera angles.</li>
+        <li><b>Layout:</b> a heuristic generator places several rectangular text regions (paragraphs) by randomly stacking grids; each region is split into lines; text size and margins are random.</li>
+        <li><b>Text:</b> words and phrases sampled from Wikipedia in the target language, rendered in Noto fonts (chosen because they cover many scripts) with random colours.</li>
+        <li><b>Post-processing:</b> colour, brightness and contrast adjustment, shadow, motion blur, Gaussian blur and JPEG compression.</li>
+      </ul>
+      <p>The rendering pipeline follows SynthTIGER, the same group's synthetic text-line generator for training text recognisers. The released generator and the four 0.5M-page datasets (synthdog-en, -zh, -ja, -ko) are public.</p>
+      <h4>Selected ranges from the released English configuration</h4>
+      <table class="cmp">
+        <tr><th>Parameter</th><th>Range in config_en.yaml</th><th>Meaning</th></tr>
+        <tr><td>short_size (canvas)</td><td>720 – 1024 px, aspect 1 – 2, landscape with probability 0.5</td><td>size of the whole output image</td></tr>
+        <tr><td>document short_size</td><td>480 – 1024 px; full-screen with probability 0.5</td><td>size of the paper within the image</td></tr>
+        <tr><td>layout max_row / max_col</td><td>10 / 3</td><td>grid from which text regions are stacked</td></tr>
+        <tr><td>text_scale</td><td>0.0334 – 0.1 of the document size</td><td>line height</td></tr>
+        <tr><td>paper alpha</td><td>0 – 0.2</td><td>strength of the paper texture</td></tr>
+        <tr><td>perspective</td><td>each corner kept at 75 – 100%</td><td>camera-angle distortion</td></tr>
+        <tr><td>background blur σ</td><td>0 – 10</td><td>out-of-focus background</td></tr>
+        <tr><td>shadow intensity</td><td>0 – 160</td><td>cast shadow</td></tr>
+        <tr><td>motion blur</td><td>probability 0.5, kernel 3 – 5</td><td>hand shake</td></tr>
+        <tr><td>JPEG quality</td><td>50 – 95</td><td>compression artefacts</td></tr>
+      </table>
+      <div class="viz" id="viz-synth">
+        <div class="vhead">
+          <span class="vtitle">Composing a SynthDoG page layer by layer</span>
+          <span class="vhint">toggle layers · resample · switch language</span>
+        </div>
+        <div class="controls">
+          <label><input type="checkbox" id="sd-bg" checked /> background</label>
+          <label><input type="checkbox" id="sd-paper" checked /> paper</label>
+          <label><input type="checkbox" id="sd-layout" checked /> layout boxes</label>
+          <label><input type="checkbox" id="sd-text" checked /> text</label>
+          <label><input type="checkbox" id="sd-fx" checked /> effects</label>
+          <label>language <select id="sd-lang"><option value="en">English</option><option value="zh">Chinese</option><option value="ja">Japanese</option><option value="ko">Korean</option></select></label>
+          <button class="btn" id="sd-new">resample</button>
+        </div>
+        <svg id="sd-svg" width="660" height="320" viewBox="0 0 660 320" role="img" aria-label="A synthetic page built from background, perspective-warped paper, text regions and text lines, with the sampled generator parameters listed"></svg>
+        <div class="readout" aria-live="polite" id="sd-read"></div>
+        <p class="vcap">A schematic re-implementation for illustration: every random draw is taken from the ranges in the released config_en.yaml (listed in the script), with a seeded generator so "resample" is reproducible. Backgrounds are coloured blobs rather than ImageNet photos and text lines are short placeholder phrases in each script, not Wikipedia; the readout lists the draws and the transcription the generator would emit as the training target.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> SynthDoG turns "pretrain a reader in a new language" into "collect a text corpus and fonts". Its pages look nothing like real invoices, and the ablation shows that is fine for extraction tasks but not for tasks whose test images are real scans.</div>
+    </section>
+
+    <!-- 16 ───────────────────────────────────────────── -->
+    <section class="topic" id="finetune" data-nav="Fine-tuning recipes">
+      <h3><span class="idx">16</span> Fine-tuning recipes per task</h3>
+      <p class="lede">Every downstream model starts from the pretrained multilingual donut-base and is trained with the same next-token loss on targets written as token sequences. What changes per task is the canvas size, the maximum output length, the learning-rate schedule, and the new special tokens. The released configuration files give the recipes behind the published checkpoints.</p>
+      <table class="cmp">
+        <tr><th>Task</th><th>Canvas (H × W)</th><th>max_length</th><th>Batch / GPU</th><th>LR, warm-up</th><th>Epochs × samples</th><th>Clip</th><th>Keys sorted</th></tr>
+        <tr><td>CORD (cord-v2)</td><td>1280 × 960</td><td>768</td><td>8</td><td>3 × 10⁻⁵, 300 steps</td><td>30 × 800</td><td>1.0</td><td>no</td></tr>
+        <tr><td>Train tickets</td><td>960 × 1280</td><td>256</td><td>8</td><td>3 × 10⁻⁵, 300 steps</td><td>10 × 1,368</td><td>1.0</td><td>yes</td></tr>
+        <tr><td>RVL-CDIP</td><td>2560 × 1920</td><td>8</td><td>2</td><td>2 × 10⁻⁵, 10,000 steps</td><td>100 × 320,000</td><td>1.0</td><td>yes</td></tr>
+        <tr><td>DocVQA</td><td>2560 × 1920</td><td>128</td><td>2</td><td>3 × 10⁻⁵, 10,000 steps</td><td>300 × 39,463</td><td>0.25</td><td>yes</td></tr>
+      </table>
+      <h4>Cost</h4>
+      <p>The appendix reports that fine-tuning on CORD or Ticket at 1280 × 960 took about half an hour on one A100, while at 2560 × 1920 on the larger datasets the cost "increased rapidly": with 64 A100s, DocVQA needed about one GPU day and RVL-CDIP about two. The configuration files note that the DocVQA and RVL-CDIP checkpoints were trained on 8 nodes. The paper reports fine-tuning learning rates between 1 × 10⁻⁵ and 1 × 10⁻⁴, selected per task, and monitoring edit distance over generated token sequences for model selection.</p>
+      <h4>Choices worth copying</h4>
+      <ul class="notes">
+        <li><b>Match the canvas to the documents.</b> Receipts go on a portrait canvas, tickets and business cards on a landscape one. The paper used 960 × 1280 for Ticket and Business Card.</li>
+        <li><b>Size max_length from the data.</b> Serialise the longest training target and add margin; a target cut by <code>max_length</code> loses its closing tokens and, with them, its trailing fields.</li>
+        <li><b>Resolution changes are allowed.</b> The CORD configuration's comment warns that when the input resolution differs from the pretraining setting "some weights will be newly initialized (but the model training would be okay)" — the paper's Ticket and Business Card results (960 × 1280) and the released CORD checkpoints (1280 × 960) use smaller canvases than pretraining; the Table 2 CORD result itself was measured at 2560 × 1920.</li>
+        <li><b>Low-resource behaviour.</b> On CORD the paper reports Donut above LayoutLMv2 with only 80 training receipts (10% of the set), and that the 2560 × 1920 canvas was more robust than 1280 × 960 in that extreme low-resource setting.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> fine-tuning Donut is ordinary sequence-to-sequence training. The decisions that matter are the canvas (orientation and resolution), the output length budget, and writing the target JSON consistently — the model learns whatever structure the targets show it.</div>
+    </section>
+
+    <nav class="pager" aria-label="Donut series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="decoder-output.html">← Donut: Decoder, Prompts &amp; JSON Tokens</a>
+      <a href="../donut.html" style="color:var(--muted)">Donut · overview</a>
+      <a href="evaluation-limits.html">Donut: Evaluation, Ablations &amp; Limits →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../donut.viz.js"></script>
+</body>
+</html>

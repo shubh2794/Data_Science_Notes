@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Data Parallelism, ZeRO &amp; FSDP</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  .tablewrap{overflow-x:auto;max-width:100%}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  pre.code{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:10px 0;overflow-x:auto;font-size:12.5px;line-height:1.5;white-space:pre}
+  pre.code code{background:none;padding:0;border-radius:0;color:var(--ink);font-size:inherit}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../distributed-training.html">Distributed Training</a> · part 1 of 5</p>
+      <h1>Data Parallelism, ZeRO &amp; FSDP</h1>
+      <p>Splitting the batch and then the model state: data parallelism with a gradient all-reduce, the sixteen bytes per parameter that mixed-precision Adam keeps on every GPU, ZeRO stages one to three and FSDP sharding optimiser state, gradients and parameters across ranks, and offloading to CPU memory and NVMe in exchange for bandwidth.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Distributed Training</span>
+        <span class="pill">Data parallel · gradient all-reduce · 16 bytes per parameter · activations · ZeRO-1/2/3 · FSDP · CPU & NVMe offload</span>
+      </div>
+    </header>
+
+<section class="topic" id="data" data-nav="Data parallelism">
+      <h3><span class="idx">03</span> Data parallelism</h3>
+      <ul class="notes">
+        <li>Every GPU holds a <b>full copy</b> of the model and processes a different slice of the batch.</li>
+        <li>After the backward pass, gradients are <b>all-reduced</b> (averaged) across GPUs so all copies stay in sync.</li>
+        <li>Simple and the most common — but needs the whole model to fit on each GPU.</li>
+      </ul>
+
+      <h4>Why averaging gradients is exactly right</h4>
+      <p>The loss of a minibatch is a mean over its examples, and the gradient is linear, so the gradient of the whole batch is the mean of the per-shard gradients. If <code>D</code> ranks each process <code>b</code> examples, the all-reduced average</p>
+      <div class="formula"><span class="lbl">data-parallel gradient</span><span class="eq">g = (1/D) · Σᵣ gᵣ ,    gᵣ = (1/b) · Σ over rank r's examples of ∇ℓ
+  = (1/(D·b)) · Σ over all D·b examples of ∇ℓ</span></div>
+      <p>is identical, up to floating-point summation order, to the gradient one device would compute on a batch of <code>D·b</code>. Data parallelism therefore does not approximate anything: it <i>is</i> large-batch training, and all the large-batch caveats (learning-rate scaling, warmup) apply unchanged — see <a href="../neural-network-training/schedules-precision-memory.html#batch-size">Batch size &amp; the LR coupling</a>. Two things break the identity. Layers whose forward pass depends on batch statistics (BatchNorm) see only <code>b</code> examples per rank unless you synchronise them, and losses normalised per rank (e.g. dividing by that rank's count of non-padding tokens) give a different average from normalising by the global count. The second one is easy to miss: with variable-length sequences, averaging per-rank token means weights each rank equally rather than each token equally.</p>
+
+      <h4>The effective batch</h4>
+      <div class="formula"><span class="lbl">global batch</span><span class="eq">global batch (sequences) = micro-batch per rank × accumulation steps × D
+worked: micro-batch 4, accumulation 8, D = 32 ranks  →  4 × 8 × 32 = 1024 sequences
+        at 4096 tokens each  →  1024 × 4096 = 4,194,304 ≈ 4.2 M tokens per optimiser step</span></div>
+      <p>Gradient accumulation (the single-device technique of <a href="../neural-network-training/schedules-precision-memory.html#memory">§28 there</a>) composes with data parallelism in one specific way: the all-reduce is only needed on the <i>last</i> micro-batch of each accumulation window. Frameworks suppress synchronisation on the intermediate backward passes (PyTorch's <code>no_sync()</code> context), so with 8 accumulation steps the gradient traffic drops 8×. Forgetting this is a common reason a job with accumulation runs no faster per sample than one without.</p>
+
+      <h4>Buckets and overlap</h4>
+      <p>DDP does not wait for the whole backward pass and then send one giant tensor. It groups gradients into <b>buckets</b> (PyTorch's default cap is 25 MB) in roughly reverse layer order, and launches an asynchronous all-reduce for each bucket the moment every gradient in it is ready. The last layers' gradients are produced first, so their all-reduce runs while the earlier layers are still computing. With a deep enough network almost all of the communication is hidden; what remains exposed is the final bucket, the one containing the first layers. Larger buckets mean fewer launches (less per-message latency) but a later start; smaller buckets start earlier but pay latency on each. Two further details matter in practice: parameters that receive no gradient in a step (a conditional branch, an unused head) will stall the bucket they belong to unless DDP is told to search for unused parameters, which costs an extra graph traversal every step; and buffers such as BatchNorm running statistics are broadcast from rank 0 at each forward by default.</p>
+      <div class="formula"><span class="lbl">what data parallelism costs, per step</span><span class="eq">memory per GPU   : the full model state (16 bytes/parameter with mixed-precision Adam, §04)
+communication    : one all-reduce of the gradients, 2·(D−1)/D · (gradient bytes) sent per rank (§07)
+compute          : unchanged per example; the batch is simply D times larger</span></div>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="memory-model" data-nav="Memory per GPU: 16 bytes/param">
+      <h3><span class="idx">04</span> Where the memory goes: sixteen bytes per parameter</h3>
+      <p class="lede">Before choosing a strategy, count what has to live on a GPU. For a model trained with Adam in mixed precision the answer is dominated by a number that is easy to remember and routinely underestimated: about 16 bytes for every parameter, before a single activation is stored.</p>
+
+      <div class="formula"><span class="lbl">model state, mixed-precision Adam (Ψ parameters)</span><span class="eq">16-bit working weights             2 bytes · Ψ
+16-bit gradients                   2 bytes · Ψ
+fp32 master weights                4 bytes · Ψ   ┐
+fp32 Adam first moment  m          4 bytes · Ψ   ├  optimiser state  K = 12 bytes · Ψ
+fp32 Adam second moment v          4 bytes · Ψ   ┘
+─────────────────────────────────────────────
+total                             16 bytes · Ψ   = 2Ψ + 2Ψ + KΨ</span></div>
+      <p>The master copy exists because updates of size <code>η·Δ</code> are often below the 16-bit resolution of the weight they are added to, so the running sum must be kept in fp32 (<a href="../neural-network-training/schedules-precision-memory.html#precision">mixed precision</a> explains the rounding). Some stacks keep fp32 parameters and fp32 gradients and cast to 16 bits only for the matmuls; that is 4 + 4 + 8 = 16 bytes as well, split differently. SGD with momentum has <code>K = 8</code> (master + momentum), and an 8-bit Adam can bring <code>K</code> down to about 6 by quantising the two moments.</p>
+
+      <h4>Worked: 7 B and 70 B parameters</h4>
+      <div class="tablewrap"><table class="grid2">
+        <tr><th>model</th><th>16-bit weights</th><th>+ gradients</th><th>+ optimiser (K = 12)</th><th>total model state</th><th>80 GB GPUs just to hold it</th></tr>
+        <tr><td><b>7 B</b></td><td class="num">14 GB</td><td class="num">14 GB</td><td class="num">84 GB</td><td class="num">112 GB</td><td class="num">≥ 2</td></tr>
+        <tr><td><b>70 B</b></td><td class="num">140 GB</td><td class="num">140 GB</td><td class="num">840 GB</td><td class="num">1,120 GB</td><td class="num">≥ 14</td></tr>
+      </table></div>
+      <p>So even a 7 B model cannot be trained with plain data parallelism on an 80 GB accelerator: its model state alone is 112 GB, and plain DDP replicates all of it on every rank. Weights you can <i>serve</i> in 14 GB take 8× that to <i>train</i>. The GB here are 10⁹ bytes; an "80 GB" part reports roughly 80 GiB (about 85 × 10⁹ bytes; the exact figure varies by model), of which the framework, CUDA context and allocator fragmentation claim a few.</p>
+
+      <h4>Activations are the other half</h4>
+      <p>Model state does not depend on the batch; activations do. For a transformer layer the stored activations scale as <code>b·s·h</code> times a constant that depends on what is kept (§12 derives the exact per-layer count). A 7 B-class model (h = 4096, 32 layers) at batch 1 and 4096 tokens stores about 34·b·s·h = 34 × 16.8 M ≈ 570 MB per layer with a fused attention kernel, or roughly 18 GB for 32 layers — before any checkpointing. Activation memory is why sharding the model state is necessary but not sufficient, and why sequence and context parallelism (§12–§14) exist.</p>
+
+      <div class="viz" id="viz-mem">
+        <div class="vhead">
+          <span class="vtitle">Per-GPU model-state memory: DDP against ZeRO stages</span>
+          <span class="vhint">all four strategies are drawn at once; the selected one is outlined and described in the readout</span>
+        </div>
+        <div class="controls">
+          <label>model <select id="mem-model">
+            <option value="1.3">1.3 B</option>
+            <option value="7" selected>7 B</option>
+            <option value="7.5">7.5 B (paper check)</option>
+            <option value="13">13 B</option>
+            <option value="70">70 B</option>
+            <option value="175">175 B</option>
+            <option value="405">405 B</option>
+          </select></label>
+          <label>data-parallel GPUs N <select id="mem-n">
+            <option>1</option><option>2</option><option>4</option><option selected>8</option><option>16</option><option>32</option><option>64</option><option>128</option><option>256</option><option>512</option><option>1024</option>
+          </select></label>
+          <label>strategy <select id="mem-strat">
+            <option value="ddp">DDP (replicate everything)</option>
+            <option value="z1">ZeRO-1 (shard optimiser)</option>
+            <option value="z2">ZeRO-2 (+ gradients)</option>
+            <option value="z3" selected>ZeRO-3 / FSDP full shard (+ weights)</option>
+          </select></label>
+          <label>optimiser <select id="mem-opt">
+            <option value="12" selected>Adam, fp32 master (K = 12)</option>
+            <option value="8">SGD + momentum (K = 8)</option>
+            <option value="6">8-bit Adam states (K ≈ 6)</option>
+          </select></label>
+          <label>offload <select id="mem-off">
+            <option value="none" selected>none</option>
+            <option value="opt">optimiser + gradients → CPU</option>
+            <option value="all">+ weights → CPU (ZeRO-3 only)</option>
+          </select></label>
+          <label>GPU memory <select id="mem-gpu">
+            <option value="24">24 GB</option>
+            <option value="40">40 GB</option>
+            <option value="80" selected>80 GB</option>
+            <option value="141">141 GB</option>
+            <option value="192">192 GB</option>
+          </select></label>
+        </div>
+        <svg id="mem-svg" width="760" height="330" viewBox="0 0 760 330" role="img" aria-label="Four horizontal stacked bars, one per strategy: plain data parallel, ZeRO stage 1, ZeRO stage 2 and ZeRO stage 3. Each bar is split into 16-bit weights, gradients and optimiser state per GPU, in gigabytes, with a vertical dashed line at the chosen GPU capacity. Bars that cross the line do not fit. The selected strategy is outlined, and a smaller bar underneath shows how much host memory offload would need per GPU."></svg>
+        <div class="readout" aria-live="polite" id="mem-read"></div>
+        <p class="vcap">Every bar is computed from the formulas in §05 with the chosen N and K; offload moves the named states to host memory and adds them to the grey host bar. Activations, temporary all-gather buffers, the CUDA context and fragmentation are not included, so a bar that only just fits does not fit in practice. Check: 7.5 B parameters at N = 64 gives 120, 31.4, 16.6 and 1.9 GB, the figures in the ZeRO paper (arXiv 1910.02054).</p>
+      </div>
+    </section>
+
+<section class="topic" id="zero" data-nav="ZeRO and FSDP">
+      <h3><span class="idx">05</span> ZeRO and FSDP: sharding the model state</h3>
+      <ul class="notes">
+        <li><b>ZeRO / FSDP:</b> shard the optimizer states, gradients, and parameters across data-parallel GPUs instead of replicating them — huge memory savings with data-parallel simplicity.</li>
+        <li><b>Gradient accumulation:</b> sum gradients over several micro-batches to simulate a large batch on limited memory.</li>
+        <li><b>Activation checkpointing:</b> drop activations in the forward pass and recompute them in the backward pass — trade compute for memory.</li>
+      </ul>
+      <p>The last two are single-device techniques (their mechanics are in <a href="../neural-network-training/schedules-precision-memory.html#memory">Neural Network Training §28</a>); they are listed here because every sharded run uses them. The rest of this section is about the first bullet.</p>
+
+      <h4>The three ZeRO stages as formulas</h4>
+      <p>Plain data parallelism keeps <code>N</code> identical copies of all 16Ψ bytes. The observation behind ZeRO ("ZeRO: Memory Optimizations Toward Training Trillion Parameter Models", arXiv 1910.02054) is that each rank only ever <i>updates</i> a slice of the parameters if the optimiser step is partitioned, so it only needs that slice's optimiser state; and it only needs full weights and full gradients for the layer it is currently computing. Partitioning each state in turn gives three stages:</p>
+      <div class="formula"><span class="lbl">per-GPU model state, N data-parallel ranks, K bytes of optimiser state per parameter</span><span class="eq">DDP                    (2 + 2 + K) · Ψ
+ZeRO-1   shard optimiser  (2 + 2) · Ψ + K·Ψ / N
+ZeRO-2   + gradients      2 · Ψ + (2 + K) · Ψ / N
+ZeRO-3   + weights        (2 + 2 + K) · Ψ / N          ← FSDP "full shard" is this stage</span></div>
+      <div class="tablewrap"><table class="grid2">
+        <tr><th>per-GPU model state (K = 12)</th><th>DDP</th><th>ZeRO-1</th><th>ZeRO-2</th><th>ZeRO-3 / FSDP</th></tr>
+        <tr><td><b>7.5 B, N = 64</b> (paper's check)</td><td class="num">120 GB</td><td class="num">30 + 1.41 = 31.4 GB</td><td class="num">15 + 1.64 = 16.6 GB</td><td class="num">1.9 GB</td></tr>
+        <tr><td><b>7 B, N = 8</b></td><td class="num">112 GB</td><td class="num">28 + 10.5 = 38.5 GB</td><td class="num">14 + 12.25 = 26.3 GB</td><td class="num">14 GB</td></tr>
+        <tr><td><b>70 B, N = 64</b></td><td class="num">1,120 GB</td><td class="num">280 + 13.1 = 293 GB</td><td class="num">140 + 15.3 = 155 GB</td><td class="num">17.5 GB</td></tr>
+        <tr><td><b>1 T, N = 1024</b></td><td class="num">16,000 GB</td><td class="num">4,000 + 11.7 GB</td><td class="num">2,000 + 13.7 GB</td><td class="num">15.6 GB</td></tr>
+      </table></div>
+      <p>Two things follow. First, ZeRO-1 and ZeRO-2 have a floor: they still replicate the 16-bit weights (and ZeRO-1 the gradients), so no number of GPUs gets a 70 B model under 140 GB per rank with ZeRO-2. Only stage 3 divides <i>everything</i> by <code>N</code>; the paper's headline — a trillion parameters on 1024 GPUs at about 16 GB each — is the last row. Second, stages 1 and 2 are close to free in communication (§07 shows they move the same bytes as DDP), so for a model whose weights fit, ZeRO-2 is the usual default and ZeRO-3 is chosen only when it does not.</p>
+
+      <h4>How ZeRO-3 / FSDP runs a layer</h4>
+      <p>Each rank permanently owns 1/N of every parameter (a flat slice, or a slice of each tensor). To run a layer it must briefly hold the whole thing:</p>
+      <div class="formula"><span class="lbl">one sharded unit (usually one transformer block), per step</span><span class="eq">forward : all-gather the unit's weights → compute → free the gathered copy
+backward: all-gather weights again     → compute grads → reduce-scatter grads (each rank keeps its 1/N)
+step    : each rank updates only its own 1/N slice with its own 1/N of the optimiser state</span></div>
+      <p>Peak memory is therefore the permanent shard (16Ψ/N) <b>plus</b> the gathered working copy of the units in flight. That working copy is why the unit size matters: wrapping the whole model as one unit gathers every weight at once and loses the saving entirely, while wrapping each transformer block bounds the transient to one or two blocks. It is also why ZeRO-3 cannot rescue a model whose <i>single largest layer</i> does not fit on a GPU — that layer is gathered whole. Splitting within a layer is tensor parallelism's job (§10).</p>
+
+      <h4>FSDP1 flat parameters against FSDP2 per-parameter sharding</h4>
+      <p>PyTorch's first FSDP ("PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel", arXiv 2304.11277) concatenates all parameters of a wrapped unit into one contiguous <b>FlatParameter</b> and shards that 1-D buffer evenly. One all-gather per unit is efficient, but the flattening leaks everywhere: individual parameters become views into a shared buffer, so freezing some of them, giving them different optimiser settings, or mixing dtypes inside a unit is awkward; and the flat shard does not respect tensor boundaries, so checkpoints need a gather or special resharding logic.</p>
+      <p>FSDP2 (the <code>fully_shard</code> API) instead shards <b>each parameter on its own dimension 0</b> and represents it as a <code>DTensor</code> with a <code>Shard(0)</code> placement. Every parameter stays a real tensor with its own dtype and <code>requires_grad</code>; a sharded state dict is just the local shards plus placement metadata; and the same DTensor abstraction composes with tensor-parallel placements, which is what makes 2-D (FSDP × TP) layouts straightforward. The cost is that a unit's all-gather must copy several per-parameter shards into and out of a contiguous communication buffer; in practice this is fused and cheap. FSDP2 also drops the caching-allocator stream tricks FSDP1 used to recycle memory, which makes its peak memory more predictable.</p>
+
+      <h4>Prefetch and resharding: three knobs trading memory for time</h4>
+      <div class="tablewrap"><table class="grid2">
+        <tr><th>knob</th><th>what it does</th><th>memory</th><th>time</th></tr>
+        <tr><td><b>forward prefetch</b></td><td>issue unit <i>i</i>+1's all-gather while unit <i>i</i> computes</td><td>+1 gathered unit in flight</td><td>hides forward all-gathers</td></tr>
+        <tr><td><b>backward prefetch</b></td><td>issue the next-needed unit's all-gather before the current unit's gradient reduce-scatter</td><td>+1 gathered unit</td><td>hides most backward all-gathers</td></tr>
+        <tr><td><b>reshard after forward = true</b></td><td>free gathered weights right after each unit's forward; re-gather in backward</td><td>lowest: only units in flight are whole</td><td>3 collective passes per step (3Ψ traffic)</td></tr>
+        <tr><td><b>reshard after forward = false</b></td><td>keep gathered weights from forward until that unit's backward</td><td>as ZeRO-2: all weights whole at the peak</td><td>2 passes (2Ψ traffic), no re-gather</td></tr>
+        <tr><td><b>hybrid sharding (HSDP)</b></td><td>shard within a node, replicate across nodes</td><td>state ÷ GPUs per node, not ÷ all GPUs</td><td>the gathers stay on NVLink; only a gradient all-reduce crosses nodes</td></tr>
+      </table></div>
+      <p>Worked hybrid case: 70 B on 16 nodes × 8 GPUs. Full sharding over 128 ranks gives 1120 / 128 = 8.75 GB of model state per GPU but runs every per-layer all-gather over InfiniBand. Hybrid sharding over the 8 GPUs of each node gives 1120 / 8 = 140 GB — does not fit. Sharding over groups of 16 (two nodes) gives 70 GB, which still leaves no room for activations on 80 GB parts. So for 70 B the hybrid group has to span at least 4 nodes (1120 / 32 = 35 GB), and the choice is between that and adding tensor parallelism inside the node (§19).</p>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="offload" data-nav="CPU &amp; NVMe offload">
+      <h3><span class="idx">06</span> Offloading to CPU and NVMe: memory you pay for in bandwidth</h3>
+      <p class="lede">A server has far more host memory than GPU memory — an 8-GPU training node often has 1–2 TB of DRAM against 640 GB of HBM, and several TB of NVMe. Offloading parks the model states that are touched only once per step in those slower tiers and streams them in and out.</p>
+      <p><b>ZeRO-Offload</b> ("ZeRO-Offload: Democratizing Billion-Scale Model Training", arXiv 2101.06840) keeps the 16-bit weights and all forward/backward compute on the GPU and moves the gradients and the whole optimiser (fp32 master, m, v) to the CPU, where a vectorised CPU Adam performs the update. The reasoning is a data-flow argument: the optimiser step is O(Ψ) arithmetic, cheap enough for a CPU, whereas forward and backward are O(Ψ · tokens) and must stay on the accelerator. What crosses PCIe per step is 2Ψ bytes of 16-bit gradients down and 2Ψ bytes of 16-bit updated weights up. The paper reports training 13 B parameters on a single V100 (about 10× what plain PyTorch fits) at 40 TFLOP/s for a 10 B model, and near-linear scaling to 128 GPUs.</p>
+      <p><b>ZeRO-Infinity</b> ("ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning", arXiv 2104.07857) extends ZeRO-3 so that the weight shards themselves can live in CPU memory or on NVMe, fetched layer by layer just before use, with partitioned fetches so that every GPU's PCIe link is used in parallel. It reports over 25 PFLOP/s on 512 V100s (about 40% of peak) and model capacities in the tens of trillions of parameters.</p>
+
+      <h4>Worked: what offload costs a 7 B model on one GPU</h4>
+      <div class="formula"><span class="lbl">7 B, single GPU, optimiser + gradients offloaded</span><span class="eq">GPU keeps       2Ψ = 14 GB of 16-bit weights (+ activations)
+CPU keeps       2Ψ + 12Ψ = 98 GB (16-bit gradients + fp32 master, m, v)
+PCIe per step   2Ψ down + 2Ψ up = 28 GB
+at ~25 GB/s     28 / 25 ≈ 1.1 s of transfer per optimiser step (PCIe 4.0 x16, achievable rate)
+CPU Adam        must read and write ≈ 16 bytes × 7 × 10⁹ ≈ 112 GB of state per step;
+                at ~100 GB/s of DRAM bandwidth that is on the order of 1 s</span></div>
+      <p>If one optimiser step's forward and backward take 5–10 s (large batch with accumulation), this is a 10–20% overhead and a good trade. If the step is short, the CPU update and the PCIe transfer dominate and the GPU sits idle. ZeRO-Offload's one-step <b>delayed parameter update</b> overlaps the CPU step of iteration <i>t</i> with the GPU work of <i>t</i>+1, at the price of the gradient being one step stale; the paper enables it only after the early, unstable phase of training. NVMe is another order of magnitude slower (a few GB/s per drive) and only makes sense when the batch per step is very large or the alternative is not training at all.</p>
+      <div class="wrong"><span class="say">Tempting:</span> "Offload makes the model fit, so turn it on."<br /><span class="fix">Better:</span> first try more sharding (ZeRO-3 over more GPUs) or tensor parallelism, which cost NVLink/InfiniBand bandwidth measured in hundreds of GB/s; offload costs PCIe and DRAM bandwidth measured in tens. Offload is the tool for a fixed, small number of GPUs.</div>
+    </section>
+
+    <nav class="pager" aria-label="Distributed Training series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../distributed-training.html">← Distributed Training · overview</a>
+      <a href="../distributed-training.html" style="color:var(--muted)">Distributed Training · overview</a>
+      <a href="collectives-ddp.html">Collectives, Ring All-Reduce &amp; DDP →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../distributed-training.viz.js"></script>
+</body>
+</html>

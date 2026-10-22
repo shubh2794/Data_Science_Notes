@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Feature Descriptors, Matching &amp; RANSAC</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses, carried over from parts 1, 2 and 5 */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../features.html">Features &amp; Matching</a> · part 4 of 4</p>
+      <h1>Feature Descriptors, Matching &amp; RANSAC</h1>
+      <p>From keypoint to verified correspondence: the invariance–discriminability trade-off in descriptor design, dominant-orientation assignment, gradient-histogram and binary descriptors with Hamming matching, the nearest-neighbour ratio test, approximate nearest-neighbour search, and RANSAC model fitting when many matches are outliers.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Features &amp; Matching</span>
+        <span class="pill">Invariance trade-off · orientation · SIFT-style histograms · binary/Hamming · ratio test · k-d trees · RANSAC</span>
+      </div>
+    </header>
+
+    <!-- ═══ 21 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="descriptors" data-nav="The descriptor design problem">
+      <h3><span class="idx">21</span> The descriptor design problem</h3>
+      <p class="lede">A detector answers <i>where</i>. A descriptor answers <i>which</i>. It has to produce the same vector for the same physical patch photographed differently, and different vectors for different patches — and those two requirements pull in opposite directions with complete symmetry.</p>
+
+      <div class="formula"><span class="lbl">the two requirements, stated so the conflict is visible</span><span class="eq">INVARIANCE       d(T(p)) = d(p)   for every nuisance transformation T
+DISCRIMINABILITY d(p) ≠ d(q)      for every pair of genuinely different patches p, q</span>
+<span class="eq">Take invariance to its limit — a descriptor that returns 0 for every patch — and it is
+perfectly invariant and useless. Take discriminability to its limit — the raw pixel
+vector — and it distinguishes everything, including the same patch under a one-degree
+rotation. Every real descriptor is a point on the line between those two, and moving
+toward one end ALWAYS costs the other. There is no design that escapes this.</span></div>
+
+      <table class="grid2">
+        <tr><th style="width:150px">Nuisance</th><th>How it is removed</th><th>What it costs</th></tr>
+        <tr><td><b>Translation</b></td><td>By construction: the descriptor is computed relative to the keypoint's position.</td><td>Nothing. This one is free, and it is the only free one.</td></tr>
+        <tr><td><b>Scale</b></td><td>Sample the support region at a radius proportional to the detected <span class="keep">σ</span> (§17), from the pyramid level at which it was detected.</td><td>Depends entirely on the detector's scale estimate being right. A 20% scale error is a 20% mis-sampling of every cell.</td></tr>
+        <tr><td><b>In-plane rotation</b></td><td>Estimate a dominant orientation and rotate the sampling frame — §22.</td><td>A wrong orientation estimate destroys the descriptor completely. This is the single largest source of matching failure.</td></tr>
+        <tr><td><b>Brightness offset</b> <code>I → I + b</code></td><td>Free, if the descriptor is built from <i>gradients</i>: the derivative kills any additive constant.</td><td>Nothing — which is a large part of why gradient-based descriptors won.</td></tr>
+        <tr><td><b>Contrast gain</b> <code>I → aI</code></td><td>Normalise the descriptor to unit length. Measured below: exactly zero change.</td><td>Amplifies the descriptor of a flat patch, where the vector is pure noise. Guard with a minimum-norm test.</td></tr>
+        <tr><td><b>Non-linear intensity</b></td><td>Cap large components and renormalise — the usual heuristic. Its value is examined, and questioned, in §23.</td><td>Discards genuine information about strong local structure.</td></tr>
+        <tr><td><b>Small localisation error</b></td><td>Soft (interpolated) spatial binning and a Gaussian weighting that fades toward the edge of the support.</td><td>Blurs the descriptor, reducing discriminability — bought deliberately.</td></tr>
+        <tr><td><b>Affine / viewpoint</b></td><td>Normalise the patch by <code>M^(−1/2)</code> — §20 — or accept the loss.</td><td>5–10× detection cost and worse performance on easy pairs. Usually not worth it.</td></tr>
+        <tr><td><b>Occlusion</b></td><td>Nothing works. A partly occluded patch has a different descriptor, and the correct response is to have enough <i>other</i> keypoints that losing this one does not matter.</td><td>This is why detectors return thousands of points and §27 tolerates most of them being wrong.</td></tr>
+      </table>
+
+      <div class="callout"><b>The one design decision that matters most.</b> Not the binning layout, not the number of dimensions — it is <b>what quantity is histogrammed</b>. Raw intensities give a descriptor that fails on any brightness change. Gradient <i>magnitudes</i> alone throw away orientation and are far less distinctive. Gradient <i>orientations weighted by magnitude</i> — the choice every successful hand-designed descriptor makes — is invariant to brightness offset for free, invariant to gain after one normalisation, and retains the local geometry that actually distinguishes patches. The rest of the design is comparatively detail.</div>
+    </section>
+
+    <!-- ═══ 22 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="orientation" data-nav="Orientation assignment">
+      <h3><span class="idx">22</span> Orientation assignment</h3>
+      <p class="lede">Rotation invariance can be built into the descriptor's <i>form</i> — or bought by measuring the patch's own orientation and cancelling it. The second is what everybody does, because the first destroys discriminability, and this section is the measurement that shows why it is worth the trouble.</p>
+
+      <h4>Two ways, and why the cheap one loses</h4>
+      <div class="cards">
+        <div class="box bad">
+          <div class="n">option 1</div>
+          <div class="t">A rotation-invariant descriptor</div>
+          <div class="g">Use only quantities that do not change under rotation — the magnitude of a Fourier coefficient, a radial profile, a differential invariant. Genuinely invariant, with no estimate to get wrong. But it maps <i>every</i> rotation of a patch to one point, and therefore also maps <b>genuinely different</b> patches that happen to share those invariants to the same point. Discriminability collapses.</div>
+        </div>
+        <div class="box good">
+          <div class="n">option 2</div>
+          <div class="t">Estimate and cancel</div>
+          <div class="g">Measure a dominant orientation <span class="keep">θ</span><code>₀</code>, rotate the sampling frame by <code>−θ₀</code>, then use a fully discriminative descriptor in that frame. Invariance is now conditional on the estimate being right — but when it is right, nothing has been given up.</div>
+        </div>
+      </div>
+
+      <h4>How the orientation is measured</h4>
+      <div class="formula"><span class="lbl">the naive estimate, and why it is not enough</span><span class="eq"><span class="keep">θ</span>₀ = ∠( ∑ w(x)·∇I(x) )       the direction of the average gradient</span>
+<span class="eq">Equivalent to a first-order steerable filter (<a href="../image-processing/linear-filtering.html#steerable">part 2 §14</a>), so it costs two convolutions
+that have already been done. But on a symmetric patch — a corner, a blob, a bar — the
+SIGNED gradients cancel and the average is near zero, so its direction is noise.</span>
+<span class="lbl">the estimate that works: a weighted histogram of orientations</span><span class="eq">1. build a 36-bin histogram of ∠∇I over the support region
+2. weight each contribution by ‖∇I‖ AND by a Gaussian in distance from the centre,
+   with that Gaussian about 1.5× the detection scale — a LARGER window than the one
+   used for detection, because orientation needs more evidence than location does
+3. smooth the histogram circularly (a few passes of [1,1,1]/3) so a single noisy
+   pixel cannot own a bin
+4. take the global peak, and refine it by fitting a parabola through the peak bin
+   and its two neighbours
+5. emit an ADDITIONAL keypoint, at the same (x, y, <span class="keep">σ</span>), for every other peak above
+   80% of the global maximum</span>
+<span class="eq">Step 5 is the one people leave out. A patch with two strong orientations — a corner,
+a cross, a bar end — has an AMBIGUOUS orientation, and picking one at random means
+getting it wrong roughly half the time. Emitting both keypoints turns a coin flip into
+two candidates, one of which is right, and lets §25's matcher decide. On real imagery
+the reported rate is around 15% of keypoints; the figure's synthetic patches, which by
+construction have one dominant edge, produce a secondary peak on only 1.7% of 600
+random draws. That gap is itself informative — ambiguous orientation is a property of
+real scene structure, not of the algorithm, and a synthetic test bed will understate
+how often step 5 matters.</span></div>
+
+      <h4>Measured: what orientation assignment is actually worth</h4>
+      <p>Take one synthetic patch, sample it through a rotated frame at twelve angles, and compute a 4 × 4 × 8 gradient-histogram descriptor (§23) with and without cancelling the estimated orientation. Distances are Euclidean between unit-normalised descriptors, so the maximum possible is <code>2</code>:</p>
+      <div class="formula"><span class="lbl">tracking accuracy and descriptor stability, twelve rotations of the same scene</span><span class="eq">rotation   <span class="keep">θ</span>₀ estimated   expected     error     d(WITH)   d(WITHOUT)
+   0°         34.24°       34.24°     0.00°     0.0000     0.8428
+  10°         23.48°       24.24°    −0.76°     0.0297     0.5897
+  15°         17.22°       19.24°    −2.02°     0.0681     0.4602
+  23°          9.35°       11.24°    −1.89°     0.0622     0.3019
+  30°          3.20°        4.24°    −1.05°     0.0366     0.1393
+  45°        −13.25°      −10.76°    −2.50°     0.0770     0.3957
+  60°        −26.93°      −25.76°    −1.17°     0.0370     0.8162
+  90°        −55.76°      −55.76°     0.00°     0.0000     1.0719
+ 137°       −104.85°     −102.76°    −2.09°     0.0646     1.2641
+ 180°       −145.76°     −145.76°     0.00°     0.0000     1.2215
+ 270°        124.24°      124.24°     0.00°     0.0000     1.2441
+ 313°         78.30°       81.24°    −2.94°     0.0932     1.2340</span>
+<span class="eq">maximum tracking error 2.94°, mean 1.20°, and EXACTLY ZERO at 0°, 90°, 180° and 270°,
+which are the only rotations the pixel lattice maps to itself — the residual is
+resampling, not method.
+mean descriptor distance WITH orientation assignment    0.0390
+mean descriptor distance WITHOUT                        0.7985      →  20.5× worse
+(These are the figure's own numbers, with a 36-bin histogram, two smoothing passes and
+parabolic peak refinement. Change any of those three in the figure and the table moves.)</span></div>
+
+      <div class="callout"><b>Read the second column of that table before the last two.</b> The estimated orientation <i>tracks</i> the rotation, which is the property that matters; the descriptor distances are downstream of it. A 2.94° tracking error at 313° produces a descriptor distance of 0.093, and a 0° error at 90° produces 0.0000 — the descriptor's stability is almost exactly a function of the orientation estimate's accuracy. Every percentage point of matching performance that a better orientation estimator buys is bought here, before the descriptor is computed at all.</div>
+
+      <div class="viz" id="viz-orient">
+        <div class="vhead">
+          <span class="vtitle">Orientation assignment: the histogram, the peak, and the descriptor it stabilises</span>
+          <span class="vhint">rotate the patch and watch the histogram rotate with it while the normalised descriptor stands still</span>
+        </div>
+        <div class="controls">
+          <label>rotation <input type="range" id="or-r" min="0" max="359" step="1" value="60" /><span id="or-rv" style="min-width:34px;display:inline-block">60°</span></label>
+          <label>bins <input type="range" id="or-b" min="8" max="72" step="4" value="36" /><span id="or-bv" style="min-width:22px;display:inline-block">36</span></label>
+          <label>histogram smoothing <input type="range" id="or-s" min="0" max="6" step="1" value="2" /><span id="or-sv" style="min-width:16px;display:inline-block">2</span></label>
+          <label><input type="checkbox" id="or-o" checked /> cancel the estimated orientation</label>
+          <label><input type="checkbox" id="or-p" checked /> parabolic peak refinement</label>
+        </div>
+        <svg id="orient-svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-label="Left: the patch sampled through a frame rotated by the chosen angle, with the estimated dominant orientation drawn as an arrow from its centre and any secondary orientations above eighty per cent of the peak drawn as fainter arrows. Middle: the orientation histogram as a polar plot around the patch, with the raw bin heights and the circularly smoothed version overlaid, the peak bin highlighted, the parabolic refinement's sub-bin position marked, and the eighty per cent line drawn as a circle so that secondary peaks can be identified by eye. Right: the descriptor computed in the rotated frame, drawn as a four by four grid of eight-bin orientation stars, next to the descriptor computed at zero rotation, and beneath them the Euclidean distance between the two. With orientation cancellation enabled this distance stays near zero as the rotation slider is swept and rises only where the estimate is inaccurate; with it disabled the distance swings across most of its possible range, and a plot of that distance against rotation over the full turn is drawn for both cases so the difference is a curve rather than an anecdote."></svg>
+        <div class="readout" aria-live="polite" id="orient-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 23 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="gradhist" data-nav="Gradient-histogram descriptors">
+      <h3><span class="idx">23</span> Gradient-histogram descriptors</h3>
+      <p class="lede">The design that dominated hand-engineered vision for fifteen years, and that convolutional networks partly re-derived. It is a histogram of gradient orientations, computed separately in each cell of a small spatial grid, with every step of the construction defending against a specific failure.</p>
+
+      <div class="formula"><span class="lbl">the construction, one line per decision</span><span class="eq">1. take a 16 × 16 sample grid around the keypoint, at the DETECTED scale, from the
+   pyramid level where it was detected                       — scale invariance (§17)
+2. rotate the sampling frame by −<span class="keep">θ</span>₀                          — rotation invariance (§22)
+3. compute ∇I at every sample; keep MAGNITUDE and ORIENTATION — brightness-offset
+                                                                invariance, for free
+4. weight every magnitude by a Gaussian centred on the keypoint, of about half the
+   support width                    — far samples are the ones a localisation error
+                                      moves most, so trust them least
+5. split the grid into 4 × 4 CELLS; in each, build an 8-bin orientation histogram
+6. add every sample to its 2 × 2 × 2 = 8 surrounding bins by TRILINEAR interpolation
+   in (x, y, <span class="keep">θ</span>)                     — so a sample crossing a cell or bin boundary moves
+                                     its weight smoothly instead of jumping
+7. concatenate: 4 × 4 × 8 = 128 non-negative numbers
+8. normalise to unit length          — gain invariance
+9. cap every component at 0.2 and renormalise  — the contentious step, examined below</span></div>
+
+      <h4>Why the cells, and why so few of them</h4>
+      <p>A single global orientation histogram over the whole patch would be far too coarse: it records <i>what</i> orientations are present and nothing about <b>where</b>. A per-pixel record would be maximally specific and would break under a half-pixel localisation error. The 4 × 4 grid is the compromise, and the trilinear interpolation of step 6 is what makes the compromise soft rather than brittle: without it, a sample sitting on a cell boundary jumps its entire weight from one cell to another when the keypoint moves by one pixel, and the descriptor changes discontinuously. Soft binning is a good idea anywhere a histogram is computed — it is the same argument as <a href="../image-processing/point-operators.html#clahe">Part 2 §06</a>'s interpolated local equalisation and the same argument as §15's hybrid Hough voting.</p>
+
+      <h4>Measured: the illumination invariances, and one that does not hold</h4>
+      <div class="formula"><span class="lbl">affine intensity change I → aI + b, descriptor distance to the reference</span><span class="eq">  a       b     normalised descriptor    raw (unnormalised) histogram
+1.00    0.00        0.000000                   0.0000
+1.00   +0.30        0.000000                   0.0000
+1.00   −0.20        0.000000                   0.0000
+1.50    0.00        0.000000                   1.9079
+0.60    0.00        0.000000                   1.5263
+1.50   +0.30        0.000000                   1.9079
+2.50   −0.40        0.000000                   5.7237</span>
+<span class="eq">EXACTLY ZERO, to every printed digit, for every affine intensity change. The offset b
+dies in step 3 because a derivative kills a constant; the gain a dies in step 8
+because scaling every component of a vector does not change its direction. These two
+invariances are not approximations and not heuristics — they are algebraic identities,
+and they are why gradient histograms beat intensity patches.</span></div>
+
+      <div class="wrong"><span class="say">And now the step that does not survive measurement.</span> The 0.2 cap of step 9 is universally described as making the descriptor robust to non-linear illumination change. <span class="fix">On this page's synthetic data it does the opposite — it makes the descriptor distance slightly <i>worse</i>, consistently, under every non-linear intensity change tested.</span>
+      <div class="formula" style="margin-top:8px"><span class="lbl">200 random synthetic patches, mean descriptor distance between a patch and its transformed self</span><span class="eq">transformation        with the 0.2 cap    without it    cap wins on
+gamma 1.6                 0.1839            0.1753        76 / 200
+gamma 0.6                 0.1515            0.1451        67 / 200
+saturate the top 15%      0.1749            0.1500        19 / 200
+an added specular blob    0.4278            0.4184        86 / 200</span>
+<span class="eq">On a single patch the cap touches only 7 of the 128 bins, and capping them loses real
+information about the strongest local structure.</span></div>
+      What this does <b>not</b> prove is that the cap is worthless. It shows that the cap does not reduce the distance between <i>corresponding</i> descriptors, which is what this measurement can see. The published justification is a different quantity: matching <b>precision</b> on real image databases, where what matters is the distance to corresponding descriptors <i>relative to</i> the distance to non-corresponding ones — and suppressing a few dominant bins can improve that ratio even while it worsens the numerator. The honest summary is: <b>the invariances in step 3 and step 8 are theorems; step 9 is a heuristic tuned on a database, and it should be described as one.</b></div>
+
+      <h4>The variants, and what each one changes</h4>
+      <table class="grid2">
+        <tr><th style="width:150px">Variant</th><th>The change</th><th>Effect</th></tr>
+        <tr><td><b>Log-polar binning</b></td><td>Replace the 4 × 4 square grid with rings and sectors — typically radii 6, 11, 15 with eight angular bins, giving 17 spatial bins and 16 orientation bins, then project to 128 dimensions.</td><td>Better than square binning by a small margin in comparative evaluations. Log-polar cells grow with radius, matching the fact that outer samples are less reliably localised.</td></tr>
+        <tr><td><b>Box-filter approximation</b></td><td>Replace derivative-of-Gaussian responses with box filters evaluated by integral images (<a href="../image-processing/nonlinear-morphology.html#integral">Part 2 §20</a>).</td><td>Several times faster with a small accuracy loss. The integral image turns an arbitrary rectangular sum into three additions, so cost stops depending on filter size.</td></tr>
+        <tr><td><b>Learned pooling</b></td><td>Fit the cell layout, the weighting and a dimension-reducing projection on a database of matched patches.</td><td>Beats hand-tuned layouts. This is the hinge point at which the field turned toward learning the whole thing — §29.</td></tr>
+        <tr><td><b>Normalised intensity patch</b></td><td>Skip gradients entirely: sample an 8 × 8 grid at a coarse pyramid level and normalise to zero mean and unit variance.</td><td>Far simpler and competitive when there is little viewpoint change, because sampling coarsely gives robustness to localisation error for free. Loses badly under foreshortening.</td></tr>
+      </table>
+
+      <div class="viz" id="viz-desc">
+        <div class="vhead">
+          <span class="vtitle">A gradient-histogram descriptor, built cell by cell</span>
+          <span class="vhint">step through the construction, and apply an intensity change to watch the normalisation absorb it exactly</span>
+        </div>
+        <div class="controls">
+          <label>stage <select id="de-stage">
+            <option value="0">1 · the sampled patch</option>
+            <option value="1">2 · gradients, weighted</option>
+            <option value="2">3 · the 4 × 4 cells</option>
+            <option value="3" selected>4 · the 128-vector</option>
+          </select></label>
+          <label>cells <input type="range" id="de-c" min="2" max="6" step="1" value="4" /><span id="de-cv" style="min-width:16px;display:inline-block">4</span></label>
+          <label>orientation bins <input type="range" id="de-o" min="4" max="16" step="2" value="8" /><span id="de-ov" style="min-width:16px;display:inline-block">8</span></label>
+          <label>gain a <input type="range" id="de-a" min="0.4" max="2.5" step="0.05" value="1.00" /><span id="de-av" style="min-width:30px;display:inline-block">1.00</span></label>
+          <label>offset b <input type="range" id="de-b" min="-0.3" max="0.3" step="0.02" value="0.00" /><span id="de-bv" style="min-width:34px;display:inline-block">0.00</span></label>
+          <label><span class="keep">γ</span> (non-linear) <input type="range" id="de-g" min="0.5" max="2" step="0.05" value="1.00" /><span id="de-gv" style="min-width:30px;display:inline-block">1.00</span></label>
+          <label><input type="checkbox" id="de-t" checked /> trilinear soft binning</label>
+          <label><input type="checkbox" id="de-k" checked /> cap at 0.2 and renormalise</label>
+        </div>
+        <svg id="desc-svg" width="760" height="470" viewBox="0 0 760 470" role="img" aria-label="Left: the patch as sampled, then its gradient field drawn as short arrows whose length is the magnitude after the Gaussian centre weighting, then the same field with the cell grid drawn over it. Middle: the descriptor as a grid of orientation stars, one per spatial cell, each star's arms proportional to that cell's orientation-bin weights, so the descriptor is readable as a picture of the patch's local structure rather than as a list of numbers; beneath it the same descriptor as a bar chart of all its components in order, with the cap level drawn as a horizontal line and the capped components highlighted. Right: the reference descriptor computed with no intensity change, and the Euclidean distance between it and the current one, printed for the normalised descriptor and for the raw histogram side by side. Sliding the gain or the offset moves the raw distance a long way and leaves the normalised distance at exactly zero; sliding the gamma slider, which applies a non-linear intensity change, moves both, and the readout reports whether the cap helped or hurt on this particular patch."></svg>
+        <div class="readout" aria-live="polite" id="desc-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 24 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="binary" data-nav="Binary descriptors">
+      <h3><span class="idx">24</span> Binary descriptors and Hamming matching</h3>
+      <p class="lede">A 128-dimensional float vector costs 512 bytes and a Euclidean distance costs 128 multiplies. Replace the vector with 256 <i>bits</i> and the distance with a population count and both costs collapse by more than an order of magnitude — at a real but surprisingly small accuracy cost.</p>
+
+      <div class="formula"><span class="lbl">the construction</span><span class="eq">choose a fixed set of D sample-point PAIRS (pᵢ, qᵢ) inside the patch, once, offline
+bit i  =  1  if  I_smoothed(pᵢ) &lt; I_smoothed(qᵢ),  else 0</span>
+<span class="eq">The descriptor is a string of D pairwise intensity COMPARISONS. That is all it is.
+Smoothing before comparing is not optional: a raw pixel comparison is dominated by
+noise, and the usual choice is a Gaussian of about 2 px or a box filter evaluated
+with an integral image (<a href="../image-processing/nonlinear-morphology.html#integral">part 2 §20</a>), which makes each bit cost 6 additions.</span>
+<span class="lbl">the distance</span><span class="eq">d_H(a, b) = popcount(a XOR b)          256 bits = 4 machine words = 4 XORs + 4 popcounts</span>
+<span class="eq">Roughly 8 CPU instructions against 128 multiply-adds plus a square root — an
+arithmetic ratio of about 40 : 1, and reported end-to-end speed-ups in the matching
+stage are of that order. That is an instruction count, not a measurement made on this
+page. What matters more than the exact factor: matching — not detection, not
+description — is what dominates the cost once there are more than a few thousand
+features, so a constant-factor win there is a constant-factor win overall.</span></div>
+
+      <h4>What is bought and what is lost</h4>
+      <table class="grid2">
+        <tr><th style="width:150px"></th><th>Gradient histogram (128 floats)</th><th>Binary string (256 bits)</th></tr>
+        <tr><td><b>Size</b></td><td>512 bytes</td><td><b>32 bytes</b> — 16× smaller, which is the difference between a million features fitting in cache and not</td></tr>
+        <tr><td><b>Distance cost</b></td><td>128 multiply-adds + a square root</td><td><b>4 XOR + 4 popcount</b></td></tr>
+        <tr><td><b>Brightness offset</b></td><td>Invariant, by using gradients</td><td>Invariant: <code>I(p) &lt; I(q)</code> is unchanged by adding a constant</td></tr>
+        <tr><td><b>Contrast gain</b></td><td>Invariant, after normalising</td><td>Invariant for <code>a &gt; 0</code>, and in fact invariant to <b>any monotonically increasing</b> intensity map — a strictly stronger guarantee, and it is free rather than fitted</td></tr>
+        <tr><td><b>Rotation</b></td><td>Handled by §22, in the sampling frame</td><td>The pair pattern must be <i>rotated</i> too — usually by precomputing the pattern at 30 discrete angles and looking one up, which quantises the orientation to 12°</td></tr>
+        <tr><td><b>Accuracy</b></td><td>The reference</td><td>Measurably lower, especially under large viewpoint change, where each bit's sample pair lands on different content</td></tr>
+        <tr><td><b>Distance distribution</b></td><td>Continuous; the ratio test of §25 works naturally</td><td><b>Integer, in [0, 256]</b>, so ties are common and the ratio test is coarser. This is a real and often-overlooked cost.</td></tr>
+      </table>
+
+      <div class="callout"><b>Why the sampling pattern is not random.</b> A pattern drawn uniformly at random works, but a better one is <i>learned</i>: generate thousands of candidate pairs, rank them so that each bit is close to an even split of 0s and 1s over a training set of patches (maximum entropy per bit), and greedily select pairs whose responses are as uncorrelated as possible with the already-selected ones. Two bits that agree 95% of the time carry roughly one bit of information between them, so 256 correlated bits are worth far less than 256 independent ones. The same logic applies to any binary code: <b>the capacity of a descriptor is its number of independent bits, not its number of bits.</b></div>
+
+      <div class="wrong"><span class="say">An easy misreading of the speed-up.</span> "Binary descriptors are 40× faster." <span class="fix">Forty times faster at <i>computing one distance</i>, which is only part of the pipeline.</span> Detection is unchanged, description is somewhat cheaper, and the approximate-search structures of §26 do not speed up by 40× because their cost is dominated by memory access rather than by arithmetic — although the 16× smaller descriptor does help that too. The honest claim is a large constant-factor win in the matching stage, on top of a substantial memory win, in exchange for a measurable accuracy loss.</div>
+
+      <div class="viz" id="viz-binary">
+        <div class="vhead">
+          <span class="vtitle">A binary descriptor: the sampling pairs, the bits, and Hamming matching</span>
+          <span class="vhint">watch the bits survive a monotone intensity change untouched, and break under rotation until the pattern is rotated too</span>
+        </div>
+        <div class="controls">
+          <label>bits <input type="range" id="bi-n" min="32" max="256" step="32" value="128" /><span id="bi-nv" style="min-width:26px;display:inline-block">128</span></label>
+          <label>pre-smoothing <input type="range" id="bi-s" min="0" max="4" step="0.25" value="2.00" /><span id="bi-sv" style="min-width:30px;display:inline-block">2.00</span></label>
+          <label>intensity map <select id="bi-m">
+            <option value="id">none</option>
+            <option value="gain">gain ×1.8</option>
+            <option value="offset">offset +0.2</option>
+            <option value="gamma" selected>gamma 2.0 (monotone)</option>
+            <option value="invert">inverted (monotone DECREASING)</option>
+          </select></label>
+          <label>rotation <input type="range" id="bi-r" min="0" max="180" step="5" value="0" /><span id="bi-rv" style="min-width:30px;display:inline-block">0°</span></label>
+          <label><input type="checkbox" id="bi-p" /> rotate the sampling pattern too</label>
+        </div>
+        <svg id="binary-svg" width="760" height="450" viewBox="0 0 760 450" role="img" aria-label="Left: the patch with the sampling pairs drawn as short segments joining each pair of sample points, coloured by the bit each comparison currently produces. Middle: the transformed patch with the same pattern, or with the pattern rotated to match if that option is ticked, and beneath the two patches the two bit strings drawn as rows of small squares with the differing bits picked out, so the Hamming distance is literally countable. Right: the Hamming distance printed and drawn as a bar against the full width of the descriptor, with the expected distance between two unrelated descriptors marked at half the bit count, since two random bit strings agree on half their bits on average. A curve plots the Hamming distance against rotation over the full turn for both the fixed and the rotated sampling pattern, showing that a fixed pattern degrades to the random baseline within a few tens of degrees and then past it, because at a half-turn the comparisons become anti-correlated rather than merely uncorrelated, while a rotated one stays at zero. Every monotonically increasing intensity map leaves the distance at zero, because each bit is a comparison rather than a value; a monotonically decreasing one flips every bit, which is the complementary fact and the reason blob polarity has to be recorded rather than assumed away."></svg>
+        <div class="readout" aria-live="polite" id="binary-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 25 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="matching" data-nav="Matching strategies">
+      <h3><span class="idx">25</span> Matching strategies, and why the ratio test wins</h3>
+      <p class="lede">Given two sets of descriptors, decide which pairs correspond. The obvious rule — accept every pair closer than some threshold — fails for a reason worth understanding, and the standard fix is one division.</p>
+
+      <h4>The four strategies</h4>
+      <div class="formula"><span class="lbl">in order of increasing sophistication and increasing cost</span><span class="eq">1. FIXED THRESHOLD   accept (a, b) if ‖dₐ − d_b‖ &lt; <span class="keep">τ</span>
+                     a feature can match many, or none
+2. NEAREST NEIGHBOUR accept (a, NN(a)) if ‖dₐ − d_NN‖ &lt; <span class="keep">τ</span>
+                     at most one match per feature in the first image
+3. RATIO TEST        accept (a, NN₁(a)) if  d₁/d₂ &lt; <span class="keep">ρ</span>
+                     where d₁ and d₂ are the FIRST and SECOND nearest distances
+4. CROSS-CHECK       accept (a, b) only if b is a's nearest AND a is b's nearest
+                     symmetric; composes with any of the above</span></div>
+
+      <h4>Why a fixed threshold cannot work</h4>
+      <p>The useful value of <span class="keep">τ</span> is not a property of the algorithm — it is a property of the <i>neighbourhood in descriptor space</i>. A feature on a distinctive, isolated structure sits alone: its correct match may be far away in absolute terms and still be unmistakable. A feature on a repetitive texture — one window of a façade, one leaf of a tree — sits in a dense cluster of near-identical descriptors: its correct match is close, and so are twenty wrong ones. <b>One global threshold has to serve both, and no value does.</b></p>
+      <div class="formula"><span class="lbl">what the ratio measures, and why it is the right quantity</span><span class="eq"><span class="keep">ρ</span> = d₁ / d₂       nearest distance ÷ second-nearest distance,   <span class="keep">ρ</span> ∈ [0, 1]</span>
+<span class="eq">d₂ is an ESTIMATE OF THE LOCAL DENSITY of descriptor space around this feature. Divide
+by it and the test becomes "is the best match distinctly better than the runner-up?"
+rather than "is the best match close?". That is a scale-free question, and it asks the
+thing you actually want to know. The second-nearest neighbour should be taken from a
+DIFFERENT structure — in object recognition, from a different database object — so
+that it estimates the background density rather than a second view of the same thing.</span></div>
+
+      <h4>Measured against brute-force ground truth</h4>
+      <p>A synthetic matching problem with known correspondences, exactly the one the figure computes: 400 features in image A, of which 244 have a true match in image B; B also contains 250 distractors. Descriptors live in 64 dimensions; some features are distinctive and 60% are drawn near one of 14 shared "texture prototypes", so descriptor space has a realistic density variation; per-feature deformation severity is log-normal with median 0.85, so some correct matches are far apart and some wrong ones are close. Nearest-neighbour search is exhaustive, so nothing here is approximate:</p>
+      <div class="formula"><span class="lbl">precision and recall, compared at MATCHED RECALL so the comparison is fair</span><span class="eq">the nearest neighbour is the true match for 220 of the 244 matchable features (90.2%)</span>
+<span class="eq">RATIO TEST                              DISTANCE THRESHOLD at the SAME recall
+<span class="keep">ρ</span> = 0.70   P = 1.0000  R = 0.5574   <span class="keep">τ</span> = 0.7272   P = 1.0000    0 false positives
+<span class="keep">ρ</span> = 0.80   P = 1.0000  R = 0.7008   <span class="keep">τ</span> = 0.8135   P = 0.9716    5 false positives
+<span class="keep">ρ</span> = 0.90   P = 0.9565  R = 0.8115   <span class="keep">τ</span> = 0.9213   P = 0.8223   43 false positives</span>
+<span class="eq">Read the third row: at essentially the same recall the ratio test admits 9 false
+matches and the distance threshold admits 43 — nearly FIVE TIMES as many, on the same
+descriptors, from the same nearest-neighbour search. Nothing changed but the division.</span>
+<span class="eq">best F over all thresholds:   ratio test 0.8835 at <span class="keep">ρ</span> = 0.905
+                              distance    0.8326 at <span class="keep">τ</span> = 0.872</span>
+<span class="lbl">and cross-checking, which is a different kind of filter</span><span class="eq">cross-check alone         P = 0.9076   R = 0.8852   22 false positives
+ratio 0.8 alone           P = 1.0000   R = 0.7008    0 false positives
+ratio 0.8 + cross-check   P = 1.0000   R = 0.7008    0 false positives</span>
+<span class="eq">Cross-checking has HIGHER RECALL and LOWER PRECISION than a tight ratio test: it
+removes only the matches whose partner prefers somebody else, which is a weak
+condition. It composes with the ratio test at essentially no cost — on this data it
+adds nothing at <span class="keep">ρ</span> = 0.8 because the ratio test has already removed everything it
+would have — and it is worth keeping for the cases where it does bite. It is not a
+substitute for the ratio test.</span></div>
+
+      <div class="callout"><b>Where the customary <span class="keep">ρ</span> = 0.8 comes from.</b> Not from theory. It is the value at which, on large real datasets, the ratio test discards about 90% of false matches while losing about 5% of correct ones. On the synthetic problem above it gives perfect precision at 70% recall, and pushing it to 0.9 buys 11 more points of recall for 9 false matches. The right way to use it is to <b>plot the curve for your own data</b> — which the figure does — and to remember that <span class="keep">ρ</span> interacts with what follows: if §27's RANSAC will clean up afterwards, a looser <span class="keep">ρ</span> that keeps more inliers is usually better, because RANSAC's iteration count depends on the inlier <i>fraction</i> and more true matches raise it.</div>
+
+      <div class="wrong"><span class="say">A subtle bug that produces mysteriously bad results.</span> Applying the ratio test when the two nearest neighbours are <b>two views of the same structure</b> — for instance, matching against a database that contains the same object twice, or against an image with a genuine repeated element. <span class="fix">Then <code>d₂</code> is small for a perfectly good reason, the ratio is near 1, and the correct match is rejected.</span> The defence is to require the second-nearest neighbour to come from a different object, a different image, or a location far from the first — which is why serious implementations do not simply take the second element of the sorted list.</div>
+
+      <div class="viz" id="viz-ratio">
+        <div class="vhead">
+          <span class="vtitle">The ratio test against a distance threshold, with ground truth known</span>
+          <span class="vhint">slide the threshold and watch correct and incorrect match counts move; the two strategies are on the same data</span>
+        </div>
+        <div class="controls">
+          <label>strategy <select id="rt-s">
+            <option value="ratio" selected>ratio test  d₁/d₂ &lt; <span class="keep">ρ</span></option>
+            <option value="dist">distance threshold  d₁ &lt; <span class="keep">τ</span></option>
+          </select></label>
+          <label>threshold <input type="range" id="rt-t" min="0.02" max="1" step="0.01" value="0.80" /><span id="rt-tv" style="min-width:34px;display:inline-block">0.80</span></label>
+          <label><input type="checkbox" id="rt-x" /> also require cross-checking</label>
+          <label>deformation severity <input type="range" id="rt-d" min="0.25" max="1.1" step="0.05" value="0.85" /><span id="rt-dv" style="min-width:34px;display:inline-block">0.85</span></label>
+          <label>repetitive fraction <input type="range" id="rt-r" min="0" max="0.8" step="0.05" value="0.60" /><span id="rt-rv" style="min-width:34px;display:inline-block">0.60</span></label>
+        </div>
+        <svg id="ratio-svg" width="760" height="470" viewBox="0 0 760 470" role="img" aria-label="Left: the two distance distributions that the whole section is about — a histogram of the nearest-neighbour distance for features whose nearest neighbour is the true match, and the same histogram for features whose nearest neighbour is wrong, drawn on one axis so their overlap is visible. Below it the same pair of histograms for the ratio of the first to the second nearest distance, whose overlap is visibly much smaller, which is the entire argument for the ratio test in one picture. The current threshold is drawn as a movable line on whichever of the two is selected. Middle: precision and recall plotted against the threshold for both strategies on the same data, with the current operating point marked on each. Right: the precision–recall curve for both strategies, traced by sweeping the threshold across its whole range, together with a confusion count at the current setting — true positives, false positives, false negatives — and the best F-measure each strategy can reach anywhere on its curve."></svg>
+        <div class="readout" aria-live="polite" id="ratio-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 26 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ann" data-nav="Approximate nearest neighbour">
+      <h3><span class="idx">26</span> Finding the nearest neighbour without looking at everything</h3>
+      <p class="lede">Matching two images with 3000 features each means nine million distance computations. Matching one image against a database of a million images is not a bigger version of that problem, it is a different problem, and the answer is always to stop insisting on the <i>exact</i> nearest neighbour.</p>
+
+      <div class="formula"><span class="lbl">the cost, stated plainly</span><span class="eq">brute force, two images:  n·m·D  =  3000 × 3000 × 128  ≈  1.2 × 10⁹ operations
+brute force, a database:  n·M·D  with M in the hundreds of millions — impossible</span>
+<span class="eq">And the exact nearest neighbour is not even what you want: §25 is going to accept the
+match only if it is distinctly better than the runner-up, so a search that returns the
+true nearest neighbour 95% of the time costs 5% of the recall and 2% of the time.</span></div>
+
+      <table class="grid2">
+        <tr><th style="width:170px">Structure</th><th>How it works</th><th>Where it is right</th></tr>
+        <tr><td><b>k-d tree</b></td><td>Recursively split on one axis at a time, choosing the split to balance the tree. At query time descend to the leaf containing the query, then back up, visiting any subtree whose bounding box could contain something closer.</td><td>Low dimensions. In high dimensions the backtracking visits almost every leaf and it degenerates to brute force with overhead.</td></tr>
+        <tr><td><b>Best-bin-first</b></td><td>The same tree, but visit bins in order of their distance to the query using a priority queue, and <b>stop after a fixed budget</b> of leaves rather than when correctness is guaranteed.</td><td>The standard fix. Turns an exact algorithm into an approximate one with a tunable time/accuracy dial, which is the correct shape for this problem.</td></tr>
+        <tr><td><b>Randomised k-d forest</b></td><td>Build several trees, each splitting on an axis drawn at random from the few with the largest variance; search all of them with one shared priority queue.</td><td>Consistently among the best in comparative studies. The randomisation decorrelates the trees' failure modes, so a query missed by one is usually caught by another.</td></tr>
+        <tr><td><b>Hierarchical k-means</b></td><td>Cluster the descriptors, recurse inside each cluster. A query descends by comparing against cluster centres.</td><td>Very large databases; the leaves become a <b>vocabulary</b> and matching becomes text retrieval on "visual words", with an inverted index.</td></tr>
+        <tr><td><b>Locality-sensitive hashing</b></td><td>Hash functions under which near points collide with high probability. Concatenate several for precision, take the union of several such groups for recall.</td><td>Sub-linear query time with a probabilistic guarantee, and it works directly on Hamming space (§24), where the hash is just a subset of the bits.</td></tr>
+      </table>
+
+      <div class="callout"><b>The curse of dimensionality, concretely.</b> In 128 dimensions the distances from a query to all points in a random dataset concentrate: the nearest and the farthest differ by a small relative margin, so a bounding-box argument can rarely exclude a subtree and every exact structure degrades toward brute force. Real descriptors are not uniformly distributed — they lie near a much lower-dimensional manifold — which is exactly why tree methods work in practice while the worst-case theory says they cannot. When they stop working, the reason is usually that the data has become more uniform, not that the structure is broken.</div>
+
+      <div class="wrong"><span class="say">The ordering mistake.</span> Applying the ratio test to the results of an approximate search without checking what the search returned. <span class="fix">If the approximate search misses the true nearest neighbour, then <code>d₁</code> is a wrong match's distance and <code>d₂</code> may be the true match's — so the ratio can be small for entirely the wrong reason, and the test <i>endorses</i> the error.</span> The standard mitigation is to retrieve <code>k ≈ 2–10</code> approximate neighbours rather than 2, and to apply the ratio test within that list, which makes the failure much less likely without costing another pass.</div>
+    </section>
+
+    <!-- ═══ 27 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ransac" data-nav="RANSAC">
+      <h3><span class="idx">27</span> RANSAC: fitting a model when a third of the data is nonsense</h3>
+      <p class="lede">§25 hands over a set of putative matches of which perhaps 60–80% are right. Least squares fitted to that set is garbage, because a squared-error objective lets one outlier at distance <code>d</code> outvote <code>d²</code> good points. The answer is not a better matcher. It is an estimator that reads the data as a <b>hypothesis generator</b> rather than as measurements.</p>
+
+      <div class="formula"><span class="lbl">the algorithm, complete</span><span class="eq">given data D, a model needing s points to determine it, a tolerance <span class="keep">τ</span>, and N:
+
+best ← ∅
+repeat N times:
+    S  ← s points drawn uniformly at random from D, WITHOUT replacement
+    M  ← the model determined exactly by S
+    I  ← { p ∈ D : residual(p, M) &lt; <span class="keep">τ</span> }              the CONSENSUS SET
+    if |I| &gt; |best| :  best ← I
+finally: re-fit the model to ALL of best, by least squares</span>
+<span class="eq">Note what is NOT here: no weights, no robust loss, no iteration to convergence. The
+model is determined EXACTLY from a MINIMAL sample, so the fit is either right or
+completely wrong, and the consensus count is the only thing that decides between them.
+That is what makes it tolerate an arbitrary fraction of outliers rather than a small
+one — the breakdown point is not 50%, it is however low the inlier rate can go before
+N becomes unaffordable.</span></div>
+
+      <h4>How many iterations, and the formula's exact meaning</h4>
+      <div class="formula"><span class="lbl">the derivation, three lines</span><span class="eq">w  = the inlier fraction of D
+wˢ = P(all s points of one minimal sample are inliers)     — sampling with replacement
+(1 − wˢ)ᴺ = P(none of N samples is all-inlier)
+1 − (1 − wˢ)ᴺ = p  ⇒</span>
+<span class="eq">        N  =  log(1 − p) / log(1 − wˢ)</span>
+<span class="lbl">what p is, precisely — and it is NOT the probability of success</span><span class="eq">p = P(at least one minimal sample is drawn entirely from inliers).
+It is NOT P(RANSAC returns the right model). The second is strictly smaller, and the
+gap is measured below. Papers and textbooks routinely conflate them.</span></div>
+
+      <div class="formula"><span class="lbl">the formula as a pure probability statement, against 200 000 Monte-Carlo draws per row</span><span class="eq">  w   s      p      N exact   N = ⌈·⌉   predicted    measured    difference
+0.50   2   0.990      16.01       17     0.99248     0.99247    −0.00002
+0.50   4   0.990      71.36       72     0.99041     0.99035    −0.00006
+0.30   4   0.990     566.23      567     0.99006     0.99013    +0.00007
+0.20   4   0.990    2875.93     2876     0.99000     0.98993    −0.00007
+0.60   2   0.950       6.71        7     0.95602     0.95605    +0.00003
+0.70   4   0.999      25.16       26     0.99921     0.99908    −0.00013
+0.40   3   0.990      69.63       70     0.99024     0.99005    −0.00019
+0.50   8   0.990    1176.62     1177     0.99001     0.98996    −0.00005</span>
+<span class="eq">Agreement to 2 × 10⁻⁴ across the board. The formula is exact for what it claims.</span></div>
+
+      <div class="callout"><b>And now the gap the formula hides.</b> Run <i>actual</i> RANSAC — draw the samples, fit the lines, count the consensus, keep the best — on a line-fitting problem with 100 points, and compare the fraction of runs in which the recovered line is within 3° and 0.05 of the truth against the fraction in which a clean minimal sample was ever drawn. This is the figure's own code, 2000 complete runs per row, <span class="keep">τ</span> = 0.05, noise <span class="keep">σ</span> = 0.02:
+      <div class="formula" style="margin-top:8px"><span class="eq">  w     N    formula p   measured P(clean sample)   P(correct model)   P(correct | clean)
+0.80    5     0.9940            0.9935                  0.9630             0.9678
+0.70    7     0.9910            0.9925                  0.9530             0.9592
+0.60   11     0.9926            0.9930                  0.9690             0.9723
+0.50   17     0.9925            0.9890                  0.9715             0.9778
+0.45   21     0.9914            0.9870                  0.9715             0.9777
+0.40   27     0.9910            0.9905                  0.9790             0.9823
+0.30   49     0.9902            0.9910                  0.9800             0.9834</span></div>
+      The measured probability of drawing a clean sample matches the formula to about 0.004 — the residual is sampling <b>without</b> replacement from a finite set, which the formula's <code>wˢ</code> ignores. But the probability of actually recovering the right model is <b>1 to 4 points lower</b> at every inlier rate, and the conditional column says why: even given a clean sample, the model is right only 96–98% of the time. Two inliers that happen to lie close together define a badly conditioned line whose consensus set is wrong. <b>A clean minimal sample is necessary and not sufficient</b>, and no choice of <code>N</code> fixes that. Note also the direction of the effect: the shortfall is <i>largest</i> at high <code>w</code>, where <code>N</code> is smallest and there are fewest chances for a well-conditioned sample to turn up.</div>
+
+      <h4>What the formula assumes, every one of which can fail</h4>
+      <table class="grid2">
+        <tr><th style="width:170px">Assumption</th><th>What happens when it fails</th></tr>
+        <tr><td><b><code>w</code> is known</b></td><td>It never is. The standard fix is <b>adaptive</b>: start with a pessimistic <code>w</code>, and every time a better consensus set is found, set <code>w = |best|/|D|</code> and recompute <code>N</code>. <code>N</code> then falls dramatically during the run — often from thousands to tens — and this is the single most valuable practical modification.</td></tr>
+        <tr><td><b>Inliers are drawn uniformly</b></td><td>They are not: matches cluster on textured regions. A minimal sample of two nearby points is <i>clean</i> and useless. Fix by sampling with a spatial constraint, or by preferring samples whose points are far apart.</td></tr>
+        <tr><td><b>A clean sample gives the right model</b></td><td>Measured above at 96–98%. Degenerate configurations — collinear points for a homography, coplanar points for a fundamental matrix — are clean and catastrophic, and must be detected explicitly.</td></tr>
+        <tr><td><b>Outliers are unstructured</b></td><td><b>The most dangerous failure.</b> If the outliers themselves fit a model — a repeated façade, a reflection, a second plane in the scene — they form a consensus set of their own that can beat the true one. RANSAC will confidently return it. No amount of iteration helps; the fix is a prior, a second model, or more scene knowledge.</td></tr>
+        <tr><td><b><span class="keep">τ</span> is right</b></td><td>Too small and true inliers are rejected, driving <code>w</code> down and <code>N</code> up. Too large and outliers join every consensus set, so the counts stop discriminating. <span class="keep">τ</span> should follow from the noise: for Gaussian residuals of standard deviation <span class="keep">σ</span>, <span class="keep">τ</span> ≈ 2–3<span class="keep">σ</span> captures 95–99% of inliers.</td></tr>
+      </table>
+
+      <div class="formula"><span class="lbl">why the sample size s matters more than anything else</span><span class="eq">N at p = 0.99, w = 0.5:     s = 2 → 17      s = 4 → 72      s = 8 → 1177
+N at p = 0.99, s = 4:       w = 0.5 → 72    w = 0.3 → 567   w = 0.2 → 2876</span>
+<span class="eq">N grows EXPONENTIALLY in s and polynomially badly in 1/w. Which is why: a line needs
+2 points, a similarity 2, an affine map 3, a homography 4 (part 6), and a fundamental
+matrix 7 or 8 (part 7) — and why the 5-point relative-pose algorithm was worth its
+considerable complexity, because dropping from 7 to 5 divides N by roughly w⁻².</span></div>
+
+      <div class="callout"><b>Where this fits in the pipeline.</b> This page produces the correspondences and owns the robust-fitting machinery. The <b>models</b> belong elsewhere: <a href="../index.html">Part 6</a> owns homography estimation and the direct linear transform that solves for it from four correspondences; <a href="../index.html">Part 7</a> owns the fundamental and essential matrices and the epipolar constraint that scores them. When §27 says "the model determined exactly by <code>S</code>", that step is theirs. What is <i>not</i> theirs is the observation that no amount of care in the estimator substitutes for the sampling: the reason these problems are solved by random sampling at all is that §25's output cannot be made clean.</div>
+
+      <div class="viz" id="viz-ransac">
+        <div class="vhead">
+          <span class="vtitle">RANSAC iterating, with the iteration-count formula checked against measurement</span>
+          <span class="vhint">step through the hypotheses; the right panel runs the whole thing hundreds of times and compares the formula's prediction with the measured rate</span>
+        </div>
+        <div class="controls">
+          <label>inlier fraction w <input type="range" id="rn-w" min="0.2" max="0.9" step="0.05" value="0.45" /><span id="rn-wv" style="min-width:32px;display:inline-block">0.45</span></label>
+          <label>iteration <input type="range" id="rn-i" min="1" max="120" step="1" value="1" /><span id="rn-iv" style="min-width:26px;display:inline-block">1</span></label>
+          <label>tolerance <span class="keep">τ</span> <input type="range" id="rn-t" min="0.01" max="0.15" step="0.005" value="0.050" /><span id="rn-tv" style="min-width:36px;display:inline-block">0.050</span></label>
+          <label>target p <input type="range" id="rn-p" min="0.80" max="0.999" step="0.005" value="0.990" /><span id="rn-pv" style="min-width:36px;display:inline-block">0.990</span></label>
+          <label><input type="checkbox" id="rn-a" /> adaptive N (re-estimate w from the best consensus)</label>
+        </div>
+        <svg id="ransac-svg" width="760" height="480" viewBox="0 0 760 480" role="img" aria-label="Left: a two-dimensional point set containing a line's worth of inliers, corrupted with noise, plus uniformly scattered outliers whose share is set by the inlier-fraction slider. The two points of the current minimal sample are ringed, the line they determine is drawn with a band of the current tolerance either side of it, and every point inside the band is coloured as an inlier of this hypothesis. The best hypothesis so far is drawn as a second, heavier line, together with the true line for reference. Middle: the consensus count of each hypothesis plotted against the iteration number as a scatter, with the running best drawn as a staircase above it and the true inlier count marked as a horizontal line, so the reader can see the search finding a good sample and then never improving. The iteration count the formula demands at the current inlier fraction and target probability is drawn as a vertical line, and if adaptive updating is enabled a second, falling line shows how that demand collapses as the estimate of the inlier fraction improves. Right: the formula checked by measurement — several hundred independent complete runs at the current settings, reporting the fraction in which some minimal sample was drawn entirely from inliers against the formula's prediction, and separately the fraction in which the recovered line was actually correct, which is consistently lower, with the gap attributed to clean but badly conditioned samples."></svg>
+        <div class="readout" aria-live="polite" id="ransac-readout"></div>
+      </div>
+    </section>
+
+    <nav class="pager" aria-label="Features &amp; Matching series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="scale-space.html">← Scale Space &amp; Blob Detection</a>
+      <a href="../features.html" style="color:var(--muted)">Features &amp; Matching · overview</a>
+      <a href="../features.html">Features &amp; Matching · overview →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../vision-viz.js"></script>
+<script src="../features.viz.js"></script>
+</body>
+</html>

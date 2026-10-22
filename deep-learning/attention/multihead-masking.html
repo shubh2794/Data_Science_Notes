@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Multi-Head Attention &amp; Masking</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to the other pages of the series */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../attention.html">Attention</a> · part 3 of 6</p>
+      <h1>Multi-Head Attention &amp; Masking</h1>
+      <p>Completing the layer: why several heads beat one, the head-dimension trade at fixed width, concatenation and the output projection, causal and padding masks, why −∞ and a large negative number are not interchangeable, and the attention backward pass audited against finite differences.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Attention</span>
+        <span class="pill">Heads · head dimension · concat & project · causal/padding masks · −∞ · backward</span>
+      </div>
+    </header>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="multihead" data-nav="Multi-head: why more than one">
+      <h3><span class="idx">12</span> Multi-head attention: why one head is not enough, stated as a limitation</h3>
+      <p class="lede"><b>Multi-head attention runs <code>h</code> independent attention operations side by side, each with its own <code>W_Q</code>, <code>W_K</code>, <code>W_V</code> on a <code>dₖ = d/h</code>-wide slice, and concatenates their outputs. It is needed because one head can produce only one weighted average per position — so a position that must read two different things at once needs two heads.</b> The usual justification — "different heads capture different relationships" — is true and unfalsifiable as stated; the sharper version is that <b>capacity argument</b>, and it predicts exactly when adding a head helps and when it does not.</p>
+
+      <div class="formula"><span class="lbl">what one head can and cannot produce</span><span class="eq">   zᵢ  =  ∑ⱼ αᵢⱼ vⱼ        αᵢⱼ ≥ 0,  ∑ⱼ αᵢⱼ = 1
+
+For output position i, ONE head produces exactly ONE convex combination of
+the value rows. That is one point in the convex hull of {v₁ … v_n}.
+
+So if position i needs to report TWO unrelated facts about two DIFFERENT
+positions — "the token before me" AND "the first token of the sentence" —
+one head must place its single weight vector somewhere between them, and
+the two facts arrive AVERAGED, in the same d_v-dimensional slot, with no way
+for a downstream position-wise layer to separate them again — unless the
+two values happen to occupy separate subspaces, which the fourth bullet
+below returns to.
+
+h heads produce h SEPARATE convex combinations, written into h DISJOINT
+blocks of the concatenated output. Two facts, two slots, no interference.</span></div>
+
+      <p>The reason "just make the single head wider" does not fix it is worth stating explicitly: widening a head widens <code>d_v</code>, giving each value more room, but it does not add a second set of <b>weights</b>. The bottleneck is the single row <code>αᵢ</code>, not the width of what it multiplies. It is a <b>selection</b> bottleneck, not a <b>capacity</b> bottleneck, and more heads is the direct relief; the only indirect one — packing two facts into orthogonal subspaces of a single head's value — is expensive and fragile, as the measurement below shows.</p>
+
+      <h4>The measurement</h4>
+      <p>A task with a controllable number of relations makes the prediction testable. At every position <code>t</code> of a random symbol sequence, the model must emit <b>three</b> things at once: the token at <code>t−1</code>, the token at position <code>0</code>, and the token at <code>t</code> itself. Nothing else changes — same width, same optimiser, same seeds, only the head count.</p>
+
+      <div class="formula"><span class="lbl">measured by the figure below — vocabulary 5, length 6, width 10, d<span class="keep">ₖ</span> 4, batch 16, 200 Adam steps at 0.04; chance = ln 5 = 1.6094</span><span class="eq">  seed    1 head    2 heads     3 heads     4 heads
+    1     0.761     0.357      1.18e−3     2.30e−5
+    2     0.750     0.110      3.91e−2     6.22e−5
+    3     0.770     0.307      3.78e−4     2.98e−5
+    4     0.765     0.316      3.92e−5     2.08e−5      ← the figure's default
+    5     0.759     0.190      4.21e−5     6.66e−5
+    6     0.767     0.320      1.86e−1     2.36e−5
+
+The one-head column is 0.75 ± 0.01 across EVERY seed. That is not an
+optimisation failure with a lucky escape somewhere; it is a ceiling, and
+it is the ceiling §12's argument predicts.</span>
+<span class="lbl">what the three heads attend to, seed 4 — mean weight over 120 held-out sequences</span><span class="eq">          on t−1     on position 0     on t
+  head 0   0.9970        0.2001        0.0003     →  "the previous token"
+  head 1   0.0573        0.0475        0.8568     →  "myself"
+  head 2   0.2188        0.9653        0.0133     →  "the first token"
+
+Three relations, three heads, one each. Nothing in the loss asked for that
+split; it is what minimising the loss produced.</span></div>
+
+      <ul class="notes">
+        <li><b>The step from one head to three is the whole effect, and the step from three to four is nearly nothing.</b> That is what a selection bottleneck looks like: adding heads helps sharply until there is one per relation the task needs, and then stops. It is not a smooth capacity curve — it is four orders of magnitude from one head to three, and none from three to four.</li>
+        <li><b>Three heads is the minimum, not always the sufficient number.</b> On four of the six seeds three heads solves the task; on seeds 2 and 6 it stalls at <code>3.9e−2</code> and <code>1.9e−1</code> and only four heads gets there. The capacity argument gives a <i>lower bound</i> on the head count and says nothing about whether the optimiser will find the assignment — which is a good reason for models to carry more heads than the minimum, and part of why head pruning so often removes a large fraction of them with little loss.</li>
+        <li><b>Two heads gets part of the way, which is informative rather than sloppy.</b> The position embedding makes the value vector at position <code>t</code> distinguishable from the one at <code>t−1</code>, so a head that splits its weight between two positions can, in principle, write them into <i>orthogonal subspaces</i> of its own output and be decoded again. That is an expensive, fragile solution and the loss shows it: 0.11–0.36 against <code>4e−5</code>.</li>
+        <li><b>The clean one-relation-per-head split is common but not guaranteed.</b> Three of the six seeds give one head per relation; the others put two heads on the same relation and pay for it in loss. Heads are interchangeable and the loss does not care which does what — <b>the specialisation is real but its assignment is arbitrary</b>, which is exactly the caveat that interpretability work on real models has to live with (§33).</li>
+      </ul>
+
+      <div class="viz" id="viz-hd">
+        <div class="vhead">
+          <span class="vtitle">Three relations, one task: train it live and watch the heads divide the work</span>
+          <span class="vhint">press <b>train</b> and then move the head slider — the loss falls off a cliff between one head and three, and the attention maps show which head took which relation</span>
+        </div>
+        <div class="controls">
+          <label>heads shown <input type="range" id="hd-h" min="1" max="4" step="1" value="3" /><span id="hd-hv" style="min-width:16px;display:inline-block">3</span></label>
+          <label>seed <input type="range" id="hd-s" min="1" max="6" step="1" value="4" /><span id="hd-sv" style="min-width:16px;display:inline-block">4</span></label>
+          <label>steps <select id="hd-n">
+            <option value="100">100</option><option value="200" selected>200</option><option value="350">350</option>
+          </select></label>
+          <button id="hd-go" type="button">train</button>
+        </div>
+        <svg id="hd-svg" width="760" height="430" viewBox="0 0 760 430" role="img" aria-label="Upper row: one causal attention map per head of the trained model, drawn as a lower-triangular heat map with the query position down and the key position across. In a solved model one map has its mass on the first sub-diagonal, one has it entirely in the leftmost column and one is concentrated on the main diagonal, which is the previous-token relation, the first-token relation and the identity relation respectively; beneath each map the mean weight it places on each of those three targets is printed, and the largest of the three names the head. Lower left: the training loss against step for every head count from one to the selected one, on a logarithmic vertical axis, showing the one-head curve flattening well above the others and the three-head curve continuing down by orders of magnitude. Lower right: the final loss against head count as a bar chart with a horizontal reference at the chance level, showing a sharp fall between one and three heads and a flat step from three to four. Changing the seed retrains and occasionally shows two heads taking the same relation at the same final loss, which the readout names when it happens. The readout prints the final loss at each head count, the ratio between one head and the selected count, and the mean attention weight each shown head places on each of the three relations."></svg>
+        <div class="readout" aria-live="polite" id="hd-readout"></div>
+      </div>
+
+      <div class="wrong"><span class="say">The claim to be careful with.</span> "Head <i>k</i> is the syntax head." <span class="fix">Heads are only defined up to permutation, and the assignment is a property of the run, not of the architecture.</span> Retrain with a different seed and the same relation appears in a different slot, or split across two. Statements of the form "<i>some</i> head implements X, reproducibly across seeds" are well supported; statements about a numbered head in a particular checkpoint are about that checkpoint.</div>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="headdim" data-nav="The head-dimension trade">
+      <h3><span class="idx">13</span> The head-dimension trade: <code>h·dₖ = d</code>, and what it costs each head</h3>
+      <p class="lede">Splitting a width-<code>d</code> block into <code>h</code> heads of width <code>d/h</code> keeps the parameter count and the arithmetic almost exactly constant. It is not free — each head gets a strictly weaker relation to express — and the constraint is a rank.</p>
+
+      <div class="formula"><span class="lbl">the constraint, and where it binds</span><span class="eq">Standard choice:   dₖ = d_v = d / h        so    h·dₖ = d
+
+ parameters   d·dₖ·(h+g) + d·d_v·(g+h)  =  4d²  when g = h    — INDEPENDENT of h
+ quadratic
+ MACs         2 n² · h·dₖ  =  2 n² d                          — INDEPENDENT of h
+
+So h is FREE in both budgets. What is not free:
+
+ head j's score matrix is   Sⱼ = X (W_Qʲ W_Kʲᵀ) Xᵀ / √dₖ
+                                  └──────┬──────┘
+                                    Mⱼ, a (d × d) matrix with
+
+                              rank(Mⱼ)  ≤  dₖ  =  d/h
+
+ The relation ONE head can express is a bilinear form of rank at most d/h.
+ Doubling h halves that rank. At h = 32, d = 4096 the rank is 128 — one
+ thirty-second of what an unconstrained (d × d) form could express.</span></div>
+
+      <p>So the trade is: <b><code>h</code> relations of rank <code>d/h</code> each, against one relation of rank <code>d</code>.</b> The total rank across heads, <code>h · (d/h) = d</code>, is the same either way — which is why the arithmetic does not change — but the <i>partition</i> is different, and it is the partition that matters, because §12 showed the binding constraint is the number of separate weight rows, not the total rank.</p>
+
+      <table class="grid2">
+        <tr><th>choice</th><th>what it buys</th><th>what it costs</th><th>where it shows up</th></tr>
+        <tr><td><b>few, wide heads</b><br><code>h</code> small, <code>dₖ</code> large</td><td>each head can express a high-rank relation, and each head's single convex combination carries a wide value vector (<code>d_v = d/h</code> is large)</td><td>few independent selections per layer; §12's bottleneck binds</td><td>early designs, including the single-head seq2seq attention of §02</td></tr>
+        <tr><td><b>many, narrow heads</b><br><code>h</code> large, <code>dₖ</code> small</td><td>many independent selections; more relations per layer</td><td>each relation is low rank; heads become individually prunable and individually weak</td><td>most modern models sit at <code>dₖ = 64</code> or <code>128</code> regardless of <code>d</code>, so <code>h</code> grows with width</td></tr>
+        <tr class="tot"><td><b>fixed <code>dₖ</code>, <code>h = d/dₖ</code></b></td><td>the rank per head is held constant as the model is scaled up, and only the <i>number</i> of relations grows</td><td>nothing obvious — which is why nearly every large model does this</td><td><code>dₖ = 128</code> at <code>d</code> = 4096, 8192 and 16384 alike: <code>h</code> = 32, 64, 128</td></tr>
+      </table>
+
+      <p>That last row is a real empirical regularity and it is worth naming. Model families do not scale <code>dₖ</code> with <code>d</code>; they hold it at 64 or 128 and let <code>h</code> absorb the growth. Read through the rank argument, that says: <b>as models get wider, they do not want richer individual relations, they want more of them.</b> It is also convenient — a fixed <code>dₖ</code> keeps the <code>√dₖ</code> statistics of §05 and the kernel tiling of §31 unchanged across a whole family.</p>
+
+      <div class="viz" id="viz-ht">
+        <div class="vhead">
+          <span class="vtitle">Sweep the head count at fixed width: what stays constant and what does not</span>
+          <span class="vhint">the two flat lines are the budgets and the falling line is the rank — that is the entire trade, in one picture</span>
+        </div>
+        <div class="controls">
+          <label>d_model <select id="ht-d">
+            <option value="512">512</option><option value="768" selected>768</option>
+            <option value="4096">4096</option><option value="8192">8192</option>
+          </select></label>
+          <label>sequence n <input type="range" id="ht-n" min="7" max="15" step="1" value="10" /><span id="ht-nv" style="min-width:46px;display:inline-block">1024</span></label>
+          <label>heads h <input type="range" id="ht-h" min="0" max="7" step="1" value="3" /><span id="ht-hv" style="min-width:22px;display:inline-block">8</span></label>
+          <label>measure <select id="ht-m">
+            <option value="rank" selected>effective rank of one head's relation</option>
+            <option value="cover">how much of a target relation h heads can cover</option>
+          </select></label>
+        </div>
+        <svg id="ht-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Left panel: four quantities plotted against head count on logarithmic axes at fixed model width — the block's parameter count, the quadratic multiply-accumulate count, the head dimension, and the rank bound of a single head's bilinear form. The first two are exactly flat, confirming that the head count is free in both budgets, and the last two fall with slope minus one. A vertical rule marks the selected head count and the four values there are printed. Right panel: a measured version of the rank claim. A target relation matrix of full rank is approximated by the sum of h rank-d-over-h bilinear forms obtained by truncated eigendecomposition, and the relative residual of that approximation is plotted against head count; because the total rank is conserved the residual is almost unchanged as the heads are subdivided, which is the point that the partition rather than the total is what changes. Beneath it the singular-value spectrum of a single head's learned bilinear form is drawn, truncated exactly at the head dimension, so the discarded tail is visible. The readout gives the head dimension, the rank bound, the parameter and multiply-accumulate counts, the ratio of each against the single-head configuration, and the measured approximation residual."></svg>
+        <div class="readout" aria-live="polite" id="ht-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="concat" data-nav="Concat and project">
+      <h3><span class="idx">14</span> Concat-and-project: what <code>W_O</code> is actually doing</h3>
+      <p class="lede"><b>The last step of a multi-head block concatenates the <code>h</code> head outputs into one <code>(n × h·d_v)</code> matrix and multiplies by <code>W_O</code> to get back to width <code>d</code>. Because a concatenation times a matrix is a sum of blocks times sub-matrices, this is the same as adding up <code>h</code> per-head contributions, each with its own <code>(d_v × d)</code> slice of <code>W_O</code>.</b> That looks like plumbing, but cutting <code>W_O</code> into blocks is what makes the block output a <b>sum of per-head contributions</b>, each with its own private output matrix, and every statement about "what a head writes into the residual stream" follows from that one rewriting.</p>
+
+      <div class="formula"><span class="lbl">the rewriting, in three lines</span><span class="eq">   Y  =  [ Z₁ | Z₂ | … | Z_h ] · W_O          W_O is (h·d_v × d)
+
+Cut W_O into h row-blocks of d_v rows each, W_O = [ W_O¹ ; W_O² ; … ; W_Oʰ ]:
+
+   Y  =  ∑ⱼ  Zⱼ · W_Oʲ        each W_Oʲ is (d_v × d)
+
+and substituting Zⱼ = Aⱼ Vⱼ = Aⱼ X W_Vʲ:
+
+   Y  =  ∑ⱼ  Aⱼ · X · ( W_Vʲ W_Oʲ )
+             ─┬─       └─────┬─────┘
+              │              the head's OUTPUT–VALUE matrix, (d × d),
+              │              rank ≤ d_v — one object, not two
+              the head's MIXING matrix, (n × n), rank ≤ n</span>
+<span class="lbl">what that buys</span><span class="eq">1 · A head is TWO low-rank matrices and nothing else:
+        W_Q W_Kᵀ   decides WHERE it reads from      rank ≤ dₖ
+        W_V W_O    decides WHAT it writes           rank ≤ d_v
+    Everything a head does factors through those two, and both are
+    invariant to the arbitrary basis inside the head. Interpretability
+    work reads these two products rather than W_Q and W_K separately,
+    because only the products are well defined (§33).
+
+2 · The heads are ADDITIVE. They do not interact inside the block at all
+    — no head can see another head's output before W_O. Interaction
+    happens only in the NEXT layer, through the FFN and the next
+    attention. "Heads compose across layers, not within one."
+
+3 · Deleting a head is deleting one term of a sum. That is why head
+    pruning is trivial to implement and why measuring a head's causal
+    effect by ablation is meaningful: the arithmetic really is a sum.</span></div>
+
+      <p>The second point is the one people get wrong most often, and it has a testable consequence: <b>within a single attention block, the heads are exactly parallel and non-interacting.</b> A claim like "head 3 uses head 7's output" cannot be about one layer; it is necessarily about a path through at least two. The figure makes the additivity concrete by reconstructing the block output as a running sum of head terms.</p>
+
+      <div class="viz" id="viz-wo">
+        <div class="vhead">
+          <span class="vtitle">The block output as a running sum of per-head terms</span>
+          <span class="vhint">add heads one at a time and watch the reconstruction converge — the residual reaches exactly zero at the last head, because the identity is exact, not an approximation</span>
+        </div>
+        <div class="controls">
+          <label>heads included <input type="range" id="wo-k" min="0" max="6" step="1" value="3" /><span id="wo-kv" style="min-width:16px;display:inline-block">3</span></label>
+          <label>total heads h <input type="range" id="wo-h" min="2" max="6" step="1" value="6" /><span id="wo-hv" style="min-width:16px;display:inline-block">6</span></label>
+          <label>sequence n <input type="range" id="wo-n" min="4" max="14" step="1" value="9" /><span id="wo-nv" style="min-width:20px;display:inline-block">9</span></label>
+          <label>order <select id="wo-o">
+            <option value="idx" selected>head order 1, 2, 3 …</option>
+            <option value="norm">largest contribution first</option>
+          </select></label>
+        </div>
+        <svg id="wo-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Left: the per-head contribution matrices, each drawn as a small grid of coloured cells one row per token, in the selected order, with the ones currently included in the running sum outlined and the ones excluded dimmed. Middle: the running sum of the included contributions and, beneath it, the true block output computed by the ordinary concatenate-and-project route; when every head is included the two are identical and the difference panel below them is uniformly blank. Right: the relative reconstruction error plotted against the number of heads included, on a logarithmic vertical axis, falling from one at zero heads to floating-point round-off at the full count, with a marker at the current setting. Selecting the largest-contribution-first ordering makes the curve fall faster at the beginning by an amount that measures how unevenly the heads share the work — with random weights of identical scale the heads are nearly equal and the two orderings nearly coincide: the readout prints the fraction of the output norm carried by the single largest head and by the smallest. The readout also prints the maximum absolute difference between the running sum at full inclusion and the true output, which is the exactness of the identity, and the rank bound of each head's value-output matrix."></svg>
+        <div class="readout" aria-live="polite" id="wo-readout"></div>
+      </div>
+
+      <div class="callout"><b>Where this is going.</b> The decomposition <code>Y = ∑ⱼ Aⱼ X (W_Vʲ W_Oʲ)</code> is the form in which §22's rank-collapse result is proved, the form in which §33's induction-head circuits are described, and the form in which head pruning and head-level interpretability are defined. It is worth being able to write it from memory. <a href="../transformers.html">The Transformer page</a> adds the residual stream around it, at which point "what a head writes" becomes literally an addition to a running sum that every later layer reads.</div>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="mask" data-nav="Masking: causal and padding">
+      <h3><span class="idx">15</span> Masking: the two kinds, and what each is actually protecting</h3>
+      <p class="lede">A mask forbids some query–key pairs. There are two of them in practice, they protect against completely different failures, and they are almost always applied together and combined by addition.</p>
+
+      <div class="cards">
+        <div class="box warn"><div class="n">causal / look-ahead</div><div class="t">Protects the training objective</div><div class="g">Position <code>i</code> may read only <code>j ≤ i</code>. Without it, a language model trained to predict token <code>i+1</code> can simply <b>read</b> token <code>i+1</code> — the loss goes to zero and the model has learned nothing. It is not a modelling choice; it is what makes the objective non-trivial.</div></div>
+        <div class="box plain"><div class="n">padding</div><div class="t">Protects the batch</div><div class="g">Sequences in a batch have different lengths, so short ones are padded to the longest. Padding tokens are an artefact of the batching, not data. Without a mask they contribute to every weighted sum, and <b>a model's output for a sentence would depend on which other sentences were in its batch</b>.</div></div>
+        <div class="box plain"><div class="n">window / sparsity</div><div class="t">Protects the budget</div><div class="g">A structural mask that forbids far-away pairs to save the <code>n²</code> cost (§29). Mechanically identical to the other two; motivated by arithmetic rather than by correctness.</div></div>
+      </div>
+
+      <div class="formula"><span class="lbl">the implementation, and the two properties that make it work</span><span class="eq">   masked scores   S′ = S + M          M ∈ {0, −∞}, ADDED, never multiplied
+   weights         A  = softmax(S′)     rows still sum to 1 over what survives
+
+why ADDITIVE and −∞ rather than multiplying A by a 0/1 mask afterwards:
+
+  ·  softmax( … , −∞ , … )  gives EXACTLY 0 at that entry, and the
+     remaining entries are renormalised to sum to 1 automatically.
+  ·  multiplying AFTER the softmax gives zeros too, but the surviving
+     weights no longer sum to 1 — the output shrinks by the fraction of
+     mass that was removed, which is a different (and length-dependent)
+     operation. It is a real bug and it does not throw.
+
+combining two masks: M = M_causal + M_pad, and −∞ + 0 = −∞, −∞ + −∞ = −∞.
+Addition is the right combinator because "forbidden" is absorbing.</span>
+<span class="lbl">§07's row again, now with key 3 forbidden — the numbers</span><span class="eq">   scaled scores        [ 0.7071  1.4142  2.1213 ]
+   + mask [0 0 −∞]      [ 0.7071  1.4142    −∞   ]
+   exp                  [ 2.0281  4.1133    0    ]        exp(−∞) = 0 exactly
+   sum                  6.1414                            key 3 contributes nothing
+   α                    [ 0.330  0.670  0.000 ]           sum = 1.000
+
+   unmasked α was       [ 0.140  0.284  0.576 ]
+
+   The surviving weights are the old ones RENORMALISED: 0.140 / (1 − 0.576) = 0.330
+   and 0.284 / (1 − 0.576) = 0.670, so their ratio 0.140 : 0.284 = 0.493 is
+   unchanged. That is what "added before the softmax" buys.
+
+   output   z = 0.330·[1 0] + 0.670·[0 1] = [ 0.330  0.670 ]     (was [1.292 1.436])
+
+   The BUG, for comparison — multiply α by [1 1 0] AFTER the softmax:
+   α_bug = [ 0.140  0.284  0 ],  sum = 0.424,  z_bug = [ 0.140  0.284 ]
+   — the output has shrunk by the 57.6% of mass that was removed, and by a
+   different factor in every row.</span>
+<span class="lbl">shapes, since this is where broadcasting bugs live</span><span class="eq">causal    (n_q × n_k)     the same for every sequence in the batch and
+                          for every head — build it once, broadcast
+padding   (N × 1 × n_k)   per SEQUENCE, broadcast over queries and heads;
+                          it depends on j (the key) and not on i (the query)
+combined  (N × n_q × n_k) or broadcastable to it
+
+The padding mask has no query axis because a padded QUERY row does not need
+protecting — its output is computed and then discarded. Silencing it as a
+KEY is what matters. Implementations that build a square padding mask and
+mask the query axis too create ALL-MASKED ROWS, which is §16's problem.</span></div>
+
+      <div class="viz" id="viz-ms">
+        <div class="vhead">
+          <span class="vtitle">The masks, drawn, combined, and applied</span>
+          <span class="vhint">switch to <b>multiply after the softmax</b> to see the bug that does not throw: the rows stop summing to one and the readout says by how much</span>
+        </div>
+        <div class="controls">
+          <label>sequence n <input type="range" id="ms-n" min="5" max="18" step="1" value="12" /><span id="ms-nv" style="min-width:20px;display:inline-block">12</span></label>
+          <label>real tokens <input type="range" id="ms-v" min="2" max="18" step="1" value="8" /><span id="ms-vv" style="min-width:20px;display:inline-block">8</span></label>
+          <label>mask <select id="ms-m">
+            <option value="none">none</option>
+            <option value="causal">causal only</option>
+            <option value="pad">padding only</option>
+            <option value="both" selected>causal + padding</option>
+          </select></label>
+          <label>applied <select id="ms-h">
+            <option value="add" selected>added before the softmax (correct)</option>
+            <option value="mul">multiplied after the softmax (the bug)</option>
+          </select></label>
+        </div>
+        <svg id="ms-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Four heat maps in a row: the raw scores, the causal mask, the padding mask, and their sum, with forbidden entries hatched. Beneath them the resulting attention weights, and beside those a bar per query row giving that row's total weight. Under the correct additive application every bar is exactly one and the printed maximum deviation from one is at floating-point round-off. Switching to the multiply-after-the-softmax option leaves the same entries at zero but the row totals fall below one by exactly the fraction of mass the mask removed, and under a causal mask the shortest bars are the EARLIEST query positions, because an early position is allowed to read almost nothing and therefore loses almost all of its mass; the readout prints the smallest and largest row total and the resulting change in the norm of the output. A separate small panel plots the row total against query index for both applications, so that the buggy one is legible as a monotone trend rising from near zero at the start of the sequence towards one at the end, rather than as noise; the correct application is a flat line at exactly one."></svg>
+        <div class="readout" aria-live="polite" id="ms-readout"></div>
+      </div>
+
+      <div class="callout"><b>The causal mask is not only a mask — it is also the reason the KV cache works.</b> Because position <code>i</code> can never read position <code>j &gt; i</code>, the key and value of a token are <b>final the moment it is produced</b>: no future token will change them. Without causality, appending a token would invalidate every previously computed attention weight and generation would cost <code>O(n²)</code> per step instead of <code>O(n)</code>. §24 builds on this directly. It is also why a bidirectional encoder cannot be decoded incrementally at all.</div>
+    </section>
+
+    <!-- ═══ 16 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="maskconst" data-nav="−∞ against a large negative number">
+      <h3><span class="idx">16</span> <code>−∞</code> against "a large negative number": the detail that fails quietly</h3>
+      <p class="lede"><b>The mask is implemented by adding <code>−∞</code> to the forbidden scores before the softmax; <code>exp(−∞) = 0</code>, so those weights are exactly zero and the rest renormalise among themselves.</b> Every implementation has to turn "forbidden" into a number, and the two common choices are <code>−Infinity</code> and a large finite constant such as <code>−1e9</code>, usually described as equivalent. They are equivalent whenever a row has at least one permitted key, and dangerously different when it has none — and the difference is a one-line property of the softmax.</p>
+
+      <h4>Where they agree: how negative is negative enough</h4>
+      <p>A masked weight is <code>exp(s + C − max)</code> divided by the row sum. It is <b>exactly</b> zero once the exponential underflows, which happens at a gap that depends only on the floating-point format:</p>
+
+      <div class="formula"><span class="lbl">measured, per precision: the gap g below the row maximum at which exp(−g) is exactly 0</span><span class="eq">                 exp(−g) = 0 exactly   exp(−g) < machine ε   smallest subnormal
+   float64              g ≈ 745.2            g > 36.04         4.941e−324
+   float32              g ≈ 104.0            g > 15.94         1.401e−45
+   float16              g ≈  17.4            g >  6.93         5.960e−08</span>
+<span class="lbl">and the leaked probability mass, causal mask on n = 64, scores N(0,1), float32</span><span class="eq">    mask constant     total leaked mass    largest single leak
+              −1         2.226823e+01         1.704378e−01     absurd, for scale
+              −5         2.000292e+00         5.429298e−02
+             −10         1.962113e−02         8.218345e−04     visible
+             −20         8.946397e−07         3.762940e−08
+             −30         4.061658e−11         1.708372e−12
+             −50         8.371700e−20         3.521211e−21
+          −10000         0.000000e+00         0.000000e+00     the common choice
+          −1e+09         0.000000e+00         0.000000e+00     the other one
+            −Inf         0.000000e+00         0.000000e+00     exact
+
+So −1e4 and −1e9 and −∞ are all IDENTICAL here, and even −30 is
+indistinguishable from exact in any precision anyone trains in. The
+"large negative constant" is fine — as long as the row has at least one
+unmasked entry.</span></div>
+
+      <h4>Where they disagree: an all-masked row</h4>
+      <p>This is the case, and the reason is one line of algebra that everyone knows and nobody applies here.</p>
+
+      <div class="formula"><span class="lbl">softmax is SHIFT-INVARIANT, which is normally a feature</span><span class="eq">   softmax(s + c·1)  =  softmax(s)          for any scalar c
+
+   That identity is why the stable implementation subtracts the row max.
+   It is also why a FINITE mask constant is a NO-OP on a fully masked row:
+   adding the SAME constant to EVERY entry changes NOTHING.</span>
+<span class="lbl">measured — the row [−1.0, 0.5, 2.0, −0.3] with every entry masked</span><span class="eq">   mask = −∞     softmax → [ nan  nan  nan  nan ]        sum = nan
+   mask = −1e9   softmax → [0.036257 0.162492 0.728239 0.073012]  sum = 1
+   mask = −1e4   softmax → [0.036257 0.162492 0.728239 0.073012]  sum = 1
+
+   and softmax of the UNMASKED row [−1.0, 0.5, 2.0, −0.3] is
+
+                          [0.036257 0.162492 0.728239 0.073012]
+
+   — the SAME NUMBERS. The finite mask did not weaken the forbidden
+   positions; it did not touch them. The layer attends, at full strength,
+   to positions that were all supposed to be forbidden, and reports a
+   perfectly normal-looking distribution while doing it.</span></div>
+
+      <div class="callout"><b>The right conclusion, which is not "always use −∞".</b> With <code>−∞</code> an all-masked row produces <code>NaN</code>, the loss becomes <code>NaN</code>, and training stops <b>immediately and loudly</b> — pointing straight at the bug. With a finite constant, training continues and quietly optimises a model that attends to padding. <b>During development the <code>NaN</code> is the behaviour you want</b>, because the quantity really is undefined: "the weighted average over an empty set" has no value. This page's <code>DL.softmaxRows</code> returns <code>NaN</code> on an all-masked row on purpose and says so in its comment.
+      <p style="margin:8px 0 0">One case is legitimate rather than a bug, and it has to be handled deliberately: <b>left-padded batches</b>. When short prompts are padded on the left so that generation can append on the right, a padding <i>query</i> under a causal-plus-padding mask sees only padding keys — a genuinely all-masked row. Its output is discarded, but a <code>NaN</code> there does not stay put: it enters the next layer's keys and values for that position, and <code>NaN + (−∞)</code> is <code>NaN</code>, so the next layer's softmax poisons every real row too. Production implementations therefore either guarantee that such rows attend to <i>something</i> (letting the padding row attend to itself, or un-masking fully masked rows entirely, both harmless because the output is discarded), or use the finite constant knowingly for exactly those rows. The rule is: no all-masked row may reach the softmax, and if one must exist, decide explicitly what it attends to.</p></div>
+
+      <h4>The mixed-precision trap on top of it</h4>
+      <div class="formula"><span class="lbl">measured</span><span class="eq">   float16 max is 65 504.
+
+   float16(−1e9)  =  −inf        ← the "safe finite constant" IS −∞ in fp16
+   float16(−1e4)  =  −10000.0    ← this one is not
+   float16(min) + float16(min)   =  −inf   (two masks added: overflow)
+   float16(−1e4) + float16(−1e4) =  −20000.0, still finite
+
+So the SAME source line behaves differently in float32 and in float16.
+A model that quietly attended to padding in float32 starts producing NaN
+the day someone turns on mixed precision, and the bug is reported as "AMP
+is unstable". It is not; the mask was wrong the whole time.</span></div>
+
+      <div class="formula"><span class="lbl">and the gradient at a masked position, since it is asked about</span><span class="eq">   ∂L/∂Sᵢⱼ  =  Aᵢⱼ ( ∂L/∂Aᵢⱼ − ∑ₖ ∂L/∂Aᵢₖ Aᵢₖ )      and Aᵢⱼ = 0 when masked
+
+   mask   −∞     A on masked = 0        |∂L/∂S| on masked = 0.000e+00
+   mask  −1e9    A on masked = 0        |∂L/∂S| on masked = 0.000e+00
+   mask   −30    A on masked ≈ 5e−14    |∂L/∂S| on masked = 1.687e−13
+   mask   −10    A on masked ≈ 2.5e−05  |∂L/∂S| on masked = 8.181e−05
+
+The gradient is exactly zero whenever the weight is exactly zero — the
+mask needs no special handling in the backward pass, provided it made the
+weight exactly zero in the forward one.</span></div>
+
+      <div class="viz" id="viz-mc">
+        <div class="vhead">
+          <span class="vtitle">The mask constant: leaked mass by precision, and the all-masked row</span>
+          <span class="vhint">the <b>mask every key in one row</b> switch is the experiment — with <code>−∞</code> the row goes to NaN and with a finite constant it comes back unchanged</span>
+        </div>
+        <div class="controls">
+          <label>mask constant, −10ᵏ <input type="range" id="mc-c" min="0" max="9" step="0.25" value="1" /><span id="mc-cv" style="min-width:66px;display:inline-block">−1.0e+1</span></label>
+          <label><input type="checkbox" id="mc-inf" /> use −∞ instead</label>
+          <label>precision <select id="mc-p">
+            <option value="64" selected>float64</option><option value="32">float32</option><option value="16">float16</option>
+          </select></label>
+          <label>keys n <input type="range" id="mc-n" min="8" max="64" step="8" value="32" /><span id="mc-nv" style="min-width:20px;display:inline-block">32</span></label>
+          <label><input type="checkbox" id="mc-all" /> mask every key in one row</label>
+        </div>
+        <svg id="mc-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Left panel: the total probability mass that leaks onto masked positions, plotted against the magnitude of the mask constant on logarithmic axes, with one curve per floating-point precision and vertical rules at the constant where each precision's exponential underflows to exactly zero. All three curves fall by roughly a factor of e for every unit of mask magnitude and then drop to exactly zero at their respective underflow points, which are around seventeen for half precision, one hundred and four for single and seven hundred and forty five for double; a marker shows the currently selected constant on the currently selected precision and the readout gives the leaked mass there. Right panel: one attention row drawn twice, once with the mask applied and once without, as bars. With a few keys masked the two differ exactly where the mask is. With the mask-every-key switch on, the two are identical for any finite constant, drawn overlaid to make the point that the finite mask did nothing at all, and the panel is replaced by a NaN annotation when the minus-infinity option is selected. The readout prints the leaked mass, the largest single leaked weight, the row sum, whether the row is NaN, and the maximum difference between the masked and unmasked rows, which is at floating-point round-off, about one part in ten to the sixteen, in the all-masked finite case — the finite mask changed the arithmetic path and nothing else."></svg>
+        <div class="readout" aria-live="polite" id="mc-readout"></div>
+      </div>
+
+      <div class="wrong"><span class="say">The habit worth breaking.</span> Writing <code>scores.masked_fill(mask, -1e9)</code> because "<code>-inf</code> causes <code>NaN</code>". <span class="fix">It does, and that is the point.</span> The <code>NaN</code> is a report that some row has no keys to attend to, which is nearly always a bug in the mask construction — a zero-length sequence, a query-axis padding mask, a sliding window that starts before the sequence does, a chunk boundary that leaves a row empty — and occasionally the left-padding case above, which deserves explicit handling rather than a blanket constant. Replacing <code>−∞</code> with <code>−1e9</code> everywhere silences the report and keeps the bug. The correct fix is upstream: never let an all-masked row reach the softmax without deciding what it should attend to.</div>
+    </section>
+
+    <!-- ═══ 17 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="backward" data-nav="The backward pass, audited">
+      <h3><span class="idx">17</span> The backward pass, derived and audited against central differences</h3>
+      <p class="lede">Attention has one non-obvious gradient in it — the one through the row-wise softmax — and it is the one every hand-written implementation gets subtly wrong. Here it is derived, and then checked the way <a href="../convolutional-networks/blocks-backprop-features.html#backprop">the convolution page</a> and <a href="../rnns-lstms/bptt.html#bptt-audit">the RNN page</a> checked theirs.</p>
+
+      <div class="formula"><span class="lbl">the whole backward pass, one head, given ∂L/∂Z</span><span class="eq">forward   S = QKᵀ·c      A = softmax_rows(S + M)      Z = A·V     with c = 1/√dₖ
+
+  ∂L/∂V  =  Aᵀ · ∂L/∂Z                        (n_k × d_v)
+  ∂L/∂A  =  ∂L/∂Z · Vᵀ                        (n_q × n_k)
+
+  ∂L/∂S  =  A ⊙ ( ∂L/∂A  −  rowsum(∂L/∂A ⊙ A) · 1ᵀ )   then × c
+            ─┬─    ────────────────┬────────────────
+             │      the row's own dot product, BROADCAST back across
+             │      the row — this is the softmax Jacobian, applied
+             │      WITHOUT ever forming the (n_k × n_k) matrix
+             the elementwise product with the weights themselves
+
+  ∂L/∂Q  =  ∂L/∂S · K                         (n_q × dₖ)
+  ∂L/∂K  =  (∂L/∂S)ᵀ · Q                      (n_k × dₖ)</span>
+<span class="lbl">where that middle line comes from</span><span class="eq">For one row, ∂aᵢ/∂sⱼ = aᵢ(δᵢⱼ − aⱼ), so
+
+   (∂L/∂s)ⱼ = ∑ᵢ (∂L/∂a)ᵢ · aᵢ(δᵢⱼ − aⱼ)
+            = aⱼ (∂L/∂a)ⱼ  −  aⱼ ∑ᵢ (∂L/∂a)ᵢ aᵢ
+            = aⱼ [ (∂L/∂a)ⱼ  −  ⟨∂L/∂a , a⟩ ]
+
+The second term is a SCALAR per row. The Jacobian is an (n × n) matrix but
+its action costs O(n): one dot product and one subtraction. Forming it
+explicitly is the single most common way to make attention's backward pass
+n times slower than it needs to be — and at n = 4096 that is a factor of
+4096 on the largest tensor in the model.</span></div>
+
+      <div class="formula"><span class="lbl">the same identity on §07's row — <span class="keep">α</span> = [0.140 0.284 0.576], with an upstream gradient ∂L/∂z = [1 0]</span><span class="eq">   ∂L/∂α  =  ∂L/∂z · Vᵀ  =  [ v₁·[1 0]   v₂·[1 0]   v₃·[1 0] ]  =  [ 1  0  2 ]
+
+   the Jacobian, written out:   J = diag(α) − ααᵀ,   Jᵢⱼ = αᵢ(δᵢⱼ − αⱼ)
+
+        ⎡ 0.140−0.0196   −0.0398        −0.0807   ⎤     ⎡  0.1204  −0.0398  −0.0807 ⎤
+   J =  ⎢ −0.0398         0.284−0.0807  −0.1636   ⎥  =  ⎢ −0.0398   0.2033  −0.1636 ⎥
+        ⎣ −0.0807        −0.1636         0.576−0.3317⎦     ⎣ −0.0807  −0.1636   0.2442 ⎦
+
+   every row (and column) of J sums to zero — the softmax is blind to a
+   common shift of its inputs, and so is its gradient.
+
+   the long way:   ∂L/∂s = ∂L/∂α · J  =  [ −0.0409  −0.3669  0.4078 ]
+
+   the two-term way:
+        ⟨∂L/∂α, α⟩  =  1·0.140 + 0·0.284 + 2·0.576  =  1.2920
+        ∂L/∂α − 1.2920  =  [ −0.2920  −1.2920  0.7080 ]
+        α ⊙ ( · )       =  [ −0.0409  −0.3669  0.4078 ]        the SAME vector,
+                                                              and it sums to 0
+
+   then the scale:  × 1/√2   →  ∂L/∂(qKᵀ) = [ −0.0289  −0.2594  0.2884 ]
+   and onward:      ∂L/∂q = ∂L/∂(qKᵀ)·K = [ 0.2594  0.0289 ]
+                    ∂L/∂V = αᵀ·∂L/∂z     = ⎡ 0.140  0 ⎤
+                                            ⎢ 0.284  0 ⎥
+                                            ⎣ 0.576  0 ⎦
+
+   Read the sign pattern: the loss wanted more of the first output
+   coordinate; key 3 (value [2 2]) supplies most of it, so its score is
+   pushed UP and the other two are pushed DOWN by exactly the amount that
+   keeps the row's total shift zero.</span></div>
+
+      <h4>The three ways to get it wrong</h4>
+      <div class="cards">
+        <div class="box bad"><div class="n">error 1</div><div class="t">Forgetting the row-sum term</div><div class="g">Writing <code>dS = A ⊙ dA</code>. This is the gradient of a normalisation-free exponential, not of a softmax. It is <b>not</b> orthogonal to the ones vector, so it pushes all scores up or down together — a direction the softmax is blind to — and training becomes mysteriously slow rather than broken.</div></div>
+        <div class="box bad"><div class="n">error 2</div><div class="t">Applying the scale once</div><div class="g">The <code>1/√dₖ</code> multiplies the score, so it must appear in <code>∂L/∂S</code> exactly once, before both <code>∂L/∂Q</code> and <code>∂L/∂K</code>. Applying it to only one of them gives a gradient that is correct in direction for <code>Q</code> and wrong by <code>√dₖ</code> for <code>K</code> — an <b>11× error</b> at <code>dₖ = 128</code>, which Adam will partially hide.</div></div>
+        <div class="box bad"><div class="n">error 3</div><div class="t">Reusing the mask</div><div class="g">Adding the mask again in the backward pass, or re-masking <code>∂L/∂S</code>. Unnecessary: <code>A</code> is already exactly zero there, so <code>∂L/∂S</code> is too. Harmless with <code>−∞</code>; with a finite constant it silently multiplies the leaked gradient by a second copy of the mask.</div></div>
+      </div>
+
+      <div class="formula"><span class="lbl">the audit — analytic gradient against central differences, <span class="keep">ε</span> = 1e−5, in the browser</span><span class="eq">  configuration                                worst relative error   on
+  n=6  d=8  dₖ=d_v=4  h=1  g=1  unmasked            5.177e−10          W_Q
+  n=6  d=8  dₖ=d_v=4  h=2  g=2  unmasked            3.828e−10          W_Q
+  n=7  d=12 dₖ=d_v=3  h=4  g=4  CAUSAL              7.577e−10          W_K
+  n=8  d=12 dₖ=d_v=4  h=4  g=2  CAUSAL  (GQA)       3.877e−10          W_Q
+  n=8  d=12 dₖ=d_v=4  h=4  g=1  CAUSAL  (MQA)       1.338e−09          W_Q
+  n=5  d=6  dₖ=8 d_v=2  h=3  g=3  unmasked          3.452e−10          W_Q
+
+  WORST OVER ALL CASES AND ALL FIVE GRADIENTS:      1.338e−09
+
+  The same audit run in an independent NumPy implementation, with ε = 1e−6,
+  gives 4.548e−09. Both are the expected size for central differences on a
+  smooth function: the truncation error is O(ε²) and the round-off is
+  O(machine ε / ε), which balance near ε ≈ 1e−5 at about 1e−10 relative.</span></div>
+
+      <div class="viz" id="viz-fd">
+        <div class="vhead">
+          <span class="vtitle">Every parameter, analytic against numeric — and each of the three errors, injected</span>
+          <span class="vhint">the fault selector is the useful part: pick an error and watch which parameter's residual jumps and by how much</span>
+        </div>
+        <div class="controls">
+          <label>n <input type="range" id="fd-n" min="4" max="9" step="1" value="6" /><span id="fd-nv" style="min-width:16px;display:inline-block">6</span></label>
+          <label>heads h <input type="range" id="fd-h" min="1" max="4" step="1" value="2" /><span id="fd-hv" style="min-width:16px;display:inline-block">2</span></label>
+          <label>KV heads g <input type="range" id="fd-g" min="1" max="4" step="1" value="2" /><span id="fd-gv" style="min-width:16px;display:inline-block">2</span></label>
+          <label>mask <select id="fd-m">
+            <option value="none">none</option><option value="causal" selected>causal</option>
+          </select></label>
+          <label>ε <select id="fd-e">
+            <option value="1e-3">1e−3</option><option value="1e-5" selected>1e−5</option>
+            <option value="1e-7">1e−7</option><option value="1e-9">1e−9</option>
+          </select></label>
+          <label>fault <select id="fd-f">
+            <option value="none" selected>none — the correct backward pass</option>
+            <option value="norow">error 1: drop the row-sum term</option>
+            <option value="onescale">error 2: apply 1/√dₖ to Q only</option>
+            <option value="remask">error 3: re-mask ∂L/∂S with a finite constant</option>
+          </select></label>
+        </div>
+        <svg id="fd-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Left panel: a scatter of the analytic gradient against the central-difference gradient, one point per parameter entry across all four weight matrices and the input, coloured by which tensor it came from, with the identity line drawn. With no fault injected every point lies on the line to within the plotted resolution. Injecting a fault moves a whole colour off the line in a structured way rather than randomly: dropping the row-sum term tilts the query and key clouds, applying the scale once leaves the query cloud on the line and multiplies the key cloud by a constant factor, and re-masking moves nothing at all under an −∞ mask, which is the honest result and is what the readout then says. Right panel: the worst relative error per tensor as a bar chart on a logarithmic axis, with a reference band marking the region a correct implementation should occupy for the chosen step size. Below it a second small chart sweeps the step size across four decades and plots the worst relative error against it, showing the characteristic V shape whose left arm is round-off and whose right arm is truncation, with the minimum near a step of one times ten to the minus five. The readout prints the worst relative error, which tensor it occurred on, the verdict, and — when a fault is injected — the factor by which it exceeds the clean value."></svg>
+        <div class="readout" aria-live="polite" id="fd-readout"></div>
+      </div>
+
+      <div class="callout"><b>Why this audit is worth the trouble every time.</b> All three faults above <b>train</b>. Fault 1 gives a gradient with a spurious component along the ones vector, which the softmax ignores in the forward pass, so the model still improves — just more slowly, and no loss curve will tell you why. Fault 2 mis-scales one of two symmetric matrices, and adaptive optimisers absorb most of it. Fault 3 does nothing at all until someone changes the mask constant. <b>A finite-difference check takes seconds and is the cheapest thing that catches all three.</b></div>
+    </section>
+
+    <nav class="pager" aria-label="Attention series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="query-key-value.html">← Queries, Keys &amp; Values</a>
+      <a href="../attention.html" style="color:var(--muted)">Attention · overview</a>
+      <a href="cost-limits.html">Attention Cost &amp; Limits →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../attention.viz.js"></script>
+</body>
+</html>

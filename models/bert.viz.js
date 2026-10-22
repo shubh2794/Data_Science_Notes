@@ -46,7 +46,9 @@ const BV = (function(){
       .attr("text-anchor",o.anchor||"start").attr("font-family",o.mono?"SF Mono,Menlo,monospace":null)
       .attr("font-weight",o.bold?600:null).text(s);
   }
-  function safe(name, fn){ try { fn(); } catch(e){ if (typeof console!=="undefined") console.error("[bert.viz] "+name+" failed:", e); } }
+  // figures are spread across the hub and its sub-pages; skip any whose element is not on this page
+  const FIG_EL = { context:"ctx-svg", leak:"lk-svg", input:"bert-input-svg", wordpiece:"wp-svg", params:"bp-svg", mlm:"bert-svg", maskabl:"ma-svg", nsp:"nsp-svg", ablate:"ab-svg", sched:"sc-svg", flops:"fl-svg", heads:"hd-svg", span:"sp-svg", probe:"pr-svg", glue:"gl-svg", gelu:"gelu-diff" };
+  function safe(name, fn){ if (!document.getElementById(FIG_EL[name] || (name + "-svg"))) return; try { fn(); } catch(e){ if (typeof console!=="undefined") console.error("[bert.viz] "+name+" failed:", e); } }
   function lcg(seed){ let s = seed >>> 0; return () => { s = (1664525*s + 1013904223) >>> 0; return s/4294967296; }; }
   function hash(str){ let h = 2166136261 >>> 0; for (let i=0;i<str.length;i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; } return h; }
   /* forward FLOPs of one sequence: weight matmuls + attention scores/mixing */

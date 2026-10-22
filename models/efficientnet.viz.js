@@ -12,6 +12,8 @@ const XC = { pu:"#c084fc", te:"#2dd4bf", pk:"#f472b6", panel:"#15181f", grid:"#2
 const AXC = { d: PAL.A, w: PAL.B, r: XC.te, c: PAL.good };   // depth, width, resolution, compound
 
 function fig(name, fn){
+  // the figures are spread across the hub and its sub-pages; skip any whose svg is not on this page
+  if (!document.getElementById(name + "-svg")) return;
   try { fn(); }
   catch (e) {
     if (typeof console !== "undefined") console.error("efficientnet figure '" + name + "' failed:", e);

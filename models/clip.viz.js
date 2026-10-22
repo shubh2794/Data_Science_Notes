@@ -49,7 +49,8 @@ const CV = (function(){
       .attr("text-anchor",o.anchor||"start").attr("font-family",o.mono?"SF Mono,Menlo,monospace":null)
       .attr("font-weight",o.bold?600:null).text(s);
   }
-  function safe(name, fn){ try { fn(); } catch(e){ if (typeof console !== "undefined") console.error("[clip.viz] "+name+" failed:", e); } }
+  // figures are spread across the hub and its sub-pages; skip any whose svg is not on this page
+  function safe(name, fn){ if (!document.getElementById(name + "-svg")) return; try { fn(); } catch(e){ if (typeof console !== "undefined") console.error("[clip.viz] "+name+" failed:", e); } }
   function lcg(seed){ let s = seed >>> 0; return () => { s = (1664525*s + 1013904223) >>> 0; return s/4294967296; }; }
   function gauss(r){ const u = Math.max(1e-12, r()), v = r(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
 

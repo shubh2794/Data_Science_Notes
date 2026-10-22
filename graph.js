@@ -37,8 +37,13 @@ let curK = 1;
 /* ---- data prep: flat node + link arrays ---- */
 const domList = Object.keys(tree);
 const topicDomain = {}; domList.forEach(d => tree[d].forEach(t => topicDomain[t]=d));
-// level-3 sub-topics inherit their parent topic's domain slot
-Object.entries(subtree).forEach(([top,kids]) => kids.forEach(k => topicDomain[k] = topicDomain[top]));
+// sub-topics (any depth) inherit the domain slot of their ancestor topic
+nodes.forEach(n => {
+  if (n.level < 3 || topicDomain[n.id] !== undefined) return;
+  let p = n.id, guard = 0;
+  while (p && topicDomain[p] === undefined && guard++ < 8) p = PARENT[p];
+  if (p && topicDomain[p] !== undefined) topicDomain[n.id] = topicDomain[p];
+});
 const degree = {}; nodes.forEach(n=> degree[n.id] = ADJ[n.id].size);
 
 /* ---- placement: a radial tree of anchors, one per node ----
@@ -54,8 +59,9 @@ const degree = {}; nodes.forEach(n=> degree[n.id] = ADJ[n.id].size);
      · sub-topics sit on an outer ring, spread across their parent topic's slice.
    The whole tree is stretched to the viewport's aspect so a landscape window is
    filled rather than a tall column squeezed to fit. */
-const RING = {1: 330, 2: 440, 3: 540};      // anchor radius by level
-function subtreeSize(dom){ return tree[dom].reduce((a,t)=> a + 1 + (subtree[t]? subtree[t].length : 0), 0); }
+const RING = {1: 330, 2: 440, 3: 540, 4: 620};      // anchor radius by level
+function nodeCount(id){ return 1 + (subtree[id] ? subtree[id].reduce((a,k)=> a + nodeCount(k), 0) : 0); }
+function subtreeSize(dom){ return tree[dom].reduce((a,t)=> a + nodeCount(t), 0); }
 
 /* cross-link weight between domains, for ordering the ring */
 const domIndex = {}; domList.forEach((d,i)=> domIndex[d]=i);
@@ -101,11 +107,14 @@ domList.forEach(d=>{
   const {start, span} = arcOf[d]; anchorAngle[d] = start + span/2;
   const kids = tree[d], m = kids.length;
   const pad = span*0.12;                                   // keep wedges from touching
+  const fan = (id, s0, s1) => {               // recursive: level-4 parts share their parent's slice
+    anchorAngle[id] = (s0+s1)/2;
+    const subs = subtree[id]; if(!subs) return;
+    subs.forEach((k,j)=> fan(k, s0 + (s1-s0)*j/subs.length, s0 + (s1-s0)*(j+1)/subs.length));
+  };
   kids.forEach((t,i)=>{
     const s0 = start + pad + (span-2*pad)*i/m, s1 = start + pad + (span-2*pad)*(i+1)/m;
-    anchorAngle[t] = (s0+s1)/2;
-    const subs = subtree[t]; if(!subs) return;
-    subs.forEach((k,j)=> anchorAngle[k] = s0 + (s1-s0)*(j+0.5)/subs.length);
+    fan(t, s0, s1);
   });
 });
 function aspect(){ return Math.max(1, Math.min(1.6, width/height)); }   // stretch x for landscape windows
@@ -137,11 +146,11 @@ function buildGraphData(){
 
 /* node radius scales with connection count, like Obsidian */
 let sizeScale = 1;        // "Node size" slider, 0.5x .. 2x
-let maxDepth = 3;         // "Show down to": 1 domains, 2 topics, 3 sub-topics
+let maxDepth = 3;         // "Show down to": 1 domains, 2 topics, 3 sub-topics, 4 parts
 let linkOpacity = 1;      // multiplier on every link's stroke opacity
 function rN(n){
   if(n.level===0) return 13*sizeScale;
-  const base = n.level===1 ? 6 : n.level===2 ? 3 : 2.4;   // sub-topics slightly smaller than topics
+  const base = n.level===1 ? 6 : n.level===2 ? 3 : n.level===3 ? 2.4 : 2;   // deeper nodes slightly smaller
   return (base + Math.sqrt(degree[n.id]||1)*1.5) * sizeScale;
 }
 /* re-radius in place: cheaper and far less jarring than rebuilding the scene */
@@ -558,5 +567,13 @@ build();
 /* deep-link: index.html?focus=<id> */
 (function(){
   const f=new URLSearchParams(location.search).get("focus");
-  if(f&&meta[f]) setTimeout(()=>activate(meta[f]),500);
+  if(f&&meta[f]){
+    // a focused node deeper than the current depth filter would be invisible — raise the filter first
+    if(meta[f].level>maxDepth){
+      maxDepth=meta[f].level;
+      const sel=document.getElementById("c-depth"); if(sel) sel.value=String(maxDepth);
+      build();
+    }
+    setTimeout(()=>activate(meta[f]),500);
+  }
 })();

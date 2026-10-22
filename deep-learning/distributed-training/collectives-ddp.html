@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Collectives, Ring All-Reduce &amp; DDP</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  .tablewrap{overflow-x:auto;max-width:100%}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  pre.code{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:10px 0;overflow-x:auto;font-size:12.5px;line-height:1.5;white-space:pre}
+  pre.code code{background:none;padding:0;border-radius:0;color:var(--ink);font-size:inherit}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../distributed-training.html">Distributed Training</a> · part 2 of 5</p>
+      <h1>Collectives, Ring All-Reduce &amp; DDP</h1>
+      <p>The traffic every parallel scheme pays for: the collectives — all-reduce, all-gather, reduce-scatter, all-to-all — and their latency and bandwidth cost, the ring all-reduce run step by step to show where 2·(n−1)/n · S comes from, and DDP in practice with one process per GPU, gradient buckets and accumulation.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Distributed Training</span>
+        <span class="pill">All-reduce · all-gather · reduce-scatter · all-to-all · α–β cost model · ring all-reduce step by step · launchers · buckets · gradient accumulation</span>
+      </div>
+    </header>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="comm" data-nav="Collectives and the α–β cost model">
+      <h3><span class="idx">07</span> Communication is the bottleneck: collectives and their cost</h3>
+      <p class="lede">Every strategy on this page moves data between GPUs — all-reduce, all-gather, all-to-all, point-to-point — and that traffic, not the arithmetic, is usually what limits scaling. A two-parameter cost model is enough to predict most of it.</p>
+      <ul class="notes">
+        <li>Real systems combine data, tensor and pipeline parallelism (and often sequence and expert parallelism) plus sharding, and lay each onto the part of the network whose bandwidth matches its traffic (§18–§19).</li>
+        <li>It is a systems problem as much as an ML one: the same model can run at very different efficiency depending on which dimension crosses which link.</li>
+      </ul>
+
+      <h4>The collectives, and what each costs per rank</h4>
+      <p>Every scheme on this page is built from six communication primitives. Their cost is best stated as the bytes each rank must <i>send</i> (and, symmetrically, receive), because on a ring or a switched fabric that is what the per-GPU link bandwidth <code>β</code> bounds. For a buffer of <code>S</code> bytes over <code>n</code> ranks:</p>
+      <div class="tablewrap"><table class="grid2">
+        <tr><th>collective</th><th>result</th><th>bytes sent per rank (bandwidth-optimal)</th><th>used by</th></tr>
+        <tr><td><b>all-reduce</b></td><td>every rank gets the sum</td><td class="mono">2·(n−1)/n · S</td><td>DDP gradients, TP block outputs</td></tr>
+        <tr><td><b>reduce-scatter</b></td><td>rank <i>i</i> gets the sum of chunk <i>i</i></td><td class="mono">(n−1)/n · S</td><td>ZeRO-2/3 gradients, sequence parallelism</td></tr>
+        <tr><td><b>all-gather</b></td><td>every rank gets every chunk</td><td class="mono">(n−1)/n · S</td><td>ZeRO-3 weights, sequence parallelism</td></tr>
+        <tr><td><b>all-to-all</b></td><td>rank <i>i</i> sends chunk <i>j</i> to rank <i>j</i></td><td class="mono">(n−1)/n · S</td><td>Ulysses, expert dispatch/combine</td></tr>
+        <tr><td><b>broadcast</b></td><td>one rank's buffer everywhere</td><td class="mono">≈ S (pipelined)</td><td>initial weights, buffers</td></tr>
+        <tr><td><b>send / recv</b></td><td>point to point</td><td class="mono">S</td><td>pipeline activations, ring attention K/V</td></tr>
+      </table></div>
+      <p>The all-reduce row is the important identity: a bandwidth-optimal all-reduce <i>is</i> a reduce-scatter followed by an all-gather, which is why the ring algorithm sends <code>2·(n−1)/n · S</code> — just under twice the buffer — no matter how many ranks there are. Adding ranks does not make the per-rank traffic grow; it adds <code>2·(n−1)</code> latency steps of <code>α</code> each (microseconds on NVLink, more across nodes), which is why very large jobs switch to tree or hierarchical algorithms for small messages.</p>
+      <div class="formula"><span class="lbl">time model (<span class="keep">α</span> = per-message latency, <span class="keep">β</span> = per-rank bandwidth)</span><span class="eq">T(all-reduce)      ≈ 2·(n−1)·α + 2·(n−1)/n · S / β
+T(reduce-scatter)  ≈   (n−1)·α +   (n−1)/n · S / β      (all-gather: the same)
+T(send / recv)     ≈          α +             S / β</span></div>
+
+      <h4>Volume per training step, strategy by strategy</h4>
+      <p>Counting in parameter elements, as the ZeRO paper does (multiply by 2 bytes for 16-bit):</p>
+      <div class="formula"><span class="lbl">elements moved per rank per step, Ψ parameters, n ranks (factor (n−1)/n dropped)</span><span class="eq">DDP        all-reduce of gradients                              = 2Ψ
+ZeRO-1     reduce-scatter of gradients Ψ + all-gather of weights Ψ = 2Ψ
+ZeRO-2     reduce-scatter of gradients Ψ + all-gather of weights Ψ = 2Ψ
+ZeRO-3     all-gather (fwd) Ψ + all-gather (bwd) Ψ + reduce-scatter Ψ = 3Ψ   → 1.5 × DDP</span></div>
+      <p>(ZeRO-1 and ZeRO-2 move the same bytes; the difference is that ZeRO-1 still allocates a full-size gradient buffer and discards the parts it does not own after the reduce-scatter.) So stages 1 and 2 add no traffic over DDP; they only change its shape. Only stage 3 costs more, and only by half. A frequently repeated rule of thumb says ZeRO needs far more interconnect than DDP; that holds for stage 3's 1.5× volume and for the fact that its all-gathers sit on the critical path of every layer (they must finish before that layer can compute), not for the total bytes of stages 1–2.</p>
+
+      <h4>Worked: 7 B, bf16 gradients</h4>
+      <div class="formula"><span class="lbl">bytes per rank per step, S = 2 bytes × 7 × 10⁹ = 14 GB</span><span class="eq">DDP,    n = 8   : 2 · 7/8 · 14 GB  = 24.5 GB     at 450 GB/s (NVLink 4)  →  54 ms
+ZeRO-3, n = 8   : 3 · 7/8 · 14 GB  = 36.75 GB    at 450 GB/s             →  82 ms
+DDP,    n = 16  : 2 · 15/16 · 14 GB = 26.25 GB   at 50 GB/s (400 Gb/s IB per GPU) → 525 ms
+compute         : 6 · Ψ · tokens = 6 · 7×10⁹ · 32,768 tokens per GPU = 1.38 × 10¹⁵ FLOP
+                  at 400 TFLOP/s achieved                              →  3.4 s</span></div>
+      <p>Even over InfiniBand the gradient traffic is about 15% of the compute time for this batch, and DDP's bucketed overlap hides most of it. The ratio that matters is <b>communication time ÷ compute time</b>, and compute scales with tokens per GPU while gradient traffic does not — halve the per-GPU batch and the ratio doubles. That is the single most useful sentence for predicting when data parallelism stops scaling.</p>
+
+      <div class="viz" id="viz-comm">
+        <div class="vhead">
+          <span class="vtitle">Communication against compute, per optimiser step</span>
+          <span class="vhint">bars are seconds per step for each strategy; the dashed line is the compute time that can hide them</span>
+        </div>
+        <div class="controls">
+          <label>model <select id="cm-model">
+            <option value="1.3">1.3 B</option><option value="7" selected>7 B</option><option value="13">13 B</option><option value="70">70 B</option>
+          </select></label>
+          <label>ranks n <select id="cm-n">
+            <option>2</option><option>4</option><option selected>8</option><option>16</option><option>64</option><option>256</option>
+          </select></label>
+          <label>link <select id="cm-link">
+            <option value="450" selected>NVLink 4 · 450 GB/s</option>
+            <option value="300">NVLink 3 · 300 GB/s</option>
+            <option value="64">PCIe 5.0 x16 · 64 GB/s</option>
+            <option value="32">PCIe 4.0 x16 · 32 GB/s</option>
+            <option value="50">InfiniBand NDR · 50 GB/s</option>
+            <option value="25">InfiniBand HDR · 25 GB/s</option>
+            <option value="12.5">100 Gb Ethernet · 12.5 GB/s</option>
+          </select></label>
+          <label>tokens per GPU per step <input type="range" id="cm-tok" min="10" max="18" step="1" value="15" /><span id="cm-tokv" style="min-width:60px;display:inline-block">32768</span></label>
+          <label>achieved TFLOP/s <input type="range" id="cm-tf" min="50" max="800" step="50" value="400" /><span id="cm-tfv" style="min-width:36px;display:inline-block">400</span></label>
+        </div>
+        <svg id="cm-svg" width="760" height="300" viewBox="0 0 760 300" role="img" aria-label="Horizontal bars of communication time per optimiser step for DDP, ZeRO-2 and ZeRO-3, and a bar for compute time, on a common seconds axis. A dashed vertical line marks the compute time. Bars that extend past the dashed line cannot be fully hidden behind computation."></svg>
+        <div class="readout" aria-live="polite" id="cm-read"></div>
+        <p class="vcap">Communication uses the bandwidth term of the ring model, 2·(n−1)/n or 3·(n−1)/n times the 16-bit gradient bytes, at the selected per-GPU link rate; latency is ignored, so small models on many ranks look better here than they are. Compute is 6·Ψ·tokens at the achieved rate. Link rates are per direction and per GPU, from vendor specifications; real collectives typically reach 70–90% of them.</p>
+      </div>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ring" data-nav="The ring all-reduce, step by step">
+      <h3><span class="idx">08</span> The ring all-reduce, step by step</h3>
+      <p class="lede">The <code>2·(n−1)/n · S</code> of §07 is not a convention; it falls out of a specific algorithm. Seeing it run explains both why the bandwidth term does not grow with the number of ranks and why the latency term eventually does.</p>
+      <p>Arrange the <code>n</code> ranks in a ring and cut every rank's buffer into <code>n</code> chunks. In <b>reduce-scatter</b> step <i>k</i>, rank <i>r</i> sends its partial sum of chunk <code>(r − k) mod n</code> to rank <i>r</i>+1, which adds it to its own copy. After <code>n − 1</code> steps every chunk has visited every rank once, and rank <i>r</i> holds the complete sum of one chunk. In <b>all-gather</b> the completed chunks travel round the ring once more, overwriting instead of adding, for another <code>n − 1</code> steps.</p>
+      <div class="formula"><span class="lbl">ring all-reduce, buffer S bytes, n ranks</span><span class="eq">steps                2·(n−1)                      (n−1 reduce-scatter + n−1 all-gather)
+bytes per step       S/n per rank, every rank sending and receiving at once
+bytes sent per rank  2·(n−1)·S/n  →  2S as n grows
+time                 2·(n−1)·α + 2·(n−1)/n · S/β</span></div>
+      <p>Every link carries traffic in every step, which is why the ring is bandwidth-optimal: no algorithm can have a rank send less than <code>(n−1)/n · S</code> in each half, because each rank must contribute its <code>(n−1)/n</code> share to other ranks' chunks and receive theirs. The cost the ring pays is the step count. Its latency term grows linearly in <code>n</code>.</p>
+
+      <h4>Worked: when latency wins</h4>
+      <div class="formula"><span class="lbl">assumed <span class="keep">α</span> = 5 µs inside a node, 10 µs across nodes (illustrative)</span><span class="eq">25 MB bucket, n = 8,   NVLink 450 GB/s : 14 × 5 µs = 70 µs   +  2·7/8·25 MB / 450 GB/s = 97 µs   → latency 42% of 167 µs
+1 GB buffer,  n = 8,   NVLink 450 GB/s : 70 µs                +  3.9 ms                         → latency 2%
+25 MB bucket, n = 512, IB 50 GB/s      : 1022 × 10 µs = 10.2 ms + 2·511/512·25 MB / 50 GB/s = 1.0 ms → latency 91%</span></div>
+      <p>For a DDP bucket on a large flat ring, the latency term is ten times the bandwidth term. Collective libraries therefore do not use one flat ring at scale. Tree algorithms (NCCL ships a double binary tree alongside the ring) have a latency term logarithmic in <code>n</code> at a modest bandwidth cost. <b>Hierarchical</b> all-reduce exploits the two-tier network: reduce-scatter inside each node over NVLink, all-reduce the resulting <code>1/g</code> shards across nodes (one ring per local GPU index, running in parallel), then all-gather inside the node. Each GPU then sends only <code>2·(N−1)/N · S/g</code> bytes across the slow network, where <code>N</code> is the node count and <code>g</code> the GPUs per node. The library picks among these per message size and topology. In practice, message size (bucket size) is the knob you control.</p>
+
+      <div class="viz" id="viz-ring">
+        <div class="vhead">
+          <span class="vtitle">Ring all-reduce: the chunk matrix after each step</span>
+          <span class="vhint">step through reduce-scatter, then all-gather; outlined cells just received data</span>
+        </div>
+        <div class="controls">
+          <label>ranks n <select id="rg-n"><option>3</option><option selected>4</option><option>5</option><option>6</option><option>8</option></select></label>
+          <label>step <input type="range" id="rg-step" min="0" max="6" step="1" value="0" /><span id="rg-stepv" style="min-width:48px;display:inline-block">0 / 6</span></label>
+          <button class="btn" id="rg-next" type="button">next step</button>
+          <label>buffer S <select id="rg-s"><option value="1">1 MB</option><option value="25" selected>25 MB (a DDP bucket)</option><option value="100">100 MB</option><option value="1000">1 GB</option><option value="14000">14 GB (7 B gradients)</option></select></label>
+          <label>link <select id="rg-link"><option value="450" selected>NVLink 4 · 450 GB/s</option><option value="50">InfiniBand NDR · 50 GB/s</option><option value="12.5">100 Gb Ethernet · 12.5 GB/s</option></select></label>
+          <label>latency <span class="keep">α</span> <select id="rg-a"><option value="2">2 µs</option><option value="5" selected>5 µs</option><option value="10">10 µs</option><option value="25">25 µs</option></select></label>
+        </div>
+        <svg id="rg-svg" width="760" height="330" viewBox="0 0 760 330" role="img" aria-label="Left: a grid with one row per rank and one column per chunk; each cell shows how many of the n ranks' contributions it has summed so far, turning green when complete. Right: the ranks drawn as a ring with the chunk each rank is sending at the current step."></svg>
+        <div class="readout" aria-live="polite" id="rg-read"></div>
+        <p class="vcap">The grid is simulated, not drawn from a table: each step applies the send rule above to a bitmask per cell. After n−1 steps each row has exactly one green cell (that rank's reduced shard, the state ZeRO-2/3 and FSDP stop at). After 2(n−1) steps all cells are green. The time uses the <span class="keep">α</span>–<span class="keep">β</span> model of §07. Real latencies depend on the library, message protocol and topology.</p>
+      </div>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ddp" data-nav="DDP in practice: launch, buckets, accumulation">
+      <h3><span class="idx">09</span> DDP in practice: launching, buckets and accumulation</h3>
+      <p class="lede">§03 explained why DDP is correct and how bucketing hides communication. This section is the working version: one process per GPU, a launcher that wires them together, and the three settings that decide whether the overlap actually happens.</p>
+
+      <h4>One process per GPU</h4>
+      <p>Each GPU is driven by its own Python process. A launcher starts them and tells each one who it is through environment variables: <code>RANK</code> (global index), <code>LOCAL_RANK</code> (index within the node, used to pick the device), <code>WORLD_SIZE</code>, and a rendezvous address (<code>MASTER_ADDR</code>/<code>MASTER_PORT</code>, or a rendezvous endpoint). The process group is then created once, the model is wrapped, and every rank gets a disjoint slice of the data.</p>
+<pre class="code"><code>import os, torch, torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
+dist.init_process_group(backend="nccl")              # reads RANK / WORLD_SIZE / MASTER_* from the launcher
+local = int(os.environ["LOCAL_RANK"]); torch.cuda.set_device(local)
+model = DDP(build_model().cuda(), device_ids=[local],
+            bucket_cap_mb=25)                         # the default; larger = fewer, later all-reduces
+sampler = DistributedSampler(dataset, shuffle=True)   # each rank sees 1/WORLD_SIZE of every epoch
+loader = DataLoader(dataset, batch_size=micro_bs, sampler=sampler)
+
+for epoch in range(E):
+    sampler.set_epoch(epoch)                          # otherwise every epoch reuses the same shuffle
+    for i, batch in enumerate(loader):
+        last = (i + 1) % accum == 0
+        ctx = contextlib.nullcontext() if last else model.no_sync()
+        with ctx:                                     # no all-reduce on the first accum−1 micro-batches
+            loss = model(batch).loss / accum
+            loss.backward()
+        if last:
+            opt.step(); opt.zero_grad(set_to_none=True)</code></pre>
+<pre class="code"><code># one node, 8 GPUs
+torchrun --nproc-per-node 8 train.py
+# two nodes: run on each, same endpoint
+torchrun --nnodes 2 --nproc-per-node 8 --rdzv-backend c10d --rdzv-endpoint head-node:29500 train.py
+# the same script under Accelerate (its config file supplies the counts)
+accelerate launch --num_processes 8 train.py</code></pre>
+      <p>With Accelerate the loop is written against an <code>Accelerator</code>. Its <code>accumulate(model)</code> context skips the gradient synchronisation on intermediate micro-batches the same way <code>no_sync()</code> does, and the Transformers <code>Trainer</code> does it for you when <code>gradient_accumulation_steps</code> is set (§20).</p>
+
+      <h4>What each setting costs</h4>
+      <div class="tablewrap"><table class="grid2">
+        <tr><th>setting</th><th>what it does</th><th>when it matters</th></tr>
+        <tr><td><b>bucket_cap_mb</b> (default 25)</td><td>size of each gradient bucket and so of each all-reduce</td><td>small buckets are latency-bound (§08); huge buckets start late and hide less. Tune only if the profiler shows exposed communication.</td></tr>
+        <tr><td><b>no_sync()</b> / accumulation</td><td>skip the all-reduce on all but the last micro-batch</td><td>with <code>accum</code> micro-batches, traffic falls by <code>accum</code>×. Forgetting it makes accumulation cost as much communication as a larger D.</td></tr>
+        <tr><td><b>find_unused_parameters</b></td><td>walks the autograd graph after each forward to mark parameters that get no gradient</td><td>needed only if some parameters are skipped in a step (conditional branches, frozen heads used sometimes). Otherwise it costs a traversal per step for nothing.</td></tr>
+        <tr><td><b>broadcast_buffers</b> (default on)</td><td>copies buffers such as BatchNorm running statistics from rank 0 at each forward</td><td>a LayerNorm-only transformer has no such buffers to keep in sync</td></tr>
+        <tr><td><b>gradient_as_bucket_view</b></td><td>makes <code>.grad</code> tensors views into the communication buckets</td><td>saves one gradient-sized copy of memory</td></tr>
+        <tr><td><b>static_graph</b></td><td>declares that the set of used parameters never changes</td><td>lets DDP skip per-step bookkeeping and supports some re-entrant checkpointing patterns</td></tr>
+      </table></div>
+      <div class="formula"><span class="lbl">worked: accumulation and gradient traffic, 7 B in bf16, D = 32 over InfiniBand at 50 GB/s</span><span class="eq">one all-reduce      2 · 31/32 · 14 GB = 27.1 GB per rank  → 0.54 s
+accum = 8, no_sync  one all-reduce per optimiser step       → 0.54 s per 8 micro-batches
+accum = 8, without  8 all-reduces                            → 4.3 s per optimiser step</span></div>
+      <div class="wrong"><span class="say">Tempting:</span> "The global batch is the per-GPU batch."<br /><span class="fix">Better:</span> the optimiser sees micro-batch × accumulation × D sequences (§03). Doubling the GPU count at a fixed per-GPU batch doubles the effective batch, and the learning-rate schedule tuned for the old batch may no longer be right.</div>
+    </section>
+
+    <nav class="pager" aria-label="Distributed Training series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="data-parallel-zero.html">← Data Parallelism, ZeRO &amp; FSDP</a>
+      <a href="../distributed-training.html" style="color:var(--muted)">Distributed Training · overview</a>
+      <a href="tensor-sequence-context.html">Tensor, Sequence &amp; Context Parallelism →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../distributed-training.viz.js"></script>
+</body>
+</html>

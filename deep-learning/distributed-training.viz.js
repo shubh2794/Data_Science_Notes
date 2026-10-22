@@ -29,6 +29,7 @@ const DT = (function(){
 
 /* ── Figure 1: how work is split across devices (schematic) ─────────────────────────── */
 (function(){ try {
+  if (!document.getElementById("dt-svg")) return;  // figure lives on another sub-page
   const C={accent:"#f87171",a2:"#ffb454",good:"#4ade80",blue:"#5b9cff",ink:"#e6e9ef",muted:"#9aa3b2",line:"#2a2f3a"};
   const svg=d3.select("#dt-svg"),W=640, G=4;
   const layerCols=["#5b9cff","#4ade80","#fbbf24","#f87171"];
@@ -70,6 +71,7 @@ const DT = (function(){
 
 /* ── Figure 2: per-GPU model-state memory, DDP vs ZeRO stages ───────────────────────── */
 (function(){ try {
+  if (!document.getElementById("mem-svg")) return;  // figure lives on another sub-page
   const {P, num, val, gb, on, MODELS} = DT;
   const svg = d3.select("#mem-svg"), W = 760, H = 330;
   const STRATS = [
@@ -152,6 +154,7 @@ const DT = (function(){
 
 /* ── Figure 3: communication against compute per optimiser step ─────────────────────── */
 (function(){ try {
+  if (!document.getElementById("cm-svg")) return;  // figure lives on another sub-page
   const {P, num, val, secs, pct, on, MODELS, $} = DT;
   const svg = d3.select("#cm-svg"), W = 760, H = 300;
   function draw(){
@@ -199,6 +202,7 @@ const DT = (function(){
 
 /* ── Figure 4: ring all-reduce, step by step ────────────────────────────────────────── */
 (function(){ try {
+  if (!document.getElementById("rg-svg")) return;  // figure lives on another sub-page
   const {P, num, val, secs, on, $} = DT;
   const svg = d3.select("#rg-svg"), W = 760, H = 330;
   /* state[r][c] = bitmask of ranks whose contribution to chunk c rank r currently holds */
@@ -272,6 +276,7 @@ const DT = (function(){
 
 /* ── Figure 5: Megatron tensor-parallel MLP and its communication ───────────────────── */
 (function(){ try {
+  if (!document.getElementById("tp-svg")) return;  // figure lives on another sub-page
   const {P, num, val, secs, pct, on, MODELS} = DT;
   const svg = d3.select("#tp-svg"), W = 760, H = 340;
   function draw(){
@@ -336,6 +341,7 @@ const DT = (function(){
 
 /* ── Figure 6: activation memory per layer (Megatron sequence parallelism) ─────────── */
 (function(){ try {
+  if (!document.getElementById("ac-svg")) return;  // figure lives on another sub-page
   const {P, num, val, on, MODELS, $} = DT;
   const svg = d3.select("#ac-svg"), W = 760, H = 300;
   function draw(){
@@ -374,6 +380,7 @@ const DT = (function(){
 
 /* ── Figure 7: ring attention blocks and causal load balance ────────────────────────── */
 (function(){ try {
+  if (!document.getElementById("cp-svg")) return;  // figure lives on another sub-page
   const {P, num, val, on, $} = DT;
   const svg = d3.select("#cp-svg"), W = 760, H = 360;
   /* sequence cut into 2C chunks; rank r owns chunks own(r) */
@@ -522,6 +529,7 @@ const DTPipe = (function(){
 })();
 
 (function(){ try {
+  if (!document.getElementById("pp-svg")) return;  // figure lives on another sub-page
   const {P, num, val, pct, on, $} = DT;
   const svg = d3.select("#pp-svg"), W = 760, H = 330;
   function draw(){
@@ -567,6 +575,7 @@ const DTPipe = (function(){
 
 /* ── Figure 9: expert-parallel all-to-all, with capacity ────────────────────────────── */
 (function(){ try {
+  if (!document.getElementById("ep-svg")) return;  // figure lives on another sub-page
   const {P, num, val, pct, on, $} = DT;
   const svg = d3.select("#ep-svg"), W = 760, H = 340;
   function rng(seed){ return function(){ seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
@@ -635,6 +644,7 @@ const DTPipe = (function(){
 
 /* ── Figure 10: N-D parallelism planner ─────────────────────────────────────────────── */
 (function(){ try {
+  if (!document.getElementById("pl-svg")) return;  // figure lives on another sub-page
   const {P, num, val, gb, secs, pct, on, MODELS} = DT;
   const svg = d3.select("#pl-svg"), W = 760, H = 360;
   function draw(){

@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Normalization Layers &amp; Training Regularization</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to part 1 */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../neural-network-training.html">Neural Network Training</a> · part 5 of 6</p>
+      <h1>Normalization Layers &amp; Training Regularization</h1>
+      <p>The layers and penalties that shape what training converges to: batch normalisation and its train/eval asymmetry, LayerNorm and RMSNorm with pre/post placement, the regularisation map, L2, L1 and weight decay, dropout as a cheap ensemble, early stopping, augmentation, noise injection and label smoothing.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Neural Network Training</span>
+        <span class="pill">BatchNorm · train/eval gap · LayerNorm · RMSNorm · weight decay · dropout · early stopping · augmentation</span>
+      </div>
+    </header>
+
+    <!-- ═══ 29 ══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="norm" data-nav="BatchNorm &amp; its train/eval gap">
+      <h3><span class="idx">29</span> Batch normalisation, and the train/eval asymmetry that causes most of its bugs</h3>
+      <p class="lede">§12 and §13 chose an initialisation so that the activation statistics start in a useful range, and then hoped they would stay there. Normalisation layers stop hoping. They <b>enforce</b> the property at every layer at every step, and that one change made deep networks dramatically easier to train — at the cost of a layer that behaves <i>differently in training and in inference</i>, which is the single most common source of the bug where a model scores 99% during training and 50% when deployed.</p>
+
+      <div class="formula"><span class="lbl">the layer, in row convention: X is (N × d), statistics taken DOWN each column</span><span class="eq">TRAINING, per feature j, over the current minibatch of N examples:
+    <span class="keep">μ</span>ⱼ  = (1/N) <span class="keep">∑</span>ᵢ X_{ij}
+    <span class="keep">σ</span>²ⱼ = (1/N) <span class="keep">∑</span>ᵢ (X_{ij} − <span class="keep">μ</span>ⱼ)²            biased, 1/N
+    x̂_{ij} = (X_{ij} − <span class="keep">μ</span>ⱼ) / <span class="keep">√</span>(<span class="keep">σ</span>²ⱼ + <span class="keep">ε</span>)
+    y_{ij} = <span class="keep">γ</span>ⱼ · x̂_{ij} + <span class="keep">β</span>ⱼ                     <span class="keep">γ</span>, <span class="keep">β</span> LEARNED, one pair per feature</span>
+<span class="eq">The <span class="keep">γ</span> and <span class="keep">β</span> exist so the layer can UNDO itself. Forcing every pre-activation to
+zero mean and unit variance would be a hard constraint on the function class;
+with <span class="keep">γ</span> and <span class="keep">β</span> the network can choose any mean and scale it likes, and only the
+PARAMETERISATION has changed — which is the point, because the new
+parameterisation is far better conditioned.</span>
+<span class="lbl">INFERENCE — a different function</span><span class="eq">    y_j = <span class="keep">γ</span>ⱼ · (x_j − <span class="keep">μ</span>ⱼ^{run}) / <span class="keep">√</span>(<span class="keep">σ</span>²ⱼ^run + <span class="keep">ε</span>) + <span class="keep">β</span>ⱼ
+with running estimates maintained during training by §18's moving average:
+    <span class="keep">μ</span>^{run} ← (1 − m)·<span class="keep">μ</span>^{run} + m·<span class="keep">μ</span>_batch
+    <span class="keep">σ</span>²^{run} ← (1 − m)·<span class="keep">σ</span>²^{run} + m·<span class="keep">σ</span>²_batch,unbiased      ← note: 1/(N−1) HERE
+These are NOT learned by gradient descent. They are statistics, updated in the
+forward pass, and they are the ONLY parameters of the model that training
+changes without a gradient ever being involved.</span></div>
+
+      <div class="callout"><b>Two variances, and they are deliberately different.</b> The variance that <i>normalises the batch</i> is the biased <code>1/N</code> one, because that is what makes the normalised batch have exactly unit variance and makes the backward pass clean. The variance that goes into the <i>running estimate</i> is the unbiased <code>1/(N−1)</code> one, because that estimate is trying to describe the population and the biased estimator would systematically under-report it by a factor of <code>N/(N−1)</code>. Verified numerically on a batch of 3: biased variances <code>(2.6667, 4.2222)</code>, unbiased <code>(4.0000, 6.3333)</code>, ratio exactly <code>1.5 = 3/2</code>. At <code>N = 32</code> the factor is 3%; at <code>N = 2</code> it is 100%.</div>
+
+      <h4>The asymmetry, measured</h4>
+      <p>Here is the same single input, put through the same layer with <code>γ = (1, 2, 0.5)</code> and <code>β = (0, −1, 0.5)</code>, in the two modes.</p>
+
+      <div class="kbox">input x = [6.0, −2.5, 3.0]
+
+TRAIN mode, as the only member of its batch:
+    every feature's batch mean IS its own value, so x̂ = 0 exactly
+    output = [0.0000, −1.0000, 0.5000]          ← this is exactly <span class="keep">β</span>.
+    The input has been ANNIHILATED. Zero information passes through.
+
+TRAIN mode, with seven other random examples in the batch — three trials:
+    trial 1 → [ 0.4990, −1.7167,  0.9051]
+    trial 2 → [ 0.1202, −2.5252,  0.8204]
+    trial 3 → [ 0.9413, −2.0315,  0.4799]
+    Same input, three different answers. In train mode BatchNorm is NOT a
+    function of x. It is a function of x AND of the other examples that
+    happened to be in the batch with it.
+
+EVAL mode, with running statistics converged to
+        <span class="keep">μ</span>^{run} = (4.959, −2.021, 0.140),  <span class="keep">σ</span>²^{run} = (3.728, 0.237, 103.055):
+    output = [0.5392, −2.9678, 0.6409]          ← deterministic, always.</div>
+
+      <div class="cards">
+        <div class="box bad">
+          <div class="n">bug 1 — the classic</div>
+          <div class="t">Forgetting to switch to eval mode</div>
+          <div class="g">Evaluate with the layer still in training mode and the statistics come from the evaluation batch. Metrics computed this way leak information <i>between test examples</i>, are wildly unstable at small batch, and collapse to <code>β</code> entirely at batch size 1. This single mistake is responsible for an enormous share of "my model works in the notebook and fails in production" reports.</div>
+        </div>
+        <div class="box bad">
+          <div class="n">bug 2</div>
+          <div class="t">Small batches</div>
+          <div class="g">The statistics are estimated from <code>N</code> samples, so their own noise scales as <code>1/√N</code>. At <code>N = 2</code> or <code>4</code> that noise is large enough to dominate, and the layer actively hurts. This is the reason gradient accumulation (§28) does not rescue a BatchNorm model, and the reason detection and segmentation models — which use tiny batches because their inputs are enormous — moved to other normalisations.</div>
+        </div>
+        <div class="box bad">
+          <div class="n">bug 3</div>
+          <div class="t">A distribution shift the running statistics never saw</div>
+          <div class="g">The running estimates describe the <i>training</i> distribution. Deploy on inputs whose statistics differ and the layer normalises by the wrong numbers, silently. Fine-tuning on a new domain without letting the statistics re-adapt is the same failure in a different costume.</div>
+        </div>
+        <div class="box good">
+          <div class="n">and the free win</div>
+          <div class="t">Fold it away after training</div>
+          <div class="g">At inference the layer is affine with fixed coefficients, so it can be <b>absorbed into the preceding linear layer</b>: with <code>W′ = γ⊙W/σ</code> and <code>b′ = γ⊙(b − μ)/σ + β</code>, the pair computes exactly <code>XW′ + b′</code>. Verified numerically: maximum discrepancy <code>1.8×10⁻¹⁵</code>, i.e. floating-point noise. The layer's entire inference cost disappears.</div>
+        </div>
+      </div>
+
+      <h4>Why it works — and the explanation that turned out to be wrong</h4>
+      <p>The original account was "internal covariate shift": each layer's input distribution keeps changing as the layers below it update, so each layer is chasing a moving target, and normalising holds it still. It is an appealing story and the evidence has not been kind to it. Later work found that networks with normalisation do not necessarily have more stable layer-input distributions, and that <i>deliberately injecting</i> distributional noise after the normalisation does not undo the benefit. The better-supported account is that normalisation <b>smooths the loss landscape</b> — it reduces the curvature and the variability of the gradients, which is §16's language for "raises the learning rate you are allowed to use". Three mechanisms that are easy to state and hold up:</p>
+      <ul class="notes">
+        <li><b>It decouples the weight scale from the function.</b> Multiply a layer's weights by <code>c</code> and the pre-activations scale by <code>c</code> — but the normalisation divides it straight back out, so the layer's <i>output is unchanged</i>. The gradient with respect to those weights, meanwhile, scales as <code>1/c</code>. A normalised layer is therefore automatically protected from a badly scaled initialisation, which is why normalised networks are so much less sensitive to §14's failures.</li>
+        <li><b>It improves the conditioning directly.</b> Zero-centring and unit-scaling every feature is precisely the input standardisation of §16 applied at <i>every</i> layer instead of only the first, and §16 showed that the condition number is what sets the achievable rate.</li>
+        <li><b>It regularises, as a side effect.</b> Because a training-mode output depends on the other examples in the batch, each example's representation carries a noise term drawn from the batch composition. That is a stochastic perturbation of the same character as dropout, and it is why adding BatchNorm often lets you reduce other regularisation. It is also why the effect weakens as the batch grows.</li>
+      </ul>
+
+      <div class="viz" id="viz-bn">
+        <div class="vhead">
+          <span class="vtitle">BatchNorm in both modes, with the running statistics converging live</span>
+          <span class="vhint">set the batch size to 1 and watch the train-mode output collapse onto <span class="keep">β</span> — the input stops mattering entirely</span>
+        </div>
+        <div class="controls">
+          <label>batch size N <input type="range" id="bn-N" min="1" max="64" step="1" value="8" /><span id="bn-Nv" style="min-width:28px;display:inline-block">8</span></label>
+          <label>momentum m <input type="range" id="bn-m" min="0.005" max="0.5" step="0.005" value="0.1" /><span id="bn-mv" style="min-width:38px;display:inline-block">0.100</span></label>
+          <label>steps <input type="range" id="bn-T" min="10" max="600" step="10" value="200" /><span id="bn-Tv" style="min-width:32px;display:inline-block">200</span></label>
+          <label>mode <select id="bn-mode">
+            <option value="both" selected>train and eval, side by side</option>
+            <option value="stats">the running statistics converging</option>
+            <option value="fold">folding the layer into the one before it</option>
+          </select></label>
+          <label><input type="checkbox" id="bn-unb" checked /> use the unbiased variance in the running estimate</label>
+        </div>
+        <svg id="bn-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="In the side-by-side view, one fixed input vector is pushed through a batch-normalisation layer many times in training mode, each time accompanied by a different random draw of companion examples, and the resulting outputs are drawn as a scatter of points per feature; the same input in evaluation mode gives a single deterministic point per feature, drawn as a horizontal line. As the batch size slider is reduced the training-mode scatter widens, and at a batch size of one every point collapses exactly onto the layer's learned offset, which is drawn as a second line, so that the total loss of information is visible rather than described. In the statistics view, the running mean and running variance of each feature are plotted against training step as they converge from their initial values of zero and one toward the true population values, which are drawn as dashed reference lines; a smaller momentum makes the convergence slower and smoother and a larger one makes it faster and noisier. In the folding view, the output of the layer applied after a linear map is compared entry by entry with the output of a single fused linear map whose weights and bias have been rewritten to absorb it, and the maximum discrepancy over the whole batch is printed."></svg>
+        <div class="readout" aria-live="polite" id="bn-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 30 ══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="layernorm" data-nav="LayerNorm, RMSNorm, pre/post">
+      <h3><span class="idx">30</span> LayerNorm, RMSNorm, and where the layer goes</h3>
+      <p class="lede">Every problem in §29 traces to one design decision: BatchNorm reduces over the <b>batch</b> axis. Reduce over the <b>feature</b> axis instead and every one of them disappears — no batch dependence, no running statistics, no train/eval asymmetry, identical behaviour at batch size 1 and batch size 1024. That is LayerNorm, and it is why sequence models use it universally.</p>
+
+      <div class="formula"><span class="lbl">the same input, three reductions</span><span class="eq">X is (N × d): N examples down the rows, d features across the columns.
+
+BatchNorm    reduce DOWN a column   → one <span class="keep">μ</span>, <span class="keep">σ</span> per FEATURE, shared by all
+                                       examples; depends on the batch.
+LayerNorm    reduce ACROSS a row    → one <span class="keep">μ</span>, <span class="keep">σ</span> per EXAMPLE, over its own
+                                       features; the batch is irrelevant.
+RMSNorm      reduce ACROSS a row,   → no centring at all.
+             second moment only</span>
+<span class="lbl">LayerNorm</span><span class="eq"><span class="keep">μ</span>ᵢ = (1/d) <span class="keep">∑</span>ⱼ x_{ij}      <span class="keep">σ</span>²ᵢ = (1/d) <span class="keep">∑</span>ⱼ (x_{ij} − <span class="keep">μ</span>ᵢ)²
+y_{ij} = <span class="keep">γ</span>ⱼ (x_{ij} − <span class="keep">μ</span>ᵢ)/<span class="keep">√</span>(<span class="keep">σ</span>²ᵢ + <span class="keep">ε</span>) + <span class="keep">β</span>ⱼ</span>
+<span class="lbl">RMSNorm — drop the mean, keep only the scale</span><span class="eq">RMS(xᵢ) = <span class="keep">√</span>( (1/d) <span class="keep">∑</span>ⱼ x²_{ij} + <span class="keep">ε</span> )
+y_{ij} = <span class="keep">γ</span>ⱼ · x_{ij} / RMS(xᵢ)              no <span class="keep">β</span>, no mean subtraction</span>
+<span class="eq">One fewer reduction, one fewer parameter vector, and empirically no worse.
+The claim it rests on is that the RE-SCALING is what mattered and the
+RE-CENTRING was never doing much work.</span></div>
+
+      <h4>The invariances differ, and it is easy to check</h4>
+      <div class="kbox">x = [1, 2, 3, 4]
+    LayerNorm(x) = [−1.34164, −0.44721, 0.44721, 1.34164]
+    RMSNorm(x)   = [ 0.36515,  0.73030, 1.09545, 1.46059]   RMS = 2.7386
+
+x + 10 = [11, 12, 13, 14]      — the SAME vector, shifted
+    LayerNorm  = [−1.34164, −0.44721, 0.44721, 1.34164]   IDENTICAL
+    RMSNorm    = [ 0.87650,  0.95618, 1.03586, 1.11555]   COMPLETELY DIFFERENT
+
+LayerNorm is invariant to a shift of the whole feature vector; RMSNorm is not.
+Whether that matters depends on whether your features have a meaningful zero,
+and in a residual stack, where the layer's input is a sum of many branches,
+the evidence is that it does not.</div>
+
+      <h4>Pre-norm and post-norm: where the layer sits in a residual block</h4>
+      <div class="formula"><span class="lbl">two placements, and they are NOT interchangeable</span><span class="eq">POST-NORM   x_{l+1} = Norm( x_l + F(x_l) )      the original arrangement
+PRE-NORM    x_{l+1} = x_l + F( Norm(x_l) )      the modern one</span>
+<span class="eq">The difference is what happens to the IDENTITY PATH.
+
+Post-norm: the skip connection passes THROUGH the normalisation, so the clean
+    identity route of §09 is interrupted at every block. The gradient at the
+    bottom of an L-block stack is scaled by a factor that GROWS with L, so a
+    deep post-norm stack cannot be trained at its target rate from step 0 —
+    it requires warmup, and the deeper it is the more it requires.
+
+Pre-norm: the skip connection is untouched. From input to output there is an
+    unbroken sum x_L = x_0 + <span class="keep">∑</span>_l F(Norm(x_l)), whose Jacobian is I plus a sum
+    of small terms, exactly the §09 fix. Gradients are well behaved at
+    initialisation, warmup becomes far less critical, and much deeper stacks
+    train without special handling.</span></div>
+
+      <div class="cards">
+        <div class="box warn">
+          <div class="n">post-norm</div>
+          <div class="t">Slightly better final quality, much harder to train</div>
+          <div class="g">The normalisation on the output of every block keeps activations bounded all the way up, and models that do train tend to end up marginally better. The cost is that they need careful warmup, are sensitive to the peak rate, and become unstable as depth grows. Used where depth is moderate and the recipe is already tuned.</div>
+        </div>
+        <div class="box good">
+          <div class="n">pre-norm</div>
+          <div class="t">Trains almost regardless</div>
+          <div class="g">The default in essentially every large model built since the failure mode was understood. Trades a little final quality for the ability to train very deep stacks at a high learning rate with a short warmup. Its one wrinkle: activations grow along the residual stream, since nothing normalises the stream itself — so a <b>final</b> normalisation before the output head is required, and is present in every implementation.</div>
+        </div>
+        <div class="box plain">
+          <div class="n">the giveaway</div>
+          <div class="t">How to tell which you have</div>
+          <div class="g">Look at what the residual addition receives. If the norm is applied to the <i>branch input</i>, it is pre-norm. If it is applied to the <i>sum</i>, it is post-norm. And if there is a lone normalisation layer immediately before the output projection with no block around it, that is the final norm a pre-norm stack requires — which is itself a reliable tell.</div>
+        </div>
+      </div>
+
+      <table class="grid2">
+        <tr><th>Layer</th><th>Reduces over</th><th class="num">extra params</th><th>Depends on the batch?</th><th>Train ≠ eval?</th><th>Where it is used</th></tr>
+        <tr><td><b>BatchNorm</b></td><td>the batch, per feature</td><td class="num">2d + 2d stats</td><td><b>yes</b></td><td><b>yes</b></td><td>convolutional vision networks with reasonable batch sizes</td></tr>
+        <tr class="tot"><td><b>LayerNorm</b></td><td>the features, per example</td><td class="num">2d</td><td>no</td><td>no</td><td>transformers, recurrent models, anything with a variable-length input</td></tr>
+        <tr><td><b>RMSNorm</b></td><td>the features, per example, no centring</td><td class="num">d</td><td>no</td><td>no</td><td>large language models — cheaper, and empirically equivalent</td></tr>
+        <tr><td><b>GroupNorm</b></td><td>groups of channels, per example</td><td class="num">2C</td><td>no</td><td>no</td><td>vision at small batch: detection, segmentation, video</td></tr>
+        <tr><td><b>InstanceNorm</b></td><td>each channel separately, per example</td><td class="num">2C</td><td>no</td><td>no</td><td>style transfer and generative image models, where per-image contrast is a nuisance variable</td></tr>
+      </table>
+
+      <div class="viz" id="viz-norms">
+        <div class="vhead">
+          <span class="vtitle">Which axis each layer reduces over, and what that costs</span>
+          <span class="vhint">the highlighted cells are the ones that share a mean and variance — that picture <i>is</i> the difference between the layers</span>
+        </div>
+        <div class="controls">
+          <label>layer <select id="nm-kind">
+            <option value="bn">BatchNorm</option>
+            <option value="ln" selected>LayerNorm</option>
+            <option value="rms">RMSNorm</option>
+            <option value="gn">GroupNorm (4 groups)</option>
+            <option value="in">InstanceNorm</option>
+          </select></label>
+          <label>batch N <input type="range" id="nm-N" min="1" max="10" step="1" value="6" /><span id="nm-Nv" style="min-width:24px;display:inline-block">6</span></label>
+          <label>features d <input type="range" id="nm-d" min="4" max="16" step="4" value="12" /><span id="nm-dv" style="min-width:24px;display:inline-block">12</span></label>
+          <label>highlight row <input type="range" id="nm-r" min="0" max="9" step="1" value="2" /><span id="nm-rv" style="min-width:20px;display:inline-block">2</span></label>
+          <label><input type="checkbox" id="nm-shift" /> add 10 to every feature (test shift-invariance)</label>
+        </div>
+        <svg id="norms-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left panel: the batch drawn as a grid of cells, one row per example and one column per feature, each cell coloured by its value. The cells that share a single mean and variance under the selected normalisation are outlined together, so BatchNorm outlines a column, LayerNorm outlines a row, GroupNorm outlines a contiguous block of a row, and InstanceNorm outlines a single cell. Right panel: the same grid after normalisation, with the highlighted row's values printed underneath as numbers. A checkbox adds a constant to every feature of every example; under LayerNorm the normalised output is bit-for-bit unchanged by that shift, while under RMSNorm it changes substantially, and the readout prints the maximum change so the invariance is a measurement rather than a claim. A summary block lists, for each layer, the number of learned parameters, whether the output of one example depends on the others in the batch, and whether the layer computes a different function at evaluation time."></svg>
+        <div class="readout" aria-live="polite" id="norms-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 31 ══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="reg" data-nav="Regularisation: the map">
+      <h3><span class="idx">31</span> Regularisation: what it actually is, and the whole map</h3>
+      <p class="lede">A regulariser is <b>any modification intended to reduce the generalisation error but not the training error</b>. That definition is worth taking literally, because it covers a much wider set of things than the penalty terms — the early stop, the extra data, the noise, the architecture choice — and because it tells you the test: if it improved your <i>training</i> loss, whatever it did, it was not regularising.</p>
+
+      <div class="formula"><span class="lbl">the classical form, and what the <span class="keep">λ</span> is trading</span><span class="eq">J̃(<span class="keep">θ</span>) = J(<span class="keep">θ</span>) + <span class="keep">λ</span>·<span class="keep">Ω</span>(<span class="keep">θ</span>)</span>
+<span class="eq"><span class="keep">Ω</span> encodes a PREFERENCE among the parameter settings that fit the data equally
+well. <span class="keep">λ</span> = 0 expresses no preference; <span class="keep">λ</span> → <span class="keep">∞</span> ignores the data entirely. Every
+useful value is in between, and the value is found on a VALIDATION set,
+because by construction the training loss is monotone increasing in <span class="keep">λ</span>.</span></div>
+
+      <div class="callout"><b>The framing that makes the whole chapter make sense.</b> Regularisation is not "making the model smaller". An over-parameterised, appropriately regularised model reliably beats a correctly-sized unregularised one, which is why the practical recipe is <b>take a model that is too big and regularise it</b>, rather than search for a model of exactly the right size. The reason is that "the right size" was never a real thing: the true data-generating process is not in your function class at any size, so there is no capacity at which the bias vanishes. See <a href="../../machine-learning/bias-variance-tradeoff.html">Bias &amp; Variance</a> for the full decomposition and for what happens past the interpolation threshold, which is that page's to own.</div>
+
+      <table class="grid2">
+        <tr><th style="width:130px">Technique</th><th>What it constrains</th><th>Cost</th><th>Where</th></tr>
+        <tr><td><b>L2 / weight decay</b></td><td>Shrinks weights toward zero, hardest in the directions the data does not constrain.</td><td>One multiply per parameter.</td><td><a href="#weight-decay">§32</a></td></tr>
+        <tr><td><b>L1</b></td><td>Drives weights to <i>exactly</i> zero. A feature-selection prior, not a shrinkage one.</td><td>One sign per parameter.</td><td><a href="#weight-decay">§32</a></td></tr>
+        <tr class="tot"><td><b>Dropout</b></td><td>Forbids the network from relying on any particular unit being present.</td><td>One mask per forward pass; no inference cost.</td><td><a href="#dropout">§33</a></td></tr>
+        <tr><td><b>Early stopping</b></td><td>Limits the total distance the parameters travel from their initialisation.</td><td>Free — it <i>saves</i> compute.</td><td><a href="#early-stop">§34</a></td></tr>
+        <tr><td><b>Data augmentation</b></td><td>Asserts an invariance the true function has, by showing the model transformed inputs with unchanged labels.</td><td>Cheap on the input pipeline.</td><td><a href="#augment">§35</a></td></tr>
+        <tr><td><b>Label smoothing</b></td><td>Caps the confidence the loss will reward, so the logits stop growing.</td><td>One line.</td><td><a href="#augment">§35</a> and §03</td></tr>
+        <tr><td><b>Noise injection</b></td><td>Requires the function to be flat in a neighbourhood of each training point, not just correct at it.</td><td>One random draw.</td><td><a href="#augment">§35</a></td></tr>
+        <tr><td><b>Minibatch noise</b></td><td>An accidental regulariser: gradient noise biases the trajectory toward wider minima.</td><td>Negative — it is <i>cheaper</i> than the alternative.</td><td>§15</td></tr>
+        <tr><td><b>BatchNorm</b></td><td>Also accidental: batch-dependent statistics inject example-level noise.</td><td>Comes free with the layer.</td><td>§29</td></tr>
+        <tr><td><b>Parameter sharing</b></td><td>Forces distinct parts of the model to use the <i>same</i> parameters — an infinitely strong prior, exactly stated.</td><td>Negative: fewer parameters.</td><td><a href="../convolutional-networks.html">CNNs</a>, <a href="../rnns-lstms.html">RNNs</a></td></tr>
+        <tr><td><b>Ensembling</b></td><td>Averages independent errors away.</td><td><code>k</code>× everything.</td><td>outside this page</td></tr>
+        <tr><td><b>More data</b></td><td>Nothing — it changes the problem rather than the model.</td><td>Usually the highest.</td><td>The best option whenever it is available.</td></tr>
+      </table>
+
+      <div class="wrong"><span class="say">The tempting shortcut.</span> "The model is overfitting, so I'll add dropout." <span class="fix">Diagnose first: is the training loss low?</span> If the training loss is <i>also</i> bad, you are underfitting and every regulariser will make it worse. Regularisation is the answer to exactly one diagnosis — training loss good, validation loss much worse — and §38's table is how to tell that apart from the four other things that look like it.</div>
+    </section>
+
+    <!-- ═══ 32 ══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="weight-decay" data-nav="L2, L1, weight decay">
+      <h3><span class="idx">32</span> L2, L1, and what weight decay actually does to a solution</h3>
+      <p class="lede">The penalty terms are the oldest regularisers and the ones whose behaviour is best understood, because on a quadratic objective the effect can be written down exactly. Doing so is worth the ten lines, because the answer — <i>shrink hardest in the directions the data constrains least</i> — is both the right intuition and a formula you can check.</p>
+
+      <div class="formula"><span class="lbl">L2, solved exactly on a quadratic</span><span class="eq">Let w* minimise the unregularised J, and H = <span class="keep">∇</span>²J(w*), so near w*
+    J(w) ≈ J(w*) + ½(w − w*)ᵀ H (w − w*)
+
+Minimise J(w) + (<span class="keep">α</span>/2)‖w‖². The gradient is <span class="keep">α</span>w + H(w − w*) = 0, so
+    w̃ = (H + <span class="keep">α</span>I)⁻¹ H w*
+
+Diagonalise H = Q<span class="keep">Λ</span>Qᵀ. In the eigenbasis this is coordinate-wise:
+    w̃ᵢ = ( <span class="keep">λ</span>ᵢ / (<span class="keep">λ</span>ᵢ + <span class="keep">α</span>) ) · w*ᵢ</span>
+<span class="eq">Read the factor. Where the curvature is LARGE (<span class="keep">λ</span> ≫ <span class="keep">α</span>) it is ≈ 1 and the
+component survives untouched. Where the curvature is SMALL (<span class="keep">λ</span> ≪ <span class="keep">α</span>) it is
+≈ <span class="keep">λ</span>/<span class="keep">α</span> ≈ 0 and the component is deleted.
+Large curvature = "moving here costs a lot of loss" = the data cares.
+Small curvature = "moving here is nearly free" = the data does not.
+So L2 keeps exactly the directions the data determined and discards the rest.</span>
+<span class="lbl">verified against a real matrix, H = diag(10, 0.2), w* = (1, 1)</span><span class="eq"><span class="keep">α</span> = 0.1   w̃ = (0.990099, 0.666667)   <span class="keep">λ</span>/(<span class="keep">λ</span>+<span class="keep">α</span>) = (0.990099, 0.666667)  ✓
+<span class="keep">α</span> = 1.0   w̃ = (0.909091, 0.166667)   <span class="keep">λ</span>/(<span class="keep">λ</span>+<span class="keep">α</span>) = (0.909091, 0.166667)  ✓
+The stiff coordinate loses 1% and then 9%; the soft one loses 33% and then 83%.
+Same penalty, same weights to start, a fivefold difference in what it does.</span></div>
+
+      <h4>L1 is a different animal</h4>
+      <div class="formula"><span class="lbl">L1, on a diagonal quadratic where it has a closed form</span><span class="eq">minimise  ½<span class="keep">∑</span>ᵢ <span class="keep">λ</span>ᵢ(wᵢ − w*ᵢ)² + <span class="keep">α</span><span class="keep">∑</span>ᵢ |wᵢ|
+
+    w̃ᵢ = sign(w*ᵢ) · max( |w*ᵢ| − <span class="keep">α</span>/<span class="keep">λ</span>ᵢ , 0 )        SOFT THRESHOLDING</span>
+<span class="eq">The difference from L2 is total and it is the max(·, 0):
+    L2 MULTIPLIES  by <span class="keep">λ</span>/(<span class="keep">λ</span>+<span class="keep">α</span>), so nothing ever reaches exactly zero;
+    L1 SUBTRACTS a constant <span class="keep">α</span>/<span class="keep">λ</span>ᵢ, so everything below that threshold lands
+       on EXACTLY zero and stays there.
+L1 therefore performs FEATURE SELECTION and produces a genuinely sparse
+parameter vector. L2 produces a small dense one. They express different
+prior beliefs, not different strengths of the same belief.</span></div>
+
+      <div class="cards">
+        <div class="box good">
+          <div class="n">use L2 when</div>
+          <div class="t">You believe every feature contributes a little</div>
+          <div class="g">The default for neural networks. Smooth, differentiable everywhere, one hyperparameter, and it composes with everything. In an adaptive optimiser use the <b>decoupled</b> form (§23).</div>
+        </div>
+        <div class="box warn">
+          <div class="n">use L1 when</div>
+          <div class="t">You believe most features are irrelevant</div>
+          <div class="g">Rare in deep networks, common in linear models on wide feature sets. Its non-differentiability at zero is handled by the sub-gradient (any value in <code>[−1, 1]</code>) or, better, by a proximal step — and a plain sub-gradient implementation will hover near zero rather than landing on it, which defeats the point.</div>
+        </div>
+        <div class="box bad">
+          <div class="n">do not penalise</div>
+          <div class="t">Biases, or normalisation gains and offsets</div>
+          <div class="g">A bias has one parameter per unit and carries no capacity worth constraining; penalising it introduces bias in the statistical sense for nothing. A normalisation layer's <code>γ</code> exists precisely to set the scale, and shrinking it toward zero fights the layer. Exclude both by name.</div>
+        </div>
+        <div class="box plain">
+          <div class="n">the honest caveat</div>
+          <div class="t">The quadratic analysis is local</div>
+          <div class="g">Everything above assumes a quadratic near a single minimum. A neural network has many, and the penalty changes <i>which</i> one you reach as well as where within it you stop. The picture is the right intuition and it is not a proof about the real object.</div>
+        </div>
+      </div>
+
+      <div class="viz" id="viz-l2">
+        <div class="vhead">
+          <span class="vtitle">The shrinkage, exactly: L2 against L1, and the early-stopping equivalence</span>
+          <span class="vhint">the third panel is the surprise — a trajectory that is simply <i>stopped</i> lands in almost the same place as one that was penalised</span>
+        </div>
+        <div class="controls">
+          <label>penalty <span class="keep">α</span> <input type="range" id="l2-a" min="-2" max="1.2" step="0.05" value="0" /><span id="l2-av" style="min-width:44px;display:inline-block">1.000</span></label>
+          <label>curvature <span class="keep">λ</span>₂ <input type="range" id="l2-l2" min="-1.3" max="1" step="0.05" value="-0.7" /><span id="l2-l2v" style="min-width:44px;display:inline-block">0.200</span></label>
+          <label>view <select id="l2-view">
+            <option value="shrink" selected>the shrinkage factor against curvature</option>
+            <option value="contour">the contours, and where the optimum moves</option>
+            <option value="early">early stopping against L2</option>
+          </select></label>
+          <label>steps <span class="keep">τ</span> <input type="range" id="l2-tau" min="1" max="400" step="1" value="50" /><span id="l2-tauv" style="min-width:30px;display:inline-block">50</span></label>
+          <label><input type="checkbox" id="l2-l1" checked /> overlay L1 soft thresholding</label>
+        </div>
+        <svg id="l2-svg" width="760" height="390" viewBox="0 0 760 390" role="img" aria-label="In the shrinkage view, the factor by which each coordinate of the unregularised optimum is multiplied is plotted against that coordinate's curvature on a logarithmic horizontal axis. The L2 curve is the ratio of curvature to curvature plus penalty, running smoothly from zero at low curvature to one at high curvature and never reaching exactly zero. The L1 curve, overlaid, is a soft-thresholding function that is exactly zero below a threshold and then rises, and the qualitative difference between never-quite-zero and exactly-zero is visible as the flat segment on the horizontal axis. In the contour view, elliptical contours of an unregularised quadratic objective are drawn together with circular contours of the penalty, and the regularised optimum is marked between them, moved much further along the shallow axis of the ellipse than along the steep one. In the early-stopping view, the gradient-descent trajectory from the origin toward the unregularised optimum is drawn, the point reached after the chosen number of steps is marked, and the L2 solution for the penalty that the equivalence predicts is marked as well, so the reader can see how close the two are along the low-curvature axis and how far apart they are along the high-curvature one."></svg>
+        <div class="readout" aria-live="polite" id="l2-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 33 ══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="dropout" data-nav="Dropout">
+      <h3><span class="idx">33</span> Dropout: an exponential ensemble, and the one line that makes it cheap</h3>
+      <p class="lede">Dropout deletes a random subset of the units on every forward pass. Two readings of what that accomplishes, and both are useful: it trains an <b>ensemble of exponentially many networks with shared weights</b>, and it forbids any unit from relying on the presence of any other unit. The first reading explains the inference rule; the second explains why it works.</p>
+
+      <div class="formula"><span class="lbl">training</span><span class="eq">sample a mask <span class="keep">μ</span>, one binary entry per unit, independently, P(<span class="keep">μ</span>ⱼ = 1) = p
+h ← (h ⊙ <span class="keep">μ</span>) / p                                   ← INVERTED dropout
+typical p: 0.5 for hidden units, 0.8 for inputs (i.e. drop 20%)</span>
+<span class="lbl">inference</span><span class="eq">h ← h                                              nothing at all</span>
+<span class="eq">The division by p at TRAINING time is what makes inference free. Without it,
+the expected activation during training is p·h and at inference it is h — a
+factor of 1/p mismatch that compounds through every layer. Two ways to fix it;
+inverted dropout puts the correction where it costs nothing at deployment.</span></div>
+
+      <div class="kbox">measured, over 20 000 random masks, p = 0.5, on a 1000-unit layer:
+
+  full output (no dropout)                       0.84979
+  mean output, DROP-ONLY (no rescaling)          0.42283   ratio 0.4976 ≈ p ✓
+  mean output, INVERTED (÷ p at train time)      0.84856   ratio 0.9985 ✓
+
+  standard deviation of ONE masked output ÷ |full output|    1.15
+
+That last number is the one to sit with: the noise a single dropout mask
+adds is LARGER than the signal. Dropout works despite that because the
+gradient is an average over many masks and many examples, not because any
+individual forward pass is close to the truth.</div>
+
+      <h4>Why the inference rule is an approximation, and why it is a good one</h4>
+      <p>The exact ensemble prediction would average over all <code>2ⁿ</code> masks, which is intractable — <code>n = 100</code> units gives <code>10³⁰</code> networks. What the weight-scaling rule computes instead is the prediction of the single network with all units present and the weights scaled. For a model with <b>no non-linearity</b> that is <i>exactly</i> the geometric mean of the ensemble's predictions; with non-linearities it is an approximation with no error bound, and it is an approximation that works extremely well in practice. If you need the ensemble properly — for a calibrated uncertainty estimate rather than a point prediction — the honest method is to <b>keep dropout on at inference and average over 10 to 20 sampled masks</b>, which also gives you a spread to report. That is more expensive by a factor of 10 to 20 and it is a genuinely different, better-calibrated model.</p>
+
+      <div class="cards">
+        <div class="box good">
+          <div class="n">what it prevents</div>
+          <div class="t">Co-adaptation</div>
+          <div class="g">Without dropout, unit <code>A</code> can learn to be useful only in combination with unit <code>B</code> — a brittle arrangement that fits the training set and does not transfer. With dropout, <code>B</code> is absent half the time, so <code>A</code> must be independently useful. Each unit is pushed toward a feature that stands on its own.</div>
+        </div>
+        <div class="box warn">
+          <div class="n">the interaction nobody mentions</div>
+          <div class="t">Dropout and BatchNorm fight</div>
+          <div class="g">Dropout changes the variance of its output between training and inference; BatchNorm's running statistics are estimated under the training-time variance and applied under the inference-time one. The mismatch degrades both. The common resolutions are to put dropout only <i>after</i> the last normalisation layer, or to use one and not the other — which is why modern convolutional networks with BatchNorm typically use little or no dropout.</div>
+        </div>
+        <div class="box warn">
+          <div class="n">where to put it</div>
+          <div class="t">On the wide layers, not everywhere</div>
+          <div class="g">Dropout is most useful where the parameters are: the large fully-connected layers, and the residual branches of a transformer block. Applying it to a narrow layer removes a large fraction of a small amount of information and mostly just adds noise. Applying it to the input is a mild form of data augmentation and usually wants a much smaller rate.</div>
+        </div>
+        <div class="box bad">
+          <div class="n">the cost</div>
+          <div class="t">Slower training, and it is not free capacity</div>
+          <div class="g">A network trained with <code>p = 0.5</code> has, in effect, half the units available on each pass, so it typically needs to be <b>wider</b> and to train for <b>longer</b> to reach the same training loss. Turning dropout on and changing nothing else usually produces a worse model, not a better one.</div>
+        </div>
+      </div>
+
+      <div class="viz" id="viz-drop">
+        <div class="vhead">
+          <span class="vtitle">The mask, the ensemble, and why the scaling factor is where it is</span>
+          <span class="vhint">the histogram is the whole argument for inverted dropout: with the division at training time the two distributions have the same mean, without it they are a factor of <code>p</code> apart</span>
+        </div>
+        <div class="controls">
+          <label>keep probability p <input type="range" id="dr-p" min="0.1" max="1" step="0.05" value="0.5" /><span id="dr-pv" style="min-width:38px;display:inline-block">0.50</span></label>
+          <label>units <input type="range" id="dr-n" min="4" max="512" step="4" value="128" /><span id="dr-nv" style="min-width:32px;display:inline-block">128</span></label>
+          <label>convention <select id="dr-conv">
+            <option value="inv" selected>inverted: ÷ p at training time</option>
+            <option value="classic">classical: × p at inference time</option>
+            <option value="none">neither — the bug</option>
+          </select></label>
+          <label>masks sampled <input type="range" id="dr-m" min="20" max="4000" step="20" value="1200" /><span id="dr-mv" style="min-width:40px;display:inline-block">1200</span></label>
+          <label><input type="checkbox" id="dr-mc" /> show the Monte-Carlo ensemble average</label>
+        </div>
+        <svg id="drop-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left panel: a grid of units for one forward pass, each cell shaded by its activation, with the dropped units drawn blank, so the fraction removed is visible and matches the keep probability. Beneath it, the count of distinct sub-networks the mask is drawn from, which is two to the power of the number of units and is printed in scientific notation because it exceeds every physical quantity within a few dozen units. Right panel: a histogram of the layer's scalar output over many independently sampled masks, drawn against a vertical line at the output the full network produces with no dropout at all. Under the inverted convention the histogram's mean sits on that line; under the classical convention with the correction omitted the mean sits at p times that line, and the gap is shaded and labelled with the measured ratio. A second, narrower histogram appears when the Monte-Carlo option is enabled, showing the distribution of averages over twenty masks rather than single masks, which is far tighter and centred in the same place, illustrating why averaging a modest number of masks recovers the ensemble."></svg>
+        <div class="readout" aria-live="polite" id="drop-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 34 ══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="early-stop" data-nav="Early stopping">
+      <h3><span class="idx">34</span> Early stopping, and why it is a regulariser rather than a shortcut</h3>
+      <p class="lede">Stop when the validation error stops improving. It is the cheapest regulariser there is — it <i>saves</i> compute rather than costing it — it needs no hyperparameter search, and it has a precise relationship to L2 that turns "stopping early" from a heuristic into a statement about where in parameter space you end up.</p>
+
+      <div class="formula"><span class="lbl">the algorithm, with the details that matter</span><span class="eq">best <span class="keep">←</span> <span class="keep">∞</span>;  patience_left <span class="keep">←</span> P;  <span class="keep">θ</span>_best <span class="keep">←</span> <span class="keep">θ</span>₀
+every k steps:
+    v <span class="keep">←</span> validation metric
+    if v &lt; best − <span class="keep">δ</span>:   best <span class="keep">←</span> v;  <span class="keep">θ</span>_best <span class="keep">←</span> copy of <span class="keep">θ</span>;  patience_left <span class="keep">←</span> P
+    else:              patience_left <span class="keep">←</span> patience_left − 1
+    if patience_left = 0: stop, and RETURN <span class="keep">θ</span>_best</span>
+<span class="eq">The two things people get wrong:
+  · returning the LAST parameters instead of the BEST ones — which throws
+    away the entire point, since the last P checks were by construction worse;
+  · a patience of 1, which stops on the first noisy uptick. Validation loss is
+    an estimate and it fluctuates; P should be several checks' worth.</span></div>
+
+      <h4>The equivalence to L2, and how far it goes</h4>
+      <p>Run gradient descent on the quadratic model of §32 from <code>w = 0</code>. In the eigenbasis each coordinate evolves independently: <code>wᵢ(τ) = [1 − (1 − ηλᵢ)^{τ}]·w*ᵢ</code>. Compare with L2's <code>w̃ᵢ = [λᵢ/(λᵢ + α)]·w*ᵢ</code>. Both are the unregularised optimum multiplied by a factor between 0 and 1, and both shrink the low-curvature directions hardest — early stopping because those directions <i>learn slowly</i>, L2 because those directions <i>cost little to give up</i>. Matching the two factors gives the classical correspondence:</p>
+
+      <div class="formula"><span class="lbl">the correspondence, and its condition</span><span class="eq">(1 − <span class="keep">η</span><span class="keep">λ</span>)^{<span class="keep">τ</span>} = <span class="keep">α</span>/(<span class="keep">λ</span> + <span class="keep">α</span>)     exact, coordinate by coordinate
+and for SMALL <span class="keep">η</span><span class="keep">λ</span> and <span class="keep">λ</span>/<span class="keep">α</span>,  <span class="keep">τ</span> ≈ 1/(<span class="keep">η</span><span class="keep">α</span>)   and   <span class="keep">α</span> ≈ 1/(<span class="keep">η</span><span class="keep">τ</span>)</span>
+<span class="eq">"The number of training steps plays the role of the inverse of the weight decay
+coefficient." Training longer = regularising less. That is a clean statement
+and it is only accurate where the approximation holds — measured below.</span>
+<span class="lbl">checked on <span class="keep">λ</span> = (10, 0.2), w* = (1, 1), <span class="keep">η</span> = 0.02, with <span class="keep">α</span> set to 1/(<span class="keep">η</span><span class="keep">τ</span>)</span><span class="eq"><span class="keep">τ</span> = 10   early (0.89263, 0.03929)   L2 <span class="keep">α</span>=5.0000  (0.66667, 0.03846)
+<span class="keep">τ</span> = 50   early (0.99999, 0.18160)   L2 <span class="keep">α</span>=1.0000  (0.90909, 0.16667)
+<span class="keep">τ</span> = 200  early (1.00000, 0.55139)   L2 <span class="keep">α</span>=0.2500  (0.97561, 0.44444)
+
+The LOW-curvature coordinate (<span class="keep">λ</span> = 0.2, <span class="keep">η</span><span class="keep">λ</span> = 0.004) matches to within 2–9%.
+The HIGH-curvature one (<span class="keep">λ</span> = 10, <span class="keep">η</span><span class="keep">λ</span> = 0.2, NOT ≪ 1) is off by up to 33%.
+The approximation needs <span class="keep">η</span><span class="keep">λ</span> ≪ 1, and the stiff direction is exactly where that
+fails. The intuition transfers; the formula is for the soft directions.</span></div>
+
+      <div class="cards">
+        <div class="box good">
+          <div class="n">the advantage that matters</div>
+          <div class="t">It tunes its own strength, in one run</div>
+          <div class="g">Finding a good <code>α</code> for L2 means training the model several times over. Early stopping finds the equivalent amount of regularisation <b>during the single run you were going to do anyway</b>, by watching a validation curve. That is why it is used essentially always, and used <i>alongside</i> the other regularisers rather than instead of them.</div>
+        </div>
+        <div class="box warn">
+          <div class="n">the cost</div>
+          <div class="t">A validation set, and periodic evaluation</div>
+          <div class="g">Data held out of training, plus the compute for an evaluation pass every <code>k</code> steps. Both are small. The subtler cost is that the validation set is now being <i>optimised against</i> — through the stopping decision — so the final validation number is optimistically biased and is no longer a clean estimate of test performance.</div>
+        </div>
+        <div class="box warn">
+          <div class="n">the question everyone asks</div>
+          <div class="t">Should I retrain on train + validation afterwards?</div>
+          <div class="g">Two options, neither obviously right. <b>Retrain from scratch</b> for the number of steps the first run took — but that number was for a smaller dataset and is now wrong. Or <b>continue training</b> the stopped model on the combined data until its loss on the former validation set falls to the training loss it had — but that may never happen. Retraining from scratch on the same number of <i>epochs</i> is the usual compromise.</div>
+        </div>
+        <div class="box plain">
+          <div class="n">the geometric picture</div>
+          <div class="t">A budget on distance travelled</div>
+          <div class="g">Gradient descent from <code>θ₀</code> can move at most <code>∑ηₜ‖g‖</code> in total, so stopping at step <code>τ</code> is a hard constraint confining <code>θ</code> to a ball around <code>θ₀</code>. That is why initialisation and early stopping interact: the initialisation is the <i>centre</i> of the ball that early stopping is drawing.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ 35 ══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="augment" data-nav="Augmentation, noise, smoothing">
+      <h3><span class="idx">35</span> Data augmentation, noise injection, and label smoothing</h3>
+      <p class="lede">The best way to make a model generalise is more data. The second best is to <b>manufacture</b> more data by applying transformations you know leave the label unchanged. That "you know" is the whole content: an augmentation is a piece of prior knowledge about the task, injected in the only form a network can absorb — examples.</p>
+
+      <div class="formula"><span class="lbl">what an augmentation asserts</span><span class="eq">Choose a family of transformations T with the property
+        f*( T(x) )  =  f*( x )        for the TRUE function f*
+and train on (T(x), y) pairs. The network is being shown, empirically, an
+invariance that you could otherwise only build into the architecture.</span>
+<span class="eq">The condition is not decoration. Horizontal flip is label-preserving for
+"cat vs dog" and DESTROYS "b vs d", "6 vs 9" and any task involving text or
+chirality. Every augmentation is a claim about the task, and a wrong claim
+teaches the model something false with full confidence.</span></div>
+
+      <table class="grid2">
+        <tr><th style="width:130px">Family</th><th>Examples</th><th>The invariance it asserts</th><th>Where it goes wrong</th></tr>
+        <tr><td><b>geometric</b></td><td>flip, crop, translate, rotate, scale</td><td>The label does not depend on position, orientation or scale.</td><td>Any task where orientation <i>is</i> the label: digits, characters, medical laterality, any text in the image.</td></tr>
+        <tr><td><b>photometric</b></td><td>brightness, contrast, hue, blur, noise</td><td>The label does not depend on the imaging conditions.</td><td>Colour-diagnostic tasks — species, ripeness, most of medical imaging.</td></tr>
+        <tr><td><b>occlusion</b></td><td>erase a random patch</td><td>The object is recognisable from any part of it.</td><td>Fine-grained tasks where the distinguishing feature is small and might be the part erased.</td></tr>
+        <tr class="tot"><td><b>mixing</b></td><td>convex combinations of two examples <i>and their labels</i></td><td>The model should behave <b>linearly between</b> training points, not just correctly at them.</td><td>Nothing much — it is one of the few augmentations that is nearly task-agnostic, and it also improves calibration.</td></tr>
+        <tr><td><b>input noise</b></td><td>Gaussian noise added to <code>x</code></td><td>The function is locally flat. For a linear model with squared error this is <b>provably equivalent</b> to L2 on the weights.</td><td>Too much noise and you are training on a different distribution from the one you will deploy on.</td></tr>
+        <tr><td><b>weight noise</b></td><td>Gaussian noise added to <code>θ</code> each step</td><td>The solution should be in a <i>flat</i> region — a small perturbation of the weights should not change the function.</td><td>Interacts badly with adaptive optimisers, whose <code>v̂</code> then measures the injected noise rather than the signal.</td></tr>
+        <tr><td><b>label smoothing</b></td><td>target <code>(1−<span class="keep">ε</span>)y + <span class="keep">ε</span>/K</code></td><td>The labels are not perfectly certain, so the model should not be either.</td><td>Distillation and any use of the logits as calibrated scores — smoothing deliberately blunts exactly what those need. §03.</td></tr>
+        <tr><td><b>text and audio</b></td><td>synonym substitution, back-translation, time/frequency masking, speed perturbation</td><td>Meaning survives paraphrase; identity survives a change of tempo or a missing band.</td><td>Synonym substitution is far less safe than it sounds — sentiment and negation are easy to invert by accident.</td></tr>
+      </table>
+
+      <div class="callout"><b>Two rules that prevent most augmentation bugs.</b> <b>(1) Augment the training split only.</b> A validation or test set that has been augmented is measuring performance on a distribution you will never see, and if the augmentation is random the number is not even reproducible. The one deliberate exception is test-time augmentation, where several transformed copies are predicted and averaged on purpose — and that is a different <i>model</i>, which must be reported as such. <b>(2) Augment inside the training loop, not once beforehand.</b> A fixed set of pre-generated variants is a slightly larger finite dataset; sampling a fresh transformation each epoch is an effectively infinite one, and it is the second that gives most of the benefit.</div>
+
+      <h4>Noise injection, and where it lands</h4>
+      <p>The three places noise can be added correspond to three different claims, and they are worth keeping distinct because they have different effects.</p>
+      <ul class="notes">
+        <li><b>To the inputs.</b> Says: the function should be flat around each training point. For a linear model under squared error this is exactly L2 on the weights, with the penalty proportional to the noise variance — one of the very few cases where two regularisers are provably the same thing.</li>
+        <li><b>To the weights.</b> Says: the <i>solution</i> should be flat — a small perturbation of the parameters should barely change the function. This is a preference for wide minima, stated directly instead of hoped for, and it is the same preference that minibatch noise (§15) expresses by accident.</li>
+        <li><b>To the labels.</b> Says: some of the labels are wrong, which is true of every real dataset. Label smoothing is the deterministic version — instead of flipping <code>ε</code> of the labels, it moves <i>every</i> target <code>ε</code> of the way toward uniform, which has the same effect on the expected loss with none of the variance.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Neural Network Training series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="schedules-precision-memory.html">← LR Schedules, Batch Size &amp; Precision</a>
+      <a href="../neural-network-training.html" style="color:var(--muted)">Neural Network Training · overview</a>
+      <a href="tuning-debugging.html">Clipping, Tuning &amp; Debugging Runs →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../neural-network-training.viz.js"></script>
+</body>
+</html>

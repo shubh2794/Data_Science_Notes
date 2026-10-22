@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Donut: Evaluation, Ablations &amp; Limits</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+.tokrow{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0;font-family:"SF Mono",Menlo,monospace;font-size:11.5px}
+.tokrow span{padding:2px 5px;border-radius:4px;background:rgba(91,156,255,.16);color:#cfe0ff}
+.tokrow span.sp{background:rgba(255,180,84,.2);color:#ffd9a3}
+.tokrow span.ctl{background:rgba(192,132,252,.2);color:#e9d5ff}
+.tokrow span.bad{background:rgba(248,113,113,.25);color:#fecaca}
+textarea.jsin{width:100%;min-height:92px;background:#10131a;color:#e6e9ef;border:1px solid #2a2f3a;border-radius:8px;font-family:"SF Mono",Menlo,monospace;font-size:12px;padding:8px;box-sizing:border-box}
+pre.jsout{background:#10131a;border:1px solid #2a2f3a;border-radius:8px;padding:8px;font-size:11.5px;white-space:pre-wrap;margin:6px 0 0;color:#cbd5e1}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../donut.html">Donut</a> · part 4 of 5</p>
+      <h1>Donut: Evaluation, Ablations &amp; Limits</h1>
+      <p>Measuring Donut: field-level F1 against tree-edit-distance accuracy, results and timings against OCR-based baselines, ablations of backbone, canvas resolution and OCR engine, its handwritten DocVQA advantage despite a lower overall score, and the limits of a fixed canvas, single page and generative decoder.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Donut</span>
+        <span class="pill">Field F1 · TED accuracy · vs OCR baselines · backbone & resolution ablations · handwriting · limits</span>
+      </div>
+    </header>
+
+    <!-- 17 ───────────────────────────────────────────── -->
+    <section class="topic" id="metrics" data-nav="Field F1 and TED accuracy">
+      <h3><span class="idx">17</span> Metrics: field-level F1 and tree-edit-distance accuracy</h3>
+      <p class="lede">Donut reports two metrics for information extraction. Field-level F1 counts a predicted key–value pair as correct only if exactly the same pair is in the ground truth. Tree-edit-distance (TED) accuracy converts both records to trees and measures how many node insertions, deletions and relabellings turn the prediction into the ground truth, normalised by the cost of building the ground truth from an empty tree. The first gives no credit for partial matches and cannot tell which item a field was grouped with (its flattened key paths do record nesting); the second rewards partial matches and scores the grouping.</p>
+      <div class="formula"><span class="lbl">field-level F1, micro-averaged over the test set (flattened (path, value) pairs, exact match)</span><span class="eq">F1 = TP / (TP + (FP + FN) / 2)</span>
+<span class="lbl">TED-based accuracy (the paper's definition; gt, pr, ∅ = ground truth, prediction, empty tree)</span><span class="eq">acc = max(0, 1 − TED(pr, gt) / TED(∅, gt))</span>
+<span class="lbl">edit costs in the released evaluator (zss tree edit distance, Zhang–Shasha)</span><span class="eq">insert / delete: key node 1, leaf "v" = len(v)        relabel: key↔key 0 or 1,  leaf↔leaf = Levenshtein(v, v′),  key↔leaf = 1 + len(leaf)</span></div>
+      <h4>How a record becomes a tree</h4>
+      <p>The evaluator first normalises both records — keys sorted by (length, name), every value wrapped in a list, empty values dropped — then builds a tree: a root, one node per key, a <code>&lt;subtree&gt;</code> node for each dictionary inside a list, and one leaf per string value. Because leaves cost their length to insert, a long missing string costs more than a short one, and a one-character misread costs 1.</p>
+      <h4>Worked example</h4>
+      <p>Ground truth {"menu": [{"nm": "Latte", "cnt": "2", "price": "9,000"}], "total": {"total_price": "9,000"}}. Its tree has key nodes menu, &lt;subtree&gt;, nm, cnt, price, total, &lt;subtree&gt;, total_price (8 nodes, cost 1 each) and leaves "Latte", "2", "9,000", "9,000" (5 + 1 + 5 + 5 = 16), so TED(∅, gt) = 24.</p>
+      <table class="cmp">
+        <tr><th>Prediction differs by</th><th>TED(pr, gt)</th><th>TED accuracy</th><th>Field F1</th></tr>
+        <tr><td>nothing</td><td>0</td><td>1 − 0/24 = 1.000</td><td>1.000</td></tr>
+        <tr><td>price "9,800" instead of "9,000"</td><td>1 (one character)</td><td>1 − 1/24 = 0.958</td><td>3 / (3 + 2/2) = 0.750</td></tr>
+        <tr><td>key "unitprice" instead of "price"</td><td>1 (one key relabel)</td><td>0.958</td><td>0.750</td></tr>
+        <tr><td>"cnt" field missing</td><td>2 (key node + 1-character leaf)</td><td>1 − 2/24 = 0.917</td><td>3 / (3 + 1/2) = 0.857</td></tr>
+        <tr><td>an extra item {"nm": "Cookie", "cnt": "1", "price": "2,500"}</td><td>16</td><td>1 − 16/24 = 0.333</td><td>4 / (4 + 3/2) = 0.727</td></tr>
+        <tr><td>all four values right but flattened (no menu/total groups)</td><td>4</td><td>0.833</td><td>0.000</td></tr>
+        <tr><td>empty output</td><td>24</td><td>0.000</td><td>0.000</td></tr>
+      </table>
+      <p>These values were computed with the released evaluator's code. They show the metrics' different sensitivities: a one-character misread costs a whole field in F1 (0.75) but only 1/24 of TED accuracy; a structurally wrong but textually perfect prediction gets zero F1 — every flattened key path differs — while TED accuracy stays at 0.83; and a hallucinated extra item hurts TED accuracy far more than F1, because the item's characters must all be deleted.</p>
+      <div class="viz" id="viz-ted">
+        <div class="vhead">
+          <span class="vtitle">Tree edit distance on two small records</span>
+          <span class="vhint">pick a prediction · compare the trees and the two metrics</span>
+        </div>
+        <div class="controls">
+          <label>prediction <select id="ted-pred">
+            <option value="exact">exact</option>
+            <option value="char">one character misread</option>
+            <option value="key">wrong key name</option>
+            <option value="miss">missing field</option>
+            <option value="extra">hallucinated extra item</option>
+            <option value="flat">flattened structure</option>
+            <option value="empty">empty output</option>
+          </select></label>
+        </div>
+        <svg id="ted-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Ground-truth and predicted trees side by side, with nodes that differ highlighted"></svg>
+        <div class="readout" aria-live="polite" id="ted-read"></div>
+        <p class="vcap">Both trees are built with the evaluator's normalisation and tree rules; TED is computed in the browser with a Zhang–Shasha implementation using the evaluator's insert, delete and relabel costs, and F1 with its flatten-and-match rule. The browser results reproduce the Python evaluator's numbers in the table above. Nodes drawn in red exist in only one tree or differ in label.</p>
+      </div>
+      <h4>ANLS for DocVQA</h4>
+      <p>DocVQA answers are scored with Average Normalized Levenshtein Similarity: for each question, 1 minus the normalised edit distance to the closest of the accepted answers, set to 0 when the distance is 0.5 or more, averaged over questions. It forgives small misspellings but not wrong answers; its formula is on the hub's <a href="../document-ai-models.html#benchmarks">benchmark section</a>.</p>
+      <div class="callout"><b>Takeaway:</b> report both metrics. Field F1 answers "how many fields could be used as-is"; TED accuracy answers "how close is the whole record, structure included". A model that reads well but groups badly, or groups well but misreads characters, looks very different under the two.</div>
+    </section>
+
+    <!-- 18 ───────────────────────────────────────────── -->
+    <section class="topic" id="results" data-nav="Results against OCR-based baselines">
+      <h3><span class="idx">18</span> Results against OCR-based baselines</h3>
+      <p class="lede">On the paper's settings Donut is the most accurate model in the classification comparison and in all four IE comparisons, and at least as fast as every baseline in every timing (it ties WYVERN on CORD at 1.2 s), while its DocVQA score is below the OCR-based LayoutLM and LayoutLMv2 models. Baseline times include their OCR engine; Donut's times were measured on an NVIDIA P40. The OCR-based IE baselines use CLOVA OCR (PaddleOCR for the Chinese tickets); classification and DocVQA timings use the Microsoft OCR API.</p>
+      <h4>Document classification (RVL-CDIP, Table 1)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>OCR</th><th>Parameters</th><th>Time (ms / page)</th><th>Accuracy (%)</th></tr>
+        <tr><td>BERT</td><td>✓</td><td>110M + α</td><td>1,392</td><td>89.81</td></tr>
+        <tr><td>RoBERTa</td><td>✓</td><td>125M + α</td><td>1,392</td><td>90.06</td></tr>
+        <tr><td>LayoutLM</td><td>✓</td><td>113M + α</td><td>1,396</td><td>91.78</td></tr>
+        <tr><td>LayoutLM (with image)</td><td>✓</td><td>160M + α</td><td>1,426</td><td>94.42</td></tr>
+        <tr><td>LayoutLMv2</td><td>✓</td><td>200M + α</td><td>1,489</td><td>95.25</td></tr>
+        <tr><td><b>Donut</b></td><td></td><td>143M</td><td>752</td><td>95.30</td></tr>
+      </table>
+      <h4>Document information extraction (Table 2; F1 = field-level F1, Acc = TED accuracy)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Params</th><th>CORD time / F1 / Acc</th><th>Ticket</th><th>Business Card</th><th>Receipt</th></tr>
+        <tr><td>BERT</td><td>86M + α</td><td>1.6 s / 73.0 / 65.5</td><td>1.7 / 74.3 / 82.4</td><td>1.5 / 40.8 / 72.1</td><td>2.5 / 70.3 / 54.1</td></tr>
+        <tr><td>BROS</td><td>86M + α</td><td>1.7 / 74.7 / 70.0</td><td>—</td><td>—</td><td>—</td></tr>
+        <tr><td>LayoutLM</td><td>89M + α</td><td>1.7 / 78.4 / 81.3</td><td>—</td><td>—</td><td>—</td></tr>
+        <tr><td>LayoutLMv2</td><td>179M + α</td><td>1.7 / 78.9 / 82.4</td><td>1.8 / 87.2 / 90.1</td><td>1.6 / 52.2 / 83.0</td><td>2.6 / 72.9 / 78.0</td></tr>
+        <tr><td><b>Donut</b></td><td>143M</td><td>1.2 / 84.1 / 90.9</td><td>0.6 / 94.1 / 98.7</td><td>1.4 / 57.8 / 84.4</td><td>1.9 / 78.6 / 88.6</td></tr>
+        <tr><td>SPADE</td><td>93M + α</td><td>4.0 / 74.0 / 75.8</td><td>4.5 / 14.9 / 29.4</td><td>4.3 / 32.3 / 51.3</td><td>7.3 / 64.1 / 53.2</td></tr>
+        <tr><td>WYVERN</td><td>106M + α</td><td>1.2 / 43.3 / 46.9</td><td>1.5 / 41.8 / 54.8</td><td>1.7 / 29.9 / 51.5</td><td>3.4 / 71.5 / 82.9</td></tr>
+      </table>
+      <p>Parameter counts in this table omit vocabulary embeddings for all models, "for fair comparisons among multi-lingual models"; BERT and LayoutLMv2 use official multilingual extensions. SPADE is a graph-based extractor over OCR boxes; WYVERN is a Transformer encoder–decoder that generates entities from OCR output — the closest OCR-based analogue of Donut's generative interface. The Business Card set is hard for every model (best F1 57.8).</p>
+      <h4>Document VQA (DocVQA test set, Table 3)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Fine-tuning set</th><th>Parameters</th><th>Time (ms)</th><th>ANLS</th><th>ANLS, handwritten</th></tr>
+        <tr><td>BERT</td><td>train</td><td>110M + α</td><td>1,517</td><td>63.5</td><td>—</td></tr>
+        <tr><td>LayoutLM</td><td>train</td><td>113M + α</td><td>1,519</td><td>69.8</td><td>—</td></tr>
+        <tr><td>LayoutLMv2</td><td>train</td><td>200M + α</td><td>1,610</td><td>78.1</td><td>—</td></tr>
+        <tr><td><b>Donut</b></td><td>train</td><td>176M</td><td>782</td><td>67.5</td><td>72.1</td></tr>
+        <tr><td>LayoutLMv2-Large-QG</td><td>train + dev + QG</td><td>390M + α</td><td>1,698</td><td>86.7</td><td>67.3</td></tr>
+      </table>
+      <div class="viz" id="viz-results">
+        <div class="vhead">
+          <span class="vtitle">Accuracy against time, as the paper reports them</span>
+          <span class="vhint">pick a dataset and metric · marker area ∝ reported parameters</span>
+        </div>
+        <div class="controls">
+          <label>benchmark <select id="res-set">
+            <option value="rvl">RVL-CDIP (accuracy)</option>
+            <option value="cord-f1">CORD (field F1)</option>
+            <option value="cord-acc">CORD (TED accuracy)</option>
+            <option value="ticket-acc">Ticket (TED accuracy)</option>
+            <option value="bc-acc">Business Card (TED accuracy)</option>
+            <option value="rec-acc">Receipt (TED accuracy)</option>
+            <option value="docvqa">DocVQA (ANLS)</option>
+          </select></label>
+        </div>
+        <svg id="res-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Scatter of score against seconds per page for Donut and the OCR-based baselines"></svg>
+        <div class="readout" aria-live="polite" id="res-read"></div>
+        <p class="vcap">Every point is a row of the Donut paper's Tables 1–3 (the arrays in the script are labelled by table). OCR-based models are blue and include OCR time; their parameter counts exclude the OCR engine (the "+ α"), so their markers are drawn with a dashed outline. The readout computes Donut's margin over the best OCR-based model and the speed ratio. Times come from different hardware setups, as the paper describes; compare them within one benchmark only.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> on classification and extraction Donut matched or beat the OCR-based models of its time while being faster end to end, with large TED-accuracy gains on both flat and nested records (Ticket 98.7 vs 90.1, CORD 90.9 vs 82.4) and a small one on Business Card (84.4 vs 83.0). On DocVQA it was 10.6 ANLS behind LayoutLMv2 trained on the same data — reading small text in dense pages is where the OCR-free design paid its price.</div>
+    </section>
+
+    <!-- 19 ───────────────────────────────────────────── -->
+    <section class="topic" id="ablations" data-nav="Ablations: backbone, resolution, OCR">
+      <h3><span class="idx">19</span> Ablations: backbone, resolution, OCR engine and data size</h3>
+      <p class="lede">The paper's further studies isolate four factors: which vision backbone to use, how large the input canvas must be, how much the OCR-based baselines depend on their OCR engine, and how the models behave with few training examples. Most are reported as bar or line charts without printed values; the numbers below are the ones the text states.</p>
+      <h4>Backbone</h4>
+      <p>Figure 7(b) compares ImageNet-pretrained ResNet-152, EfficientNetV2, ViT-B and Swin-B with 18 and with 14 stage-3 blocks, on CORD and DocVQA. EfficientNetV2 and Swin outperform the others; Swin is chosen for its scalability and higher score. The paper attributes the gap to "the high expressiveness of the backbones", not to a document-specific property.</p>
+      <h4>Resolution</h4>
+      <p>Figure 7(c) shows performance growing rapidly with canvas size across 640 × 640, 960 × 960, 1280 × 960 and 2560 × 1920, most clearly on DocVQA, "where the images are larger with many tiny texts". The stated CORD numbers are 91.1 TED accuracy at 0.7 s per image with 1280 × 960 against 90.9 at 1.2 s with 2560 × 1920 (Table 2) — on receipts the larger canvas costs 70% more time for no gain in full-data accuracy, but the paper reports it was more robust with only 80 training examples. The repository lists the released 1280 × 960 CORD-v2 checkpoint at 91.3. The authors note an efficient attention mechanism could reduce the cost but keep the original Transformer for simplicity.</p>
+      <div class="viz" id="viz-res">
+        <div class="vhead">
+          <span class="vtitle">Resolution: what a character gets and what it costs</span>
+          <span class="vhint">slide the canvas size · pick the smallest text on the page</span>
+        </div>
+        <div class="controls">
+          <label>canvas <input type="range" id="rs-i" min="0" max="5" step="1" value="4" /> <span id="rs-v"></span></label>
+          <label>smallest text <select id="rs-pt"><option value="10">10 pt</option><option value="8">8 pt</option><option value="6">6 pt (fine print)</option></select></label>
+        </div>
+        <svg id="rs-svg" width="660" height="290" viewBox="0 0 660 290" role="img" aria-label="Encoder cost and stage-4 tokens against canvas size, with the size of a character in patches and the paper's reported CORD points"></svg>
+        <div class="readout" aria-live="polite" id="rs-read"></div>
+        <p class="vcap">Cost is the encoder's multiply–accumulates from the Swin formulas (depths {2, 2, 14, 2}, window 10, padding included), relative to 2560 × 1920. Character size assumes an A4 page at 300 dpi fitted as in <a href="ocr-free-encoder.html#preprocess">preprocessing</a>, taking a lowercase letter's height as half the point size. The two CORD points are the paper's (Table 2 and the text of §3.3); 640 × 640 and 960 × 960 appear in Figure 7(c) without printed values, 2048 × 1536 is donut-proto's canvas, and 3840 × 2880 is a hypothetical larger canvas; none of these carries an accuracy marker.</p>
+      </div>
+      <h4>OCR engine</h4>
+      <p>Figure 9 re-runs BERT and LayoutLMv2 on CORD with four OCR engines — EasyOCR (about 27M parameters, open source), PaddleOCR (a mobile model of about 10M, served on CPU), Microsoft Azure and CLOVA OCR — and shows both speed and accuracy of the OCR-based systems varying widely with the engine, with CLOVA OCR most accurate. The comparison supports the paper's claim that an OCR-based model's reported accuracy is partly a property of the OCR it was paired with.</p>
+      <h4>Training-set size</h4>
+      <p>Limiting CORD's training set to 80, 160, 400 and 800 receipts (Figure 9, right), Donut stays robust; with 80 receipts (10%) it already exceeds LayoutLMv2's accuracy, and the 2560 × 1920 variant is the more robust one at that extreme.</p>
+      <div class="callout"><b>Takeaway:</b> resolution is Donut's main dial. Small, well-printed documents such as receipts are served well at 1280 × 960; dense pages with small print need the full 2560 × 1920 or more, at a cost that grows with area.</div>
+    </section>
+
+    <!-- 20 ───────────────────────────────────────────── -->
+    <section class="topic" id="handwriting" data-nav="Handwriting and failure cases">
+      <h3><span class="idx">20</span> Handwriting, robustness and failure cases</h3>
+      <p class="lede">On DocVQA's handwritten questions Donut scores 72.1 ANLS, above LayoutLMv2-Large-QG's 67.3, although its overall score is 19.2 points lower (67.5 vs 86.7). The paper's explanation is the one it opened with: handwriting is where OCR is weakest, and an OCR-based model cannot answer better than its OCR reads.</p>
+      <h4>The paper's three examples (Figure 6)</h4>
+      <table class="cmp">
+        <tr><th>Question</th><th>Answer</th><th>Donut</th><th>LayoutLMv2-Large-QG</th><th>What went wrong</th></tr>
+        <tr><td>What is the phone number given?</td><td>336-723-6100</td><td>336-723-6100</td><td>336-723- 4100</td><td>OCR misread a digit and split the string</td></tr>
+        <tr><td>What is the name of the passenger?</td><td>DR. William J. Darby</td><td>DR. William J. Darby</td><td>DR. William J. Jarry</td><td>OCR misread handwriting</td></tr>
+        <tr><td>What is the Publication No.?</td><td>540</td><td>943</td><td>540</td><td>Donut read another number in the image — the text was too small for its canvas</td></tr>
+      </table>
+      <p>The first two show OCR errors setting an upper bound on the OCR-based model; the third shows Donut's characteristic failure — tiny text in a large image, which the paper says "could be mitigated by scaling the input image size". Note what the third failure looks like: a well-formed, plausible answer taken from elsewhere on the page. Nothing in the output flags it as a guess.</p>
+      <h4>Where the robustness comes from, and where it stops</h4>
+      <ul class="notes">
+        <li><b>Joint reading and understanding.</b> A plausible mechanism, not one the paper tests: the decoder knows the question while it reads, so it can use context ("the passenger's name") to resolve an ambiguous scrawl, where an OCR engine must commit to a transcription first.</li>
+        <li><b>No dedicated handwriting data.</b> Donut's pretraining corpora are IIT-CDIP scans (mostly print, with some handwritten documents — RVL-CDIP's "handwritten" class is drawn from the same collection) and rendered fonts; its handwriting ability presumably comes from those scans. Dessurt, a contemporaneous OCR-free model, instead generated 800,000 lines of synthetic handwriting for pretraining (<a href="variants-relatives.html#relatives">relatives</a>).</li>
+        <li><b>Low overall DocVQA score.</b> 67.5 ANLS is below even LayoutLM-base with OCR (69.8). Most DocVQA pages are printed, dense and small-fonted — plausibly the setting where a commercial OCR engine reading the full-resolution scan has the advantage over Donut reading a 2560 × 1920 canvas.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> OCR-free models degrade differently from pipelines. A pipeline fails where OCR fails — handwriting, unusual scripts, degraded scans; Donut fails where resolution fails — small print on large pages — and fails fluently, with confident answers that may come from the wrong place.</div>
+    </section>
+
+    <!-- 21 ───────────────────────────────────────────── -->
+    <section class="topic" id="limitations" data-nav="Limitations">
+      <h3><span class="idx">21</span> Limitations</h3>
+      <p class="lede">Donut's design trades an external dependency for constraints inside the model: a fixed canvas that bounds legibility and cost, a single page per input, an output budget, and a generative decoder whose answers are not tied to locations on the page. Some of these are fixable engineering; others are properties of the approach.</p>
+      <h4>Resolution against memory and time</h4>
+      <p>Legibility needs pixels: the fine print that OCR engines read at scan resolution must survive resizing onto the canvas. Doubling both canvas sides quadruples the stage-1 tokens and roughly quadruples encoder cost; activations grow the same way. The paper's own training shows the effect — about half an hour on one A100 for CORD at 1280 × 960 against about a day on 64 A100s for DocVQA at 2560 × 1920 (on a much larger dataset).</p>
+      <h4>Fixed aspect ratio and single pages</h4>
+      <ul class="notes">
+        <li><b>Aspect ratio.</b> Every page is fitted into one rectangle. Very tall or wide documents lose most of the canvas to padding. The Pix2Struct paper fine-tuned Donut on InfographicVQA, whose images are large with extreme aspect ratios, and measured 11.6 ANLS against Pix2Struct-Large's 40.0, speculating that Donut's fixed-aspect scaling is the cause.</li>
+        <li><b>One page.</b> The model reads one image. Multi-page documents need splitting and a merge step outside the model, or page tiling, neither of which the paper addresses.</li>
+        <li><b>Output budget.</b> Generation stops at <code>max_length</code> (1,536 in pretraining, 768 for CORD). A long invoice with many line items can exceed it; the truncated sequence loses its closing tokens and, by the parser's rule, the fields they close.</li>
+      </ul>
+      <h4>Hallucination and grounding</h4>
+      <ul class="notes">
+        <li><b>Generated, not extracted.</b> An OCR-based tagger can only label words that exist; Donut can write any string in its vocabulary. A misread becomes a plausible wrong value, and a value can come from the wrong place on the page (the "943" example).</li>
+        <li><b>No boxes, no confidences by default.</b> The output carries no location. Cross-attention maps give a hint; token probabilities give a rough confidence; neither is calibrated or supervised.</li>
+        <li><b>Repetition.</b> Autoregressive decoders can loop. Nougat, which uses the same encoder–decoder design for long academic pages, reports repetition as a major failure mode and adds anti-repetition augmentation and a logit-variance detector; Donut's short targets make this rarer but not impossible.</li>
+      </ul>
+      <h4>Coverage</h4>
+      <ul class="notes">
+        <li><b>Languages</b> are bounded by the four-language vocabulary and the pretraining data; a new script needs vocabulary changes and new SynthDoG data.</li>
+        <li><b>Pseudo-labels.</b> The 11M real pretraining pages were transcribed by an OCR API, so systematic OCR mistakes on real scans could be learned during pretraining.</li>
+        <li><b>Dense-page reading</b> lags OCR: DocVQA 67.5 against 78.1 for LayoutLMv2 on the same training data.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> use Donut where its failure modes are acceptable — short structured outputs from documents of known format and size — and add what it lacks outside the model: schema validation, per-field confidence thresholds, and a human check for fields that matter.</div>
+    </section>
+
+    <nav class="pager" aria-label="Donut series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="training.html">← Donut: Pretraining, SynthDoG &amp; Fine-Tuning</a>
+      <a href="../donut.html" style="color:var(--muted)">Donut · overview</a>
+      <a href="variants-relatives.html">Donut: DONUT-hole, Relatives &amp; Practice →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../donut.viz.js"></script>
+</body>
+</html>

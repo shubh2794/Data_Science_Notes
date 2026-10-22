@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · KV Cache &amp; Generation</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to the other pages of the series */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../transformers.html">Transformers</a> · part 7 of 7</p>
+      <h1>KV Cache &amp; Generation</h1>
+      <p>Generation as an engineered loop: the KV cache as an object and its strategies costed in bytes, the generate loop and logits processors, stopping, streaming and step latency, contrastive search, DoLa and constrained beams, sliding-window perplexity, chat templates, and the levers for serving a large model.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Transformers</span>
+        <span class="pill">Cache object · strategies · generate loop · streaming · DoLa · perplexity · chat templates</span>
+      </div>
+    </header>
+
+    <!-- ═══ 44 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="cachemech" data-nav="The KV cache as an object">
+      <h3><span class="idx">44</span> The KV cache as an implementation holds it: a list of layers, an update call, and the shapes of one decode step</h3>
+      <p class="lede"><a href="../attention/kv-cache-gqa-mla.html#kvcache">The attention page</a> proved why the cache is exact — under a causal mask an old key or value never changes — and <a href="../attention/kv-cache-gqa-mla.html#kvmem">counted its bytes</a>. This section is what the cache looks like as an object passed through a model: per layer, a key tensor and a value tensor; one call that appends the new rows and returns the whole history; and the bookkeeping — mask length, position ids, rollback — that has to stay consistent with it.</p>
+
+      <div class="formula"><span class="lbl">the object and its one essential method</span><span class="eq">cache.layers[ℓ].keys, .values      shape (batch, g, t, dₖ)      t = tokens cached so far
+K, V = cache.update(k_new, v_new, ℓ)                          append along t, return the full history
+inside attention layer ℓ, at every forward call:
+   q, k_new, v_new  from the NEW tokens only                   (batch, h or g, n_new, dₖ)
+   K, V = cache.update(k_new, v_new, ℓ)                        (batch, g, t_past + n_new, dₖ)
+   scores = q·Kᵀ / √dₖ + mask                                  (batch, h, n_new, t_past + n_new)
+the three things that must agree with t_past:
+   attention mask   length t_past + n_new   (padding of the past is still masked)
+   position ids     t_past, t_past + 1, …   — RoPE (§06) rotates by ABSOLUTE position, so a new
+                    token must get angle t_past·θᵢ, not 0·θᵢ
+   the cache length itself</span>
+<span class="lbl">by hand — §36's model, a 1 000-token prompt, then one decode step, batch 1</span><span class="eq">PREFILL  one forward over 1 000 tokens
+         per layer: q (1, 32, 1000, 128)   k, v (1, 8, 1000, 128) → cache
+         scores (1, 32, 1000, 1000), causal                       — compute-bound (§47)
+DECODE   one forward over 1 token
+         per layer: q (1, 32, 1, 128)      k_new, v_new (1, 8, 1, 128)
+         K, V after update (1, 8, 1001, 128)
+         grouped-query heads: query head j reads KV head ⌊j/4⌋ (h/g = 4, <a href="../attention/kv-cache-gqa-mla.html#gqa">the attention page</a>)
+         scores (1, 32, 1, 1001)            mask length 1 001     position id 1 000
+         bytes read from the cache this step: 1 001 × 131 072 B = 131.2 MB   — memory-bound (§47)</span></div>
+
+      <h4>Growing, rolling back, and reusing</h4>
+      <ul class="notes">
+        <li><b>Growing.</b> The simplest layer appends by concatenation, which allocates a new tensor of length <code>t + 1</code> and frees the old one every step; for one moment both exist, so the transient peak is one layer's cache on top of the whole cache. The fixed-size layers of §45 write into a pre-allocated slot instead.</li>
+        <li><b>Rolling back.</b> <a href="../../mlops/speculative-decoding.html">Speculative decoding</a> appends several drafted tokens and then rejects some of them, so the cache must be <b>cropped</b> back to the last accepted position — for full-attention layers simply a shorter view. A sliding-window layer (§45) has already discarded the oldest entries it would need, so it can roll back only if it was told in advance to keep them; the cheap default cannot.</li>
+        <li><b>Reusing a prefix.</b> A long system prompt shared by many requests can be run once, its cache kept, and a copy handed to each request, which then prefills only its own suffix. For a 1 000-token shared prefix and a 30-token question the prefill runs over 30 tokens instead of 1 030 — 34× fewer prefill operations. The same idea across calls to a hosted model is prompt caching, whose economics are <a href="../../llm/context-engineering.html#caching">Context Engineering</a>'s; the paged pool of §42 makes the sharing copy-free.</li>
+        <li><b>Multi-turn chat.</b> Keeping the cache between turns works only if the new prompt's token prefix is <i>identical</i> to what was cached. A chat template (§50) that re-renders history differently — dropping a reasoning block from the previous answer, say — produces a different prefix, and a cache reused against it is silently wrong. The safe rule: reuse a cache only after checking that the re-tokenised history begins with exactly the cached ids.</li>
+        <li><b>Only at inference.</b> Training computes every position in one pass (§24) and needs no cache; turning it on during training wastes memory and can interfere with gradient checkpointing.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 45 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="cachestrategies" data-nav="Cache strategies, with the bytes">
+      <h3><span class="idx">45</span> Cache strategies: dynamic, static, offloaded, sliding-window and quantised — the bytes of each, for one model and one conversation</h3>
+      <p class="lede">The cache of §44 can be allocated and stored in several ways, and each is a different trade between GPU memory, speed and compatibility with a compiled decode step. None changes what attention computes (the quantised one changes it slightly, by rounding). Put all five on one model — §36's, at <code>2·L·g·dₖ·b = 2 × 32 × 8 × 128 × 2 = 131 072</code> bytes per token — and one workload, and the differences become numbers.</p>
+
+      <table class="grid2">
+        <tr><th>strategy</th><th>what is allocated</th><th>GPU bytes after t tokens</th><th>compiles to a fixed graph?</th><th>costs</th></tr>
+        <tr><td><b>dynamic</b> (the usual default)</td><td>grows by one token per step, per layer</td><td class="mono">t · 2Lg dₖ b</td><td>no — shapes change every step</td><td>a reallocation per step; the transient of §44</td></tr>
+        <tr><td><b>static</b></td><td>a fixed <code>max_len</code> for every layer, up front</td><td class="mono">max_len · 2Lg dₖ b, from step 0</td><td>yes — the reason it exists</td><td>memory for the whole budget, and attention over <code>max_len</code> slots with the unused ones masked</td></tr>
+        <tr><td><b>offloaded</b> (dynamic or static)</td><td>all layers in CPU memory; the layer being computed, and the next one prefetched, on the GPU</td><td class="mono">≈ (2/L) of the above</td><td>the static variant does</td><td>moving each layer's cache across the bus every step</td></tr>
+        <tr><td><b>sliding window</b></td><td>at most <code>w</code> tokens on sliding layers (a rolling buffer)</td><td class="mono">min(t, w) · 2Lg dₖ b, or a per-layer mix</td><td>yes (fixed size)</td><td>nothing — if and only if the model was <i>trained</i> with that window</td></tr>
+        <tr><td><b>quantised</b></td><td>older tokens in 2–8 bits with per-group scales; the newest <code>r</code> tokens in full precision</td><td class="mono">≈ (t − r)·2Lg dₖ·(bits/8 + overhead) + r·2Lg dₖ b</td><td>no</td><td>dequantising each layer every step; small quality loss; slower at short contexts</td></tr>
+        <tr><td><b>paged</b> (§42)</td><td>fixed-size blocks from a shared pool</td><td class="mono">⌈t/B⌉·B · 2Lg dₖ b</td><td>with paged kernels</td><td>an indirection in the kernel</td></tr>
+      </table>
+
+      <div class="formula"><span class="lbl">by hand — §36's model, batch 1: a 1 000-token prompt plus 1 000 generated tokens, and the same at 32 768</span><span class="eq">                               t = 2 000                              t = 32 768
+dynamic                        2 000 × 128 KiB   = 250.0 MiB           4.00 GiB
+static, max_len 4 096          4 096 × 128 KiB   = 512.0 MiB           (must be ≥ 32 768: 4.00 GiB)
+   attention work at step t: every step reads max_len slots — over steps 1 000 … 2 000 the mean
+   useful length is 1 500, so 4 096 / 1 500 = 2.7× the cache traffic of the dynamic layout
+offloaded (2 of 32 layers)     250 MiB × 2/32    =  15.6 MiB on GPU    256 MiB on GPU
+   bus traffic per step ≈ the whole cache in, once:  250 MiB  |  4 GiB  — at ~25 GB/s ≈ 10 ms | 172 ms
+   (one common implementation also copies each layer back out after use, doubling the traffic)
+   against reading it from GPU memory at 3.35 TB/s:          0.08 ms | 1.3 ms
+sliding window w = 4 096,      no change below w: 250.0 MiB            all 32 layers: 4 096 × 128 KiB = 512 MiB
+                                                                        16 sliding + 16 full layers:
+                                                                        16 × 32768 × 4 KiB + 16 × 4096 × 4 KiB = 2.25 GiB
+quantised, 4-bit, group 64,    per element 0.5 B + (2 + 2 B)/64 = 0.5625 B, against 2 B: 3.56× smaller
+   residual r &lt; 128 tokens     t = 2 000, r = 1 000 mod 128 = 104:  1 896 × 128 KiB × 0.28125 + 104 × 128 KiB
+                                                  = 66.7 + 13.0 = 79.7 MiB
+                               t = 32 768, r = 24:  1.21 GB (1.13 GiB) against 4.29 GB (4.00 GiB)
+   plus, every step, one layer dequantised to full precision: 1/32 of the full cache (128 MiB at 32 768)</span></div>
+
+      <h4>Reading the table</h4>
+      <p><b>Static trades memory for a fixed shape.</b> A decode step whose tensors never change shape can be compiled once and replayed as a captured graph, which removes per-step launch overhead — the dominant cost of a small model's decode — and that, not memory, is why the static cache exists; compilation itself is <a href="../../mlops/model-acceleration.html">Model Acceleration</a>'s. <b>Offloading trades speed for memory</b>, and the bandwidth arithmetic above says how much: the transfer is overlapped with other layers' compute, so it is nearly free while the cache is small and dominates once a layer's cache takes longer to move than the layer takes to compute — at 32k tokens, 128 MiB per layer at ~25 GB/s is about 5 ms, against roughly 0.13 ms to read that layer's 0.44 GB of weights from GPU memory. It is a fallback for running out of memory, not a speed setting. <b>A sliding window is free only for models trained with it</b>: imposing a window on a full-attention model deletes context it was trained to read. <b>Quantisation</b> is modelled on the KIVI paper's asymmetric scheme (which quantises keys per channel and values per token; one common implementation quantises both per channel), with a full-precision residual of the most recent tokens (128 by default in one common implementation) because the newest keys and values are the ones attended to most sharply; its cost is dequantisation work every step, so it pays only when memory, not speed, is the limit. <b>The per-layer rule of §40 applies to all of them</b>: a model with mixed sliding and full layers needs a cache that knows which layer is which.</p>
+
+      <div class="viz" id="viz-kv">
+        <div class="vhead">
+          <span class="vtitle">KV-cache strategies over one generation: GPU bytes held, token by token</span>
+          <span class="vhint">the x-axis runs through the prompt and the generated tokens; each line is one strategy's GPU-resident cache, computed from the configuration — static is flat from the start, sliding flattens at the window, quantised grows at a fraction of the slope (0.28 of it at 4 bits) with a saw-tooth residual, offloaded keeps two layers</span>
+        </div>
+        <div class="controls">
+          <label>model <select id="kv-m"><option value="7b">7B-class, MHA (g = h = 32)</option><option value="8b" selected>8B-class, GQA g = 8 (§36)</option><option value="70b">70B-class, GQA g = 8, 80 layers</option></select></label>
+          <label>prompt <select id="kv-p"><option value="1000" selected>1 000</option><option value="8000">8 000</option><option value="30000">30 000</option></select></label>
+          <label>new tokens <select id="kv-n"><option value="1000" selected>1 000</option><option value="4000">4 000</option><option value="16000">16 000</option></select></label>
+          <label>static max_len <select id="kv-s"><option value="4096" selected>4 096</option><option value="32768">32 768</option><option value="131072">131 072</option></select></label>
+          <label>window w <select id="kv-w"><option value="1024">1 024</option><option value="4096" selected>4 096</option></select></label>
+          <label>quantised bits <select id="kv-q"><option value="2">2</option><option value="4" selected>4</option><option value="8">8</option></select></label>
+          <label>batch <select id="kv-b"><option value="1" selected>1</option><option value="8">8</option><option value="32">32</option></select></label>
+        </div>
+        <svg id="kv-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left: GPU memory held by the key-value cache against the number of tokens processed, from zero through the prompt and the generated tokens, one line per strategy: dynamic, a straight line rising at the bytes-per-token slope; static, a flat line at the pre-allocated maximum from the first token, or marked as overflowing if the maximum is smaller than the total; sliding window, rising and then flat at the window; a hybrid of half sliding and half full layers, rising at half slope after the window; quantised, rising at a fraction of the dynamic slope with a small saw-tooth from the full-precision residual; and offloaded, near the axis because only two layers are resident. A vertical line marks the end of the prompt. Right: a bar per strategy at the final token with its bytes printed, and for the offloaded strategy the bus time per decode step at an assumed transfer rate. The readout prints the bytes per token, every strategy's final size, the static cache's wasted fraction, and the offloaded bus time."></svg>
+        <div class="readout" aria-live="polite" id="kv-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 46 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="generate" data-nav="The generate loop and logits processors">
+      <h3><span class="idx">46</span> The generate loop: prefill, then one step at a time through a pipeline of logits processors</h3>
+      <p class="lede">§29 reshaped one distribution and §30 ran three rules on the page's model. A production generate loop is those rules embedded in a fixed sequence of steps, with a <b>pipeline of logits processors</b> between the model's raw logits and the choice of token. Each processor is a small function <code>(input_ids, logits) → logits</code>; they run in a fixed order, and the order matters because several of them are not invariant to the others.</p>
+
+      <div class="formula"><span class="lbl">one call, end to end</span><span class="eq">prepare    messages → text (§50) → ids; batch with LEFT padding (so every row's last position is a
+           real token and the new tokens are appended directly after it); attention mask; a cache (§45)
+prefill    one forward over the whole prompt; keep only the LAST position's logits  z (V)
+loop       1  z ← processors(ids, z)      penalties and constraints, then (if sampling) warpers:
+                                          repetition penalty → no-repeat n-gram → banned words
+                                          → minimum length (EOS → −∞) → forced / suppressed tokens → …
+                                          → temperature → top-k → top-p            (§29's order)
+                                          → watermark bias, if configured, after all of them
+           2  choose                      argmax | sample from softmax(z) | beam bookkeeping (§30)
+           3  append the token; extend the mask by one; advance the position id (§44)
+           4  stopping criteria           max new tokens, EOS, stop strings, time budget (§47)
+           5  stream the new text out if a streamer is attached (§47)
+           6  forward ONE token through the model with the cache → the next z</span>
+<span class="lbl">the two penalties, exactly</span><span class="eq">repetition penalty <span class="keep">θ</span> (> 1), for every token id v that already occurs in the ids:
+      z_v ← z_v / θ   if z_v > 0          z_v ← z_v · θ   if z_v ≤ 0
+no-repeat n-gram n: if the last n − 1 tokens equal the first n − 1 tokens of an n-gram already in
+      the ids, set that n-gram's last token to −∞  (it can never be produced twice)</span></div>
+
+      <h4>By hand: one step through the pipeline</h4>
+      <div class="formula"><span class="lbl">vocabulary {the, cat, sat, on, mat, .}, context "the cat sat on the", <span class="keep">θ</span> = 1.2, n = 2, T = 0.7, top-k 3, top-p 0.9</span><span class="eq">raw logits z        the 2.00   cat 1.50   sat 0.80   on −0.30   mat 1.20   .  −1.00
+softmax              0.399      0.242      0.120      0.040      0.179      0.020
+repetition 1.2       1.667      1.250      0.667     −0.360      1.200     −1.000     (the, cat, sat, on seen)
+softmax              0.350      0.231      0.129      0.046      0.220      0.024
+no-repeat 2-gram     last token "the"; bigram (the, cat) already occurred → cat = −∞
+softmax              0.455      0          0.168      0.060      0.286      0.032
+temperature 0.7      2.381      −∞         0.952     −0.514      1.714     −1.429
+softmax              0.546      0          0.131      0.030      0.280      0.012
+top-k 3              keep the, mat, sat                          → 0.570   0.293   0.137
+top-p 0.9            cumulative 0.570, 0.863, 1.000 → all three needed to reach 0.9 → unchanged
+sample from          the 0.570   mat 0.293   sat 0.137</span></div>
+      <p>Two things the numbers show. First, <b>the n-gram ban is absolute and the repetition penalty is not</b>: "cat" went to zero, while "the" — seen twice — lost only a few points and is still the likeliest token. Second, and less often noticed, <b>the repetition penalty is not invariant to shifting the logits</b>, though the softmax is. Subtract 3 from every raw logit — the same distribution — and "the" becomes <code>−1.0</code>, which the penalty <i>multiplies</i> to <code>−1.2</code>; its probability after the penalty is then 0.407, <b>higher</b> than the 0.399 it had with no penalty at all, because the unseen "mat" (<code>−1.8</code>) was left alone. The penalty's strength therefore depends on an arbitrary offset of the model's logits, and one value of <code>θ</code> is not comparable across models. The figure steps through every stage for any setting.</p>
+
+      <table class="grid2">
+        <tr><th>processor</th><th>what it does to z</th><th>typical use</th></tr>
+        <tr><td><b>repetition penalty</b></td><td>÷θ or ×θ on every seen token (above)</td><td>θ ≈ 1.1–1.3 against loops in greedy decoding; 1.2 is the value the original proposal found balanced</td></tr>
+        <tr><td><b>no-repeat n-gram</b></td><td>−∞ on the token that would complete a repeated n-gram</td><td>summarisation and beam search, n = 3 or 4; forbids legitimate repeats too (a name used twice)</td></tr>
+        <tr><td><b>minimum length</b></td><td>−∞ on EOS until the minimum is reached</td><td>stop a model from ending immediately</td></tr>
+        <tr><td><b>banned / forced tokens</b></td><td>−∞ on listed ids, or −∞ on everything but one</td><td>block a word; force a format's first token</td></tr>
+        <tr><td><b>watermark</b></td><td>+δ on a pseudo-random "green list" seeded by the previous token(s)</td><td>detectable provenance: generated text has more green tokens than human text (δ = 2.0 with a green-list fraction of 0.25 by default in one implementation); it runs after the warpers</td></tr>
+        <tr><td><b>temperature, top-k, top-p</b></td><td>§29</td><td>sampling only, applied after everything above except the watermark</td></tr>
+      </table>
+
+      <div class="viz" id="viz-lp">
+        <div class="vhead">
+          <span class="vtitle">One decoding step through the logits-processor pipeline, stage by stage</span>
+          <span class="vhint">each column of bars is the distribution after one stage — penalties first, then the warpers of §29; the row of cells at the top is the context the penalties read — change the offset to see the repetition penalty's shift-dependence</span>
+        </div>
+        <div class="controls">
+          <label>repetition <span class="keep">θ</span> <input type="range" id="lp-r" min="1" max="2" step="0.05" value="1.2" /><span id="lp-rv" style="min-width:30px;display:inline-block">1.20</span></label>
+          <label>no-repeat n <select id="lp-n"><option value="0">off</option><option value="2" selected>2</option><option value="3">3</option></select></label>
+          <label>T <input type="range" id="lp-T" min="0.2" max="2" step="0.1" value="0.7" /><span id="lp-Tv" style="min-width:24px;display:inline-block">0.7</span></label>
+          <label>top-k <select id="lp-k"><option value="0">off</option><option value="2">2</option><option value="3" selected>3</option><option value="5">5</option></select></label>
+          <label>top-p <input type="range" id="lp-p" min="0.5" max="1" step="0.05" value="0.9" /><span id="lp-pv" style="min-width:30px;display:inline-block">0.90</span></label>
+          <label>logit offset <input type="range" id="lp-o" min="-4" max="4" step="0.5" value="0" /><span id="lp-ov" style="min-width:30px;display:inline-block">0.0</span></label>
+        </div>
+        <svg id="lp-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Top: the context tokens the, cat, sat, on, the as labelled cells, with the tokens that the repetition penalty will touch outlined. Below, six small bar charts side by side over the six-word vocabulary, one per pipeline stage: the raw softmax, after the repetition penalty, after the no-repeat n-gram ban, after temperature, after top-k, and after top-p, each bar labelled with its probability; banned tokens drop to zero. At the defaults the word cat is banned by the bigram rule, the word the stays the most likely, and the final distribution keeps three words. The readout prints each stage's probabilities for the most likely token, the entropy after each stage, and the probability of the repeated word the with and without the penalty at the current logit offset."></svg>
+        <div class="readout" aria-live="polite" id="lp-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 47 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="stopstream" data-nav="Stopping, streaming, and step latency">
+      <h3><span class="idx">47</span> Stopping criteria, streaming, and what one step costs: time to first token against time per token</h3>
+      <p class="lede">A generate loop needs a rule for when to stop and, in an interactive setting, a way to show text before it has stopped. Both look trivial and both have edge cases that come from the same fact: <b>the model emits token ids, and the things people care about — a stop phrase, a printable character — are defined on text</b>.</p>
+
+      <div class="formula"><span class="lbl">the stopping criteria, any of which ends a sequence</span><span class="eq">max new tokens     a hard budget. If none is given, a generation configuration may fall back to a small
+                   default (20 new tokens in one widely used library) — the usual cause of "truncated" answers
+end of sequence    the EOS id, or a SET of ids (a chat model may end a turn with an end-of-turn token that
+                   differs from the tokenizer's EOS — §50); the set comes from the generation configuration
+stop strings       text-level: "\nUser:" — must be matched on TEXT, not on the string's own token ids, because it can span tokens
+max time           a wall-clock budget
+batched            a finished row keeps being padded while others run; the batch stops when all have stopped</span>
+<span class="lbl">by hand — why a stop string cannot be matched on ids, and what a finished row costs</span><span class="eq">stop string "END", tokenised on its own as [END]; the model instead writes "...the EN" + "D"
+   neither id equals the id of "END"; only the text of the tail, "…the END", reveals the match,
+   so the check either decodes a window of recent tokens at least as long as the stop string or,
+   as one implementation does, precomputes which token strings can overlap the stop string and
+   matches on those tables without decoding
+
+batch of 4 whose answers end after 20, 50, 100 and 400 tokens:
+   steps run 400; token-slots computed 4 × 400 = 1 600; useful 570; utilisation 35.6%
+   — the waste continuous batching removes by admitting new requests into finished rows</span></div>
+
+      <h4>Streaming: hold back what cannot be printed yet</h4>
+      <p>A streamer receives each new id and must emit text. Decoding ids one at a time is wrong in two ways. <b>Byte-level tokens can split a character</b>: <code>é</code> is the two UTF-8 bytes <code>C3 A9</code>, and a byte-level vocabulary may emit them as two tokens; decoding the first alone yields a replacement character. <b>Word-piece and space conventions</b> make a token's text depend on its neighbours. So a streamer decodes the whole pending tail, prints only the part that ends at a safe boundary — a completed character, or conventionally a space or newline — and keeps the rest pending. The printed text is then exactly the final decoded text, delivered early; the latency the user perceives is the time to the first printable chunk, not the time to the last token.</p>
+
+      <h4>What one step costs: two regimes</h4>
+      <div class="formula"><span class="lbl">by hand — §36's model in bf16 on one GPU with 989 TFLOP/s dense bf16 and 3.35 TB/s of memory bandwidth</span><span class="eq">time to first token ≈ prefill: 2 FLOPs per parameter per token (§23's forward, weights only)
+   1 000-token prompt:  2 × 8.03e9 × 1 000 = 1.61e13 FLOPs  ÷ 989e12  ≈ 16 ms    compute-bound
+time per output token ≈ decode: every weight read once per step, batch 1
+   16.06 GB ÷ 3.35 TB/s ≈ 4.8 ms  →  at most ≈ 209 tokens/s                  memory-bound
+   + the cache read of §44: 131 MB at t = 1 000 → +0.04 ms;  4.3 GB at t = 32 768 → +1.3 ms
+   batch 32: the weights are read once for all 32 rows → ≈ 32× the tokens per second, until the
+   caches' bytes (which are NOT shared, <a href="../attention/kv-cache-gqa-mla.html#intensity">the attention page's intensity section</a>) take over
+(ideal bounds at full utilisation; real kernels reach a fraction of them)</span></div>
+      <p>These two numbers explain most of inference engineering. Prefill is arithmetic-bound, so it benefits from fused kernels (§41) and larger batches of prompt tokens. Decode is bandwidth-bound, so it benefits from fewer bytes per weight (quantisation), fewer bytes per cached token (GQA, §45's strategies), batching many users onto one read of the weights (§42), and producing several tokens per read of the weights — <a href="../../mlops/speculative-decoding.html">Speculative Decoding</a>'s idea. More arithmetic throughput alone does almost nothing for decode.</p>
+    </section>
+
+    <!-- ═══ 48 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="searchplus" data-nav="Contrastive search, DoLa, diverse and constrained beams">
+      <h3><span class="idx">48</span> Decoding rules beyond greedy, beam and sampling: contrastive search, contrasting layers, diverse beams and constraints</h3>
+      <p class="lede">§30's three rules optimise the next token, the sequence's probability, or nothing. Each of the rules below adds one more term to the choice — similarity to the context, disagreement between layers, disagreement between beams, or a hard requirement on the output — and each is worked by hand here. In current library versions several of them are distributed as community-maintained "custom generation" methods loaded by name rather than built into the core loop; the mechanisms are what matter.</p>
+
+      <h4>Contrastive search: confidence minus similarity to what was already said</h4>
+      <div class="formula"><span class="lbl">the rule — <span class="keep">α</span> ∈ [0, 1], V⁽ᵏ⁾ the k most probable next tokens, h the last hidden state</span><span class="eq">x_t = argmax over v ∈ V⁽ᵏ⁾ of   (1 − α) · p(v | x&lt;t)   −   α · max over j &lt; t of cos( h_v , h_xⱼ )
+                                  model confidence              degeneration penalty
+α = 0 is greedy search. h_v is the hidden state the model WOULD have after appending v, so every
+step runs the k candidates through the model (batched as k rows) to obtain them.
+settings: k = 8, α = 0.6 in the proposal's main experiments; α ∈ [0.5, 0.8] reported to give human-like
+          diversity, and k ∈ [5, 10] recommended in follow-up work</span>
+<span class="lbl">by hand — k = 3, <span class="keep">α</span> = 0.6</span><span class="eq">candidate   p(v)    max cosine with the context   score = 0.4·p − 0.6·sim
+   A        0.50            0.95                    0.200 − 0.570 = −0.370
+   B        0.30            0.40                    0.120 − 0.240 = −0.120    ← chosen
+   C        0.20            0.45                    0.080 − 0.270 = −0.190
+greedy takes A, whose hidden state is almost identical to something already in the context —
+the signature of a loop. Contrastive search takes B: less probable, and new.</span></div>
+      <p>The rule targets the failure §29's table called "the mode of a language model is repetitive": greedy and beam search fall into loops because a repeated phrase makes itself more probable. Sampling escapes loops by adding randomness and pays in coherence; contrastive search stays deterministic and penalises only candidates whose representation duplicates the context. Its cost is the <code>k</code> candidate rows per step — cheap in a bandwidth-bound decode (§47), where <code>k</code> extra rows share one read of the weights — and a penalty that depends on the geometry of the hidden states, which works best when those are not all mutually similar (the proposal paired it with a training objective that spreads them out). The figure runs it against greedy on a toy model built to loop.</p>
+
+      <div class="viz" id="viz-cs">
+        <div class="vhead">
+          <span class="vtitle">Contrastive search against greedy on a toy language model that loops</span>
+          <span class="vhint">the toy model is a fixed next-token table whose greedy path falls into a cycle; its "hidden state" for a candidate is that word's vector — raise α from 0 (greedy) and the degeneration penalty breaks the cycle; the table below the two rows scores every candidate at the chosen step</span>
+        </div>
+        <div class="controls">
+          <label><span class="keep">α</span> <input type="range" id="cs-a" min="0" max="0.9" step="0.05" value="0.6" /><span id="cs-av" style="min-width:30px;display:inline-block">0.60</span></label>
+          <label>k <select id="cs-k"><option value="2">2</option><option value="3">3</option><option value="4" selected>4</option><option value="6">6</option></select></label>
+          <label>step to inspect <input type="range" id="cs-s" min="1" max="15" step="1" value="4" /><span id="cs-sv" style="min-width:20px;display:inline-block">4</span></label>
+          <label>seed <input type="range" id="cs-seed" min="1" max="6" step="1" value="1" /><span id="cs-seedv" style="min-width:16px;display:inline-block">1</span></label>
+        </div>
+        <svg id="cs-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Top: two rows of word cells, sixteen generation steps each, produced from the same one-word prompt by greedy search and by contrastive search on a toy next-token model; repeated words are outlined, and at the defaults the greedy row falls into a short cycle within a few steps while the contrastive row keeps producing new words. Bottom left: for the inspected step of the contrastive row, a table of the top-k candidates with their model probability, their largest cosine similarity to any earlier word's vector, and the combined score, the chosen candidate highlighted. Bottom right: the fraction of distinct bigrams and the mean log probability per token for each row, as paired bars. The readout prints both sequences, their distinct-bigram ratios, their mean log-probabilities, and the chosen candidate's score at the inspected step."></svg>
+        <div class="readout" aria-live="polite" id="cs-readout"></div>
+      </div>
+
+      <h4>DoLa: contrast the final layer with an earlier one</h4>
+      <p>Decoding by contrasting layers reads the next-token distribution at two depths — the final layer <code>N</code> and a "premature" layer <code>M</code>, obtained exactly as §33's logit lens obtains it, by applying the final norm and the output head to layer <code>M</code>'s residual stream — and prefers tokens whose probability <i>grew</i> between the two. The motivation is that factual content is added in later layers while shallow, surface-level predictions are already present early, so the growth isolates the later layers' contribution; the reported effect is a 12–17 point absolute improvement on a truthfulness benchmark for one family of 7B–65B models.</p>
+      <div class="formula"><span class="lbl">the rule, and one step by hand (<span class="keep">α</span> = 0.1)</span><span class="eq">V_head = { v : q_N(v) ≥ α · max_w q_N(w) }                          adaptive plausibility: never pick a token
+F(v)   = log q_N(v) − log q_M(v)   for v ∈ V_head,   −∞ otherwise      the final layer finds implausible
+M      = argmax over candidate layers j of  JSD( q_N ‖ q_j )            the layer that disagrees most, chosen
+         from a "bucket" of layers (e.g. [0, 16) or [16, 32) of 32) picked on validation data
+a repetition penalty of 1.2 (§46) is applied as well, since the contrast amplifies repeats
+
+             q_N     q_M     in V_head (q_N ≥ 0.06)?    F = ln(q_N/q_M)
+   token 0   0.60    0.70    yes                         −0.154
+   token 1   0.25    0.10    yes                         +0.916   ← chosen
+   token 2   0.10    0.10    yes                          0.000
+   token 3   0.05    0.10    no                           −∞
+greedy on the final layer picks token 0, which the early layer already predicted; DoLa picks the
+token the later layers promoted.</span></div>
+
+      <h4>Diverse (group) beam search, and constrained beam search</h4>
+      <p>A beam's <code>B</code> hypotheses tend to differ only in their last few tokens. Diverse beam search splits the beams into <code>G</code> groups decoded in turn at each step, and subtracts from a later group's scores a penalty <code>λ</code> times the number of times each token was already chosen by earlier groups at that step (a Hamming diversity term). Constrained beam search goes the other way: it forces given words or phrases into the output by tracking, per hypothesis, how much of each constraint is satisfied, and reserving part of the beam for hypotheses at each level of progress so that a constraint-satisfying but initially improbable path is not pruned. Both run the model exactly as ordinary beam search does; they change only which <code>B</code> of the <code>B·V</code> candidates survive.</p>
+      <div class="formula"><span class="lbl">by hand — two groups of one beam each, one step, diversity strength <span class="keep">λ</span></span><span class="eq">log p:   a −0.51   b −1.20   c −2.30
+group 1 chooses a.
+group 2 scores a − λ·1, b, c:     λ = 0.5:  a −1.01  b −1.20  → a again (no diversity yet)
+                                  λ = 1.0:  a −1.51  b −1.20  → b
+the groups diverge once λ exceeds the log-probability gap, here 1.20 − 0.51 = 0.69.</span></div>
+    </section>
+
+    <!-- ═══ 49 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="perplexity" data-nav="Perplexity with a sliding window">
+      <h3><span class="idx">49</span> Perplexity of a fixed-context model: disjoint chunks against a strided sliding window, worked token by token</h3>
+      <p class="lede">Perplexity is the exponentiated mean negative log-likelihood of a text under the model — the same quantity as §24's loss, read back as "the effective number of equally likely choices per token". For a model with a trained context of <code>n_ctx</code> tokens the exact definition cannot be evaluated on a longer text, and the approximation chosen changes the number by more than many of the differences it is used to report.</p>
+
+      <div class="formula"><span class="lbl">the definition, and the approximations a fixed context forces</span><span class="eq">PPL(x₁ … x_N) = exp( −(1/N′) ∑ₜ log p(xₜ | x&lt;t) )          N′ = the tokens that are scored
+exact           each token conditioned on EVERYTHING before it — impossible once t > n_ctx
+disjoint chunks cut the text into windows of n_ctx; score every token in each window once
+                → tokens early in a window have almost no context; the first token of each
+                  window (after the first) cannot be scored at all, since a window's labels are
+                  shifted by one inside it
+strided window  windows of n_ctx starting every s tokens (s &lt; n_ctx); in each window score only
+                the LAST s tokens (the new ones), using the rest as context only
+                → every scored token after the first window has at least n_ctx − s tokens of context
+cost            forward passes ≈ ⌈(N − n_ctx)/s⌉ + 1;   tokens processed ≈ passes × n_ctx</span>
+<span class="lbl">by hand — N = 12 tokens, n_ctx = 6, a toy model whose loss falls with context c: nll(c) = 2 + 2/(1 + c) nats</span><span class="eq">stride 6 (disjoint)   windows [0,6) [6,12)
+   contexts of the scored tokens:  1 2 3 4 5 | 1 2 3 4 5        token 6 is never scored
+   mean nll 2.580 over 10 tokens → PPL 13.20        2 passes, 12 tokens processed
+stride 3              windows [0,6) [3,9) [6,12)
+   contexts:  1 2 3 4 5 | 3 4 5 | 3 4 5                          all 11 scorable tokens scored
+   mean nll 2.488 → PPL 12.04                        3 passes, 18 tokens processed
+stride 1              windows [0,6) [1,7) … [6,12)
+   contexts:  1 2 3 4 5 | 5 5 5 5 5 5
+   mean nll 2.445 → PPL 11.54                        7 passes, 42 tokens processed
+unbounded context     contexts 1 … 11:  PPL 10.83    (what the text "really" scores under this model)</span></div>
+      <p>The same effect at real scale: a 774M-parameter decoder with a 1 024-token context scores a standard Wikipedia test set at a perplexity of 19.44 with disjoint 1 024-token chunks — close to the 19.93 its authors reported — and at <b>16.44</b> with windows sliding by 512, the same model and the same text. A 15% difference in the headline number from the evaluation loop alone is the reason a reported perplexity is meaningless without its stride and context. Two further rules. <b>Perplexity is per token</b>, so two models with different tokenizers are not comparable on it; the tokenizer-free form is bits per byte, <code>(N_tokens / N_bytes) · ln PPL / ln 2</code> — for PPL 16.44 at an assumed 4 bytes per token that is <code>2.80 / 4 / 0.693 ≈ 1.01</code> bits per byte. <b>It is defined for causal models only</b>: a masked (bidirectional) model does not define <code>p(xₜ | x&lt;t)</code>, and its "pseudo-perplexity" is a different quantity. The loss from which it is computed is the one-hot cross-entropy, never a label-smoothed one (§25).</p>
+
+      <div class="viz" id="viz-px">
+        <div class="vhead">
+          <span class="vtitle">Strided perplexity: the windows, which tokens each one scores, and the context every scored token had</span>
+          <span class="vhint">each horizontal bar is one forward pass; its dark segment is the context-only part and its bright segment the tokens it scores — shrink the stride and the scored tokens get more context, the perplexity falls toward the unbounded-context value, and the passes multiply</span>
+        </div>
+        <div class="controls">
+          <label>text length N <input type="range" id="px-N" min="12" max="96" step="4" value="48" /><span id="px-Nv" style="min-width:24px;display:inline-block">48</span></label>
+          <label>context n_ctx <select id="px-L"><option value="6">6</option><option value="12" selected>12</option><option value="24">24</option></select></label>
+          <label>stride s <input type="range" id="px-s" min="1" max="24" step="1" value="6" /><span id="px-sv" style="min-width:20px;display:inline-block">6</span></label>
+          <label>how fast loss falls with context <select id="px-b"><option value="1">slowly</option><option value="2" selected>moderately</option><option value="4">steeply</option></select></label>
+        </div>
+        <svg id="px-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Top: one horizontal bar per forward pass over a row of N token positions, each bar spanning its window of n_ctx tokens, with its context-only prefix drawn dark and the tokens it scores drawn bright; with the stride equal to the context the bars tile the row without overlap and each window's first token is marked as unscored. Middle: for every token position, the number of preceding tokens of context it was scored with, as a bar chart, jagged saw-teeth for disjoint windows and a flat plateau near n_ctx for a small stride. Bottom right: perplexity against stride for the current settings, with the unbounded-context perplexity drawn as a dashed line below it and the current stride marked. The readout prints the number of passes, tokens processed, tokens scored, unscored tokens, the mean context, and the perplexity against the unbounded value."></svg>
+        <div class="readout" aria-live="polite" id="px-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 50 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="chattemplates" data-nav="Chat templates and special tokens">
+      <h3><span class="idx">50</span> Chat templates: a conversation is one token sequence, and the model only knows the format it was trained on</h3>
+      <p class="lede">A chat model is still the decoder of §18: it continues a sequence of tokens. What makes it a chat model is fine-tuning on conversations <b>serialised in one specific format</b> — role markers, message delimiters, special control tokens — and a <b>chat template</b> is the program, shipped with the tokenizer, that serialises a list of <code>{role, content}</code> messages into exactly that format. Two models fine-tuned from the same base can use different formats; given the wrong one, a model still produces text, usually noticeably worse.</p>
+
+      <div class="formula"><span class="lbl">one conversation, four serialisations (each ends with the generation prompt)</span><span class="eq">messages   system: "Be brief."   user: "Hi!"   assistant: "Hello."   user: "2+2?"
+
+im-marker style      &lt;|im_start|&gt;system\nBe brief.&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\nHi!&lt;|im_end|&gt;\n
+                     &lt;|im_start|&gt;assistant\nHello.&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\n2+2?&lt;|im_end|&gt;\n
+                     &lt;|im_start|&gt;assistant\n
+role-tag style       &lt;|system|&gt;\nBe brief.&lt;/s&gt;\n&lt;|user|&gt;\nHi!&lt;/s&gt;\n&lt;|assistant|&gt;\nHello.&lt;/s&gt;\n
+                     &lt;|user|&gt;\n2+2?&lt;/s&gt;\n&lt;|assistant|&gt;\n
+header-token style   &lt;|begin_of_text|&gt;&lt;|start_header_id|&gt;system&lt;|end_header_id|&gt;\n\nBe brief.&lt;|eot_id|&gt;
+                     … &lt;|start_header_id|&gt;assistant&lt;|end_header_id|&gt;\n\n
+[INST] style         &lt;s&gt;[INST] Hi! [/INST]Hello.&lt;/s&gt; [INST] 2+2? [/INST]      (no system role in
+                     its earliest form: the template raises an error, or folds it into the first turn)
+
+the markers in &lt;|…|&gt; are single vocabulary entries — control tokens — not the characters they print as.</span></div>
+
+      <h4>The four switches that decide the string</h4>
+      <ul class="notes">
+        <li><b>The generation prompt.</b> Ending the string with the opening of an assistant turn (<code>&lt;|im_start|&gt;assistant\n</code>) tells the model that what comes next is its reply. Without it the model may continue the <i>user's</i> message instead. Some formats have no assistant header, and the switch does nothing.</li>
+        <li><b>Continuing the final message.</b> The opposite: leave the last (assistant) message open, without its end-of-turn token, so generation continues it — "prefilling" a reply that starts with <code>{"name": "</code> to force a JSON answer. It cannot be combined with the generation prompt, which would open a new turn.</li>
+        <li><b>Special tokens, once.</b> A template usually emits the begin-of-sequence token itself. Tokenising its output with the tokenizer's default "add special tokens" adds a second one — a sequence starting <code>&lt;s&gt;&lt;s&gt;</code> that the model never saw in training. Nothing fails; quality drops. Render and tokenise in one step, or tokenise without adding special tokens.</li>
+        <li><b>The end-of-turn token is a stop token.</b> A format whose assistant turns end in <code>&lt;|eot_id|&gt;</code> or <code>&lt;|im_end|&gt;</code> must have that id in the stopping set of §47, or the model writes the end of its turn and then keeps going — often by writing the user's next message itself.</li>
+      </ul>
+
+      <h4>Tools, and where the template stops</h4>
+      <p>Tool use extends the same scheme. Tools are passed to the template as JSON schemas (name, description, typed parameters) and rendered into the system block in whatever form the model was trained on — some templates render them as function signatures. An assistant message may carry <code>tool_calls</code> (a list of <code>{name, arguments}</code>) instead of content; the tool's result comes back as a message with role <code>tool</code>; the template renders each in the model's trained delimiters, for example <code>&lt;tool_call&gt;{"name": "multiply", "arguments": {"a": 5, "b": 6}}&lt;/tool_call&gt;</code> and a tool turn whose content is <code>30</code>. For training, the same template is applied without the generation prompt, and usually only the assistant tokens contribute to the loss (§24's per-position mask). Templates are small programs (Jinja) stored as a file beside the tokenizer; whitespace is significant, which is why they are written with whitespace-trimming syntax, and a newline the model never saw after a role marker is enough to change its behaviour. One safety note: many tokenizers recognise a control token's literal text anywhere in their input, so user-supplied text containing <code>&lt;|im_end|&gt;</code> can close a turn from inside a message unless the application escapes it. What to put <i>in</i> the messages — prompting, retrieval, tool schemas as a design problem, the context budget — is <a href="../../llm/context-engineering.html#prompting">Context Engineering</a>'s; this section owns only how the list becomes tokens.</p>
+
+      <div class="viz" id="viz-ct">
+        <div class="vhead">
+          <span class="vtitle">A chat template renderer: the exact string a message list becomes, with control tokens marked</span>
+          <span class="vhint">pick a format and toggle the switches — control tokens are drawn as boxes because each is one vocabulary entry; the counters are computed from the rendered string, and the double-BOS check fires when the tokenizer would add a second begin-of-sequence token</span>
+        </div>
+        <div class="controls">
+          <label>format <select id="ct-f"><option value="im" selected>im-marker</option><option value="tag">role-tag</option><option value="hdr">header-token</option><option value="inst">[INST]</option></select></label>
+          <label><input type="checkbox" id="ct-sys" checked /> system message</label>
+          <label><input type="checkbox" id="ct-gp" checked /> generation prompt</label>
+          <label><input type="checkbox" id="ct-tool" /> a tool call and its result</label>
+          <label><input type="checkbox" id="ct-bos" /> tokenise again with special tokens added</label>
+        </div>
+        <svg id="ct-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="The rendered chat string laid out line by line in a monospace font, with every control token drawn as a coloured box — begin and end markers, role headers and end-of-turn tokens — and ordinary text drawn plainly, newlines shown as a return symbol. Beneath it a row of counters: the number of messages, the number of control tokens, the number of characters of ordinary text, and whether the string ends with an open assistant turn. With the tool option on, an assistant tool call rendered as JSON inside tool-call markers and a tool result turn appear before the final user message. With the square-bracket format and a system message, a note shows how that format folds the system text into the first user turn. With the re-tokenise option on in a format whose template already emits a begin-of-sequence token, a warning box shows the doubled token at the start. The readout prints the counts, the final characters of the string, and the double-token check."></svg>
+        <div class="readout" aria-live="polite" id="ct-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 51 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="llmopt" data-nav="Getting the most out of an LLM">
+      <h3><span class="idx">51</span> Getting the most out of a large model: fewer bytes per weight, an attention kernel that never forms n², and an architecture built for decoding</h3>
+      <p class="lede">Deploying a large decoder comes down to three levers, and this page has already derived each of them; this section puts them in one place with the numbers, and points to where each is taken further. <b>Lower precision</b> shrinks the weights that every decode step must read (§47). <b>A fused attention kernel</b> removes the <code>n²</code> array (§41). <b>Architectural choices made at training time</b> — relative positions that survive long inputs, and fewer key/value heads — shrink the cache and extend the usable context.</p>
+
+      <div class="formula"><span class="lbl">lever 1 — precision: weights in bytes, for a 15.5B-parameter code model</span><span class="eq">rule of thumb      X billion parameters ≈ 4X GB in fp32, 2X GB in bf16/fp16
+bf16               15.5 × 2 = 31 GB  (= 28.9 GiB)       measured peak on one GPU: 29.0 GiB
+8-bit weights      measured peak 15.2 GiB                 about half
+4-bit weights      measured peak 9.5 GiB                  under a third
+the weights are DEQUANTISED to bf16 inside each matmul, so the saving is memory and bandwidth,
+and latency can go either way — faster where decode is bandwidth-bound, slower where the
+dequantisation is not fused. Output quality at 8 bits was indistinguishable in that example;
+4 bits changed a few tokens.  Quantisation methods: <a href="../../mlops/model-acceleration.html#quant">Model Acceleration</a>.</span>
+<span class="lbl">lever 2 — the attention kernel: the QKᵀ array of a 40-head model in bf16, per layer</span><span class="eq">bytes = 40 × 2 × N²          N = 1 000:   80 MB        N = 16 000:  20.5 GB        N = 100 000:  800 GB
+a flash-style kernel holds none of it (§41), gives the same values up to floating-point
+re-association (not bit-identical — sums are formed in a different order), and is faster because it
+moves fewer bytes, despite recomputing some softmax statistics.</span>
+<span class="lbl">lever 3 — architecture: the same 15.5B model's KV cache at N = 16 000 (40 layers, 48 heads of 128)</span><span class="eq">values  = 2 × N × L × h × dₖ = 2 × 16 000 × 40 × 6 144 = 7 864 320 000        fp16: 15.7 GB
+          — half the size of the weights themselves, for ONE sequence
+multi-query attention (g = 1, one key/value head for all 48):   15.7 GB / 48 = 328 MB
+the original multi-query measurement: decoder time per token 46 µs → 3.8 µs (≈ 12×) at a
+training step time of 433 ms → 425 ms, with quality slightly below the multi-head baseline;
+grouped-query attention recovers most of that quality with g between 1 and h, and an existing
+multi-head checkpoint can be converted by continued training on about 5% of its pre-training compute.</span></div>
+      <p>The architectural lever has two halves, and both are derived above rather than here. <b>Positions</b>: relative schemes put position where tokens meet — RoPE (§06–§07) and ALiBi (§08) — and §09 measured what each does past the training length; ALiBi degrades least out of the box, RoPE degrades gently and is the one that <a href="../../llm/context-length-extension.html">context-length extension</a> rescales. <b>The cache</b>: <a href="../attention/kv-cache-gqa-mla.html#gqa">the attention page's MQA/GQA section</a> derives the saving exactly, §45 shows what each allocation strategy then does with it, and §42 how a server packs many such caches into one pool. None of these can be retrofitted by a flag — a model trained with full multi-head attention and learned positions keeps them — which is why they are decisions for §31's stage of design, not for deployment.</p>
+
+      <table class="grid2">
+        <tr><th>technique</th><th>faster</th><th>less memory</th><th>changes the output?</th><th>where it is taken further</th></tr>
+        <tr><td><b>fused attention backend</b></td><td>yes</td><td>yes (O(n) not O(n²))</td><td>last bits only</td><td>§41; <a href="../attention/efficient-attention.html#flash">attention page</a></td></tr>
+        <tr><td><b>KV cache, and its strategies</b></td><td>yes (O(n) per token, not O(n²))</td><td>strategy-dependent</td><td>no (quantised: slightly)</td><td>§44–§45, §42</td></tr>
+        <tr><td><b>weight quantisation</b></td><td>often, for decode</td><td>yes</td><td>slightly</td><td><a href="../../mlops/model-acceleration.html#quant">Model Acceleration</a></td></tr>
+        <tr><td><b>compilation, fixed-shape decode</b></td><td>yes</td><td>no (a static cache costs memory)</td><td>no</td><td><a href="../../mlops/model-acceleration.html">Model Acceleration</a>; enabled by §45's static cache</td></tr>
+        <tr><td><b>parallelism across devices</b></td><td>yes, for models that do not fit</td><td>per device</td><td>no</td><td><a href="../distributed-training/tensor-sequence-context.html#model">Distributed Training</a>; the load-time slicing of §39</td></tr>
+        <tr><td><b>continuous batching, paged cache</b></td><td>throughput, not latency</td><td>yes (§42)</td><td>no</td><td>§42; <a href="../../mlops/model-acceleration.html">Model Acceleration</a></td></tr>
+        <tr><td><b>speculative decoding</b></td><td>yes, per sequence</td><td>no (a draft model)</td><td>no (with exact verification)</td><td><a href="../../mlops/speculative-decoding.html">Speculative Decoding</a></td></tr>
+      </table>
+
+      <div class="wrong"><span class="say">The claim to soften.</span> "Using the KV cache gives identical results." <span class="fix">Identical in exact arithmetic; in floating point, close.</span> With the cache, the last token's attention is computed as a <code>(1 × t)</code> product instead of one row of a <code>(t × t)</code> product, and matmul kernels sum in different orders for different shapes, so logits can differ in the last bits and a greedy decode can, rarely, take a different branch at a near-tie. The same is true of switching attention backends (§41). A test that compares generations across these switches should compare logits with a tolerance, not strings.</div>
+    </section>
+
+    <nav class="pager" aria-label="Transformers series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="definitions-loading.html">← Model Definitions &amp; Loading</a>
+      <a href="../transformers.html" style="color:var(--muted)">Transformers · overview</a>
+      <a href="../transformers.html">Transformers · overview →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../transformers.viz.js"></script>
+</body>
+</html>

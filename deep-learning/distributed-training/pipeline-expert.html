@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Pipeline &amp; Expert Parallelism</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  .tablewrap{overflow-x:auto;max-width:100%}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  pre.code{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:10px 0;overflow-x:auto;font-size:12.5px;line-height:1.5;white-space:pre}
+  pre.code code{background:none;padding:0;border-radius:0;color:var(--ink);font-size:inherit}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../distributed-training.html">Distributed Training</a> · part 4 of 5</p>
+      <h1>Pipeline &amp; Expert Parallelism</h1>
+      <p>Splitting the model by depth and by expert: pipeline stages fed with micro-batches and the bubble that idles them, the 1F1B, interleaved and zero-bubble schedules that trade activation memory against idle time, and expert parallelism's all-to-all dispatch and combine of routed tokens in mixture-of-experts layers.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Distributed Training</span>
+        <span class="pill">Stages & micro-batches · the bubble · GPipe · 1F1B · interleaved · zero bubble · MoE all-to-all dispatch & combine</span>
+      </div>
+    </header>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="pipeline" data-nav="Pipeline parallelism and the bubble">
+      <h3><span class="idx">15</span> Model parallelism II — pipeline parallelism and the bubble</h3>
+      <p class="lede">Cut the model by depth into <code>p</code> stages of <code>L/p</code> consecutive layers, one stage per GPU (or per tensor-parallel group). Only the activations at stage boundaries cross the network, point to point, so pipeline parallelism is the cheapest scheme in bandwidth and the natural one to stretch across nodes. The price is idle time.</p>
+      <p>Naively, stage 1 cannot start until stage 0 has finished the whole batch, so only one GPU works at a time. <b>GPipe</b> ("GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism", arXiv 1811.06965) splits the batch into <code>m</code> micro-batches and streams them through, running all forwards and then all backwards. The pipeline still has to fill and drain. Stage <code>p−1</code> waits <code>p−1</code> forward slots before its first micro-batch arrives, and stage 0 waits the same at the end of the backward.</p>
+      <div class="formula"><span class="lbl">bubble, p stages, m micro-batches, forward time F and backward B per micro-batch per stage</span><span class="eq">time per step        (m + p − 1) · (F + B)
+useful work          m · (F + B)
+bubble fraction      (p − 1) / (m + p − 1)          (idle ÷ total)
+                     (p − 1) / m                    (idle ÷ useful, the convention in Megatron-LM papers)
+worked, p = 4:  m = 4  → 3/7  = 42.9%     m = 8  → 3/11 = 27.3%
+                m = 16 → 3/19 = 15.8%     m = 32 → 3/35 =  8.6%
+worked, p = 16, m = 16 → 15/31 = 48.4%</span></div>
+      <p>The two conventions describe the same schedule: <code>(p−1)/m ÷ (1 + (p−1)/m) = (p−1)/(m+p−1)</code>. A quoted "bubble of 37.5%" at p = 4, m = 8 is the second one; the fraction of wall-clock time idle is 27.3%. The remedy is more micro-batches. GPipe reports the bubble as negligible once <code>m ≥ 4p</code>. But <code>m</code> is bounded by the global batch: m = global batch ÷ (micro-batch × data-parallel degree), so adding data parallelism shrinks the <code>m</code> available to each pipeline.</p>
+      <p>GPipe reports a 557 M-parameter AmoebaNet at 84.4% ImageNet top-1 and a 6 B-parameter, 128-layer multilingual Transformer. It kept memory in check with re-materialisation, storing only stage-boundary activations and recomputing the rest in backward, because an all-forwards-first schedule must hold activations for all <code>m</code> micro-batches at once.</p>
+
+      <h4>What crosses the stage boundary</h4>
+      <div class="formula"><span class="lbl">point-to-point traffic per micro-batch per boundary</span><span class="eq">forward: one activation  b·s·h × 2 bytes      backward: its gradient, the same size
+worked (h = 8192, 4096 tokens): 67 MB each way — versus 470 MB per layer for 8-way TP (§11)</span></div>
+      <p>Two practical costs are not in the formula. <b>Stage balance</b>: the slowest stage sets the clock, and the embedding and output layers make the first and last stages heavier than the middle ones, so layer counts per stage are often uneven. And <b>batch-statistics layers and tied weights</b> across stages (input and output embeddings on different GPUs) need their own synchronisation.</p>
+      <p>The Hugging Face parallelism guide summarises the trade in words. Pipeline parallelism "creates <i>micro-batches</i>" so that GPUs work concurrently, but "it also isn't possible to completely reduce idle time because the last <code>forward</code> pass must also wait for the <code>backward</code> pass to finish". It also notes that models may need rewriting as a sequence of <code>nn.Sequential</code> modules.</p>
+    </section>
+
+    <!-- ═══ 16 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="schedules" data-nav="1F1B, interleaved, zero bubble">
+      <h3><span class="idx">16</span> Pipeline schedules: 1F1B, interleaved, zero bubble</h3>
+      <p class="lede">Every schedule after GPipe attacks one of two costs: the activation memory of holding many micro-batches in flight, or the bubble itself.</p>
+
+      <h4>1F1B: same bubble, bounded memory</h4>
+      <p>The one-forward-one-backward schedule was introduced in PipeDream ("PipeDream: Fast and Efficient Pipeline Parallel DNN Training", arXiv 1806.03377). Its flushed, synchronous form is used by Megatron-LM. After a warm-up of <code>p − 1 − i</code> forwards on stage <i>i</i>, each stage alternates one forward with one backward. A micro-batch's activations are released as soon as its backward runs, so stage 0 never holds more than <code>p</code> micro-batches and later stages fewer, whatever <code>m</code> is. The bubble is unchanged, <code>(p−1)/(m+p−1)</code>, but raising <code>m</code> to shrink it no longer costs memory. PipeDream itself was asynchronous and kept several weight versions ("weight stashing") so that a micro-batch's backward used the weights of its forward. Synchronous flushed 1F1B gives the same updates as ordinary training.</p>
+      <p>Since stage 0 holds <code>p</code> micro-batches of <code>L/p</code> layers each, the peak activation memory on stage 0 is <b>L layers' worth for one micro-batch</b>, the same as without pipelining. Pipelining divides the weights by <code>p</code> but not the first stage's activations.</p>
+
+      <h4>Interleaved 1F1B: v chunks per device</h4>
+      <p>Megatron-LM's interleaved schedule (arXiv 2104.04473) gives each device <code>v</code> non-contiguous chunks of layers. With p = 4 and v = 2, device 0 holds layers 1–2 and 9–10 of 16. Each forward slot is now <code>1/v</code> as long, so the fill and drain shrink by <code>v</code>:</p>
+      <div class="formula"><span class="lbl">interleaved bubble</span><span class="eq">bubble fraction  (p − 1) / (v·m + p − 1)      (idle ÷ useful: (p − 1) / (v·m))
+cost             v× as many point-to-point messages; m must be a multiple of p in Megatron's implementation</span></div>
+      <p>The paper reports that the interleaved schedule "can improve throughput by 10+% with memory footprint comparable to existing approaches". The whole system trained a 1 T-parameter model at 502 petaFLOP/s on 3072 GPUs, 52% of theoretical peak per GPU.</p>
+
+      <h4>Zero bubble: split the backward</h4>
+      <p>"Zero Bubble Pipeline Parallelism" (arXiv 2401.10241) observes that the backward is two computations with different dependencies. <b>B</b> computes the gradient with respect to the layer's input, which the previous stage is waiting for. <b>W</b> computes the gradient with respect to the weights, which nobody downstream needs until the optimiser step. Running B promptly and deferring W into what would otherwise be bubble slots fills the drain. With F, B and W each taking one unit, the paper's handcrafted ZB-H1 schedule has a bubble of <code>(p−1)·(F + B − W)</code>, one third of 1F1B's <code>(p−1)·(F + B + W)</code>, at the same peak memory. ZB-H2 reaches nearly zero with more memory. The paper also bypasses the synchronisation normally done before the optimiser step and adds an automatic scheduler. It reports up to 23% higher throughput than 1F1B under a similar memory limit, and up to 31% when the memory constraint is relaxed.</p>
+
+      <div class="viz" id="viz-pipe">
+        <div class="vhead">
+          <span class="vtitle">Pipeline schedules, simulated</span>
+          <span class="vhint">each row is a stage; bars are micro-batches (number = micro-batch); the readout measures the idle fraction from the simulation</span>
+        </div>
+        <div class="controls">
+          <label>schedule <select id="pp-sched"><option value="gpipe">GPipe (all F, then all B)</option><option value="1f1b" selected>1F1B</option><option value="inter">interleaved 1F1B</option><option value="zb">zero bubble (ZB-H1-style)</option></select></label>
+          <label>stages p <select id="pp-p"><option>2</option><option selected>4</option><option>8</option></select></label>
+          <label>micro-batches m <input type="range" id="pp-m" min="1" max="32" step="1" value="8" /><span id="pp-mv" style="min-width:24px;display:inline-block">8</span></label>
+          <label>chunks v (interleaved) <select id="pp-v"><option selected>2</option><option>4</option></select></label>
+        </div>
+        <svg id="pp-svg" width="760" height="330" viewBox="0 0 760 330" role="img" aria-label="Gantt chart with one row per pipeline stage and time on the horizontal axis. Blue bars are forward passes, green bars backward passes, and for the zero-bubble schedule purple bars are deferred weight-gradient passes; gaps are the pipeline bubble. Interleaved chunks are outlined."></svg>
+        <div class="readout" aria-live="polite" id="pp-read"></div>
+        <p class="vcap">Each schedule is simulated: GPipe, 1F1B and interleaved 1F1B use a fixed per-stage op order (Megatron's for interleaving), and each op starts when its stage is free and its dependency has finished (F after the previous stage's F; B after the next stage's B). Times are F = 1 and B = 2 per full stage. Zero bubble splits B into B = 1 and W = 1 and schedules greedily (B first, then F, then W) under a memory cap of p micro-batches on every stage. There F stashes one unit, B frees half and W the rest, which is an assumption about the split, not a measurement. The ZB formula holds only for m ≥ p. Point-to-point transfer time is ignored.</p>
+      </div>
+
+      <div class="tablewrap"><table class="grid2">
+        <tr><th>schedule</th><th>bubble (idle ÷ total)</th><th>stage-0 activations in flight</th><th>extra cost</th></tr>
+        <tr><td><b>GPipe</b></td><td class="mono">(p−1)/(m+p−1)</td><td>m micro-batches (hence re-materialisation)</td><td>—</td></tr>
+        <tr><td><b>1F1B</b></td><td class="mono">(p−1)/(m+p−1)</td><td>p</td><td>—</td></tr>
+        <tr><td><b>interleaved</b></td><td class="mono">(p−1)/(v·m+p−1)</td><td>somewhat above p (longer warm-up; the figure measures it)</td><td>v× point-to-point messages; m a multiple of p</td></tr>
+        <tr><td><b>zero bubble (H1)</b></td><td class="mono">(p−1)/(3m+p−1) with F = B = W</td><td>p (every stage may use it)</td><td>B/W split in the framework; W stash lives longer</td></tr>
+      </table></div>
+      <p>Production systems adapt these. Llama 3's training modified its schedule to run any number of micro-batches per batch, fewer or more than the stage count, and used an interleaved schedule with several stages per pipeline rank.</p>
+    </section>
+
+    <!-- ═══ 17 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="expert" data-nav="Expert parallelism">
+      <h3><span class="idx">17</span> Expert parallelism: all-to-all dispatch and combine</h3>
+      <p class="lede">A mixture-of-experts layer replaces one MLP with <code>E</code> expert MLPs and a router that sends each token to its top-<code>k</code> (<a href="../mixture-of-experts.html#routing">routing</a> is covered on its own page). Parameters grow with <code>E</code> while FLOPs per token grow only with <code>k</code>, which makes the experts the natural thing to spread across GPUs.</p>
+      <p>With expert-parallel degree <code>X</code>, each rank holds <code>E/X</code> experts. The rest of the layer (attention, norms, router) is replicated across those same ranks and trained data-parallel on different tokens. Each MoE layer then needs two all-to-alls. <b>Dispatch</b> sends every token's hidden vector to the ranks that own its chosen experts. <b>Combine</b> sends the expert outputs back so each token's weighted sum can be formed where the token lives. Backward repeats both in reverse.</p>
+      <div class="formula"><span class="lbl">bytes per rank per MoE layer, T tokens per rank, top-k, width h, 16-bit</span><span class="eq">dispatch      ≈ (X−1)/X · T · k · h · 2        (uniform routing; the diagonal stays local)
+combine       the same
+forward + backward   4 × dispatch
+worked: T = 8192, k = 2, h = 4096, X = 8:  7/8 · 8192 · 2 · 4096 · 2 B = 117 MB per all-to-all
+        → 470 MB per layer per step: 1.0 ms at 450 GB/s, 9.4 ms at 50 GB/s</span></div>
+      <p>Unlike a ring collective, an all-to-all finishes when its <i>slowest</i> pair finishes, so it is sensitive both to topology and to routing skew: a popular expert makes its rank receive more than <code>T·k/X</code>. That is why EP groups are usually kept inside a fast domain, and why load balance is also a systems property, not only a modelling one.</p>
+
+      <h4>Capacity factor</h4>
+      <p>Static-shape implementations allocate a fixed buffer per expert. With capacity factor <code>CF</code>, each expert accepts at most</p>
+      <div class="formula"><span class="lbl">expert capacity</span><span class="eq">capacity = ⌈ CF · (tokens routed in the group · k) / E ⌉
+tokens over capacity are dropped: they skip the expert and pass on through the residual connection</span></div>
+      <p><code>CF = 1</code> is exactly enough under perfectly uniform routing and drops tokens under any skew. Larger factors drop fewer tokens but pad every buffer, so they waste both all-to-all bandwidth and expert FLOPs. GShard ("GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding", arXiv 2006.16668) used such a per-expert capacity alongside its sharding annotations. It trained a 600 B-parameter multilingual translation MoE on 2048 TPU v3 accelerators in 4 days. Later "dropless" implementations avoid capacity altogether with variable-size grouped matmuls.</p>
+
+      <div class="viz" id="viz-ep">
+        <div class="vhead">
+          <span class="vtitle">Expert parallelism: the dispatch matrix and expert capacity</span>
+          <span class="vhint">routing is sampled from a skewed preference over experts; raise the skew to see drops and a hot rank</span>
+        </div>
+        <div class="controls">
+          <label>EP ranks X <select id="ep-x"><option>2</option><option selected>4</option><option>8</option></select></label>
+          <label>experts E <select id="ep-e"><option>8</option><option selected>16</option><option>32</option><option>64</option></select></label>
+          <label>top-k <select id="ep-k"><option>1</option><option selected>2</option><option>4</option></select></label>
+          <label>capacity factor <input type="range" id="ep-cf" min="1" max="2" step="0.25" value="1.25" /><span id="ep-cfv" style="min-width:34px;display:inline-block">1.25</span></label>
+          <label>routing skew <input type="range" id="ep-skew" min="0" max="2" step="0.1" value="0.4" /><span id="ep-skewv" style="min-width:28px;display:inline-block">0.4</span></label>
+          <label>tokens per rank <select id="ep-tok"><option value="256">256</option><option value="1024" selected>1,024</option><option value="4096">4,096</option></select></label>
+          <label>hidden h <select id="ep-h"><option value="4096" selected>4096</option><option value="7168">7168</option></select></label>
+        </div>
+        <svg id="ep-svg" width="760" height="340" viewBox="0 0 760 340" role="img" aria-label="Left: an X by X heatmap of how many token assignments each rank sends to each other rank in the dispatch all-to-all, with the diagonal outlined because it stays local. Right: a bar per expert showing tokens accepted, with the demanded excess in red above a dashed capacity line."></svg>
+        <div class="readout" aria-live="polite" id="ep-read"></div>
+        <p class="vcap">Routing is simulated with a fixed seed. Expert e is preferred with weight 1/(rank + 1)^skew over a shuffled order, each token draws k distinct experts, and tokens are processed in order so the last arrivals at a full expert are the ones dropped. Skew 0 is uniform routing. Bytes are 16-bit hidden vectors for the rank that sends the most off-rank traffic.</p>
+      </div>
+
+      <h4>Laying out EP with DP and TP</h4>
+      <p>Expert parallelism is carved out of ranks that are otherwise data-parallel (and possibly context-parallel) for the dense layers. With <code>D</code> data-parallel ranks and EP degree <code>X</code> dividing <code>D</code>, there are <code>D/X</code> copies of each expert, and an expert's gradients are all-reduced only among those copies. Tensor parallelism can additionally split each expert's matrices, or it can be kept for attention only. The Transformers expert-parallel path does the latter (§20).</p>
+      <p><b>The inference angle.</b> In serving, expert parallelism lets a model whose total parameters exceed a node's memory run with each GPU holding a few experts. The all-to-all latency per generated token then matters more than bandwidth, which is why serving stacks co-locate EP groups on the fastest link available.</p>
+    </section>
+
+    <nav class="pager" aria-label="Distributed Training series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="tensor-sequence-context.html">← Tensor, Sequence &amp; Context Parallelism</a>
+      <a href="../distributed-training.html" style="color:var(--muted)">Distributed Training · overview</a>
+      <a href="nd-parallelism-practice.html">N-D Parallelism, Planning &amp; Checkpointing →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../distributed-training.viz.js"></script>
+</body>
+</html>

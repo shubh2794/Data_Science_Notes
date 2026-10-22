@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Dense Stereo Matching</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses, carried over from parts 1-6 */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../stereo-sfm.html">Stereo &amp; Structure from Motion</a> · part 4 of 5</p>
+      <h1>Dense Stereo Matching</h1>
+      <p>Dense depth from a calibrated pair: rectification that turns epipolar lines into scanlines, the inverse disparity–depth law and its error growth, matching costs from SAD to NCC and census, the cost volume with winner-take-all, window aggregation, global and semi-global smoothness, sub-pixel refinement and its bias, and the failure modes.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Stereo &amp; Structure from Motion</span>
+        <span class="pill">Rectification · Z = fB/d · SAD/NCC/census · cost volume · aggregation · SGM · sub-pixel</span>
+      </div>
+    </header>
+
+    <!-- ═══ 17 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="rectification" data-nav="Rectification">
+      <h3><span class="idx">17</span> Rectification: making the epipolar lines into scanlines</h3>
+      <p class="lede">The epipolar constraint already reduced the search to a line. Rectification makes that line <b>the same row of memory in both images</b>, which turns a geometric fact into an engineering one.</p>
+
+      <p>Searching along an arbitrary line in an image means interpolating: the line passes between pixel centres, so every sample is a weighted average of four neighbours, and the cost aggregation of §21 has to be done along a slanted window. Searching along a <i>row</i> means incrementing a pointer. That is the entire motivation, and it is worth a resampling of both images.</p>
+
+      <div class="formula"><span class="lbl">the construction — one new orientation, shared by both cameras</span><span class="eq">both rectified cameras get the SAME rotation R_rect and the SAME intrinsics K_new,
+and keep their own centres. Build R_rect from its three rows:
+
+    r₁  =  (c₁ − c₀) / ‖c₁ − c₀‖        the new x-axis IS the baseline
+    r₂  =  (k × r₁) / ‖k × r₁‖          k = the old optical axis of camera 0;
+                                          this makes the new y-axis ⟂ the baseline
+                                          and as close to the old "up" as possible
+    r₃  =  r₁ × r₂                       the new optical axis, ⟂ to the baseline
+
+    P′ⱼ  =  K_new [ R_rect | −R_rect cⱼ ]
+
+and the warp that takes the old image j to the new one is the homography
+
+    Hⱼ  =  K_new R_rect (Kⱼ Rⱼ)⁻¹        (a pure 3 × 3 homography, because the
+                                          camera CENTRE has not moved — only the
+                                          orientation and the intrinsics have)</span>
+<span class="eq">The choice of K_new is free and matters. Taking the mean of K₀ and K₁ with the skew
+zeroed is the simple choice; minimising the distortion the warp introduces, subject to
+the same constraints, is the refinement production code uses, and it is worth the extra
+work whenever the vergence is large.</span></div>
+
+      <h4>What is true afterwards, verified</h4>
+      <p>Applying this to the running rig — baseline 1.006 m, verged 8°, different intrinsics in the two cameras — and checking every one of the 40 correspondences:</p>
+      <div class="formula"><span class="lbl">the four properties, each measured</span><span class="eq">1 · corresponding points share a row
+       max |v′₀ − v′₁| = 1.7 × 10⁻¹³ px,  RMS 6.3 × 10⁻¹⁴ px       (machine precision)
+
+2 · the relative translation becomes pure horizontal
+       t′ = (−1.006231, 0, 0)    exactly; the y and z components are 0.0
+
+3 · the fundamental matrix becomes the canonical rectified one
+                 ⎡ 0  0  0 ⎤
+       F′  ∼     ⎢ 0  0  1 ⎥          and max |x̄′₁ᵀF′x̄′₀| = 3.0 × 10⁻¹⁶
+                 ⎣ 0 −1  0 ⎦          — this F′ says exactly "v′₁ = v′₀", nothing more
+
+4 · depth and disparity satisfy the inverse law of §18
+       max relative error of  Z = f B / d  against the true rectified depth:
+       2.8 × 10⁻¹⁵</span></div>
+
+      <div class="callout"><b>Rectification is exact, not approximate.</b> Every number above is at the level of double-precision rounding. That is worth stressing because rectified stereo is often described as an approximation or a convenience; it is neither. It is a change of coordinates that leaves the geometry alone. What is approximate is the <b>resampling</b>: the warp is a homography, the images are sampled, and interpolating them costs a little sharpness. That cost is <a href="../image-processing.html">Part 2</a>'s subject, not this page's.</div>
+
+      <h4>When it fails, and what to do instead</h4>
+      <table class="grid2">
+        <tr><th style="width:26%">Situation</th><th>What happens</th></tr>
+        <tr><td><b>Epipole inside, or near, the image</b> — i.e. mostly forward motion</td><td><b>The fatal case.</b> Rectification sends the epipole to infinity, and a homography that sends an <i>interior</i> point to infinity tears the image apart: the required output canvas grows without bound as the epipole approaches the frame. There is no fix within rectification. The standard alternative is the <b>plane sweep</b>: hypothesise a family of planes at increasing depth, warp every image onto each plane by the homography it induces, and measure photo-consistency there. It needs no rectification, works for any camera arrangement, and generalises to many views at once.</td></tr>
+        <tr><td><b>Baseline nearly parallel to the optical axis</b></td><td>Same problem in different words — <code>k × r₁ → 0</code> and the second row of <code>R_rect</code> is undefined.</td></tr>
+        <tr><td><b>Very different focal lengths or strong vergence</b></td><td>Works, but one image must be magnified to match the other, and magnifying resamples above its own resolution. Magnify the <i>smaller</i> image rather than shrinking the larger, so nothing is aliased away.</td></tr>
+        <tr><td><b>More than two views</b></td><td>Simultaneous rectification of <code>n</code> views is possible only if the <code>n</code> camera centres are <b>collinear</b>, because there must be a single baseline direction. Otherwise, rectify pairs, or sweep planes.</td></tr>
+        <tr><td><b>Significant lens distortion</b></td><td>Must be removed <i>first</i>. Distortion is not a homography, so it does not compose into <code>H</code>; a rectified image built from distorted pixels has curved epipolar "lines". <a href="../image-formation/pinhole-camera.html#distortion">Part 1 §17</a> owns the model and its inverse.</td></tr>
+      </table>
+
+      <div class="viz" id="viz-rect">
+        <div class="vhead">
+          <span class="vtitle">Rectification, and the canvas blowing up as the motion turns forward</span>
+          <span class="vhint">the row-disagreement readout is the whole point: it stays at machine precision until the epipole reaches the frame</span>
+        </div>
+        <div class="controls">
+          <label>vergence <input type="range" id="rc-v" min="0" max="20" step="0.5" value="8" /><span id="rc-vv" style="min-width:34px;display:inline-block">8.0°</span></label>
+          <label>forward travel c₁_z <input type="range" id="rc-z" min="0" max="3" step="0.02" value="0.10" /><span id="rc-zv" style="min-width:46px;display:inline-block">0.10 m</span></label>
+          <label>show <select id="rc-m"><option value="both">original and rectified</option><option value="rect">rectified only</option></select></label>
+        </div>
+        <svg id="rect-svg" width="760" height="452" viewBox="0 0 760 452" role="img" aria-label="Four image panels arranged two by two on the left. The top row shows the two original images of a two-view rig, each with the same set of scene points marked and each point's epipolar line drawn; the lines converge towards an epipole outside the frame. The bottom row shows the same two images after the rectifying homographies have been applied, drawn on the same axes, with the transformed points and lines: every epipolar line is now exactly horizontal, and each point sits at the same row in both rectified images, with a faint horizontal rule joining the two to make the row agreement visible. On the right, a plot of the area of the bounding box needed to hold the rectified image, as a multiple of the original image area, against the forward component of the camera motion over its whole range on a logarithmic axis, with a marker at the current setting and a shaded region beyond the point at which the warp stops being a valid image transform at all, because the line it sends to infinity has begun to cross the picture. The curve is flat and near one for sideways motion — one and a third times the original area at the default forward travel of ten centimetres — climbs to over a hundred times by one metre of forward travel, and is unbounded past about one and a half, which is the exact sense in which rectification fails for a forward-moving camera."></svg>
+        <div class="readout" aria-live="polite" id="rect-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 18 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="disparity" data-nav="Disparity &amp; depth">
+      <h3><span class="idx">18</span> Disparity and depth: the inverse law and its consequences</h3>
+      <p class="lede">In a rectified pair, matching reduces to one number per pixel — how far left or right its partner is. That number is not depth. It is <b>inverse</b> depth, and everything unpleasant about stereo follows from the "inverse".</p>
+
+      <div class="formula"><span class="lbl">the derivation, three lines, in the rectified frame</span><span class="eq">two identical cameras, focal length f px, centres at (0,0,0) and (B,0,0), both looking
+along +z with no rotation. A world point (X, Y, Z) projects to
+
+    u₀ = f·X/Z + cₓ                    u₁ = f·(X − B)/Z + cₓ            v₀ = v₁
+
+so the horizontal difference — the DISPARITY — is
+
+    d  ≡  u₀ − u₁  =  f·B/Z            and therefore        Z  =  f·B / d</span>
+<span class="eq">Read off four facts immediately:
+ · d > 0 for any point in front of the cameras, and d = 0 exactly at infinity;
+ · d is INDEPENDENT of X and Y — every point at depth Z has the same disparity;
+ · the map Z ↦ d is a hyperbola, so equal steps in d are NOT equal steps in Z;
+ · d scales with both f and B, which is why they are the two design knobs of a rig.</span></div>
+
+      <h4>The <code>Z²</code> law, derived</h4>
+      <div class="formula"><span class="lbl">propagating the matching error into depth</span><span class="eq">differentiate Z = fB/d with respect to d:
+
+    dZ/dd  =  −fB/d²  =  −(fB)/(fB/Z)²  =  −Z²/(fB)
+
+so for small disparity error <span class="keep">σ</span>_d,
+
+    <span class="keep">σ</span>_Z  ≈  Z² <span class="keep">σ</span>_d / (fB)                    absolute depth error grows as Z²
+
+and, dividing by Z,
+
+    <span class="keep">σ</span>_Z / Z  ≈  Z <span class="keep">σ</span>_d / (fB)  =  <span class="keep">σ</span>_d / d       relative depth error grows as Z¹</span>
+<span class="eq">The second form is the useful one and is worth memorising: RELATIVE depth accuracy
+equals RELATIVE disparity accuracy. A quarter-pixel matcher on a 12-pixel disparity
+gives 2% depth; the same matcher on a 2.5-pixel disparity gives 10%. The matcher did
+not get worse. The geometry did.</span></div>
+
+      <h4>Measured, against the prediction</h4>
+      <p>A Monte-Carlo check, 400 000 samples per depth, with <code>f = 500 px</code>, <code>B = 0.12 m</code> and Gaussian disparity noise <code><span class="keep">σ</span>_d = 0.25 px</code>. The measured column is the standard deviation of <code>fB/(d + noise)</code>; the predicted column is <code>Z²<span class="keep">σ</span>_d/(fB)</code>.</p>
+
+      <div class="formula"><span class="lbl">the measurement — f = 500 px, B = 0.12 m, <span class="keep">σ</span>_d = 0.25 px</span><span class="eq">  Z (m)   d (px)   measured <span class="keep">σ</span>_Z   predicted   ratio    relative
+   1.0    60.000     0.00417      0.00417   0.9998     0.42 %
+   2.0    30.000     0.01664      0.01667   0.9986     0.83 %
+   5.0    12.000     0.10440      0.10417   1.0022     2.09 %
+  10.0     6.000     0.41886      0.41667   1.0053     4.19 %
+  15.0     4.000     0.95359      0.93750   1.0172     6.36 %
+  20.0     3.000     1.71670      1.66667   1.0300     8.58 %
+  30.0     2.000     4.01355      3.75000   1.0703    13.38 %
+  40.0     1.500     7.60289      6.66667   1.1404    19.01 %</span>
+<span class="eq">Fitting a straight line to log <span class="keep">σ</span>_Z against log Z over Z ≤ 15 m gives a slope of
+
+    2.0050          against the predicted exponent of exactly 2.
+
+Over the full range to 40 m the fitted slope is 2.0257, and the ratio column drifts
+from 1.00 to 1.14. (The live figure below applies a slightly different cut — it keeps
+the depths with d > 8σ_d — and reports 2.011, for the same reason.) That drift is NOT an error in the derivation — it is the
+derivation's own first-order assumption failing. 1/d is convex, so averaging over
+noise in d gives a distribution for Z with a heavy upper tail, and its standard
+deviation exceeds the linearised estimate. The approximation is excellent while
+<span class="keep">σ</span>_d ≪ d and degrades exactly when d approaches the noise, which at these settings
+is around 30–40 m.</span></div>
+
+      <div class="callout"><b>What this means for building a rig.</b> Fix a tolerable relative error, say 5%. Then <code>d ≥ <span class="keep">σ</span>_d/0.05 = 20<span class="keep">σ</span>_d</code>, so with a quarter-pixel matcher you need <code>d ≥ 5 px</code>, so <code>Z ≤ fB/5</code>. With <code>f = 500</code> and <code>B = 0.12 m</code> that is <b>12 m</b>, full stop. To double the range you must double <code>f</code> — which halves the field of view — or double <code>B</code> — which increases occlusion, foreshortening and the disparity search range, all of which make the matching <i>harder</i> and so increase <code><span class="keep">σ</span>_d</code>. <b>There is no free parameter.</b> Every stereo rig is a fixed point of this argument, and it is why long-range depth is not a stereo problem.</div>
+
+      <div class="viz" id="viz-depth">
+        <div class="vhead">
+          <span class="vtitle">Z = fB/d, the depth quantisation it implies, and the Z² error law measured</span>
+          <span class="vhint">the middle panel is a live Monte Carlo — the fitted slope is computed from the dots, not assumed</span>
+        </div>
+        <div class="controls">
+          <label>focal f <input type="range" id="dp-f" min="200" max="1200" step="20" value="500" /><span id="dp-fv" style="min-width:48px;display:inline-block">500 px</span></label>
+          <label>baseline B <input type="range" id="dp-b" min="0.02" max="1" step="0.01" value="0.12" /><span id="dp-bv" style="min-width:46px;display:inline-block">0.12 m</span></label>
+          <label>disparity noise <span class="keep">σ</span>_d <input type="range" id="dp-s" min="0.05" max="1" step="0.05" value="0.25" /><span id="dp-sv" style="min-width:44px;display:inline-block">0.25 px</span></label>
+          <label>tolerance <input type="range" id="dp-t" min="1" max="20" step="1" value="5" /><span id="dp-tv" style="min-width:30px;display:inline-block">5 %</span></label>
+        </div>
+        <svg id="depth-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Left: depth against disparity, the hyperbola Z equals f times B divided by d, with a horizontal tick drawn at the depth corresponding to each whole-pixel disparity so that the quantisation of depth is visible; the ticks are dense at short range and spread apart without bound as the disparity falls towards one pixel, which is the same fact as the error law in a different costume. Middle: the standard deviation of the estimated depth against the true depth, both on logarithmic axes, as measured points from a live Monte Carlo of forty thousand samples at each of fifteen depths, together with the straight line predicted by the formula Z squared times the disparity noise divided by f times B; a least-squares fit to the measured points over the range where the linearisation holds is printed together with the predicted exponent of exactly two. Right: the ratio of measured to predicted standard deviation against depth on a linear axis, which sits on one at short range and drifts upward beyond about fifteen metres as the first-order approximation stops holding, together with a vertical rule marking the maximum range at which the relative depth error stays inside the chosen tolerance."></svg>
+        <div class="readout" aria-live="polite" id="depth-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 19 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="costs" data-nav="Matching costs">
+      <h3><span class="idx">19</span> Matching costs: what "these two patches look alike" means</h3>
+      <p class="lede">Everything from here to §24 is dense stereo: a disparity for <i>every</i> pixel, not just for the corners of Part 4. The first decision is the smallest one and it decides more than it looks.</p>
+
+      <p>After rectification, a candidate match for the left pixel <code>(x, y)</code> at disparity <code>d</code> is the right pixel <code>(x − d, y)</code>. A <b>matching cost</b> <code>C(x, y, d)</code> scores that candidate, lower being better. Comparing single pixels is hopeless — one intensity carries almost no information — so every cost compares a <b>window</b> around the two pixels.</p>
+
+      <div class="formula"><span class="lbl">the four costs this page measures, on a (2r+1)² window</span><span class="eq">SAD    C = (1/n) ∑ | I_L(x+i, y+j) − I_R(x−d+i, y+j) |
+SSD    C = (1/n) ∑ ( I_L(x+i, y+j) − I_R(x−d+i, y+j) )²
+
+NCC    C = 1 − ∑(I_L − Ī_L)(I_R − Ī_R) / √( ∑(I_L − Ī_L)² ∑(I_R − Ī_R)² )
+       — invariant to I → aI + b for any a > 0, b, by construction
+
+CENSUS at each pixel, write the bit string "is each neighbour darker than the
+       centre?"; C = the HAMMING DISTANCE between the two strings.
+       — invariant to ANY strictly increasing intensity mapping, not just affine
+       ones, because it only records ORDER. Also naturally robust at depth
+       discontinuities, because a few outlying pixels flip a few bits and no more,
+       whereas one outlier can dominate an SSD.</span></div>
+
+      <h4>Why radiometric invariance is not a luxury</h4>
+      <p>The two cameras of a stereo rig have different sensors, different lenses, different vignetting and — if auto-exposure is on — different exposures. A surface is also not Lambertian, so it does not reflect the same radiance towards both cameras. The result is that <code>I_R ≈ aI_L + b</code> with <code>a</code> and <code>b</code> unknown and slowly varying. Measured on the synthetic pair below, with a five-pixel window and winner-take-all:</p>
+
+      <table class="grid2">
+        <tr><th style="width:34%">Right image transformed by</th><th style="width:16%">SAD</th><th style="width:16%">SSD</th><th style="width:16%">NCC</th><th>Census</th></tr>
+        <tr><td><b>nothing</b> — <code>a = 1, b = 0</code></td><td class="num">14.5 %</td><td class="num">16.1 %</td><td class="num">18.0 %</td><td class="num">29.2 %</td></tr>
+        <tr><td>a bias of <b>+25</b> grey levels</td><td class="num">80.8 %</td><td class="num">73.2 %</td><td class="num">18.0 %</td><td class="num">29.2 %</td></tr>
+        <tr><td>a gain of <b>×1.35</b></td><td class="num">83.7 %</td><td class="num">79.1 %</td><td class="num">18.0 %</td><td class="num">29.2 %</td></tr>
+        <tr class="tot"><td>gain <b>×0.7</b> and bias <b>−20</b></td><td class="num">85.2 %</td><td class="num">80.5 %</td><td class="num">18.0 %</td><td class="num">29.2 %</td></tr>
+      </table>
+
+      <p>Read the table twice. Read left-to-right and the story is that <b>SAD and SSD collapse completely</b> — from one bad pixel in seven to five in six — under a change a human eye would barely notice, while NCC and census do not move by a tenth of a percentage point. Read top-to-bottom and the story is the opposite: <b>on clean data SAD is the best of the four and census is much the worst</b>, at 29.2% against 14.5%. There is no free invariance.</p>
+      <p>The census result is worth understanding rather than memorising, because it is the clearest case of an invariance being paid for. Census records only the <i>sign</i> of each neighbour's difference from the centre pixel. In a region of strong texture that sign is decided by the texture and is stable. In a region of weak texture it is decided by whatever is left — here, 1.5 grey levels of sensor noise — and roughly half the bits become coin flips. The synthetic pair below contains a deliberately flat patch, and census is wrong on <b>79.5%</b> of it against SAD's 46.9%. Census is the right choice when the two images differ radiometrically <i>and</i> the scene is textured. It is the wrong choice on a white wall.</p>
+
+      <div class="callout"><b>The rest of the taxonomy, in one place.</b> The four above are the ones this page measures; several others matter in practice. <b>Rank transform</b> replaces each pixel by the rank of its intensity in its window and then uses SAD — cheaper than census, weaker. <b>Mutual information</b> estimates the joint intensity histogram between the images and is invariant to <i>any</i> monotone or even non-monotone relation, at the cost of needing a global iteration to estimate it. <b>Gradient-based</b> costs difference the derivatives rather than the intensities, killing the bias but not the gain. <b>Sampling-insensitive</b> costs compare each pixel against a linearly interpolated <i>interval</i> in the other image rather than a single value, which removes a systematic bias at high frequencies. And <b>bilateral-subtraction</b> costs remove a locally weighted mean first. The empirical finding that keeps recurring is that census and mutual information are the two that survive real illumination change.</div>
+
+      <div class="viz" id="viz-cost">
+        <div class="vhead">
+          <span class="vtitle">Four matching costs, one synthetic rectified pair, and a live radiometric attack</span>
+          <span class="vhint">the probe starts on the textured part of the foreground box; drag it into the flat patch or the stripes and watch the curve lose its minimum</span>
+        </div>
+        <div class="controls">
+          <label>gain a <input type="range" id="ct-g" min="0.5" max="2" step="0.05" value="1.00" /><span id="ct-gv" style="min-width:34px;display:inline-block">1.00</span></label>
+          <label>bias b <input type="range" id="ct-b" min="-60" max="60" step="5" value="0" /><span id="ct-bv" style="min-width:30px;display:inline-block">0</span></label>
+          <label>window radius r <input type="range" id="ct-r" min="1" max="5" step="1" value="2" /><span id="ct-rv" style="min-width:20px;display:inline-block">2</span></label>
+          <label>probe x <input type="range" id="ct-x" min="6" max="89" step="1" value="35" /><span id="ct-xv" style="min-width:22px;display:inline-block">35</span></label>
+          <label>probe y <input type="range" id="ct-y" min="4" max="67" step="1" value="50" /><span id="ct-yv" style="min-width:22px;display:inline-block">50</span></label>
+        </div>
+        <svg id="cost-svg" width="760" height="438" viewBox="0 0 760 438" role="img" aria-label="Top row: the left image of a synthetic rectified stereo pair, the right image after the gain and bias sliders have been applied to it, and the ground-truth disparity map, all drawn as small rasters at the same scale; the scene contains a textured foreground box with a deliberately flat untextured patch inside it, a slanted plane on the right carrying a periodic stripe pattern, and a textured background, and the probe pixel is ringed in all three. Bottom left: the matching cost as a function of disparity at the probe pixel, for all four cost measures, each rescaled to the unit interval so they can share an axis, with a vertical rule at the true disparity; at the default probe, which lies on the textured part of the box, all four are minimised at the true disparity of fourteen. Bottom right: the percentage of non-occluded pixels whose winner-take-all disparity is wrong by more than one level, as four bars, one per cost measure, under the current gain and bias, with the undisturbed values drawn as hollow outlines behind them so the collapse of the two intensity-difference measures under a radiometric change is visible against their own baseline."></svg>
+        <div class="readout" aria-live="polite" id="cost-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 20 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="costvolume" data-nav="The cost volume &amp; WTA">
+      <h3><span class="idx">20</span> The cost volume, and winner-take-all</h3>
+      <p class="lede">Compute the cost at every pixel for every candidate disparity and you have a three-dimensional array. Almost every dense stereo algorithm ever written is a different way of collapsing it to two dimensions.</p>
+
+      <div class="formula"><span class="lbl">the object, and the four stages that operate on it</span><span class="eq">C(x, y, d)      x ∈ [0, W),  y ∈ [0, H),  d ∈ [0, d_max]
+                the DISPARITY SPACE IMAGE — one scalar per pixel per hypothesis.
+                For a 640 × 480 image and 64 disparities that is 19.7 M entries.
+
+1 · matching cost computation      fill C                              §19
+2 · cost aggregation               smooth C over a spatial support     §21
+3 · disparity computation          collapse C to d(x, y)               §20, §22
+4 · disparity refinement           sub-pixel, cross-check, hole fill   §23</span>
+<span class="eq">Every stereo algorithm is a choice at each of the four. LOCAL methods put their effort
+into stages 1 and 2 and make stage 3 trivial — WINNER-TAKE-ALL,
+
+    d(x, y)  =  argmin_d  C(x, y, d)
+
+independently at every pixel. GLOBAL methods skip stage 2 and make stage 3 an
+optimisation over the whole image, with an explicit smoothness term (§22).</span></div>
+
+      <h4>Reading the slices</h4>
+      <p>Two slices are worth knowing on sight, because everything a stereo algorithm does is visible in one of them.</p>
+      <ul class="notes">
+        <li>A <b>constant-<code>d</code> slice</b>, <code>C(·, ·, d₀)</code>, is an image that is dark exactly where the scene is at the depth corresponding to <code>d₀</code>. Sweeping <code>d₀</code> is exactly the <b>plane sweep</b> of §17 in the rectified case: each slice is the photo-consistency of one hypothesised depth plane.</li>
+        <li>A <b>constant-<code>y</code> slice</b>, <code>C(·, y₀, ·)</code>, is the cost matrix for one pair of scanlines, with <code>x</code> across and <code>d</code> down. The correct answer is a <b>path</b> through this matrix, and every fronto-parallel surface is a horizontal segment of it. This slice is where dynamic programming and semi-global matching live, and it is the left panel of the figure below.</li>
+      </ul>
+
+      <h4>What winner-take-all does and does not do</h4>
+      <table class="grid2">
+        <tr><th style="width:26%">Property</th><th>Consequence</th></tr>
+        <tr><td><b>No spatial coupling</b></td><td>Neighbouring pixels are decided independently. All the smoothness a local method has comes from the <i>overlap of the aggregation windows</i>, which is an implicit and rather crude prior — it assumes the surface is fronto-parallel across the window, which is exactly what §21 measures the cost of.</td></tr>
+        <tr><td><b>Uniqueness only one way</b></td><td>Every left pixel gets exactly one disparity, but nothing stops two left pixels claiming the same right pixel. Real geometry forbids that except at occlusions. The fix is <b>left–right cross-checking</b>: compute the map both ways and discard any pixel where <code>d_L(x) ≠ d_R(x − d_L(x))</code>. It detects occlusions almost for free, and it is the single cheapest quality improvement available.</td></tr>
+        <tr><td><b>Integer output</b></td><td>The scene is quantised into <code>d_max + 1</code> depth planes, which by §18 are far apart at range. Sub-pixel interpolation, §23.</td></tr>
+        <tr><td><b>No notion of confidence</b></td><td>A pixel whose cost curve is a sharp V and a pixel whose curve is dead flat both produce one integer with no qualifier. §23 recovers a confidence from the curvature.</td></tr>
+      </table>
+
+      <div class="viz" id="viz-dsi">
+        <div class="vhead">
+          <span class="vtitle">The cost volume, one scanline slice, and where winner-take-all fails</span>
+          <span class="vhint">the default row cuts through the untextured patch <i>and</i> the stripes, which is where both failures live</span>
+        </div>
+        <div class="controls">
+          <label>scanline y <input type="range" id="ds-y" min="4" max="67" step="1" value="30" /><span id="ds-yv" style="min-width:22px;display:inline-block">30</span></label>
+          <label>cost <select id="ds-k">
+            <option value="sad" selected>SAD</option><option value="ssd">SSD</option>
+            <option value="ncc">NCC</option><option value="census">census</option></select></label>
+          <label>window radius r <input type="range" id="ds-r" min="1" max="5" step="1" value="2" /><span id="ds-rv" style="min-width:20px;display:inline-block">2</span></label>
+          <label><input type="checkbox" id="ds-x" /> left–right cross-check (drop the inconsistent pixels)</label>
+        </div>
+        <svg id="dsi-svg" width="760" height="450" viewBox="0 0 760 450" role="img" aria-label="Top left: one constant-row slice through the cost volume, drawn with horizontal position across and disparity down, dark where the cost is low; the ground-truth disparity for that row is drawn over it as one curve and the winner-take-all choice as another, so where the two separate is exactly where the method fails. Two dark horizontal bands appear at the disparities of the background and the foreground box, a diagonal streak marks the slanted plane whose disparity varies along the row, and inside the untextured patch the slice has no dark band at all, only a broad flat trough. Top right: the winner-take-all disparity map for the whole image, and next to it a map of which pixels are wrong by more than one disparity, with half-occluded pixels drawn separately in a third colour because they have no correct answer to be wrong about. Bottom: the cost against disparity at three chosen pixels, one in a well-textured region where the curve has a single sharp minimum at the true value, one inside the untextured patch where the curve is almost flat so that the winner is decided by noise, and one inside the periodic stripes where the curve has several minima of nearly equal depth, one per period of the pattern, and the winner is the wrong one."></svg>
+        <div class="readout" aria-live="polite" id="dsi-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 21 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="aggregation" data-nav="Aggregation &amp; window size">
+      <h3><span class="idx">21</span> Aggregation: the window that cannot be the right size</h3>
+      <p class="lede">A single pixel carries no information; a window carries some. Every extra pixel of window buys signal in flat regions and pays for it at depth edges, and there is no radius at which both bills are zero.</p>
+
+      <div class="formula"><span class="lbl">aggregation is a filter applied to each disparity slice independently</span><span class="eq">C(x, y, d)  =  w(x, y)  ∗  C₀(x, y, d)              for each d separately
+
+with a box w this is a moving average, computable in O(1) per pixel per disparity
+by a summed-area table REGARDLESS of the window size — the same integral-image trick
+as part 2. So a bigger window costs nothing at run time; it costs accuracy.</span>
+<span class="eq">The hidden assumption. Averaging the cost over a window says "the disparity is the
+same everywhere in this window". That is exactly the FRONTO-PARALLEL assumption. It
+is wrong at every depth discontinuity, and it is wrong on every slanted surface,
+where the true disparity varies linearly across the window and the aggregated cost
+is a blur of several correct answers.</span></div>
+
+      <h4>The trade, measured</h4>
+      <p>Bad-pixel rates on the synthetic pair, SAD, split by where the pixel is. The two columns move in opposite directions, which is the whole point.</p>
+      <table class="grid2">
+        <tr><th style="width:14%">radius r</th><th style="width:22%">textured, away from any depth edge</th><th style="width:22%">within 2 px of a depth edge</th><th style="width:20%">everything (incl. flat &amp; striped)</th><th>RMS disparity error at edges</th></tr>
+        <tr><td class="num">1 (3×3)</td><td class="num">1.9 %</td><td class="num">12.7 %</td><td class="num">15.5 %</td><td class="num">2.85</td></tr>
+        <tr><td class="num">2 (5×5)</td><td class="num">0.6 %</td><td class="num">15.1 %</td><td class="num">14.5 %</td><td class="num">3.32</td></tr>
+        <tr><td class="num">3 (7×7)</td><td class="num">0.2 %</td><td class="num">16.1 %</td><td class="num">12.3 %</td><td class="num">3.44</td></tr>
+        <tr class="tot"><td class="num">5 (11×11)</td><td class="num">0.1 %</td><td class="num">14.6 %</td><td class="num">11.2 %</td><td class="num">3.34</td></tr>
+        <tr><td class="num">7 (15×15)</td><td class="num">0.9 %</td><td class="num">17.7 %</td><td class="num">12.3 %</td><td class="num">3.51</td></tr>
+      </table>
+      <p>The textured column falls by a factor of nineteen from <code>r = 1</code> to <code>r = 5</code> and then turns back up. The edge column rises and stays high. The overall column, which is what a benchmark reports, is a weighted average of two opposite trends and its minimum at <code>r = 5</code> is a compromise between them and not a property of either. <b>Reporting only the overall number hides the entire phenomenon</b>, and this is a general lesson about benchmark aggregates, not a fact about stereo.</p>
+
+      <h4>Shiftable windows: getting most of it back for almost nothing</h4>
+      <p>A pixel next to a depth edge is badly served by a window <i>centred</i> on it, and well served by a window that lies entirely on its own side of the edge. Trying all shifted windows and taking the best is equivalent to a much cheaper operation.</p>
+
+      <div class="formula"><span class="lbl">the identity that makes it cheap</span><span class="eq">min over all (2r+1)² windows CONTAINING the pixel of [ aggregated cost ]
+      =  min over the (2r+1)² neighbours q of the pixel of  C_agg(q, d)
+      =  a MIN-FILTER applied to the already-aggregated cost volume
+
+and a min-filter over a square is separable — one pass in x, one in y — so the whole
+thing is two extra linear-time passes per disparity slice.</span></div>
+
+      <table class="grid2">
+        <tr><th style="width:14%">radius r</th><th style="width:22%">box: near a depth edge</th><th style="width:22%">shiftable: near a depth edge</th><th style="width:20%">box: everything</th><th>shiftable: everything</th></tr>
+        <tr><td class="num">1</td><td class="num">12.7 %</td><td class="num">2.2 %</td><td class="num">15.5 %</td><td class="num">14.0 %</td></tr>
+        <tr class="tot"><td class="num">2</td><td class="num">15.1 %</td><td class="num">2.7 %</td><td class="num">14.5 %</td><td class="num">12.7 %</td></tr>
+        <tr><td class="num">3</td><td class="num">16.1 %</td><td class="num">8.3 %</td><td class="num">12.3 %</td><td class="num">10.8 %</td></tr>
+        <tr><td class="num">4</td><td class="num">13.9 %</td><td class="num">18.3 %</td><td class="num">11.4 %</td><td class="num">11.6 %</td></tr>
+        <tr><td class="num">5</td><td class="num">14.6 %</td><td class="num">23.3 %</td><td class="num">11.2 %</td><td class="num">17.3 %</td></tr>
+      </table>
+      <p>At small radii the shiftable window is transformative — the edge error falls by a factor of five or six — and at large radii it becomes actively harmful, because a min over a large neighbourhood will find <i>some</i> window with a spuriously low cost almost anywhere. Note also the effect on the overall column: shiftable windows help there too, but by one or two points, not five. <b>The improvement is concentrated exactly where it was designed to be</b>, which is the sign of a correct idea rather than a lucky one.</p>
+
+      <h4>What replaced it</h4>
+      <ul class="notes">
+        <li><b>Adaptive-weight aggregation.</b> Instead of choosing a window <i>shape</i>, weight every pixel in a large window by how similar its colour is to the centre and how far away it is — a joint bilateral filter of the cost volume, guided by the reference image. It assumes colour edges coincide with depth edges, which is usually right and occasionally catastrophic. This is the strongest local method there is, and it is a bilateral filter applied to a cost volume rather than to an image.</li>
+        <li><b>Segmentation-based aggregation.</b> Segment the reference image (<a href="../segmentation.html">Part 5</a>), assume disparity is smooth within a segment, and fit a plane per segment. Better again, and it inherits Part 5's failure modes wholesale.</li>
+        <li><b>Three-dimensional support.</b> Aggregate over a region of <code>(x, y, d)</code> space that is <i>slanted</i> rather than fronto-parallel, so that a sloping surface is supported by a sloping window. Equivalent to a limited-disparity-gradient constraint.</li>
+        <li><b>Nothing at all.</b> Global methods (§22) skip aggregation entirely and put the smoothness into an explicit energy where it can be reasoned about, which is generally the better trade once you can afford the optimisation.</li>
+      </ul>
+
+      <div class="viz" id="viz-agg">
+        <div class="vhead">
+          <span class="vtitle">Window radius: the two errors that move in opposite directions, and shiftable windows</span>
+          <span class="vhint">the first two curves in the left panel move in opposite directions — that opposition is the whole design problem of local stereo</span>
+        </div>
+        <div class="controls">
+          <label>window radius r <input type="range" id="ag-r" min="1" max="6" step="1" value="2" /><span id="ag-rv" style="min-width:20px;display:inline-block">2</span></label>
+          <label>cost <select id="ag-k"><option value="sad" selected>SAD</option><option value="ssd">SSD</option><option value="ncc">NCC</option><option value="census">census</option></select></label>
+          <label>profile row <input type="range" id="ag-y" min="46" max="62" step="1" value="54" /><span id="ag-yv" style="min-width:22px;display:inline-block">54</span></label>
+        </div>
+        <svg id="agg-svg" width="760" height="462" viewBox="0 0 760 462" role="img" aria-label="Left: bad-pixel rate against window radius, as four curves — box aggregation scored on textured pixels away from any depth edge, box aggregation scored within two pixels of a depth edge, box aggregation scored on everything, and shiftable-window aggregation scored on everything — with a vertical marker at the current radius. The first curve falls steeply with radius — by a factor of nineteen from radius one to radius five — and the second rises. They do not cross, because the error beside a depth edge is always the larger of the two; what matters is that they move in opposite directions, so the overall curve is a compromise between them with a shallow minimum that belongs to neither. Middle and right: the winner-take-all disparity map at the current radius, computed with plain box aggregation and with shiftable windows, drawn side by side at the same grey scale, so that the thickening of the foreground box at large radii and its repair by the shiftable window are directly comparable. Bottom, spanning the width: the recovered disparity along one row crossing the slanted plane, plotted against the ground-truth straight line, for both aggregation schemes; the recovered profile is a staircase rather than a ramp, because a box window assumes the disparity is constant across it, and the treads widen as the radius grows — about 2.3 pixels at radius one, 3.5 at radius two and 4 at radius six."></svg>
+        <div class="readout" aria-live="polite" id="agg-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 22 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="global" data-nav="Global methods &amp; SGM">
+      <h3><span class="idx">22</span> Global methods: putting the smoothness where you can argue with it</h3>
+      <p class="lede">A local method's prior is hidden inside the shape of a window. A global method writes it down as a term in an objective, which makes it inspectable, tunable, and — the real prize — able to propagate information into regions that have none.</p>
+
+      <div class="formula"><span class="lbl">the energy</span><span class="eq">E(d)  =  E_data(d)  +  <span class="keep">λ</span> E_smooth(d)
+
+E_data(d)   =  ∑_(x,y)  C( x, y, d(x,y) )                     the cost volume of §20
+
+E_smooth(d) =  ∑_(x,y)  <span class="keep">ρ</span>( d(x,y) − d(x+1, y) )  +  <span class="keep">ρ</span>( d(x,y) − d(x, y+1) )</span>
+<span class="eq">The whole design is the choice of <span class="keep">ρ</span>:
+
+  <span class="keep">ρ</span>(t) = t²        standard regularisation. Smooth EVERYWHERE, including across depth
+                 discontinuities, which it therefore blurs into ramps. Convex and
+                 easy to minimise, and wrong at exactly the places that matter.
+
+  <span class="keep">ρ</span>(t) = |t|       total variation. Allows jumps, still penalises them linearly.
+
+  <span class="keep">ρ</span>(t) = min(|t|, T)   TRUNCATED — discontinuity-preserving. Once two neighbours
+                 differ by more than T there is no further penalty for differing more,
+                 so an edge costs a fixed amount rather than an unbounded one. Not
+                 convex, which is why the optimisation gets hard.
+
+  <span class="keep">ρ</span>_d(Δd) · <span class="keep">ρ</span>_I(ΔI)    modulated by the IMAGE gradient: make the smoothness penalty
+                 small where the reference image has a strong edge. This encodes
+                 "depth discontinuities tend to coincide with intensity edges", it is
+                 cheap, and it accounts for a large part of the practical advantage of
+                 global methods. It is also a prior that a glass door violates.</span></div>
+
+      <div class="callout"><b>The complexity wall.</b> Minimising this energy exactly over a 2-D grid is <b>NP-hard</b> for the interesting choices of <code><span class="keep">ρ</span></code>. Everything practical is therefore an approximation: <b>graph cuts</b> (α-expansion gives a solution within a known factor of the optimum for metric <code><span class="keep">ρ</span></code>), <b>loopy belief propagation</b> (no guarantee, works well), <b>simulated annealing</b> (asymptotic guarantee, useless run times). One special case <i>is</i> exactly solvable in polynomial time, and it is the one that took over the field.</div>
+
+      <h4>One dimension is easy: scanline dynamic programming</h4>
+      <p>Drop the vertical smoothness term and the energy decouples into independent rows. Each row is then a shortest-path problem through the <code>(x, d)</code> slice of §20, solvable exactly by dynamic programming in <code>O(W · d_max)</code> per row with the recursion</p>
+
+      <div class="formula"><span class="lbl">the scanline recursion</span><span class="eq">L(x, d)  =  C(x, d)  +  min_{d′} [ L(x−1, d′)  +  <span class="keep">ρ</span>(d − d′) ]
+
+which is exact for the 1-D energy, and cheap. Its two defects are structural:
+
+ · STREAKING. Rows are optimised independently, so a wrong decision propagates along
+   a row and nothing above or below contradicts it. The result is unmistakable:
+   horizontal stripes of wrong disparity.
+ · The ORDERING CONSTRAINT. Classic DP formulations also assume that the left-to-right
+   order of matched points is the same in both images. That is false whenever a thin
+   object stands in front of a distant background — the background can be seen on
+   both sides of it in one view and not the other — and enforcing it then forbids the
+   correct answer.</span></div>
+
+      <h4>Semi-global matching: the fix that made this practical</h4>
+      <p>The insight is embarrassingly simple. If one scanline direction gives a good but streaky result, run the <i>same</i> recursion along <b>eight</b> directions — left, right, up, down and the four diagonals — and <b>sum</b> the resulting cost arrays before taking the winner. No direction is privileged, so no direction's streaks survive.</p>
+
+      <div class="formula"><span class="lbl">the SGM recursion, per direction r</span><span class="eq">L_r(p, d)  =  C(p, d)  +  min ⎧ L_r(p − r, d)
+                              ⎪ L_r(p − r, d−1) + P₁
+                              ⎨ L_r(p − r, d+1) + P₁
+                              ⎪ min_k L_r(p − r, k) + P₂
+                              ⎩
+                            −  min_k L_r(p − r, k)          ← keeps L bounded
+
+S(p, d)  =  ∑_r L_r(p, d)          d(p) = argmin_d S(p, d)</span>
+<span class="eq">Two penalties, not one, and the difference is the whole idea:
+  P₁ is the SMALL penalty for a ±1 change of disparity — it lets SLANTED surfaces
+     bend gradually without being punished as discontinuities;
+  P₂ ≫ P₁ is the penalty for any larger jump — it is what preserves real edges.
+Standard practice reduces P₂ where the image gradient is large, which is the
+intensity-modulated smoothness of the energy above, applied locally.
+
+The subtraction of min_k L_r(p − r, k) does not change the argmin at any pixel; it
+only stops L growing without bound along the path, so that L fits in 16 bits — which
+is why SGM runs in real time on modest hardware.</span></div>
+
+      <h4>Measured on the synthetic pair</h4>
+      <p>Base cost SAD on a 3 × 3 window, <code>P₁ = 8</code>, <code>P₂ = 64</code>, bad-pixel rate over non-occluded pixels:</p>
+      <table class="grid2">
+        <tr><th style="width:30%">Method</th><th style="width:16%">bad &gt; 1 px</th><th style="width:18%">untextured patch</th><th style="width:18%">periodic stripes</th><th>Comment</th></tr>
+        <tr><td>Winner-take-all, 3 × 3</td><td class="num">15.5 %</td><td class="num">61 %</td><td class="num">44 %</td><td>No spatial coupling at all.</td></tr>
+        <tr><td>1 direction (scanline DP)</td><td class="num">12.0 %</td><td class="num">0 %</td><td class="num">5 %</td><td>The hard regions are <b>fixed</b> — information has propagated in from the textured neighbourhood. The overall number barely moves because the method has introduced <b>streaks</b> elsewhere.</td></tr>
+        <tr><td>2 directions (← and →)</td><td class="num">1.7 %</td><td class="num">0 %</td><td class="num">0 %</td><td>Adding the reverse direction cancels most of the streaking immediately.</td></tr>
+        <tr><td>4 directions</td><td class="num">2.1 %</td><td class="num">0 %</td><td class="num">5 %</td><td>Not better here.</td></tr>
+        <tr class="tot"><td>8 directions (full SGM)</td><td class="num">2.0 %</td><td class="num">0 %</td><td class="num">0 %</td><td><b>A factor of nearly eight better than winner-take-all</b>, and the two pathological regions are solved outright.</td></tr>
+      </table>
+
+      <div class="wrong">
+        <p><span class="say">The tempting summary:</span> "more directions is monotonically better."</p>
+        <p><span class="fix">Measured:</span> it is not, on this scene — 2 directions score 1.7% and 8 score 2.0%. The scene is small and its only strongly directional structure is a slant that varies along <code>x</code>, so horizontal aggregation alone happens to suit it. What eight directions genuinely buy is <b>isotropy</b>: no artefact is tied to a scan order, which matters enormously on real images with structure at every orientation and matters little here. The bad-pixel rate does not see streaks that happen to run along the direction of the ground truth. <b>Look at the maps, not only at the number.</b></p>
+      </div>
+
+      <div class="viz" id="viz-sgm">
+        <div class="vhead">
+          <span class="vtitle">Scanline optimisation, its streaks, and semi-global matching removing them</span>
+          <span class="vhint">start at one direction and watch the horizontal streaking; then add directions</span>
+        </div>
+        <div class="controls">
+          <label>directions <select id="sg-n">
+            <option value="1">1 — pure scanline</option><option value="2">2 — ← and →</option>
+            <option value="4">4 — plus ↑ and ↓</option><option value="8" selected>8 — full SGM</option></select></label>
+          <label>P₁ <input type="range" id="sg-p1" min="2" max="24" step="1" value="8" /><span id="sg-p1v" style="min-width:20px;display:inline-block">8</span></label>
+          <label>P₂ <input type="range" id="sg-p2" min="8" max="200" step="4" value="64" /><span id="sg-p2v" style="min-width:26px;display:inline-block">64</span></label>
+          <label>base window r <input type="range" id="sg-r" min="0" max="3" step="1" value="1" /><span id="sg-rv" style="min-width:16px;display:inline-block">1</span></label>
+        </div>
+        <svg id="sgm-svg" width="760" height="452" viewBox="0 0 760 452" role="img" aria-label="Top row: three disparity maps at the same grey scale — the plain winner-take-all result, the result of running the semi-global recursion along a single left-to-right direction, and the result with the chosen number of directions — followed by a small rose of arrows showing which directions are in use. The single-direction map shows horizontal streaking, because each row is optimised without reference to the rows above and below; the readout quantifies it as the ratio of the mean vertical disparity gradient to the mean horizontal one, which the ground truth puts at 0.59 and which a single direction inflates to about 1.46 before eight directions bring it back down. Bottom left: the bad-pixel rate as bars for one, two, four and eight directions at the current penalties, with the winner-take-all rate drawn as a horizontal reference line well above all of them. Bottom right: the bad-pixel rate as a function of the large penalty P two, swept over its whole range on a logarithmic axis for each of the four direction counts, with a marker at the current setting; every curve has a minimum, and it is shallow, which is the practical reason semi-global matching is easy to tune."></svg>
+        <div class="readout" aria-live="polite" id="sgm-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 23 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="subpixel" data-nav="Sub-pixel &amp; confidence">
+      <h3><span class="idx">23</span> Sub-pixel refinement, its variance, and its bias</h3>
+      <p class="lede">An integer disparity map quantises the world into <code>d_max</code> planes, and §18 showed how far apart those planes are at range. A parabola through three cost values fixes most of it, for almost nothing, and introduces one systematic error worth knowing about.</p>
+
+      <div class="formula"><span class="lbl">the parabola fit</span><span class="eq">let d̂ be the integer winner and C₋₁, C₀, C₊₁ the costs at d̂ − 1, d̂, d̂ + 1.
+Fit  C(d̂ + t) ≈ at² + bt + c  through the three points:
+
+    c = C₀        b = (C₊₁ − C₋₁)/2        a = (C₋₁ − 2C₀ + C₊₁)/2
+
+the vertex is at t = −b/(2a), i.e.
+
+                     C₋₁ − C₊₁
+    <span class="keep">δ</span>  =  ───────────────────────           and     d  =  d̂ + <span class="keep">δ</span>
+              2 (C₋₁ − 2C₀ + C₊₁)</span>
+<span class="eq">ALWAYS CLAMP <span class="keep">δ</span> to [−½, +½]. The denominator is the discrete curvature; when it is near
+zero — a flat cost curve, which is exactly a textureless region — the vertex flies off
+to infinity. Every real implementation clamps, and the clamp changes the estimator's
+statistics, which the measurement below has to account for rather than ignore.</span></div>
+
+      <h4>The variance, derived</h4>
+      <div class="formula"><span class="lbl">propagating image noise into the sub-pixel estimate</span><span class="eq">write e(x, d) = I_L(x) − I_R(x − d) over the window, and let both images carry
+independent Gaussian noise of variance <span class="keep">σ</span>_I². Near the true disparity d*,
+
+    C(d)      = ∑ e²                                            the SSD
+    dC/dd     = −2 ∑ e · I′_R                                   chain rule
+    d²C/dd²   ≈ 2 ∑ (I′_R)²  =  2G      where  G ≡ ∑ I_x²       drop the e·I″ term,
+                                                                which vanishes at d*
+at d* the residual e is pure noise of variance 2<span class="keep">σ</span>_I² (one <span class="keep">σ</span>_I² from each image), so
+
+    Var(dC/dd)|_{d*}  =  4 · 2<span class="keep">σ</span>_I² · G  =  8<span class="keep">σ</span>_I² G
+
+and one Newton step Δd = −(dC/dd)/(d²C/dd²) has
+
+    Var(Δd)  =  8<span class="keep">σ</span>_I² G / (2G)²  =  2<span class="keep">σ</span>_I² / G                <span class="keep">σ</span>_d = <span class="keep">σ</span>_I √(2/G)</span>
+<span class="eq">Read it as a statement about texture: G = ∑ I_x² is the SQUARED GRADIENT ENERGY of the
+window, which is the (1,1) entry of part 4's structure tensor summed over the window.
+A flat window has G ≈ 0 and infinite variance; a strongly textured one has large G and
+small variance. This is the same quantity that decides whether a corner is localisable
+in <a href="../features/corners.html#tensor">part 4 §05</a>, arriving here as a depth uncertainty.</span></div>
+
+      <div class="callout"><b>The version usually quoted, and the difference.</b> The classic result is written <code>Var(d) = <span class="keep">σ</span>_I²/a</code> with <code>a</code> the curvature of the cost as a function of <code>d</code>. That is the same formula with the noise charged to one image rather than two: if only one view is noisy the residual variance is <code><span class="keep">σ</span>_I²</code> rather than <code>2<span class="keep">σ</span>_I²</code> and the factor of two disappears. Both are correct for their own noise model, and the figure below measures the <b>two-noisy-images</b> version, because a stereo rig has two cameras.</div>
+
+      <h4>Measured, and where it stops holding</h4>
+      <p>A 21-pixel window on a synthetic scanline, 2 500 trials per setting, true disparity 7.30, comparing the measured standard deviation of <code>d̂ + <span class="keep">δ</span></code> against <code><span class="keep">σ</span>_I√(2/G)</code>. Two estimators are measured: the one the derivation describes — <b>one refinement step from the integer nearest the truth</b> — and the one a real matcher uses, which <b>searches for the integer winner first</b>.</p>
+
+      <div class="formula"><span class="lbl">smooth texture — shortest wavelength 34 px, G = 157.2</span><span class="eq"> <span class="keep">σ</span>_I    measured   predicted  ratio   clamp fired   mean d   search-first (ratio)
+ 0.10    0.01134    0.01128   1.005      0.0 %      7.2917    0.01134  (1.005)
+ 0.25    0.02836    0.02820   1.006      0.0 %      7.2914    0.02836  (1.006)
+ 0.50    0.05701    0.05640   1.011      0.0 %      7.2912    0.05701  (1.011)
+ 1.00    0.11300    0.11280   1.002      4.4 %      7.2902    0.11672  (1.035)
+ 2.00    0.20659    0.22559   0.916     22.0 %      7.2657    0.24972  (1.107)
+ 3.00    0.28923    0.33839   0.855     31.6 %      7.1943    0.42120  (1.245)
+ 4.00    0.30686    0.45119   0.680     31.3 %      7.1264    0.60801  (1.348)</span>
+<span class="eq">Within 1.1% for <span class="keep">σ</span>_I ≤ 1, which is the regime the derivation assumed. Above that, TWO
+things go wrong and they pull in opposite directions:
+ · the CLAMP truncates the tails of the one-step estimator, so its measured spread
+   falls BELOW the prediction — 0.680 at <span class="keep">σ</span>_I = 4 — while its bias grows, the mean
+   drifting from 7.292 to 7.126. A truncated estimator is not a better estimator;
+ · the INTEGER SEARCH starts choosing the wrong winner, so the practical estimator's
+   spread rises ABOVE the prediction, to 1.348 at <span class="keep">σ</span>_I = 4. That is the honest number
+   for a real matcher, and it is 35% worse than the formula suggests.
+Report the clamp rate alongside the variance, or the variance means nothing.</span></div>
+
+      <div class="formula"><span class="lbl">near-Nyquist texture — shortest wavelength 4 px, G = 20 729.7</span><span class="eq"> <span class="keep">σ</span>_I    measured   predicted  ratio   clamp fired   mean d (true 7.30)
+ 0.10    0.00088    0.00098   0.897      0.0 %      7.2331
+ 0.50    0.00440    0.00491   0.897      0.0 %      7.2331
+ 2.00    0.01763    0.01964   0.897      0.0 %      7.2334
+ 4.00    0.03541    0.03929   0.901      0.0 %      7.2341</span>
+<span class="eq">A CONSTANT ratio of 0.897 at every noise level, and the clamp never fires. This is not
+a breakdown of the variance law; it is a systematic error in G. G is computed with a
+central difference, whose gain on a sinusoid of wavelength <span class="keep">λ</span> is sin(2π/<span class="keep">λ</span>)/(2π/<span class="keep">λ</span>) —
+1.00 for a smooth signal but 0.64 at <span class="keep">λ</span> = 4 samples. The discrete gradient therefore
+UNDER-measures the true gradient energy of a near-Nyquist texture, which inflates the
+predicted <span class="keep">σ</span>_d by a fixed factor. The law is right; the way G was measured is a few per
+cent wrong, and the constancy of the ratio is exactly what says so.
+
+Note also the mean: 7.2331 against a truth of 7.3000, a bias of −0.067 px that noise
+has nothing to do with. That is the next subsection.</span></div>
+
+      <h4>Pixel locking</h4>
+      <p>The parabola is fitted to a cost function that is <i>not</i> a parabola, and the mismatch is systematic rather than random: the estimate is pulled towards the nearest <b>integer</b> disparity. The size of the effect depends entirely on how much energy the texture has near the sampling limit.</p>
+      <div class="formula"><span class="lbl">measured bias, mean estimate − true, over one whole disparity pixel</span><span class="eq">true d :     7.0     7.1     7.2     7.3     7.4     7.5     7.6     7.7     7.8     7.9     8.0
+
+smooth texture, shortest wavelength 34 px:
+  bias   : −0.009  −0.010  −0.010  −0.010  −0.008  −0.007  −0.007  −0.008  −0.009  −0.009  −0.009
+                                                             peak-to-peak swing: 0.0036 px
+
+near-Nyquist texture, shortest wavelength 4 px:
+  bias   : −0.024  −0.050  −0.065  −0.067  −0.053  −0.017  +0.011  +0.020  +0.015  +0.000  −0.024
+                                                             peak-to-peak swing: 0.0865 px</span>
+<span class="eq">On smooth texture the bias is a near-constant −0.009 px and is not really "locking" at
+all — it swings by less than four thousandths of a pixel across the whole range. On
+texture with energy near the sampling limit it is an unmistakable S-curve, 0.087 px peak
+to peak and reaching −0.067 px, negative below the half-pixel point and positive above
+it: every estimate is pulled towards the NEAREST INTEGER. A disparity histogram of a whole image then shows
+visible spikes at the integers, which is where the name comes from.
+
+The cause is aliasing, which is <a href="../frequency-domain/sampling-aliasing.html#aliasing">part 3</a>'s subject: a sampled signal with content above
+half the sampling rate has a cost function that is not even approximately parabolic
+near its minimum. The fixes are to low-pass before matching, which costs resolution; to
+fit a model that respects the sampling, rather than a parabola; or to use more than
+three samples. Note that the swing is 24 times larger at 4 px than at 34 px, while the
+NOISE-driven error at these settings is the same either way — so the bias, not the
+variance, is what limits sub-pixel accuracy on fine texture.</span></div>
+
+      <h4>Confidence, for free</h4>
+      <p>The same denominator that can be dangerous is also the most useful by-product of the fit. <code>a = (C₋₁ − 2C₀ + C₊₁)/2</code> is the curvature of the cost at its minimum, and <code>Var(d) = 2<span class="keep">σ</span>_I²/(2a)</code> turns it directly into an error bar. A dense stereo output should carry it. Related cheap confidence measures: the ratio of the best cost to the <b>second-best distinct</b> minimum (which catches the periodic-pattern failure of §24 specifically), and agreement between the left-to-right and right-to-left maps (§20). None of them is expensive and all of them are usually thrown away.</p>
+
+      <div class="viz" id="viz-sub">
+        <div class="vhead">
+          <span class="vtitle">The parabola fit, its variance law, and the bias that appears as the texture approaches Nyquist</span>
+          <span class="vhint">the wavelength slider starts at 4 px — near the sampling limit — which is where pixel locking is worst</span>
+        </div>
+        <div class="controls">
+          <label>sensor noise <span class="keep">σ</span>_I <input type="range" id="sb-s" min="0.1" max="4" step="0.1" value="0.5" /><span id="sb-sv" style="min-width:34px;display:inline-block">0.5</span></label>
+          <label>shortest wavelength <input type="range" id="sb-w" min="3" max="34" step="1" value="4" /><span id="sb-wv" style="min-width:34px;display:inline-block">4 px</span></label>
+          <label>window <input type="range" id="sb-n" min="7" max="31" step="2" value="21" /><span id="sb-nv" style="min-width:30px;display:inline-block">21 px</span></label>
+          <label>true disparity <input type="range" id="sb-d" min="7" max="8" step="0.05" value="7.30" /><span id="sb-dv" style="min-width:34px;display:inline-block">7.30</span></label>
+        </div>
+        <svg id="sub-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Left: the sum-of-squared-differences cost against integer disparity for one noisy realisation, with the three values used by the fit ringed, the fitted parabola drawn through them, its vertex marked, and the true fractional disparity marked separately so the gap between them is visible. Middle: the measured standard deviation of the refined disparity against the sensor noise level, both on logarithmic axes, from a live Monte Carlo, together with the straight line predicted by sigma sub I times the square root of two over the gradient energy of the window. Two estimators are plotted: filled circles for a single refinement step taken from the integer nearest the truth, which is what the derivation describes, and hollow squares for the practical estimator that searches for the integer winner first. At the default near-Nyquist texture the two coincide and both run parallel to the prediction about ten per cent below it, a fixed offset caused by the central difference under-measuring the gradient energy rather than by any failure of the law; dragging the wavelength slider up to a smooth texture puts them on the line, and then raising the noise separates them, the one-step estimator falling below the line as its clamp truncates the distribution and the practical one rising above it as the integer search begins to fail. Right: the measured bias, that is the mean estimate minus the truth, plotted against the true disparity across one whole pixel from seven to eight, showing a flat near-zero line for smooth texture and a pronounced S-shaped curve pulling the estimate towards the nearest integer when the texture has energy near the sampling limit."></svg>
+        <div class="readout" aria-live="polite" id="sub-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 24 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="failures" data-nav="Stereo failure modes">
+      <h3><span class="idx">24</span> The failure modes, and which of them are fixable</h3>
+      <p class="lede">Dense stereo fails in a small number of characteristic ways, and they are worth knowing individually because they have <i>different</i> remedies — and because two of them are not remediable at all, only detectable.</p>
+
+      <table class="grid2">
+        <tr><th style="width:20%">Failure</th><th style="width:30%">Why it happens</th><th style="width:24%">Measured, on the synthetic pair</th><th>Remedy</th></tr>
+        <tr><td><b>Textureless regions</b></td><td>The cost curve is flat: many disparities explain the data equally well. There is <b>no information</b> in the data — this is not an estimation problem but an under-determination.</td><td>Winner-take-all, SAD 5 × 5: <b>46.9%</b> bad in the flat patch, against 3.9% on textured background</td><td><b>A prior.</b> Only a smoothness assumption can fill it, so a global method: SGM reduces it to <b>0.0%</b> by propagating in from the textured surround. Nothing local can help, at any window size.</td></tr>
+        <tr><td><b>Repeated structure</b></td><td>The cost curve is multi-modal, with one minimum per period of the pattern, and they are of nearly equal depth. Here the data actively <b>lies</b>: the wrong answer fits as well as the right one.</td><td>SAD 5 × 5: <b>46.7%</b> bad in the striped region; the single probe of §20 chose <code>d = 2</code> against a truth of 8.6</td><td>Widen the aggregation window past the period; use a wider baseline so the disparity range covers fewer periods; use a global method with a smoothness term that prefers a consistent alias (SGM: <b>0.0%</b> here); or detect it from the ratio of best to second-best minimum and refuse to answer.</td></tr>
+        <tr><td><b>Occlusion &amp; half-occlusion</b></td><td>A pixel visible in one view only. It has <b>no correct disparity</b> and any algorithm that returns one is fabricating.</td><td><b>11.1%</b> of left pixels are half-occluded, concentrated in a 10-pixel band beside the foreground box — the difference between the two disparities</td><td><b>Detect, do not fix.</b> Left–right cross-checking flags <b>79.6%</b> of them and drops 19.6% of the image; the flagged pixels are then filled by interpolating from the <i>background</i> side, never the foreground side.</td></tr>
+        <tr><td><b>Specular &amp; non-Lambertian surfaces</b></td><td>The surface does not look the same from the two viewpoints. A highlight sits at a <i>different surface point</i> in each view, so matching it produces the disparity of a virtual object that is not there.</td><td>A highlight displaced 6 px beyond the true disparity: SAD in that region goes from <b>7% to 48%</b> bad; NCC from <b>11% to 14%</b></td><td>A radiometrically robust cost (§19) helps a great deal but does not solve it — the highlight is a genuine geometric lie, not a photometric one. Multi-view redundancy and outlier rejection across many views is the real fix.</td></tr>
+        <tr><td><b>Slanted surfaces</b></td><td>A window assumes constant disparity within it, so a sloping surface is reconstructed as a staircase (§21).</td><td>SAD 5 × 5 across the slanted plane: a staircase of treads several pixels wide instead of a ramp</td><td>Slanted support windows, plane-fitting per segment, or a smoothness term that penalises the <i>second</i> difference of disparity rather than the first.</td></tr>
+        <tr><td><b>Depth discontinuities</b></td><td>A window straddling an edge votes for a compromise, so the foreground <b>fattens</b> by roughly the window radius.</td><td>Within 2 px of an edge the error rises with window size, 12.7% at <code>r = 1</code> to 17.7% at <code>r = 7</code>, while it falls everywhere else</td><td>Shiftable windows (§21) cut it by a factor of five or six; adaptive-weight aggregation; intensity-modulated smoothness in a global method.</td></tr>
+        <tr><td><b>Thin structures</b></td><td>A foreground object narrower than the window is swallowed by it. It also <b>violates the ordering constraint</b>, so dynamic-programming formulations that enforce ordering cannot represent the right answer at all.</td><td>—</td><td>Small windows plus a global method; do not enforce ordering; or accept that a chair leg will not appear.</td></tr>
+        <tr><td><b>Transparency and reflection</b></td><td>A pixel genuinely observes <b>two</b> surfaces at two depths. The model — one disparity per pixel — cannot express the answer.</td><td>—</td><td>None, within this formulation. Layered or multi-hypothesis models are required.</td></tr>
+      </table>
+
+      <div class="callout"><b>The two categories, and why the distinction matters.</b> <b>Textureless</b> and <b>occluded</b> regions are cases where the data does not contain the answer. The honest responses are to interpolate from a prior and <i>say so</i>, or to return "unknown". <b>Repeated structure</b> and <b>specular highlights</b> are worse: the data contains a confident wrong answer, and any confidence measure derived from the cost curve alone will endorse it. That is why the useful confidence measures (§23) look at the <i>second-best</i> minimum and at left–right agreement rather than at the depth of the winner.</div>
+
+      <div class="viz" id="viz-fail">
+        <div class="vhead">
+          <span class="vtitle">Every failure mode on one image, scored, with and without a global method</span>
+          <span class="vhint">the specular attack starts at strength 40 — turn it off to see the baseline it is measured against</span>
+        </div>
+        <div class="controls">
+          <label>specular highlight <input type="range" id="fl-a" min="0" max="80" step="5" value="40" /><span id="fl-av" style="min-width:24px;display:inline-block">40</span></label>
+          <label>highlight extra shift <input type="range" id="fl-s" min="0" max="12" step="1" value="6" /><span id="fl-sv" style="min-width:30px;display:inline-block">6 px</span></label>
+          <label><input type="checkbox" id="fl-c" /> left–right cross-check</label>
+        </div>
+        <svg id="fail-svg" width="760" height="440" viewBox="0 0 760 440" role="img" aria-label="Left: the left image of the synthetic pair with each problem region outlined and named — the untextured patch inside the foreground box, the periodic stripe region on the slanted plane, the slanted plane's own textured part, the occlusion band beside the box, and the specular highlight added by the slider, drawn as a ring. Middle: bad-pixel rates as grouped bars, one group per region, comparing plain winner-take-all with semi-global matching; the two hardest regions, untextured and repeated, are the two where the global method's advantage is enormous, while on textured background and on the slant the two methods are close. Right: the bad-pixel rate inside the specular highlight for all four matching costs, at the current highlight strength, with the highlight-free baseline drawn as hollow outlines behind them; the two intensity-difference costs rise steeply as the highlight strengthens while normalised cross-correlation barely moves, because the highlight is a photometric lie that correlation can partly see through, but it also does not vanish, because a highlight that moves with the viewpoint is a geometric lie as well."></svg>
+        <div class="readout" aria-live="polite" id="fail-readout"></div>
+      </div>
+    </section>
+
+    <nav class="pager" aria-label="Stereo &amp; Structure from Motion series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="pose-triangulation.html">← Relative Pose &amp; Triangulation</a>
+      <a href="../stereo-sfm.html" style="color:var(--muted)">Stereo &amp; Structure from Motion · overview</a>
+      <a href="sfm-bundle-adjustment.html">Structure from Motion &amp; Bundle Adjustment →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../vision-viz.js"></script>
+<script src="../stereo-sfm.viz.js"></script>
+</body>
+</html>

@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Alignment, Scores &amp; Scaling</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to the other pages of the series */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../attention.html">Attention</a> · part 1 of 6</p>
+      <h1>Alignment, Scores &amp; Scaling</h1>
+      <p>Where the attention score comes from: alignment derived for translation, what 'soft' lookup means, additive, bilinear and dot-product score functions compared, why the dot product is divided by √dₖ derived from its variance, and what the softmax saturates into without that scale.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Attention</span>
+        <span class="pill">Alignment · soft lookup · additive vs dot-product · √dₖ · saturation</span>
+      </div>
+    </header>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="align" data-nav="Alignment, derived">
+      <h3><span class="idx">02</span> Alignment: the original formulation, derived from what it has to do</h3>
+      <p class="lede">The decoder needs one fixed-size vector per step, and it has <code>L</code> of them to choose from. Write down the three requirements that choice must satisfy and the 2015 formulation is essentially forced.</p>
+
+      <p>At decode step <code>i</code> the decoder has a state <code>sᵢ₋₁</code> — everything it has produced so far — and it has the encoder states <code>h₁ … h_L</code>. It must produce a single vector <code>cᵢ</code> to condition the next output on. Three requirements:</p>
+
+      <div class="cards">
+        <div class="box"><div class="n">requirement 1</div><div class="t">Fixed size, any <code>L</code></div><div class="g"><code>cᵢ</code> must have a shape the decoder can consume, and that shape cannot depend on <code>L</code> — otherwise the decoder's weights depend on the input length and it is not a model.</div></div>
+        <div class="box"><div class="n">requirement 2</div><div class="t">Different at every step</div><div class="g">If <code>cᵢ</code> were the same for all <code>i</code> we would be back at <a href="../rnns-lstms/architectures-seq2seq.html#bottleneck">the recurrent encoder's single summary</a> and the bound would return. The read must depend on <code>sᵢ₋₁</code>.</div></div>
+        <div class="box"><div class="n">requirement 3</div><div class="t">Differentiable end to end</div><div class="g">There is no supervision for <i>which source word</i> to look at. The choice must be learned from the translation loss alone, which means the gradient has to flow through the choosing.</div></div>
+      </div>
+
+      <h4>From the requirements to the three steps</h4>
+      <p>Requirement 1 forces a <b>reduction</b> over the <code>L</code> states. The simplest linear reduction that keeps each state intact — each <code>hⱼ</code> enters scaled by a single number rather than being passed through its own matrix — is a weighted sum with scalar weights, and that is the choice the original formulation made. Requirement 2 forces the weights to be a function of <code>sᵢ₋₁</code>. Requirement 3 forces that function to be smooth. Put together:</p>
+
+      <div class="formula"><span class="lbl">the mechanism, in the three steps it has always had</span><span class="eq">   score      eᵢⱼ = a( sᵢ₋₁ , hⱼ )                for every j = 1 … L
+   normalise  αᵢⱼ = exp(eᵢⱼ) / ∑ₖ exp(eᵢₖ)        so  αᵢⱼ ≥ 0,  ∑ⱼ αᵢⱼ = 1
+   blend      cᵢ  = ∑ⱼ αᵢⱼ · hⱼ                    ONE vector, dₕ wide, any L</span>
+<span class="lbl">and the alignment function a( <span class="keep">·</span> , <span class="keep">·</span> ) that the 2015 model used</span><span class="eq">a(s, h)  =  vᵀ · tanh( s·W_a  +  h·U_a )            ← ADDITIVE / concat scoring
+
+shapes, in the row convention of §01:
+   s  (1 × d_s)      W_a  (d_s × d_a)
+   h  (1 × dₕ)       U_a  (dₕ  × d_a)       v  (d_a)  a single vector
+   the score is a SCALAR: a one-hidden-layer network with d_a units, one
+   output, no output bias, applied to the pair (s, h). "vᵀ tanh(·)" is
+   the dot product of v with the d_a hidden activations; in the row
+   convention it is tanh(s·W_a + h·U_a) · v.</span></div>
+
+      <div class="callout"><b>The standard vocabulary, since other sources use it.</b> The scores <code>eᵢⱼ</code> are the <b>alignment scores</b> (or energies) and the function <code>a(·,·)</code> is the <b>alignment model</b> or <b>score function</b>; the normalised <code>αᵢⱼ</code> are the <b>attention weights</b> (alignment weights); <code>cᵢ</code> is the <b>context vector</b>. Scoring with a small network, as above, is <b>additive attention</b> (also "concat" or "MLP" attention); scoring with a dot product, as §04 introduces, is <b>multiplicative</b> or <b>dot-product attention</b>. Because the query comes from the decoder and the keys from the encoder, this wiring is <b>encoder–decoder attention</b>, which §09 renames <b>cross-attention</b>; when queries and keys come from the same sequence it is <b>self-attention</b> (originally "intra-attention"). Selecting by similarity of content rather than by index is <b>content-based addressing</b>, the term the differentiable-memory literature uses for the same operation. The original formulation scores against the <i>previous</i> decoder state <code>sᵢ₋₁</code>; a common later variant scores against the current state <code>sᵢ</code> and feeds the context into the output layer instead of the recurrence — a plumbing difference, not a different mechanism.</div>
+
+      <h4>Three design decisions hiding in the formula</h4>
+      <p>Three things about that formula are worth naming, because each is a design decision and not a detail.</p>
+      <ul class="notes">
+        <li><b>It is a small MLP, and it is the smallest one that can work.</b> A <i>linear</i> score <code>(sW + hU)·v</code> would be additively separable, and each of its two terms is useless on its own: the <code>sW·v</code> term is the same for every key <code>j</code>, so it shifts a whole softmax row by a constant and cancels; the <code>hU·v</code> term does not depend on the query at all, so it gives every decode step the <i>same</i> weights — a fixed prior over source positions, which is exactly what requirement 2 forbids. The <code>tanh</code> is what makes the score depend on <b>the interaction</b> between the query and the key rather than on each separately. §04's <a href="#score">dot product</a> gets the interaction a different way.</li>
+        <li><b>The two projections have different input widths on purpose.</b> <code>d_s</code> and <code>dₕ</code> need not match: additive attention can score a query against a key of a completely different dimension, which is why it survives in settings where the two sides are genuinely different objects. The dot product cannot; it requires the same width <code>dₖ</code> on both sides, which is one reason <code>W_Q</code> and <code>W_K</code> exist (§07 gives the other: a learned, asymmetric notion of similarity).</li>
+        <li><b>The softmax is what makes the choice a <i>choice</i>.</b> It is not there to be probabilistic. It is there because it maps <code>L</code> unconstrained real numbers onto the simplex — non-negative and summing to one — so that <code>cᵢ</code> is a <b>convex combination</b> of the states and therefore lives in their convex hull, at the same scale as any single state, for any <code>L</code>. Replace the softmax with, say, raw scores and <code>cᵢ</code>'s norm grows with <code>L</code>; replace it with a sigmoid applied per position and the sum grows with <code>L</code> too. §06 shows what else the softmax quietly guarantees, and §23 shows what it costs.</li>
+      </ul>
+
+      <div class="viz" id="viz-al">
+        <div class="vhead">
+          <span class="vtitle">One decode step, computed: score every source position, normalise, blend</span>
+          <span class="vhint">step the decoder along and watch <code>c</code> move — the bars are the weights, the arrow is the blend, and the bottom strip is the weight matrix the whole decode builds up</span>
+        </div>
+        <div class="controls">
+          <label>decode step i <input type="range" id="al-i" min="1" max="8" step="1" value="3" /><span id="al-iv" style="min-width:16px;display:inline-block">3</span></label>
+          <label>source length L <input type="range" id="al-L" min="4" max="12" step="1" value="8" /><span id="al-Lv" style="min-width:16px;display:inline-block">8</span></label>
+          <label>alignment sharpness <input type="range" id="al-t" min="0.2" max="4" step="0.1" value="1.6" /><span id="al-tv" style="min-width:28px;display:inline-block">1.6</span></label>
+          <label>score <select id="al-s">
+            <option value="add" selected>additive · vᵀtanh(sW + hU)</option>
+            <option value="dot">dot · s·hᵀ</option>
+          </select></label>
+        </div>
+        <svg id="al-svg" width="760" height="430" viewBox="0 0 760 430" role="img" aria-label="Upper left: a column of source positions, each a small vector drawn as a row of coloured cells, with a horizontal bar beside it whose length is the alignment weight that the current decode step assigns to that position. The weights are computed from the chosen score function and are non-negative and sum to one, which is stated numerically beside the bars. Upper right: the resulting context vector, drawn as the same kind of coloured cell row, together with a faint overlay of each source state scaled by its weight, so that the context vector is visibly the sum of the faint rows. Lower panel: the full alignment matrix for the whole decode, one row per decode step and one column per source position, shaded by weight, with the current decode step's row outlined; a mostly monotone bright band runs from the top left to the bottom right, interrupted at the two positions where the latent correspondence was deliberately swapped, which is what a translation alignment looks like when the two languages mostly but not entirely agree about word order. Small circles mark the latent correspondence the states were built with, and the readout counts how many decode steps put their maximum on it. Increasing the sharpness control concentrates every row onto fewer positions and the printed entropy falls; decreasing it flattens every row towards the uniform distribution and the entropy rises towards the logarithm of the source length. Switching the score function changes the matrix but not the mechanism. The readout prints the weights of the current row to three decimals, their sum, the entropy of the row in nats against its maximum, and the effective number of source positions being read, defined as the exponential of the entropy."></svg>
+        <div class="readout" aria-live="polite" id="al-readout"></div>
+      </div>
+
+      <h4>The alignment matrix</h4>
+      <p>The bottom strip of that figure is the object the mechanism is usually judged by: the <b>alignment matrix</b> <code>α</code>, one row per decode step and one column per source position. Nothing in the loss asks for it to be interpretable. It becomes roughly monotone on language pairs with similar word order because that is what minimises the translation loss, and it stops being monotone exactly where the languages disagree about order — which was early evidence that the mechanism was learning something structural rather than memorising. §33 revisits how much weight that kind of evidence can bear.</p>
+
+      <div class="callout"><b>Where this landed historically.</b> The formulation above was introduced to fix translation quality on long sentences, and the effect it fixed is measurable: without it, quality falls off sharply once the source is longer than the sentences the model was trained on, because the fixed summary is being asked to hold more than §01's bound permits; with it, the fall-off largely disappears. <a href="../../nlp/machine-translation.html">Machine Translation</a> owns that story and the evaluation metrics that measured it.</div>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="soft" data-nav="What 'soft' means">
+      <h3><span class="idx">03</span> What "soft" alignment means, and why the hard version is a different problem</h3>
+      <p class="lede"><b>Soft attention reads every source position and weights each one; hard attention picks a single position.</b> The soft version is differentiable end to end, because a weighted sum has a gradient with respect to its weights and the softmax has a gradient with respect to its scores; the hard version is not, because an argmax has zero gradient almost everywhere. That is why "soft" is not a hedge or an approximation of something better: it is the choice that makes the selection <b>trainable by gradient descent at all</b>, and the alternative is not a slightly worse attention — it is a reinforcement-learning problem.</p>
+
+      <p>The honest way to see this is to write down the hard version and try to differentiate it. Hard selection picks one source position:</p>
+
+      <div class="formula"><span class="lbl">hard selection, and the wall it hits</span><span class="eq">SOFT   cᵢ = ∑ⱼ αᵢⱼ hⱼ            α = softmax(e)      ∂cᵢ/∂e exists everywhere
+HARD   cᵢ = h_{j*}   where j* = argmaxⱼ eᵢⱼ
+
+∂ j* / ∂ e  =  0   almost everywhere, and UNDEFINED on the ties.
+
+The argmax is piecewise constant. Its gradient carries no information about
+how to change the scores, because a small change in e leaves j* alone —
+until it does not, and then it jumps. There is nothing for the chain rule
+to propagate.</span>
+<span class="lbl">the two standard escapes from the hard version, what each costs, and the third option — which is soft attention</span><span class="eq">1 · SAMPLE and use a score-function estimator (REINFORCE):
+       j ∼ α          ∇ E[loss]  =  E[ loss · ∇ log α_j ]
+    unbiased, and its VARIANCE grows with L and with the loss scale. It
+    needs a baseline, many samples, or both.
+
+2 · RELAX: keep the sample but reparametrise it (Gumbel-softmax /
+    concrete), giving a biased but low-variance gradient, with a
+    temperature that has to be annealed.
+
+3 · DO NOT CHOOSE. Take the convex combination and let the WEIGHTS carry
+    the choice. Gradient is exact, variance is zero, no extra
+    hyper-parameter. This is soft attention, and it is the reason the
+    mechanism was usable immediately.</span></div>
+
+      <p>The figure measures the difference rather than asserting it. It takes one tiny selection problem and computes the gradient two ways: exactly, by differentiating the soft mechanism, and by sampling, as the hard mechanism with a score-function estimator must. The right panel plots the spread of the sampled estimate of the <i>whole gradient vector</i>, relative to the norm of the exact gradient, against the number of candidates — and that relative spread is the quantity that grows like <code>√L</code>.</p>
+
+      <div class="viz" id="viz-hs">
+        <div class="vhead">
+          <span class="vtitle">Soft against hard: the same objective, the exact gradient against the sampled one</span>
+          <span class="vhint">the right panel is the one to watch: the sampled estimator's spread relative to the exact gradient grows like √L when the scores are of order one, and the soft gradient has none, because there is no sampling in it</span>
+        </div>
+        <div class="controls">
+          <label>candidates L <input type="range" id="hs-L" min="2" max="64" step="1" value="16" /><span id="hs-Lv" style="min-width:20px;display:inline-block">16</span></label>
+          <label>samples per estimate <input type="range" id="hs-S" min="1" max="64" step="1" value="8" /><span id="hs-Sv" style="min-width:20px;display:inline-block">8</span></label>
+          <label>score spread <input type="range" id="hs-sd" min="0.2" max="3" step="0.1" value="1" /><span id="hs-sdv" style="min-width:26px;display:inline-block">1.0</span></label>
+          <label><input type="checkbox" id="hs-base" checked /> subtract a baseline from the sampled estimator</label>
+        </div>
+        <svg id="hs-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left panel: for one fixed set of alignment scores, the distribution of the estimated gradient with respect to a single score, drawn as a histogram over two thousand independent estimates for the sampling-based hard estimator, with a vertical line at the exact gradient obtained by differentiating the soft mechanism analytically. The histogram is centred on the exact value, confirming that the sampled estimator is unbiased, and is wide, which is the point. Turning off the baseline widens it substantially further. Right panel: the spread of the sampled estimator of the whole gradient vector, relative to the norm of the exact gradient, plotted against the number of candidates on logarithmic axes for the current number of samples per estimate, computed exactly from the sampling distribution and averaged over twenty-four random draws of scores and values; a flat line at zero marks the exact soft gradient, and a dashed reference of slope one half shows that the relative spread grows like the square root of the number of candidates when the scores are of order one, because the total spread stays of order one while the exact gradient shrinks like one over root L. With a large score spread the softmax is nearly one-hot, only a few candidates are ever sampled, and the growth is suppressed; the readout prints the fitted slope so the departure is a number. Increasing the samples per estimate lowers the whole curve by the square root of that number and never reaches the exact gradient. The readout prints the exact soft gradient, the mean and standard deviation of the sampled estimator, the ratio between the standard deviation and the value being estimated, and the number of samples that would be needed to bring the standard deviation below one tenth of the exact value."></svg>
+        <div class="readout" aria-live="polite" id="hs-readout"></div>
+      </div>
+
+      <div class="callout"><b>The trade being made, stated plainly.</b> Soft attention reads <i>everything</i> and weights it. That is more expensive than reading one position — <code>O(L)</code> work instead of <code>O(1)</code> — and it is the origin of the quadratic cost in §18. Hard attention would be cheaper at inference, and the analogous discrete choice is what a retrieval system makes when the candidate set is enormous (millions of documents, where reading everything is not an option). The reason soft won inside the model is not that it is cheaper; it is that it turns a discrete decision into a smooth one, and gradient descent can only optimise the second kind.</div>
+
+      <div class="wrong"><span class="say">The common phrasing.</span> "Soft attention is a differentiable approximation to hard attention." <span class="fix">A legitimate reading, but the emphasis is the wrong way round for learning the mechanism.</span> Hard attention is the special case that soft attention reaches in the limit of infinitely sharp scores, and it is the one that loses the property being relied on. Calling the smooth thing an approximation of the non-smooth thing makes the softmax look like a compromise instead of the load-bearing part.</div>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="score" data-nav="Score functions">
+      <h3><span class="idx">04</span> Score functions: additive, dot, general — and one that cannot do what the others do</h3>
+      <p class="lede"><b>A score function takes a query and a key and returns one number. The two families are additive — a small network on the pair, <code>vᵀtanh(qW + kU)</code> — and multiplicative — a dot product <code>q·kᵀ</code>, optionally through a learned matrix or divided by <code>√dₖ</code>. The dot product won because a whole matrix of scores is one matrix multiplication.</b> Four candidates, all in use, are tabulated below. They differ in parameter count, in cost, and — this is the part usually skipped — in <b>what they can represent at all</b>: the bias-free additive scorer has an exact symmetry that makes it incapable of expressing a similarity, and it is the one everybody writes first.</p>
+
+      <table class="grid2">
+        <tr><th style="width:150px">Score</th><th>Form</th><th>Extra parameters</th><th>Cost for one <code>(n_q × n_k)</code> matrix</th></tr>
+        <tr><td><b>additive</b> (concat)</td><td class="mono">a(q,k) = vᵀ tanh(qW_a + kU_a + b)</td><td class="mono">d_q·d_a + d_k·d_a + 2d_a</td><td>an MLP <i>per pair</i>: after hoisting the two projections (<code>n_q·d_q·d_a + n_k·d_k·d_a</code>, once), still <code>n_q·n_k·d_a</code> MACs for the dot with <code>v</code> plus <code>n_q·n_k·d_a</code> tanh evaluations, and the <code>tanh</code> cannot be hoisted out of the pair loop</td></tr>
+        <tr><td><b>dot</b></td><td class="mono">a(q,k) = q·kᵀ</td><td class="mono">0</td><td>one matrix product: <code>n_q·n_k·d</code> MACs, and it is <i>one</i> GEMM</td></tr>
+        <tr><td><b>general</b> (bilinear)</td><td class="mono">a(q,k) = q W_g kᵀ</td><td class="mono">d_q·d_k</td><td><code>n_q·d_q·d_k + n_q·n_k·d_k</code> — fold <code>W_g</code> into the queries once, then one GEMM</td></tr>
+        <tr class="tot"><td><b>scaled dot</b></td><td class="mono">a(q,k) = q·kᵀ / √dₖ</td><td class="mono">0</td><td>identical to dot: the scale is <code>n_q·n_k</code> multiplies, or is folded into <code>W_Q</code> for free</td></tr>
+      </table>
+
+      <p>The cost column is the reason the dot product won, and it is a bigger reason than the arithmetic suggests. An <code>n×n</code> matrix of additive scores is <code>n²</code> independent little MLPs; an <code>n×n</code> matrix of dot-product scores is <b>one matrix multiplication</b>, which is the operation modern accelerators are built around. The additive form does more arithmetic <i>and</i> does it in the shape hardware is worst at. §26 makes the general version of that argument.</p>
+
+      <h4>The part that is not about cost: an odd scorer cannot express a similarity</h4>
+      <p>Write the additive score without the internal bias, which is how the 2015 formulation is usually quoted:</p>
+
+      <div class="formula"><span class="lbl">an exact symmetry, not an approximation argument</span><span class="eq">a(q, k)  =  vᵀ tanh( qW_a + kU_a )              no bias inside the tanh
+
+tanh is an ODD function, so for any W_a, U_a, v and any pair (q, k):
+
+      a(−q, −k) = vᵀ tanh( −qW_a − kU_a ) = −vᵀ tanh( qW_a + kU_a ) = −a(q, k)
+
+The score is an ODD function of the concatenated input (q, k).</span>
+<span class="lbl">but a dot product is EVEN</span><span class="eq">      (−q)·(−k)ᵀ  =  + q·kᵀ
+
+An odd function and an even function are orthogonal in every reasonable
+sense: the ONLY function that is both is the zero function. So the
+bias-free additive scorer cannot represent the dot product — not
+approximately, not with more units, not with better training. Its whole
+even component is identically zero.
+
+The one assumption: this is a statement over input distributions that
+are SYMMETRIC under (q, k) → (−q, −k), such as the unit-norm pairs
+below. On a distribution confined to a half-space (all-positive
+activations, say) an odd function CAN match an even target on the
+region that matters — which is the escape the callout below describes.</span>
+<span class="lbl">measured — least-squares fit of the output layer v, held out on fresh pairs</span><span class="eq">d = 6, unit-norm q and k, 2000 fitting pairs, 2000 held-out pairs,
+W_a and U_a random with scale 2, v fitted by ridge regression.
+The number is ‖a − q·kᵀ‖ / ‖q·kᵀ − mean‖ on the HELD-OUT pairs:
+1.0 means "explains nothing".
+
+   d_a     b = 0        b ~ N(0, ¼)   b ~ N(0,1)   b ~ N(0,4)
+     4     1.0019       1.0013        0.9992       0.9884
+     8     1.0024       1.0010        0.9937       0.9774
+    16     1.0059       0.9887        0.9620       0.9604
+    32     1.0094       0.9383        0.8990       0.9210
+    64     1.0242       0.8865        0.8104       0.8162
+   128     1.0380       0.7387        0.5840       0.6010
+   256     1.0814       0.5467        0.3461       0.4256
+   512     1.1877       0.4143        0.2633       0.2307
+
+The b = 0 column does not improve with width — it gets WORSE, because the
+extra capacity can only overfit the fitting set. Every other column falls
+monotonically. Adding a bias inside the tanh breaks the oddness, and the
+moment it is broken the same architecture starts working.</span></div>
+
+      <div class="callout"><b>Why this matters in practice and not only on paper.</b> Frameworks differ on whether the additive alignment layer carries an internal bias, and the difference is usually presented as a nicety. It is not: without it, the scorer is constrained to a function class that excludes the most obvious notion of "these two vectors are similar". It can still solve alignment tasks — the figure in §02 shows a bias-carrying version doing exactly that — but it is solving them with a strictly odd function, and if your task's true score is even, the model must build it out of interactions with whatever asymmetry the inputs happen to have. <b>The fix is one bias vector.</b></div>
+
+      <div class="viz" id="viz-sf">
+        <div class="vhead">
+          <span class="vtitle">Four score functions on the same pairs: what each can represent, and what each costs</span>
+          <span class="vhint">the internal-bias slider is the whole point — take it to zero and the additive curve sits flat at 1.0 for every width; raise it and the same architecture starts working</span>
+        </div>
+        <div class="controls">
+          <label>d <input type="range" id="sf-d" min="2" max="16" step="1" value="6" /><span id="sf-dv" style="min-width:16px;display:inline-block">6</span></label>
+          <label>target <select id="sf-t">
+            <option value="dot" selected>the dot product q·kᵀ — an EVEN function</option>
+            <option value="bil">a random bilinear form q·G·kᵀ — also even</option>
+            <option value="odd">a deliberately ODD target</option>
+          </select></label>
+          <label>internal bias scale <input type="range" id="sf-b" min="0" max="4" step="0.25" value="2" /><span id="sf-bv" style="min-width:30px;display:inline-block">2.00</span></label>
+          <label>fitting pairs <select id="sf-n">
+            <option value="500">500</option>
+            <option value="1500" selected>1500</option>
+            <option value="3000">3000</option>
+          </select></label>
+        </div>
+        <svg id="sf-svg" width="760" height="410" viewBox="0 0 760 410" role="img" aria-label="Left panel: the held-out relative residual of a least-squares fit of an additive scorer's output layer to the chosen target, plotted against the number of hidden units on logarithmic horizontal axis, with a horizontal reference line at one meaning the fit explains nothing. Two curves are drawn: one for a scorer with no bias inside the nonlinearity and one for a scorer with a bias of the selected scale. On the even targets — the dot product and the random bilinear form — the bias-free curve sits at or slightly above one at every width and drifts upwards as width grows, because the extra capacity can only overfit, while the bias-carrying curve falls steadily. On the deliberately odd target the two curves swap roles: the bias-free scorer now fits, and the bias-carrying one does no better, which is the symmetry argument seen from the other side. Setting the bias scale to zero makes the two curves coincide exactly. Right panel: the cost of producing one full score matrix, as multiply-accumulate counts against sequence length on logarithmic axes, with one line per score function — additive, dot, general bilinear and scaled dot — drawn at a head width and a hidden width of sixty-four each, so that the additive line, which counts its multiply-accumulates and its tanh evaluations together, sits a factor of two above the dot line, and the dot and scaled-dot lines are identical because the scale folds into the query projection. The point is not the factor of two: a separate annotation states how many separate nonlinearity evaluations the additive form needs, which is the quantity that cannot be expressed as a matrix product and is what actually makes it slow. The readout prints the residual for both scorers at the current width, the ratio between them, the parameter counts, and the multiply-accumulate counts at the current sequence length."></svg>
+        <div class="readout" aria-live="polite" id="sf-readout"></div>
+      </div>
+
+      <div class="wrong"><span class="say">The usual summary.</span> "Additive and multiplicative attention perform similarly; multiplicative is faster, so we use it." <span class="fix">The first half is true only once both are trained, and it hides the fact that they are different function classes.</span> The original comparison found that the additive form actually <i>outperformed</i> the unscaled dot product at large <code>dₖ</code> — which is what motivated the scale in the first place (§05), and is the opposite of "similar". Once the scale is added they become comparable in quality, and then speed decides. The honest ordering is: representational difference first, scale second, speed third.</div>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="scale" data-nav="Why √dₖ, derived">
+      <h3><span class="idx">05</span> Why the <code>1/√dₖ</code> is there, derived rather than asserted</h3>
+      <p class="lede"><b>A dot product of two <code>dₖ</code>-dimensional vectors with independent unit-variance components has variance <code>dₖ</code>; dividing by <code>√dₖ</code> makes every score have variance 1 regardless of the head width, so the softmax starts at the same, gentle sharpness for any <code>dₖ</code>.</b> That is the whole reason the factor is there. It is therefore not a tuning constant and not "for numerical stability": it is the exact standardisation of a sum of <code>dₖ</code> independent products, and the derivation takes three lines.</p>
+
+      <p>Take the assumption the scale is derived under and state it plainly: the components of <code>q</code> and <code>k</code> are independent, mean 0, variance 1. That is not true of a trained model, but it is close to true at initialisation, which is when the decision has to be made — a layer that saturates at step zero never gets to step one.</p>
+
+      <div class="formula"><span class="lbl">the variance of a dot product, exactly</span><span class="eq">q·kᵀ = ∑_{c=1..dₖ} q_c k_c            with q_c, k_c independent, E = 0, Var = 1
+
+E[ q_c k_c ]   = E[q_c]·E[k_c]  = 0                     independence
+Var[ q_c k_c ] = E[q_c²k_c²] − 0 = E[q_c²]·E[k_c²] = 1  independence again
+
+The dₖ terms are independent, so the variances ADD:
+
+      E[ q·kᵀ ]   = 0
+      Var[ q·kᵀ ] = dₖ          sd[ q·kᵀ ] = √dₖ</span>
+<span class="lbl">so the scale is a z-score and nothing more</span><span class="eq">      q·kᵀ / √dₖ      has mean 0 and variance 1, for EVERY dₖ.
+
+That is the whole derivation. The factor is √dₖ because a sum of dₖ
+independent unit-variance terms has standard deviation √dₖ, the same
+reason a random walk of dₖ steps travels √dₖ. Not dₖ, not √d_model,
+not √(dₖ·h) — √dₖ, the width of ONE head's key.</span></div>
+
+      <div class="formula"><span class="lbl">measured — 200 000 draws per row, q and k componentwise standard normal</span><span class="eq">    dₖ         mean          var     var/dₖ           sd     sd/√dₖ
+     1    −0.001456       1.0065    1.00650       1.0032    1.00325
+     2     0.001991       2.0014    1.00069       1.4147    1.00034
+     4     0.002155       3.9869    0.99673       1.9967    0.99836
+     8    −0.000275       7.9530    0.99412       2.8201    0.99706
+    16    −0.012460      16.0095    1.00059       4.0012    1.00030
+    32     0.023017      32.1862    1.00582       5.6733    1.00290
+    64     0.031306      64.2916    1.00456       8.0182    1.00228
+   128     0.014028     128.0944    1.00074      11.3179    1.00037
+   256     0.001350     256.3457    1.00135      16.0108    1.00068
+   512     0.037838     510.9403    0.99793      22.6040    0.99896
+  1024     0.082857    1025.7427    1.00170      32.0272    1.00085
+
+The var/dₖ column is 1 to within Monte-Carlo error across three orders of
+magnitude in dₖ. The relationship is exact; the deviations are the
+sampling error of 200 000 draws, which is about 1/√200000 ≈ 0.2%.</span></div>
+
+      <div class="viz" id="viz-vr">
+        <div class="vhead">
+          <span class="vtitle">Var[q·kᵀ] against dₖ, measured — and what changes when the assumption is wrong</span>
+          <span class="vhint">the distribution selector is the interesting control: the √dₖ law survives non-Gaussian components and dies the moment the components are correlated</span>
+        </div>
+        <div class="controls">
+          <label>draws per point <select id="vr-n">
+            <option value="4000">4 000</option>
+            <option value="20000" selected>20 000</option>
+            <option value="80000">80 000</option>
+          </select></label>
+          <label>component distribution <select id="vr-d">
+            <option value="norm" selected>standard normal</option>
+            <option value="unif">uniform, rescaled to variance 1</option>
+            <option value="rade">Rademacher ±1</option>
+            <option value="heavy">heavy-tailed (t, ν = 5), rescaled</option>
+          </select></label>
+          <label>correlation between components ρ <input type="range" id="vr-r" min="0" max="0.9" step="0.05" value="0" /><span id="vr-rv" style="min-width:30px;display:inline-block">0.00</span></label>
+          <label><input type="checkbox" id="vr-sc" /> divide by √dₖ</label>
+        </div>
+        <svg id="vr-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left panel: the measured variance of the dot product plotted against the key dimension on logarithmic axes, with a dashed reference line of slope one passing through the point where the key dimension is one. When the components are independent, the measured points lie on that line for every distribution offered, including the bounded uniform, the two-point Rademacher and the heavy-tailed one, because the result depends only on the second moment. Raising the correlation control lifts the measured points off the reference line and onto a steeper one, because correlated components make the terms of the sum dependent and the variances no longer simply add; the readout prints the fitted exponent of the measured relationship so the departure is a number rather than an impression. Ticking the scaling box divides every draw by the square root of the key dimension and the measured curve becomes exactly flat at one, which is the whole content of the scaling factor. Right panel: histograms of the score itself at three key dimensions, drawn on a shared horizontal axis, unscaled or scaled according to the box; unscaled they spread wider and wider with dimension, and scaled they lie on top of one another. The readout prints the measured mean and variance at the selected key dimension, the ratio of that variance to the key dimension, the fitted exponent of variance against dimension, and the standard deviation before and after scaling."></svg>
+        <div class="readout" aria-live="polite" id="vr-readout"></div>
+      </div>
+
+      <div class="callout"><b>What the derivation assumes, and what it is worth when the assumption fails.</b> It needs three things: <code>q</code> and <code>k</code> <b>independent of each other</b>, every component with <b>mean 0 and second moment 1</b>, and the components of at least one of the two vectors <b>uncorrelated with one another</b> (then <code>Var[∑ q_c k_c] = ∑_{a,b} E[q_a q_b]·E[k_a k_b] = ∑_c 1·1 = dₖ</code>). It does not need Gaussian, identically distributed or even continuous components — the figure checks that by swapping in a uniform, a two-point and a heavy-tailed distribution and getting the same law. What it genuinely needs is the independence <i>across components</i>, and that is what training typically breaks: <code>q</code> and <code>k</code> come to live in a lower-dimensional, correlated subspace, and the effective number of independent directions falls below <code>dₖ</code>. The scale is therefore <b>right at initialisation and approximate afterwards</b> — which is exactly why §06's failure mode is a training-time phenomenon rather than an initialisation one, and why some models add an explicit normalisation of <code>q</code> and <code>k</code> on top of the fixed scale.</div>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="saturation" data-nav="What the softmax does without it">
+      <h3><span class="idx">06</span> What actually goes wrong without the scale — and what does not</h3>
+      <p class="lede"><b>Without the scale, an untrained head's scores have standard deviation <code>√dₖ</code> instead of 1, so at the usual head widths the softmax row is already nearly one-hot on an arbitrary key before any learning, and most query–key pairs receive almost no gradient. With the scale, every row starts near uniform and every pair is trainable.</b> That is what to take away. The standard sentence — "for large <code>dₖ</code> the dot products grow, pushing the softmax into regions where it has extremely small gradients" — is the same fact, but every clause of it is worth checking, and the check sharpens the conclusion: the <i>typical</i> gradient really does collapse, the <b>aggregate</b> gradient does not, and the damage that actually shows up in training depends on what the task wants the attention to look like.</p>
+
+      <h4>First, what the layer looks like before any learning</h4>
+      <p>Fix <code>n = 64</code> keys and draw scores from the distribution §05 derived — <code>N(0, dₖ)</code> unscaled, <code>N(0, 1)</code> scaled. This is the attention row of an untrained head.</p>
+
+      <div class="formula"><span class="lbl">measured, 40 000 random rows of 64 keys, unscaled unless marked</span><span class="eq">    dₖ   mean maxα   P(maxα>0.9)  P(maxα>0.99)  P(H<0.05 nats)   mean ‖J‖_F  median ‖J‖_F  5th pct ‖J‖_F
+     1      0.1072        0.0000        0.0000          0.0000       0.1836        0.1798      1.600e−01
+     4      0.3024        0.0021        0.0000          0.0000       0.2818        0.2834      2.226e−01
+    16      0.5947        0.1288        0.0181          0.0124       0.2951        0.3342      4.197e−02
+    64      0.7948        0.4455        0.1945          0.1745       0.2096        0.1938      4.595e−04
+   128      0.8527        0.5828        0.3343          0.3131       0.1650        0.0875      1.377e−05
+   256      0.8967        0.6947        0.4736          0.4563       0.1252        0.0245      5.950e−08
+   512      0.9278        0.7837        0.6044          0.5905       0.0918        0.0035      4.863e−11
+  1024      0.9490        0.8431        0.7020          0.6918       0.0675        0.0003      1.258e−15
+SCALED      0.1073        0.0000        0.0000          0.0000       0.1837        0.1799      1.599e−01
+
+ln 64 = 4.1589 nats is the largest entropy a 64-key row can have.
+‖J‖_F is the Frobenius norm of the softmax Jacobian J = diag(α) − ααᵀ.
+The SCALED row is the same for every dₖ — that is the point of the scale.</span></div>
+
+      <p>Read the first column before anything else. <b>At <code>dₖ = 64</code> — the head width of the original design — an untrained unscaled head already puts 79% of its weight on one randomly chosen key</b>, and one row in five is more than 99% committed. The layer is not "slightly sharp"; it is a hard, arbitrary selector that has learned nothing. That is the first-order damage, and it is a statement about the <i>forward</i> pass. The scaled column is at <code>0.107</code> at every <code>dₖ</code> — what a softmax of 64 unit-variance scores gives: the largest of 64 standard normals is about 2.4, so the top weight is roughly <code>e^2.4 / (64·e^0.5) ≈ 0.10</code>, seven times the uniform <code>1/64 = 0.0156</code> but nowhere near a decision.</p>
+
+      <h4>Now the gradient claim, checked</h4>
+      <p>The softmax Jacobian is the object the claim is about:</p>
+
+      <div class="formula"><span class="lbl">the softmax Jacobian, and why it dies at BOTH ends</span><span class="eq">   ∂αᵢ/∂sⱼ  =  αᵢ(δᵢⱼ − αⱼ)          J = diag(α) − ααᵀ
+
+α uniform (αᵢ = 1/n):   ‖J‖_F = √(1/n − 1/n²)  →  0  as n grows
+α one-hot:              J = 0 EXACTLY
+in between:             ‖J‖_F is largest at MODERATE concentration —
+                        for α = (½, ½, 0, …) it is exactly ½.
+
+So ‖J‖_F is not monotone in the sharpness, and therefore not monotone in dₖ.</span></div>
+
+      <p>That non-monotonicity is visible in the table and it is where the standard sentence over-reaches. The <b>mean</b> <code>‖J‖_F</code> <i>rises</i> from <code>0.184</code> at <code>dₖ = 1</code> to <code>0.295</code> at <code>dₖ = 16</code>, and at <code>dₖ = 64</code> it is still <code>0.210</code> — <b>larger than the scaled value of 0.184</b>. On the mean, the unscaled head at the original design point has a bigger softmax gradient, not a smaller one.</p>
+
+      <p>The claim is nonetheless true, and the table shows in which sense. Look at the <b>median</b> and the <b>5th percentile</b>. At <code>dₖ = 1024</code> the median <code>‖J‖_F</code> is <code>3e−04</code> against the scaled <code>0.180</code> — a factor of <b>600</b> — and the 5th percentile is <code>1.3e−15</code>, which is not small but <i>at the level of double-precision round-off</i>. The mean is being held up by the minority of rows that happen not to have saturated. So:</p>
+
+      <div class="callout"><b>The precise version of the claim.</b> Without the scale, the <i>typical</i> query–key pair receives essentially no gradient — the median softmax Jacobian norm falls by a factor of 600 at <code>dₖ = 1024</code> and the bottom 5% by fourteen orders of magnitude — while the <i>total</i> gradient norm stays large, concentrated in a few unsaturated rows. Training does not stall silently. It becomes a high-variance, nearly discrete search, in which most of the attention map is frozen and a handful of rows carry all the signal. "Gradients vanish" describes the distribution's body and mis-describes its total.</div>
+
+      <div class="viz" id="viz-st">
+        <div class="vhead">
+          <span class="vtitle">The attention row without the scale: the whole distribution, not the mean</span>
+          <span class="vhint">watch the median and the 5th-percentile lines separate from the mean as d<sub>k</sub> rises — that gap is what the standard sentence collapses</span>
+        </div>
+        <div class="controls">
+          <label>dₖ <input type="range" id="st-dk" min="0" max="10" step="1" value="7" /><span id="st-dkv" style="min-width:40px;display:inline-block">128</span></label>
+          <label>keys n <select id="st-n">
+            <option value="16">16</option>
+            <option value="64" selected>64</option>
+            <option value="256">256</option>
+            <option value="1024">1024</option>
+          </select></label>
+          <label>statistic <select id="st-w">
+            <option value="jac" selected>softmax Jacobian norm ‖J‖_F</option>
+            <option value="max">largest weight max α</option>
+            <option value="ent">entropy H(α), nats</option>
+          </select></label>
+          <label>rows sampled <select id="st-r">
+            <option value="2000">2 000</option>
+            <option value="8000" selected>8 000</option>
+            <option value="30000">30 000</option>
+          </select></label>
+        </div>
+        <svg id="st-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Left panel: the distribution of the selected per-row statistic over thousands of randomly drawn attention rows, drawn as a histogram on a logarithmic horizontal axis for the Jacobian norm and a linear one for the other two, with the unscaled and the scaled distributions overlaid in two colours. At small key dimensions the two histograms sit on top of one another. As the key dimension slider rises, the unscaled histogram develops a long left tail reaching many orders of magnitude below the scaled one, while its upper end barely moves, so the mean stays comparable while the median collapses. Vertical rules mark the mean, the median and the fifth percentile of each distribution. Right panel: the mean, the median and the fifth percentile of the same statistic plotted against key dimension on logarithmic axes, with the scaled reference drawn flat because it does not depend on the key dimension at all. The mean curve for the unscaled case rises to a maximum near key dimension sixteen and only then falls, crossing the scaled reference between key dimensions sixty-four and one hundred and twenty-eight, while the median and the fifth-percentile curves fall monotonically and steeply from the start; the crossing point of the mean curve is printed. The readout gives all three statistics for both the scaled and the unscaled rows at the current key dimension, the ratio between them, and the proportion of unscaled rows that are more than ninety-nine per cent committed to a single key."></svg>
+        <div class="readout" aria-live="polite" id="st-readout"></div>
+      </div>
+
+      <h4>The experiment that decides it, on one task family: train with and without, on tasks that need different answers</h4>
+      <p>Statistics of an untrained layer are suggestive, not decisive. The decisive test is to train the same head twice, changing nothing but the scale — and the result depends on <b>what the task wants the attention to look like</b>, which is why single-benchmark comparisons of this question disagree with each other.</p>
+
+      <p>Task family: <code>n = 8</code> positions, each carrying a mark bit and a value vector; exactly <code>m</code> are marked; the target is the <b>mean of the marked values</b>. The optimal attention row is uniform over <code>m</code> positions. <code>m = 1</code> is hard selection, <code>m = 8</code> is a uniform average. One head, mean-squared error, Adam at <code>3e−3</code>, 1200 steps, identical seeds and identical everything except the scale.</p>
+
+      <div class="formula"><span class="lbl">normalised held-out MSE (1.0 = the error of predicting zero) — scaled / UNSCALED</span><span class="eq">  m        dₖ = 8              dₖ = 64             dₖ = 512
+  1   0.00085 / 0.00033   0.00047 / 0.00005   0.00185 / 0.00070
+  2   0.00094 / 0.00041   0.00054 / 0.00017   0.00234 / 0.01560
+  3   0.00096 / 0.00047   0.00058 / 0.00016   0.00273 / 0.00571
+  4   0.00094 / 0.00053   0.00060 / 0.00014   0.00928 / 0.08207
+  6   0.00083 / 0.00073   0.00064 / 0.00023   0.00346 / 0.00517
+  8   0.00000 / 0.00000   0.00000 / 0.00000   0.00000 / 1.02521
+                                                          ↑
+                          the unscaled head at dₖ = 512 with a uniform target
+                          does not learn AT ALL — worse than predicting zero</span></div>
+
+      <ul class="notes">
+        <li><b>At <code>m = 1</code> the unscaled head is better, at every <code>dₖ</code>.</b> The task's optimum <i>is</i> a one-hot row, so starting saturated starts closer to the answer. This is not a fluke of one task: in a companion run on a pure associative-recall task (not shown in the figure) the unscaled head also reached 95% accuracy in fewer steps at every <code>dₖ</code> tested, by a factor of two to three.</li>
+        <li><b>At <code>m = 8</code> and <code>dₖ = 512</code> the unscaled head fails completely</b> — normalised error <code>1.03</code> against <code>0.000000</code> for the scaled one. Its rows start 93% committed to one key and the gradient that would spread them is, per the table above, at the fifteenth decimal place. The scaled head starts nearly uniform, which is the answer, and reaches it exactly.</li>
+        <li><b>At <code>dₖ = 8</code> and <code>dₖ = 64</code> the choice barely matters</b> under Adam. Adam's per-parameter normalisation removes the overall scale of the gradient, so the only thing the scale can still do is change <i>where the softmax starts</i> — and at <code>dₖ = 64</code> it does not start far enough into saturation to matter on these tasks.</li>
+      </ul>
+
+      <div class="wrong"><span class="say">What a single benchmark would have told you.</span> Run the comparison on retrieval and the scale looks useless or harmful. Run it on averaging and it looks essential. <span class="fix">Both results are real and they are the same experiment.</span> The scale's function is to make the layer <b>start undecided</b>. That is worthless when the answer is a decision and decisive when it is not — and a deep model does both in different heads (§12), which is why the scale is worth keeping even though many heads would be fine without it.</div>
+
+      <div class="callout"><b>What is done instead, when the scale is not enough.</b> The <code>√dₖ</code> factor is fixed at initialisation-time statistics and §05 showed why it drifts: training correlates the components of <code>q</code> and <code>k</code>, and the effective dimension of the dot product falls below <code>dₖ</code>. Two responses are common. <b>A learned scalar</b> multiplying the scores, so the model can pick its own sharpness — cheap, and it can be learned into saturation too. <b>Normalising <code>q</code> and <code>k</code> before the dot product.</b> In its strict form — projecting each onto the unit sphere ("cosine attention") — every score is bounded in <code>[−1, +1]</code> and saturation is impossible without an explicit learned temperature; the more common "QK-norm" applies a LayerNorm or RMSNorm with learned gains to <code>q</code> and <code>k</code>, which bounds the <i>growth</i> of the scores rather than the scores themselves. Either is a genuine architectural change and belongs to <a href="../transformers.html">the Transformer page's</a> account of what goes into a block. §23 measures the failure mode both are aimed at.</div>
+    </section>
+
+    <nav class="pager" aria-label="Attention series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../attention.html">← Attention · overview</a>
+      <a href="../attention.html" style="color:var(--muted)">Attention · overview</a>
+      <a href="query-key-value.html">Queries, Keys &amp; Values →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../attention.viz.js"></script>
+</body>
+</html>

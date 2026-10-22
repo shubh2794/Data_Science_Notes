@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Array Memory Layout &amp; Dynamic Arrays</title>
+<script src="../../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../arrays-strings.html">Arrays &amp; Strings</a> · part 1 of 5</p>
+      <h1>Array Memory Layout &amp; Dynamic Arrays</h1>
+      <p>Why indexing is O(1): the memory model and address arithmetic, the sequence ADT versus its implementation, referential (boxed, pointer) versus compact arrays, access versus update costs, and dynamic arrays whose geometric growth makes append amortized O(1) — with the 2 versus 1.5 growth-factor trade-off.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Arrays &amp; Strings</span>
+        <span class="pill">Address arithmetic · ADT vs impl · referential vs compact · access vs update · doubling · growth factor</span>
+      </div>
+    </header>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="memory-model" data-nav="The memory model">
+      <h3><span class="idx">02</span> The memory model: words, lines, and why contiguity is the whole story</h3>
+      <p class="lede">The <a href="../../algorithms/analysis/cost-models-counting.html#ram-model">RAM model</a> that prices every bound in this series says that one memory access costs <code>O(1)</code>, uniformly, wherever the address points. That is the right model for deriving asymptotics and the wrong model for predicting a runtime, and the gap between the two is where arrays earn most of their practical advantage. This section sets out just enough of the real machine to make the rest of the page's performance claims meaningful.</p>
+
+      <h4>The layers, and the numbers that matter</h4>
+      <ul class="notes">
+        <li><b>A byte</b> is the unit of address. Consecutive addresses differ by one byte; the address formula of §01 is arithmetic on byte counts.</li>
+        <li><b>A word</b> is the unit the processor computes on — 8 bytes on a current 64-bit machine. A pointer is one word. An index into any array that fits in memory is one word. The <a href="../../algorithms/analysis/cost-models-counting.html#ram-model">word-RAM</a> assumption that a word holds <code><span class="keep">Θ</span>(log n)</code> bits is exactly the assumption that an index fits in a register.</li>
+        <li><b>A cache line</b> is the unit of <i>transfer</i>, and it is the one most people never think about. Memory does not move between DRAM and the processor one byte or one word at a time; it moves in aligned blocks, typically <b>64 bytes</b> on x86 and 64 or 128 bytes on ARM. Touching one byte fetches the whole line containing it.</li>
+        <li><b>A page</b> is the unit of virtual-memory mapping, typically 4 KB, and the unit at which a translation lookaside buffer miss is paid. It matters for very large strided traversals; the cache line matters for almost everything else.</li>
+        <li><b>The latency spread.</b> On a current mainstream core an L1 hit resolves in roughly 4–5 cycles, an L2 hit in roughly 12–15, an L3 hit in roughly 40, and a DRAM access somewhere in the region of 200 cycles (published figures vary from about 100 to 400 with the part, the frequency and the access pattern). <b>That is a factor of forty to fifty between the cheapest and the most expensive "one memory access", all of which the RAM model prices identically.</b></li>
+      </ul>
+
+      <h4>What contiguity does with a cache line</h4>
+      <p>An array of 4-byte integers packs <b>16 elements into one 64-byte line</b>. A sequential scan therefore pays one memory transaction per sixteen elements and gets fifteen of them free — and because the access pattern is a constant stride, the hardware prefetcher recognises it and starts fetching the next line before it is asked for, which can hide the latency of even the paid one. The same <code>n</code> elements held as separately allocated nodes, each carrying a value and a pointer, occupy <code>n</code> lines in the worst case and are reached in an order the prefetcher cannot predict. Both traversals are <code><span class="keep">Θ</span>(n)</code>. They are not remotely the same speed.</p>
+      <div class="formula"><span class="lbl">the quantity the RAM model cannot see</span><span class="eq">line transfers for a sequential scan of n elements  =  ceil(n × itemsize / linesize)</span>
+<span class="lbl">4-byte elements, 64-byte lines</span><span class="eq">= ceil(n / 16)     — sixteen elements per transaction</span>
+<span class="lbl">the same n elements as scattered nodes</span><span class="eq">= up to n transactions, one per node, with no usable stride to prefetch</span>
+<span class="lbl">so the ratio of memory traffic, same asymptotic class</span><span class="eq">up to linesize / itemsize  =  16×,  on top of the bytes the links themselves cost</span>
+<span class="lbl">what the links cost, which depends on the payload</span><span class="eq">4-byte payload + one 8-byte link, rounded to the allocator's 16-byte grain ⇒ ≈ 4× the bytes</span>
+<span class="eq">8-byte payload + one 8-byte link                                        ⇒ ≈ 2× the bytes</span>
+<span class="eq">a 64-byte record + one link                                             ⇒ ≈ 1.13× the bytes</span></div>
+      <p>The name for the property the array has and the node chain does not is <b>locality of reference</b>: the tendency of a program to touch addresses that are near ones it has recently touched (<i>spatial</i> locality) or to touch the same address again soon (<i>temporal</i> locality). Caches are a bet that programs have both. A contiguous array traversed in order is the best possible spatial locality — every byte fetched is used — and that is the single sentence behind most of this page's constant factors.</p>
+
+      <h4>Three consequences that recur for the rest of this page</h4>
+      <ul class="notes">
+        <li><b>Traversal order is a performance decision, not a stylistic one.</b> Walking a matrix along its storage direction touches each line once; walking across it can touch a fresh line on every element. <a href="multidim-locality-strings.html#cache-locality">§09</a> measures exactly that, under a stated cache model.</li>
+        <li><b>A "linear scan beats the clever structure" result is usually this effect.</b> For small <code>n</code> — and "small" can mean a few hundred elements — scanning a packed array often beats a hash table or a balanced tree whose asymptotics are strictly better, because the array does one or two memory transactions and the tree does one per level, each a cache miss. The crossover is real, it is machine-specific, and the only way to find it is to <a href="../../algorithms/analysis/space-empirical-limits.html#empirical">measure</a>.</li>
+        <li><b>Space is a time cost.</b> Every extra byte per element is a fraction of a line wasted and a proportional increase in transactions. This is why a <i>compact</i> array of numbers (§04) is not merely more memory-efficient than an array of boxed references; it is faster by the same factor, on the same algorithm.</li>
+      </ul>
+      <div class="callout"><b>Model discipline, restated.</b> Every asymptotic bound on this page is a bound in the RAM model, where all accesses cost the same. Every claim about one structure being <i>faster in practice</i> than another with the same bound is a claim about this section — line transfers, not step counts. Keep the two ledgers separate and both are useful; mix them and you will find yourself defending an <code>O(1)</code> access that takes 200 cycles.</div>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="array-adt" data-nav="ADT vs implementation">
+      <h3><span class="idx">03</span> The array ADT versus the array implementation</h3>
+      <p class="lede">There are two different things called "array" and conflating them causes most of the confusion about what arrays cost. One is an <b>abstract data type</b> — a named set of operations with a stated contract. The other is a <b>layout in memory</b> — the contiguous block of §01. The ADT says <i>what you may ask for</i>; the layout says <i>what each request costs</i>. Keeping them apart is the habit that lets you read a library's complexity table and know what it is telling you.</p>
+
+      <h4>The array ADT, minimally</h4>
+      <div class="formula"><span class="lbl">the operations, and the contract each carries</span><span class="eq">create(n)        allocate n cells;  n ≥ 0 (a zero-length array is legal);  size fixed from here on</span>
+<span class="eq">length()         the number of cells                                    O(1)</span>
+<span class="eq">get(i)           the value in cell i;  requires 0 ≤ i &lt; n               O(1)</span>
+<span class="eq">set(i, v)        write v into cell i;  requires 0 ≤ i &lt; n               O(1)</span>
+<span class="eq">clear(v)         write v into every cell                               <span class="keep">Θ</span>(n)</span>
+<span class="eq">iterate()        visit cell 0, 1, …, n−1 in order                      <span class="keep">Θ</span>(n)</span></div>
+      <p>That is the whole interface. The hardware offers exactly three of these — allocate, read a cell, write a cell — and everything else on the list is a convenience written in terms of them. Notice what is <b>absent</b>: no insert, no delete, no search, no sort, no resize, no concatenation. Those are operations of richer sequence types, and their absence here is the point: the array ADT is deliberately impoverished so that <i>every operation it offers is constant time</i>. A structure whose interface contains nothing expensive is a structure you can reason about at a glance.</p>
+
+      <h4>Why an impoverished interface is a feature</h4>
+      <ul class="notes">
+        <li><b>It makes the cost of the richer type visible.</b> When a list type offers <code>insert(k, v)</code> and the array does not, the difference is not a missing feature — it is a shift loop, priced at <code><span class="keep">Θ</span>(n − k)</code> in <a href="#access-and-update">§05</a>. Starting from the poor interface forces you to see the loop.</li>
+        <li><b>It makes the storage exactly the data.</b> A fixed array of <code>n</code> elements occupies <code>n × itemsize</code> bytes and not a byte more. A growable list holds spare capacity — commonly up to twice what is needed — which is the price of amortized append (<a href="#dynamic-arrays">§06</a>). When the count is known in advance and never changes, paying it is waste: a preallocated block of 100 000 numbers is 100 000 cells, where a doubling list that reached the same length may hold capacity for 200 000.</li>
+        <li><b>It is what every other structure in this series is built out of.</b> A <a href="../heaps-priority-queues.html#what-a-heap-is">binary heap</a> is an array plus index arithmetic. A <a href="../index.html#map">hash table</a> is an array plus a function from keys to indices. A ring buffer is an array plus two indices modulo <code>n</code>. A <a href="../../../programming/numpy.html">dense matrix</a> is an array plus a stride. None of them need more than the six operations above from the layer beneath.</li>
+      </ul>
+
+      <h4>The same ADT, three implementations, three cost profiles</h4>
+      <table class="cmp">
+        <tr><th>Implementation</th><th><code>get(i)</code></th><th>Memory per element</th><th>What it is good for</th></tr>
+        <tr><td><b>Contiguous block</b> of fixed-width cells</td><td><code>O(1)</code>, one address computation</td><td>exactly <code>itemsize</code></td><td>everything on this page; the default meaning of "array"</td></tr>
+        <tr><td><b>Array of references</b> to boxed elements</td><td><code>O(1)</code>, two memory accesses — the slot, then the object</td><td><code>8</code> bytes + the object, scattered</td><td>heterogeneous or large elements; the usual layout of a dynamic language's list</td></tr>
+        <tr><td><b>Array of arrays</b> (rows held separately)</td><td><code>O(1)</code>, two address computations</td><td><code>itemsize</code> + one pointer per row</td><td>ragged rows, or rows you want to swap in <code>O(1)</code>; the usual 2-D layout when a single flat block is inconvenient</td></tr>
+      </table>
+      <p>All three satisfy the ADT. All three are <code>O(1)</code> access in the RAM model. They differ by a constant factor of memory traffic that §02 says can reach an order of magnitude, and they differ in whether the elements are <i>near each other</i>, which is what decides whether a traversal runs at cache speed or at DRAM speed. <b>This is the general shape of the ADT/implementation distinction and it will recur in every part of this series:</b> the interface fixes what you can ask, the asymptotics are often identical across implementations, and the choice is then decided by constants, by space, or by which operations are hot.</p>
+      <div class="callout"><b>How to read a complexity table.</b> When a language's documentation says indexing is <code>O(1)</code> and insertion is <code>O(n)</code>, it is describing the <i>implementation</i>, not the ADT — and the numbers only mean something once you know which of the three rows above it is. A <code>list</code> in a dynamic language is row two plus dynamic growth; an <code>ndarray</code> of a numeric type is row one; a "2-D list" is row three. Those are three different memory models wearing the same subscript syntax.</div>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="referential-compact" data-nav="Referential vs compact">
+      <h3><span class="idx">04</span> Referential arrays versus compact arrays</h3>
+      <p class="lede">§01 required every cell to be the same width. Real collections routinely hold things that are not the same width — strings of different lengths, objects of different classes, integers of unbounded magnitude. The universal resolution is to store <b>a fixed-width reference in the cell and the variable-width object elsewhere</b>. That keeps the address formula intact and quietly changes almost every constant on the page.</p>
+
+      <h4>The two layouts</h4>
+      <ul class="notes">
+        <li><b>Compact.</b> The cell <i>is</i> the datum. An array of 4-byte integers holds the integers' bits; a string holds the characters' code units. <code>itemsize</code> is the element's own size, the block is exactly <code>n × itemsize</code> bytes, and one memory access gets you a value.</li>
+        <li><b>Referential.</b> The cell holds a machine address — one word, 8 bytes on a 64-bit machine — and the object lives wherever the allocator put it. <code>itemsize</code> is 8 regardless of what is being stored, so the block is <code>8n</code> bytes <i>plus</i> the objects, and getting a value costs <b>two</b> memory accesses: read the slot, then follow it.</li>
+      </ul>
+      <div class="formula"><span class="lbl">bytes for n elements, compact</span><span class="eq">n × itemsize                              (4n for 32-bit ints)</span>
+<span class="lbl">bytes for n elements, referential</span><span class="eq">8n  +  n × sizeof(boxed element)          (often 8n + 16n to 8n + 28n)</span>
+<span class="lbl">a worked case: one million 64-bit integers</span><span class="eq">compact:     1 000 000 × 8 B  =  8 MB, one contiguous block</span>
+<span class="eq">referential: 1 000 000 × 8 B of pointers + a boxed integer object each,</span>
+<span class="eq">             typically 16–28 B apiece  ⇒  roughly 24–36 MB, scattered</span>
+<span class="lbl">so the same data, same asymptotics</span><span class="eq">≈ 3–4.5× the memory and ≈ 2× the memory accesses per element read</span>
+<span class="lbl">why the box is never small</span><span class="eq">a heap object carries a header — a type/class word and usually a size or refcount word —</span>
+<span class="eq">and is padded to the allocator's alignment, so 16 B is about the floor for a boxed 32-bit int</span></div>
+
+      <h4>Three consequences worth naming</h4>
+      <ul class="notes">
+        <li><b>Aliasing becomes possible.</b> Two cells may hold the <i>same</i> address, so two entries of a referential array can be the same object. Copying the array copies the references, not the objects — which is exactly right for immutable elements and a trap for mutable ones. <a href="multidim-locality-strings.html#slicing-aliasing">§10</a> is about the bug this causes.</li>
+        <li><b>Element access is a dependent load.</b> The second access cannot begin until the first returns, so the processor cannot overlap them. On a cache-resident array this costs a few cycles; on a large scattered one it can cost two DRAM round trips per element, which is the practical reason numerical code insists on compact storage — the <a href="../../../programming/numpy.html">ndarray</a> is a compact array with a dtype, and that is most of why it is fast.</li>
+        <li><b>The compact form requires a declared element type.</b> You cannot pack elements end to end without knowing their width, and you cannot know the width without knowing the type. This is why compact arrays in dynamically typed languages always come with a type code attached, and why a general-purpose list cannot be compact.</li>
+      </ul>
+
+      <h4>Pointers built out of indices</h4>
+      <p>The relationship also runs the other way: if you have arrays but no pointers, you can <b>synthesise</b> pointers from indices, and this is worth seeing once because it demystifies what a pointer is. Represent a collection of records with one array per field — <code>key[]</code>, <code>next[]</code>, <code>prev[]</code> — and let the "pointer" to a record simply be a common index <code>x</code> into all three. Then <code>x.next</code> is <code>next[x]</code>, a null pointer is any index the arrays cannot legally take (0, if the arrays are 1-based, or −1 if 0-based), and a linked list is a chain of array indices. The alternative single-array representation packs each record into a contiguous run <code>A[j .. k]</code>, makes the "pointer" the start index <code>j</code>, and reaches a field by adding its fixed offset — <b>which is precisely §01's address formula applied at the granularity of records rather than machine bytes</b>. A pointer really is nothing more than an index into one enormous array called memory.</p>
+      <div class="callout"><b>The decision rule.</b> Use compact storage when the elements are numbers of a known width and the workload traverses them; use referential storage when the elements are large, heterogeneous, shared, or immutable enough that copying references is the right semantics. The asymptotics are identical either way, so the choice is made entirely on §02's ledger — bytes moved and dependent loads — plus the aliasing semantics you want.</div>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="access-and-update" data-nav="Access vs update">
+      <h3><span class="idx">05</span> What indexing buys, and what insertion costs</h3>
+      <p class="lede">The contiguity that makes <code>get(i)</code> one step is the same contiguity that makes <code>insert(k, v)</code> a loop. There is no slack between cell <code>k</code> and cell <code>k+1</code> — that is what "consecutive" means — so making room means <b>moving every element from <code>k</code> to the end one position right</b>, and closing a hole means moving every element after it one position left. Nothing is being decided cleverly here; the cost is a direct consequence of the layout, and it is the price paid for the <code>O(1)</code> access.</p>
+
+      <div class="formula"><span class="lbl">insert v at index k into n live elements (room already available)</span><span class="eq">for j = n down to k+1:   A[j] = A[j−1]        // shift right, rightmost first</span>
+<span class="eq">A[k] = v;  n = n + 1</span>
+<span class="lbl">element moves</span><span class="eq">n − k        worst case k = 0 ⇒ n,  best case k = n ⇒ 0</span>
+<span class="lbl">delete the element at index k</span><span class="eq">for j = k to n−2:        A[j] = A[j+1]        // shift left, leftmost first</span>
+<span class="eq">A[n−1] = null;  n = n − 1</span>
+<span class="lbl">element moves</span><span class="eq">n − 1 − k    worst case k = 0 ⇒ n−1,  best case k = n−1 ⇒ 0</span>
+<span class="lbl">average over a uniformly random position</span><span class="eq">(1/(n+1)) · ∑ₖ₌₀ⁿ (n − k)  =  (1/(n+1)) · n(n+1)/2  =  n/2  =  <span class="keep">Θ</span>(n)</span></div>
+
+      <h4>Two details that are easy to get wrong</h4>
+      <ul class="notes">
+        <li><b>The shift direction matters.</b> An insert must copy the <i>rightmost</i> element first; going left to right would overwrite each element with its predecessor before the element had been read, smearing <code>A[k]</code> across the tail. A delete must go the other way, leftmost first. Both loops are one line and both have exactly one correct direction — a classic source of silent corruption when the loop is written from memory.</li>
+        <li><b>The average is <code><span class="keep">Θ</span>(n)</code>, not a constant.</b> "Inserting in the middle is only half as expensive" is true and irrelevant: <code>n/2</code> is still linear. The only positions that are genuinely cheap are the ones at or near the end, which is why the end of an array is a privileged place and why every array-backed stack, queue and buffer is designed so that the mutation happens there.</li>
+        <li><b>A real implementation does not write that loop.</b> For a <a href="#referential-compact">compact</a> array the whole shift is one <b>block move</b> of a contiguous byte range — the <code>memmove</code> primitive, which is specified to behave correctly when source and destination <i>overlap</i> and therefore handles the direction question of the previous bullet for you. A tuned <code>memmove</code> copies a cache line or a vector register at a time and can move an order of magnitude more bytes per cycle than a scalar element loop. <b>It does not change the asymptotics:</b> the work is still proportional to <code>n − k</code> bytes moved, and the constant, while small, is not zero. This is the standard shape of the distinction — a <code><span class="keep">Θ</span>(n)</code> operation with an excellent constant is still <code><span class="keep">Θ</span>(n)</code>, and a loop that performs <code>n</code> of them is still quadratic.</li>
+      </ul>
+
+      <div class="viz" id="viz-shift">
+        <div class="vhead">
+          <span class="vtitle">The cost of making room, measured at every position</span>
+          <span class="vhint">the bars are counter output, the dashed line is the closed form</span>
+        </div>
+        <div class="controls">
+          <label for="shift-op">operation</label>
+          <select id="shift-op">
+            <option value="insert" selected>insert 99 at k</option>
+            <option value="delete">delete the element at k</option>
+          </select>
+          <label for="shift-k">position k = <b id="shift-k-out"></b></label>
+          <input type="range" id="shift-k" min="0" max="12" step="1" value="3" />
+        </div>
+        <svg id="shift-svg" width="690" height="320" viewBox="0 0 690 320" role="img" aria-label="A twelve-cell array shown before and after an insertion, with the shifted span marked, above a bar chart of the measured number of element moves for every insertion position"></svg>
+        <div class="readout" id="shift-readout" aria-live="polite"></div>
+      </div>
+      <p>The bar chart is a straight line falling to zero, and that shape <i>is</i> the cost model: inserting at the front moves everything, inserting at the back moves nothing, and every position in between interpolates. Switch to <b>delete</b> and the line is the same shape shifted down by one, because a deletion at index <code>k</code> moves the <code>n − 1 − k</code> elements strictly after it. The dashed closed form is drawn from the formula and the bars from the counter; they lie on top of each other at every position, which is the check. The violet line is the measured mean over all positions — <b>6.0 for an insert into 12 elements</b>, which is <code>n/2</code>, and the reason "insert in the middle" is not a fix for anything.</p>
+
+      <h4>The resulting cost table, and the shape of the trade</h4>
+      <table class="cmp">
+        <tr><th>Operation</th><th>Cost</th><th>Why</th></tr>
+        <tr><td><code>A[i]</code> read or write</td><td><code>O(1)</code></td><td>address arithmetic; no element is consulted but the target</td></tr>
+        <tr><td>append at the end (room available)</td><td><code>O(1)</code></td><td>nothing to move</td></tr>
+        <tr><td>append at the end (no room)</td><td><code><span class="keep">Θ</span>(n)</code> worst case, <code>O(1)</code> amortized</td><td>reallocate and copy — <a href="#dynamic-arrays">§06</a></td></tr>
+        <tr><td>insert at index <code>k</code></td><td><code><span class="keep">Θ</span>(n − k)</code>, <code><span class="keep">Θ</span>(n)</code> worst case</td><td>shift the suffix right</td></tr>
+        <tr><td>delete at index <code>k</code></td><td><code><span class="keep">Θ</span>(n − k)</code>, <code><span class="keep">Θ</span>(n)</code> worst case</td><td>shift the suffix left</td></tr>
+        <tr><td>delete at the end</td><td><code>O(1)</code></td><td>decrement the count — nothing moves</td></tr>
+        <tr><td>search for a value, unsorted</td><td><code><span class="keep">Θ</span>(n)</code> worst and average</td><td>every cell may have to be examined</td></tr>
+        <tr><td>search for a value, sorted</td><td><code><span class="keep">Θ</span>(log n)</code></td><td>binary search — <a href="array-techniques.html#binary-search">§16</a></td></tr>
+        <tr><td>swap two elements</td><td><code>O(1)</code></td><td>two computed addresses, three writes</td></tr>
+        <tr><td>reverse, rotate, partition in place</td><td><code><span class="keep">Θ</span>(n)</code> time, <code>O(1)</code> extra space</td><td><a href="array-techniques.html#in-place">§15</a></td></tr>
+      </table>
+      <p><b>Read the table as a single sentence:</b> arrays are fast to read anywhere and fast to modify only at the end. That is the contract. Every structure in the rest of this series exists because some workload could not live with it — a <a href="../index.html#map">linked list</a> buys <code>O(1)</code> insertion at a known position by giving up computed access; a <a href="../index.html#map">hash table</a> buys expected-constant insertion <i>and</i> lookup by giving up order; a <a href="../balanced-trees/avl-rotations.html#avl">balanced tree</a> buys logarithmic everything by giving up the contiguous block entirely.</p>
+      <div class="callout"><b>The move that removes the shift.</b> When deletions are frequent and <i>order does not matter</i>, deleting at index <code>k</code> can be done in <code>O(1)</code>: overwrite <code>A[k]</code> with <code>A[n−1]</code> and decrement the count. This "swap with the last" trick is everywhere in simulation and game code, and it is a perfect example of paying with a property you did not need — you give up the relative order of the elements and get a linear operation for a constant one.</div>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="dynamic-arrays" data-nav="Dynamic arrays">
+      <h3><span class="idx">06</span> Dynamic arrays: growing a thing that cannot grow</h3>
+      <p class="lede">A block of memory cannot be extended in place — the bytes after it belong to something else. So a growable array is a lie told convincingly: the structure holds a block with <b>spare capacity</b>, tracks how much of it is live, and when the spare runs out <b>allocates a larger block, copies everything across, and frees the old one</b>. A single append can therefore cost <code><span class="keep">Θ</span>(n)</code>. The result that makes the structure usable is that <b>a sequence of <code>n</code> appends costs <code><span class="keep">Θ</span>(n)</code> in total</b>, so each append is <code>O(1)</code> <i>amortized</i>.</p>
+
+      <div class="formula"><span class="lbl">the two numbers a dynamic array keeps</span><span class="eq">num  = elements currently live          size = cells the block actually has</span>
+<span class="eq">invariant:  0 ≤ num ≤ size,  and cells num … size−1 hold nothing meaningful</span>
+<span class="lbl">append, with doubling</span><span class="eq">if num == size:  allocate a block of 2·size;  copy all num elements;  free the old</span>
+<span class="eq">A[num] = x;  num = num + 1</span>
+<span class="lbl">cost of the i-th append, counted in elementary insertions</span><span class="eq">cᵢ = i   if i − 1 is an exact power of 2   (an expansion happened)</span>
+<span class="eq">cᵢ = 1   otherwise</span>
+<span class="lbl">the result</span><span class="eq">∑ᵢ₌₁ⁿ cᵢ  ≤  n + ∑ⱼ₌₀^floor(log₂ n) 2ʲ  &lt;  n + 2n  =  3n     ⇒  amortized ≤ 3 = O(1)</span>
+<span class="lbl">(the cᵢ formula assumes the block starts with one cell; a larger initial capacity only removes early terms)</span><span class="eq"> </span></div>
+
+      <h4>The first nine appends, by hand</h4>
+      <p>Nothing about the argument is visible until you count a concrete run. Start from a one-cell block and append nine times, charging one unit for placing an element and one for each element copied during an expansion:</p>
+      <div class="formula"><span class="lbl">append i · block state before it · what happens · cost cᵢ · running total</span><span class="eq">i=1   num=0 size=1   room available; place                     c=1    total 1</span>
+<span class="eq">i=2   num=1 size=1   FULL → grow to 2, copy 1, place           c=2    total 3</span>
+<span class="eq">i=3   num=2 size=2   FULL → grow to 4, copy 2, place           c=3    total 6</span>
+<span class="eq">i=4   num=3 size=4   room available; place                     c=1    total 7</span>
+<span class="eq">i=5   num=4 size=4   FULL → grow to 8, copy 4, place           c=5    total 12</span>
+<span class="eq">i=6   num=5 size=8   room available; place                     c=1    total 13</span>
+<span class="eq">i=7   num=6 size=8   room available; place                     c=1    total 14</span>
+<span class="eq">i=8   num=7 size=8   room available; place                     c=1    total 15</span>
+<span class="eq">i=9   num=8 size=8   FULL → grow to 16, copy 8, place          c=9    total 24</span>
+<span class="lbl">check against the bound</span><span class="eq">total 24 &lt; 3n = 27 ✓;   the expensive appends are i = 2, 3, 5, 9 — exactly the i with i−1 a power of 2</span>
+<span class="lbl">read the running mean, not the individual cost</span><span class="eq">24/9 = 2.67 per append.  Run to i=16 and the total is 31, a mean of 1.94;</span>
+<span class="eq">the 17th append costs 17, taking the total to 48 and the mean back to 2.82.</span>
+<span class="eq">The mean oscillates inside the 3n bound forever and never escapes it.</span></div>
+      <p>The shape in that column of costs is the whole phenomenon: <b>the expensive steps get more expensive without bound, and they get rarer at exactly the same rate</b>, so their product stays flat. Notice too that the running mean is highest immediately after an expansion and lowest just before one — the sawtooth that <a href="#growth-factor">§07</a>'s measurement runs into.</p>
+
+      <h4>Where the derivation lives</h4>
+      <p>This is <i>the</i> case study of amortized analysis, and it is worked three separate ways — the aggregate method, the accounting method with its three-credit charge, and a potential function <code><span class="keep">Φ</span> = 2·num − size</code> built from its design constraints rather than guessed — in <a href="../../algorithms/analysis/amortized-analysis.html#dynamic-array">the dynamic-array section of Algorithm Analysis</a>, together with instrumented figures showing the per-append spikes and the running mean. Two results from there are worth carrying here because they change how you use the structure, and neither is obvious from the <code>O(1)</code>:</p>
+      <ul class="notes">
+        <li><b>Amortized is not average-case, and the difference is what is being averaged over.</b> An <b>average-case</b> bound averages over a <i>probability distribution on inputs</i> — it is a statement about what usually happens, and a sufficiently unlucky input can beat it. An <b>amortized</b> bound averages over a <i>sequence of operations on one structure</i>, with no probability anywhere: it is a worst-case guarantee on the total, so <b>no input at all</b> can make <code>n</code> appends cost more than <code>3n</code>. The two are often confused because both produce a divided-by-<code>n</code> number. Say which denominator you mean and the confusion cannot survive.</li>
+        <li><b>The per-operation latency is not amortized.</b> An amortized bound is a statement about a <i>sequence</i>. The individual append that triggers a reallocation genuinely copies <code>n</code> elements and genuinely takes linear time, and in a latency-sensitive loop that shows up as a periodic spike exactly when the structure doubles. If you need a worst-case bound per operation, a dynamic array does not give you one; you either preallocate the final capacity or use a structure that resizes incrementally.</li>
+        <li><b>Shrinking has to be hysteretic.</b> If the array halves its block as soon as it is half empty, an adversary alternating append and delete at the boundary forces a reallocation on every operation and the amortized cost degrades to <code><span class="keep">Θ</span>(n)</code>. The standard fix is to shrink only when the array falls to <b>one quarter</b> full, and to shrink to half: a structure holding <code>num = size/4</code> that reallocates to <code>size/2</code> comes out <i>exactly half full</i>, so it needs <code>size/4</code> further appends to fill up again and <code>size/8</code> further deletions to fall to the next shrink threshold — <code><span class="keep">Θ</span>(n)</code> cheap operations before the next resize in either direction. The general principle — <b>after any resize, leave enough slack in both directions that a linear number of cheap operations must pass before the next one</b> — reappears for every structure that resizes, notably <a href="../index.html#map">hash tables</a>.</li>
+      </ul>
+
+      <h4>Why the geometric rule is not negotiable</h4>
+      <p>The tempting alternative is to grow by a fixed number of cells — "add 1000 each time" — which wastes less memory. It is asymptotically catastrophic. With a fixed increment <code>c</code>, reaching <code>n</code> elements requires <code>m = n/c</code> reallocations at sizes <code>c, 2c, 3c, …, mc</code>, and the copying cost is the sum of those sizes:</p>
+      <div class="formula"><span class="lbl">arithmetic growth — increment c per resize</span><span class="eq">total copies = c + 2c + 3c + ⋯ + mc = c·m(m+1)/2,  with m = n/c</span>
+<span class="eq">             = (n/c)·(n/c + 1)·c/2  =  <span class="keep">Θ</span>(n²/c)  =  <span class="keep">Ω</span>(n²)  for any constant c</span>
+<span class="lbl">geometric growth — factor g &gt; 1 per resize</span><span class="eq">total copies ≈ 1 + g + g² + ⋯ + g^(K−1) = (g^K − 1)/(g − 1) ≈ n/(g − 1)  =  <span class="keep">Θ</span>(n)</span>
+<span class="lbl">the structural reason</span><span class="eq">a geometric series is dominated by its LAST term;  an arithmetic one is not</span></div>
+      <p>An increment of 1000 does not rescue it — it divides a quadratic by 1000 and leaves it quadratic, which is invisible at <code>n = 10⁴</code> and fatal at <code>n = 10⁷</code>. <b>The property that matters is that the amount of new space is proportional to the current size</b>, so that the work done by each expansion is paid for by a number of cheap appends proportional to that same size. Any rule with that property gives <code>O(1)</code> amortized; no rule without it does.</p>
+      <div class="callout"><b>What to take away.</b> Appending to a dynamic array is constant time in the only sense that matters for throughput, and linear time in the sense that matters for a latency budget. Both statements are true simultaneously, they are not in tension, and confusing them is the single commonest misreading of an amortized bound.</div>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="growth-factor" data-nav="The growth factor">
+      <h3><span class="idx">07</span> Choosing the growth factor</h3>
+      <p class="lede">Doubling is a convention, not a theorem. The amortized <code>O(1)</code> holds for <i>any</i> constant factor <code>g &gt; 1</code>, so the factor is a free parameter and choosing it is a genuine engineering trade: <b>a larger <code>g</code> means fewer copies and more wasted space; a smaller <code>g</code> means less waste and more copying.</b> Both sides of that sentence have closed forms, and the figure below measures both.</p>
+
+      <div class="formula"><span class="lbl">copies over n appends, factor g</span><span class="eq">≈ 1 + g + g² + ⋯ ≈ n/(g − 1)</span>
+<span class="lbl">total elementary writes per append — one to place, the rest to copy</span><span class="eq">1 + 1/(g − 1)  =  g/(g − 1)</span>
+<span class="lbl">space slack immediately after an expansion</span><span class="eq">(size − num)/size  =  1 − 1/g</span>
+<span class="lbl">the trade, at the usual settings</span><span class="eq">g = 1.25 → 5.00 writes/append, up to 20% slack</span>
+<span class="eq">g = 1.5  → 3.00 writes/append, up to 33% slack</span>
+<span class="eq">g = 2    → 2.00 writes/append, up to 50% slack</span>
+<span class="eq">g = 4    → 1.33 writes/append, up to 75% slack</span></div>
+
+      <div class="viz" id="viz-grow">
+        <div class="vhead">
+          <span class="vtitle">Time against space, as the growth factor moves</span>
+          <span class="vhint">both curves are simulations of the real append loop, counted</span>
+        </div>
+        <div class="controls">
+          <label for="grow-g">growth factor g = <b id="grow-g-out"></b></label>
+          <input type="range" id="grow-g" min="1.1" max="4" step="0.05" value="2" />
+          <label for="grow-n">appends n = <b id="grow-n-out"></b></label>
+          <input type="range" id="grow-n" min="100" max="5000" step="100" value="1000" />
+        </div>
+        <svg id="grow-svg" width="690" height="300" viewBox="0 0 690 300" role="img" aria-label="Two panels plotted against the growth factor: measured elementary writes per append falling steeply toward one beside its closed form, and measured mean wasted-space fraction climbing beneath a dashed worst-case curve"></svg>
+        <div class="readout" id="grow-readout" aria-live="polite"></div>
+      </div>
+      <p>The two panels move in opposite directions and that opposition is the entire content of the decision. The left one drops steeply as <code>g</code> rises from 1.1 — where at <code>n = 1000</code> the counter records about <b>11.9 elementary writes per append</b> — and then flattens hard: by <code>g = 1.5</code> it is about <b>3.1</b>, by <code>g = 2</code> about <b>2.02</b>, and by <code>g = 4</code> about <b>1.34</b>. Past 2 you are buying a fraction of one write per append for another 25 percentage points of memory. The right panel climbs the other way — jaggedly, because where the run happens to stop decides how much slack is live at the end — from a measured mean of about <b>4%</b> at <code>g = 1.1</code> to roughly <b>25%</b> at <code>g = 2</code> and <b>38%</b> at <code>g = 4</code>, beneath a dashed worst case of <code>1 − 1/g</code> that reaches three quarters. <b>The knee is in the region of roughly 1.5 to 2</b>, and the reason the conventional answer is 2 rather than 3 or 4 is that the left curve has already done nearly all of its falling by then.</p>
+      <p>Real containers are spread across a wider band than that knee suggests, because they weigh the two panels differently. Factors of <b>2</b> (several systems languages' vectors, and the growth of small slices in others) and <b>1.5</b> (several standard library list types, and one widely used C++ standard library implementation) are the commonest, but implementations that care more about memory than about copies go lower — around <b>1.25</b> for large blocks in one mainstream runtime, and about <b>1.125</b> for the list type of one widely used dynamic language, whose rule adds <code>size/8</code> plus a small constant. All of those are geometric, so all of them are <code>O(1)</code> amortized; they differ only in where on this figure's two curves they choose to stand. <b>The right reading of the figure is therefore "anything from about 1.1 to about 2 is a defensible engineering choice", not "the answer is 2".</b></p>
+
+      <h4>Two effects visible in the figure that are not in the formula</h4>
+      <ul class="notes">
+        <li><b>The measured curve sits above the closed form, sometimes by a lot, and the gap is not an error.</b> At <code>g = 2</code>, <code>n = 1000</code> the measurement is 2.023 against a prediction of 2.000; at <code>g = 3</code> it is <b>2.09 against a prediction of 1.50</b>, which looks like a failure and is not. <code>g/(g−1)</code> is the limit of the running mean, and the running mean is a <i>sawtooth</i> — it jumps when a copy is charged and decays as cheap appends dilute it. Where you stop counting decides which part of the tooth you read. Stopping just after an expansion reads high; stopping just as the block fills exactly reads low. This is a general hazard of amortized measurement, treated at length in <a href="../../algorithms/analysis/amortized-analysis.html#dynamic-array">the amortized-analysis case study</a>: <i>a partial sequence is not a sequence</i>.</li>
+        <li><b>The first few expansions are not geometric at all.</b> A rule stated as a factor cannot grow a one-slot block — <code>floor(1 × 1.5) = 1</code> — so the simulation, like every real implementation, uses <code>max(size + 1, floor(size × g))</code>. At small <code>g</code> the first several expansions therefore add a single cell each and the geometric argument has not started. Real containers avoid the region entirely by starting from a minimum capacity of four or eight.</li>
+      </ul>
+
+      <h4>Why an allocator might prefer 1.5</h4>
+      <p>There is a second, subtler argument for a factor below 2 that has nothing to do with the slack percentage. It rests on <b>three assumptions that have to be stated, because the argument is false without them</b>: that the allocator hands out blocks at consecutive addresses, that it <i>coalesces</i> adjacent freed blocks back into one usable run, and that the old block is released only after the new one has been allocated and copied into (which is what a growable array has to do).</p>
+      <p>Under those assumptions, follow the arena. With doubling, the capacities are <code>1, 2, 4, 8, …</code>; at the moment the block of 8 is requested, the block of 4 is still live and only <code>1 + 2 = 3</code> bytes of coalesced free space sit below it. Even counting the live block, the whole history is <code>1 + 2 + 4 = 7 &lt; 8</code> — so <b>no doubling request can ever be satisfied from the space its predecessors occupied</b>, however the timing works out, and the arena grows monotonically. With <code>g = 1.5</code> the capacities run <code>1, 2, 3, 4, 6, 9, 13, …</code> and the sums catch up: when the block of 9 is requested the live block is the one of 6, the blocks of 1, 2, 3 and 4 have all been released, and they coalesce into a contiguous run of <code>10 ≥ 9</code> — so the new block can be carved out of the hole its own predecessors left.</p>
+      <div class="formula"><span class="lbl">the condition, in the limit, for the freed run to cover the next request</span><span class="eq">freed after k expansions ≈ g⁰ + g¹ + ⋯ + g^(k−2)  =  (g^(k−1) − 1)/(g − 1)</span>
+<span class="lbl">require it to reach the next request g^k</span><span class="eq">g^(k−1)/(g − 1)  ≥  g^k    ⇔    1/(g − 1) ≥ g    ⇔    g² − g − 1 ≤ 0</span>
+<span class="lbl">the root of g² − g − 1 = 0</span><span class="eq">g = (1 + √5)/2  =  <span class="keep">φ</span>  ≈  1.618</span>
+<span class="lbl">so</span><span class="eq">g &lt; <span class="keep">φ</span>  ⇒  the freed run eventually overtakes the next request, and space is reused</span>
+<span class="eq">g ≥ <span class="keep">φ</span>  ⇒  it never does, and every expansion consumes fresh arena</span></div>
+      <p>Whether any of this matters depends entirely on the allocator, and modern size-class allocators — which round requests to fixed buckets and never coalesce across buckets — make the argument largely moot. It is <b>the argument usually offered</b> for preferring 1.5 to 2, and it is worth knowing for that reason and because it is a clean example of a <i>constant-factor</i> consideration that no asymptotic analysis can see. It is not, however, a proof that 1.5 was chosen for this reason in any particular implementation; treat that as folklore unless you have read the commit that made the choice.</p>
+      <div class="callout"><b>Preallocation beats every factor.</b> If you know the final length, ask for it up front. That turns the whole discussion off: no expansions, no copies, no slack, exactly <code>n</code> cells and exactly <code>n</code> writes. The growth factor is a policy for when you <i>do not</i> know — which is most of the time, which is why the policy exists.</div>
+    </section>
+
+    <nav class="pager" aria-label="Arrays &amp; Strings series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../arrays-strings.html">← Arrays &amp; Strings · overview</a>
+      <a href="../arrays-strings.html" style="color:var(--muted)">Arrays &amp; Strings · overview</a>
+      <a href="multidim-locality-strings.html">Multidimensional Arrays, Locality &amp; Strings →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../../data.js"></script>
+<script src="../../../notes.js"></script>
+<script src="../../dsa-viz.js"></script>
+<script src="../arrays-strings.viz.js"></script>
+</body>
+</html>

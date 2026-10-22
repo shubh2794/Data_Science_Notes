@@ -107,7 +107,9 @@ const LV = (function(){
       .attr("text-anchor",o.anchor||"start").attr("font-family",o.mono?"SF Mono,Menlo,monospace":null)
       .attr("font-weight",o.bold?600:null).text(s);
   }
-  function safe(name, fn){ try { fn(); } catch(e){ if (typeof console!=="undefined") console.error("[llama.viz] "+name+" failed:", e); } }
+  // figures are spread across the hub and its sub-pages; skip any whose svg is not on this page
+  const SVG_ID = { lineage:"lin", block:"blk", rmsnorm:"rms", ropescale:"rsc", params:"pc", kvcache:"kv", compute:"cmp", rejection:"rs", llama4:"l4", quant:"q" };
+  function safe(name, fn){ if (!document.getElementById((SVG_ID[name] || name) + "-svg")) return; try { fn(); } catch(e){ if (typeof console!=="undefined") console.error("[llama.viz] "+name+" failed:", e); } }
   function lcg(seed){ let s = seed >>> 0; return () => { s = (1664525*s + 1013904223) >>> 0; return (s+0.5)/4294967296; }; }
   function gauss(r){ return Math.sqrt(-2*Math.log(r())) * Math.cos(2*Math.PI*r()); }
   return {P, CFG, REL, isMoe, isNope, params, kvBytes, kvPerToken, ffnHidden, invFreq, llama3Scale, fmtN, sci, bytes, gb, ctxLabel, txt, safe, lcg, gauss};

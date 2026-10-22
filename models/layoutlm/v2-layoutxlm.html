@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · LayoutLM: v2 Spatial Attention &amp; LayoutXLM</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../layoutlm.html">LayoutLM</a> · part 2 of 4</p>
+      <h1>LayoutLM: v2 Spatial Attention &amp; LayoutXLM</h1>
+      <p>LayoutLMv2 and its multilingual sibling: text and 49 visual tokens from a ResNeXt-101-FPN backbone in one sequence, the six-part layout embedding, spatial-aware self-attention with learned relative 1-D and 2-D biases, text–image alignment and matching added to masked prediction, configurations and results, and LayoutXLM across 53 languages with XFUND.</p>
+      <div style="margin-top:10px">
+        <span class="pill">LayoutLM</span>
+        <span class="pill">One sequence, three modalities · ResNeXt-FPN 7 × 7 visual tokens · six-part layout embedding · spatial-aware attention bias · MVLM + TIA + TIM · XFUND</span>
+      </div>
+    </header>
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="v2-arch" data-nav="v2: one sequence, three modalities">
+      <h3><span class="idx">11</span> v2: one sequence, three modalities</h3>
+      <p class="lede">LayoutLMv2 moves the image inside the Transformer. A CNN turns the page into 49 visual tokens that are concatenated with the text tokens into one sequence, every token — text or visual — gets a layout embedding, and all of them are pretrained together. The abstract calls it a two-stream multi-modal Transformer encoder; in the architecture section the two token streams are concatenated into one sequence, so text and visual tokens attend to one another in every layer.</p>
+      <div class="formula"><span class="lbl">text token i (0 ≤ i &lt; L): WordPiece id, 1-D index, segment [A] or [B]</span><span class="eq">tᵢ = TokEmb(wᵢ) + PosEmb1D(i) + SegEmb(sᵢ)</span>
+<span class="lbl">visual token i (0 ≤ i &lt; W·H): projected CNN feature, shared 1-D table, segment [C]</span><span class="eq">vᵢ = Proj( VisTokEmb(I)ᵢ ) + PosEmb1D(i) + SegEmb([C])</span>
+<span class="lbl">first-layer input: concatenate, then add each token's layout embedding</span><span class="eq">X = { v₀ … v_(WH−1), t₀ … t_(L−1) }        xᵢ⁽⁰⁾ = Xᵢ + lᵢ</span></div>
+      <h4>What changed from v1</h4>
+      <ul class="notes">
+        <li><b>Initialisation:</b> the encoder and text embeddings come from UniLMv2 rather than BERT (same WordPiece vocabulary size, 30,522); the visual backbone from a Mask R-CNN trained on PubLayNet; everything else is random.</li>
+        <li><b>Segments:</b> [A] and [B] separate text segments (question and context in DocVQA); [C] marks visual tokens. In pretraining all text is [A].</li>
+        <li><b>Layout for everyone:</b> visual tokens get boxes too — the grid cell each one pools — and special tokens get the empty box (0, 0, 0, 0, 0, 0).</li>
+        <li><b>Attention gains relative biases</b> for 1-D and 2-D offsets (<a href="#v2-attn">spatial-aware self-attention</a>).</li>
+        <li><b>Two new objectives</b> tie the modalities together (<a href="#v2-pretrain">TIA and TIM</a>).</li>
+      </ul>
+      <h4>Where released code differs from the paper's description</h4>
+      <ul class="notes">
+        <li>The paper's Figure 1 puts the visual tokens first; the Transformers implementation appends them after the text tokens. Because attention is order-agnostic apart from position terms, this changes indexing, not capacity.</li>
+        <li>The released v2 configurations set <code>has_visual_segment_embedding</code> to false (the large configuration explicitly, the base by the library default), so the checkpoints carry no trained [C] segment vector. One exception in the Transformers code: <code>LayoutLMv2ForQuestionAnswering</code> switches the flag on by default (<code>has_visual_segment_embedding=True</code>), so for question answering that vector is created freshly initialised rather than loaded. The released LayoutXLM-base configuration sets the flag to true.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> v2 feeds text tokens and image tokens through one encoder as a single concatenated sequence, with layout added to both. Pretraining sees all three modalities at once — the change v1's authors named as their next step.</div>
+    </section>
+
+    <!-- 12 ───────────────────────────────────────────── -->
+    <section class="topic" id="v2-visual" data-nav="v2: the 7 × 7 visual tokens">
+      <h3><span class="idx">12</span> v2: the visual backbone and the 7 × 7 visual tokens</h3>
+      <p class="lede">The page is resized to 224 × 224 and passed through a ResNeXt-101-FPN (32 groups × 8 channels, the "MaskRCNN ResNeXt101 32x8d FPN 3X" Detectron2 setting). The output feature map is average-pooled to W × H = 7 × 7, flattened into 49 vectors, and linearly projected to the model width. The backbone's weights are updated during pretraining and fine-tuning.</p>
+      <div class="formula"><span class="lbl">shape arithmetic in the Transformers implementation (FPN level P2, stride 4, 256 channels)</span><span class="eq">224 × 224 × 3  →  P2: 56 × 56 × 256  →  AdaptiveAvgPool(7, 7): 7 × 7 × 256  →  49 × 256  →  Proj: 49 × 768</span>
+<span class="lbl">each visual token averages an 8 × 8 block of P2 cells = a 32 × 32 pixel block of the 224 image</span><span class="eq">56 / 7 = 8        8 × 4 = 32 pixels</span>
+<span class="lbl">visual token (r, c) is given the grid cell as its box, on the 0–1000 grid</span><span class="eq">x̂₀ = floor(1000·c/7)   x̂₁ = floor(1000·(c+1)/7)   ŷ₀ = floor(1000·r/7)   ŷ₁ = floor(1000·(r+1)/7)</span></div>
+      <h4>Worked example</h4>
+      <p>Grid boundaries on the 0–1000 grid are floor(1000·k/7) for k = 0…7: 0, 142, 285, 428, 571, 714, 857, 1000. The word "Total:" at (665, 826, 745, 843) straddles columns 4 (571–714) and 5 (714–857) in row 5 (714–857), so two visual tokens, (5, 4) and (5, 5), cover it. Each visual token summarises about 1/49 of the page — on an A4 scan at 300 dpi that is a block roughly 354 × 501 original pixels, far too coarse to read 10-point text, which is fine because the text arrives from OCR. The visual tokens carry what OCR drops: rules, boxes, logos, stamps, density, the page's overall genre.</p>
+      <div class="viz" id="viz-grid">
+        <div class="vhead">
+          <span class="vtitle">Pooling the page into visual tokens</span>
+          <span class="vhint">drag the pool size · click a cell to see its box and the words under it</span>
+        </div>
+        <div class="controls">
+          <label>pool W = H <input type="range" id="grid-k" min="1" max="14" step="1" value="7" /><span id="grid-kv" style="min-width:40px;display:inline-block"></span></label>
+        </div>
+        <svg id="grid-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="Mock invoice with a grid of visual-token cells overlaid and a selected cell's normalised box"></svg>
+        <div class="readout" aria-live="polite" id="grid-read"></div>
+        <p class="vcap">The released configurations use 7 × 7 (<code>image_feature_pool_shape</code> = [7, 7, 256]); other sizes are shown for intuition only. Cell boxes use the implementation's floor(1000·k/n) boundaries; "pixels per token" is 224 / n on the resized image and the original A4-at-300-dpi page divided by n per axis.</p>
+      </div>
+      <h4>Practical details that bite</h4>
+      <ul class="notes">
+        <li>The Detectron2 backbone expects BGR channel order and normalises internally; LayoutLMv3 by contrast expects normalised RGB (the Transformers documentation states both).</li>
+        <li>The backbone brings about 90M parameters — nearly half of v2-base — and a Detectron2 dependency, one reason v3 removed it.</li>
+        <li>Batch-norm layers in the backbone need synchronising across GPUs in distributed training; the Transformers class exposes a helper for it.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> v2's image branch is deliberately low-resolution — 49 tokens from a 224 × 224 image. It supplies layout and appearance context; reading is still OCR's job.</div>
+    </section>
+
+    <!-- 13 ───────────────────────────────────────────── -->
+    <section class="topic" id="v2-layout" data-nav="v2: the six-part layout embedding">
+      <h3><span class="idx">13</span> v2: the six-part layout embedding</h3>
+      <p class="lede">v2 keeps the 0–1000 normalisation but changes how coordinates enter: each token's box is described by six features — x_min, x_max, width, y_min, y_max, height — and the paper builds the layout embedding by concatenating an x-part and a y-part rather than summing full-width vectors.</p>
+      <div class="formula"><span class="lbl">the paper's layout embedding for token i</span><span class="eq">lᵢ = Concat( PosEmb2Dₓ(x_min, x_max, width),  PosEmb2D_y(y_min, y_max, height) )</span>
+<span class="lbl">the released implementation: six slices concatenated to the model width</span><span class="eq">lᵢ = [ X(x̂₀) | Y(ŷ₀) | X(x̂₁) | Y(ŷ₁) | H(ĥ) | W(ŵ) ]</span>
+<span class="lbl">slice widths from the released configurations (coordinate_size c, shape_size s)</span><span class="eq">base:  4·128 + 2·128 = 768        large:  4·171 + 2·170 = 1024</span></div>
+      <h4>Worked example: the parameter saving</h4>
+      <p>In the open-source v1 code, four tables of 1,024 rows × 768 columns hold 4 · 1024 · 768 = 3,145,728 parameters. v2-base's four tables are 1,024 rows × 128 columns: 4 · 1024 · 128 = 524,288 — one sixth. The x table is still shared by x̂₀ and x̂₁ and the y table by ŷ₀ and ŷ₁; each lookup now fills its own 128-wide slice of the vector instead of being summed with the others, so a left edge and a right edge with the same value occupy different slices.</p>
+      <p>For "Total:" (665, 826, 745, 843): the vector is X[665] in dimensions 0–127, Y[826] in 128–255, X[745] in 256–383, Y[843] in 384–511, H[17] in 512–639 and W[80] in 640–767. It is then added to the token's text embedding.</p>
+      <h4>Width and height are now explicit</h4>
+      <p>This is where width and height embeddings enter the family in the papers: v1's paper uses corners only, v2's paper names width and height among the box features, and v3 embeds "x-axis, y-axis, width and height features separately". (The widely used v1 implementation already added width and height tables, which is why many descriptions of v1 include them.)</p>
+      <div class="callout"><b>Takeaway:</b> v2's layout embedding is the same coordinate lookup, made cheaper by concatenating narrow slices and made richer by explicit width and height.</div>
+    </section>
+
+    <!-- 14 ───────────────────────────────────────────── -->
+    <section class="topic" id="v2-attn" data-nav="v2: spatial-aware self-attention">
+      <h3><span class="idx">14</span> v2: spatial-aware self-attention</h3>
+      <p class="lede">Absolute embeddings tell a token where it is; a relative bias tells a pair of tokens how far apart they are. v2 adds three learned scalars to every attention logit — one for the 1-D offset in the token stream, one for the horizontal offset and one for the vertical offset between the two boxes — before the softmax. The biases differ across heads and are shared across layers.</p>
+      <div class="formula"><span class="lbl">ordinary scaled dot-product score for query i and key j (one head)</span><span class="eq">αᵢⱼ = (xᵢ W_Q)(xⱼ W_K)ᵀ / √d_head</span>
+<span class="lbl">spatial-aware score: add learned biases indexed by relative offsets</span><span class="eq">α′ᵢⱼ = αᵢⱼ + b¹ᴰ[ j − i ] + b²ᴰˣ[ xⱼ − xᵢ ] + b²ᴰʸ[ yⱼ − yᵢ ]</span>
+<span class="lbl">output: softmax over j, then the usual weighted sum of values</span><span class="eq">hᵢ = ∑ⱼ softmaxⱼ(α′ᵢ·) · xⱼ W_V</span></div>
+      <h4>Buckets, not raw offsets</h4>
+      <p>Offsets range over hundreds of tokens and up to ±1000 grid units, so the implementation maps each offset to a bucket with the T5 scheme: half the buckets are for the sign, and within each sign half the small distances get one bucket each while larger distances share logarithmically wider buckets up to a maximum distance, beyond which everything shares the last bucket. The released configurations use 32 buckets up to 128 tokens for 1-D and 64 buckets up to 256 grid units for each 2-D axis.</p>
+      <div class="formula"><span class="lbl">bucket(r; n buckets, max distance D) — bidirectional</span><span class="eq">h = n / 2        base = (r &gt; 0) ? h : 0        m = |r|        e = h / 2
+bucket = base + m                                          if m &lt; e
+bucket = base + min( h − 1,  e + floor( ln(m/e) / ln(D/e) · (h − e) ) )   otherwise</span></div>
+      <div class="viz" id="viz-bucket">
+        <div class="vhead">
+          <span class="vtitle">The bucketing curve</span>
+          <span class="vhint">drag the offset · both schemes use the released configurations</span>
+        </div>
+        <div class="controls">
+          <label>offset r <input type="range" id="bk-r" min="-600" max="600" step="1" value="101" /><span id="bk-rv" style="min-width:48px;display:inline-block"></span></label>
+        </div>
+        <svg id="bk-svg" width="640" height="280" viewBox="0 0 640 280" role="img" aria-label="Step plot of bucket index against relative offset for the 1-D and 2-D bias schemes"></svg>
+        <div class="readout" aria-live="polite" id="bk-read"></div>
+        <p class="vcap">Both curves are computed with the bucket function above: 1-D with n = 32, D = 128; 2-D with n = 64, D = 256 (<code>rel_pos_bins</code>, <code>max_rel_pos</code>, <code>rel_2d_pos_bins</code>, <code>max_rel_2d_pos</code> in the released configurations). Exact buckets cover |r| &lt; 8 (1-D) and |r| &lt; 16 (2-D). Because of the floor, the last bucket of each sign is reached before D: from |r| = 91 in 1-D and |r| = 216 in 2-D, so every offset from there on, including everything beyond D, shares it.</p>
+      </div>
+      <h4>Worked example: "Total:" attending to "$1,240.00"</h4>
+      <p>Take the two tokens as adjacent in the stream (j − i = +1). The implementation measures 2-D offsets on the left edge x̂₀ and the bottom edge ŷ₁: the value's left edge is x̂₀ = 766, so Δx = 766 − 665 = +101; both share ŷ₁ = 843, so Δy = 0.</p>
+      <ul class="notes">
+        <li>1-D: r = 1 &lt; 8, positive → bucket 16 + 1 = <b>17</b>.</li>
+        <li>x: r = 101 ≥ 16 → 16 + floor(ln(101/16) / ln(256/16) · 16) = 16 + floor(1.8425 / 2.7726 · 16) = 16 + floor(10.63) = 26, positive → 32 + 26 = <b>58</b>.</li>
+        <li>y: r = 0 → bucket <b>0</b>.</li>
+        <li>With illustrative learned values b¹ᴰ[17] = 0.40, b²ᴰˣ[58] = 0.25 and b²ᴰʸ[0] = 0.90 for one head, an unbiased logit of 1.20 becomes 1.20 + 0.40 + 0.25 + 0.90 = 2.75: the head can learn to favour "same line, a little to the right" as a pattern, independent of what the words say.</li>
+        <li>A token 600 units above ("Date:" in the page header) has Δy = −600, and |Δy| &gt; D, so it lands in bucket 31, the same bucket as every offset of −216 or below.</li>
+      </ul>
+      <div class="viz" id="viz-attn">
+        <div class="vhead">
+          <span class="vtitle">Relative-bias buckets for every pair on the page</span>
+          <span class="vhint">pick a component and a query · click any cell to read that pair</span>
+        </div>
+        <div class="controls">
+          <label>component <select id="attn-comp"><option value="x">2-D x bucket</option><option value="y">2-D y bucket</option><option value="d1">1-D bucket</option><option value="sum">illustrative total bias</option></select></label>
+          <label>query <select id="attn-key"></select></label>
+        </div>
+        <svg id="attn-svg" width="640" height="380" viewBox="0 0 640 380" role="img" aria-label="Heatmap of relative-position bucket indices between all word pairs on the mock invoice"></svg>
+        <div class="readout" aria-live="polite" id="attn-read"></div>
+        <p class="vcap">Rows are queries, columns keys, both in raster reading order over the mock invoice's words (one token per word here, for legibility). Buckets are exact, from the released configurations and the implementation's choice of x̂₀ and ŷ₁. The "illustrative total bias" uses made-up bias tables that decay with bucket distance from zero — real learned values differ per head and are not published — to show how a head could come to prefer same-line neighbours.</p>
+      </div>
+      <h4>A detail where code and paper disagree</h4>
+      <p>The paper anchors each box by its top-left corner (x_min, y_min). The released implementation — in both v2 and v3 — uses the left edge x̂₀ and the <em>bottom</em> edge ŷ₁. For words on one text line the two choices give nearly the same Δy; they differ when boxes of different heights are compared. Models loaded from the released checkpoints were trained with the implementation's choice.</p>
+      <p>The v2 ablation (DocVQA validation ANLS, base size, one epoch) credits the mechanism with 0.7124 → 0.7217 when added on top of all three pretraining tasks.</p>
+      <div class="callout"><b>Takeaway:</b> spatial-aware attention adds three table lookups per head per token pair — 32 + 64 + 64 scalars per head in total — and lets attention prefer pairs by stream distance and by 2-D offset, which matches the "value is to the right of or below its key" regularity common in forms.</div>
+    </section>
+
+    <!-- 15 ───────────────────────────────────────────── -->
+    <section class="topic" id="v2-pretrain" data-nav="v2 pretraining: MVLM, TIA, TIM">
+      <h3><span class="idx">15</span> v2 pretraining: MVLM, text–image alignment and matching</h3>
+      <p class="lede">With the image inside the model, masked-token prediction alone gives the network no loss that directly requires the pixels — though the v2 ablation shows an MVLM-only model with visual tokens still gains a little (0.6841 → 0.6915 ANLS), so it does use them. v2 therefore adds a fine-grained task, text–image alignment (TIA), which asks each token whether its own image region was covered, and a coarse task, text–image matching (TIM), which asks whether the image and the text come from the same page.</p>
+      <div class="formula"><span class="lbl">MVLM, as in v1 — plus the masked words' image regions are blanked to prevent leakage</span><span class="eq">15% of text tokens selected;  80% [MASK] / 10% random / 10% unchanged</span>
+<span class="lbl">TIA: cover 15% of OCR lines on the image; binary label per token, masked tokens excluded</span><span class="eq">ℒ_TIA = − ∑_(i ∉ M) [ cᵢ log p(Covered | hᵢ) + (1 − cᵢ) log p(Not covered | hᵢ) ]</span>
+<span class="lbl">TIM: on [CLS]; negatives replace the image (15%) or drop it (5%)</span><span class="eq">ℒ_TIM = − [ m log p(Matched | h_CLS) + (1 − m) log p(Not matched | h_CLS) ]        ℒ = ℒ_MVLM + ℒ_TIA + ℒ_TIM</span></div>
+      <h4>Design choices inside TIA</h4>
+      <ul class="notes">
+        <li><b>Line-level covering.</b> At 224 × 224, a covered word-sized patch can be confused with signatures or bars in a figure, so the paper covers whole OCR lines and calls the operation "covering" to keep it distinct from MVLM's masking.</li>
+        <li><b>Masked tokens are excluded</b> from the TIA loss, so the model cannot learn the shortcut "[MASK] implies Covered" (MVLM already blanks those tokens' regions).</li>
+        <li><b>In TIM negatives,</b> the same masking and covering are applied to the substituted image so the model cannot simply spot negatives by their lack of covering, and every TIA label is set to Covered.</li>
+      </ul>
+      <div class="viz" id="viz-tia">
+        <div class="vhead">
+          <span class="vtitle">TIA covering and labels</span>
+          <span class="vhint">resample · change the covered-line rate · switch to a TIM negative</span>
+        </div>
+        <div class="controls">
+          <label>lines covered <input type="range" id="tia-rate" min="0" max="50" step="5" value="15" /><span id="tia-rv" style="min-width:40px;display:inline-block"></span></label>
+          <label>sample <select id="tia-tim"><option value="pos">matched page (TIM positive)</option><option value="neg">replaced image (TIM negative)</option></select></label>
+          <button class="btn ghost" id="tia-new">Resample</button>
+        </div>
+        <svg id="tia-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="Mock invoice with some text lines covered on the image and each word labelled Covered, Not covered, or excluded"></svg>
+        <div class="readout" aria-live="polite" id="tia-read"></div>
+        <p class="vcap">Lines are the raster lines of the mock invoice; covering is drawn per line with a seeded generator, and 15% of words are independently MVLM-masked (shown hatched and excluded from TIA). In the negative case the label set follows the paper: every non-masked token is labelled Covered.</p>
+      </div>
+      <h4>Recipe</h4>
+      <ul class="notes">
+        <li>IIT-CDIP (11M pages, Microsoft Read API OCR); random sliding window over text longer than L = 512; all text in segment [A]; 7 × 7 visual tokens.</li>
+        <li>Adam, learning rate 2 × 10⁻⁵, weight decay 0.01, (β₁, β₂) = (0.9, 0.999), linear warm-up over the first 10% of steps then linear decay. Base: batch 64 for 5 epochs. Large: batch 2,048 for 20 epochs.</li>
+      </ul>
+      <h4>What each task is worth (v2 paper, Table 5)</h4>
+      <table class="cmp">
+        <tr><th>#</th><th>Configuration (base, 1 epoch)</th><th>DocVQA val ANLS</th></tr>
+        <tr><td>1</td><td>LayoutLM architecture, BERT init, MVLM</td><td>0.6841</td></tr>
+        <tr><td>2a</td><td>+ X101-FPN visual tokens, MVLM only</td><td>0.6915</td></tr>
+        <tr><td>2b</td><td>+ TIA</td><td>0.7061</td></tr>
+        <tr><td>2c</td><td>+ TIM (without TIA)</td><td>0.6955</td></tr>
+        <tr><td>2d</td><td>+ TIA + TIM</td><td>0.7124</td></tr>
+        <tr><td>3</td><td>+ spatial-aware self-attention</td><td>0.7217</td></tr>
+        <tr><td>4</td><td>UniLMv2 initialisation instead of BERT</td><td>0.7421</td></tr>
+      </table>
+      <p>TIA contributes more than TIM (+1.46 versus +0.40 ANLS over 2a), together they add +2.09, and the text-side initialisation is worth another +2.04 — the largest change from a single component (only the two alignment tasks together, +2.09, add more).</p>
+      <div class="callout"><b>Takeaway:</b> an image input is most useful when some loss cannot be minimised without it (MVLM alone extracted only +0.74 ANLS from the visual tokens in the ablation). TIA supplies that at the token level, TIM at the page level; in the ablation, the token-level task is the more valuable of the two.</div>
+    </section>
+
+    <!-- 16 ───────────────────────────────────────────── -->
+    <section class="topic" id="v2-results" data-nav="v2: configurations and results">
+      <h3><span class="idx">16</span> v2: configurations, fine-tuning heads and results</h3>
+      <p class="lede">Two sizes: base (12 layers, width 768, 12 heads) and large (24 layers, width 1024, 16 heads), both with the same ResNeXt-101-FPN; the paper reports about 200M and 426M parameters. Fine-tuning heads sit on the text part of the output, except for page classification, which uses the visual tokens as well.</p>
+      <h4>Fine-tuning heads (v2 paper, appendix)</h4>
+      <ul class="notes">
+        <li><b>Sequence labelling</b> (FUNSD, CORD, SROIE, Kleister-NDA): a token-classification layer over text outputs predicting BIO tags.</li>
+        <li><b>DocVQA:</b> extractive QA — start and end classifiers over text tokens; question in segment [A], context in [B], visual tokens in [C]; maximum sequence length L = 384. An extra setting first fine-tunes on a question-generation dataset of almost one million synthetic question–answer pairs.</li>
+        <li><b>RVL-CDIP:</b> concatenate the [CLS] output, a pooled pre-encoder visual feature and a pooled post-encoder visual feature, then classify.</li>
+      </ul>
+      <h4>Results (v2 paper, Tables 2–4 and appendix)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>FUNSD F1</th><th>CORD F1</th><th>SROIE F1</th><th>Kleister-NDA F1</th><th>RVL-CDIP acc.</th><th>DocVQA ANLS (train only)</th></tr>
+        <tr><td>BERT-base</td><td>0.6026</td><td>0.8968</td><td>0.9099</td><td>0.779</td><td>89.81%</td><td>0.6354</td></tr>
+        <tr><td>UniLMv2-base</td><td>0.6890</td><td>0.9092</td><td>0.9459</td><td>0.795</td><td>90.06%</td><td>0.7134</td></tr>
+        <tr><td>LayoutLM-base</td><td>0.7866</td><td>0.9472</td><td>0.9438</td><td>0.827</td><td>94.42% (w/ image)</td><td>0.6979</td></tr>
+        <tr><td>LayoutLM-large</td><td>0.7895</td><td>0.9493</td><td>0.9524</td><td>0.834</td><td>94.43% (w/ image)</td><td>0.7259</td></tr>
+        <tr><td>LayoutLMv2-base</td><td>0.8276</td><td>0.9495</td><td>0.9625</td><td>0.833</td><td>95.25%</td><td>0.7808</td></tr>
+        <tr><td>LayoutLMv2-large</td><td>0.8420</td><td>0.9601</td><td>0.9781*</td><td>0.852</td><td>95.64%</td><td>0.8348</td></tr>
+      </table>
+      <p>* SROIE large is 0.9661 on the raw test set and 0.9781 "excluding OCR mismatch" — the version the abstract quotes. Kleister-NDA figures are on the validation set, since test labels were not available.</p>
+      <h4>DocVQA settings, stated explicitly</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Fine-tuning data</th><th>ANLS</th></tr>
+        <tr><td>LayoutLM-large</td><td>train</td><td>0.7259</td></tr>
+        <tr><td>LayoutLMv2-large</td><td>train</td><td>0.8348</td></tr>
+        <tr><td>LayoutLMv2-large</td><td>train + dev</td><td>0.8529</td></tr>
+        <tr><td>LayoutLMv2-large</td><td>train + dev, after question-generation pre-fine-tuning</td><td>0.8672</td></tr>
+        <tr><td>Leaderboard top-1 before v2 (30-model ensemble)</td><td>—</td><td>0.8506</td></tr>
+      </table>
+      <p>So the like-for-like v1 → v2 comparison at large size is 0.7259 → 0.8348 (train only). The abstract's "0.7295 → 0.8672" pairs a starting value that appears in none of the paper's tables with v2's best setting, which used more data. Every other "from" value in that abstract (0.7895, 0.9493, 0.9524, 0.8340, 0.9443) is LayoutLM-large's figure from the paper's own tables, so 0.7295 is most plausibly a digit transposition of LayoutLM-large's 0.7259 — an inference, since the paper does not say; the "to" end, 0.8672, is not a train-only number.</p>
+      <div class="callout"><b>Takeaway:</b> At large size, v2's gains over v1 are largest on DocVQA (+10.9 ANLS at equal fine-tuning data) and FUNSD (+5.3 F1), and smallest on CORD (+1.1) and RVL-CDIP (+1.2, where v1 already used image features) — plausibly because text and layout already carry most of the receipt signal.</div>
+    </section>
+
+    <!-- 17 ───────────────────────────────────────────── -->
+    <section class="topic" id="layoutxlm" data-nav="LayoutXLM and XFUND">
+      <h3><span class="idx">17</span> LayoutXLM: the v2 recipe in 53 languages, and XFUND</h3>
+      <p class="lede">LayoutXLM keeps the v2 architecture and objectives and changes the data and the text side: the encoder is initialised from the multilingual InfoXLM, the vocabulary is a 250,002-entry SentencePiece model, and pretraining uses 30 million documents in 53 languages. Its paper also introduces XFUND, FUNSD-style forms in seven more languages.</p>
+      <h4>Data pipeline</h4>
+      <ul class="notes">
+        <li><b>Collection:</b> publicly available born-digital multilingual PDFs, downloaded "following the principles and policies of Common Crawl", parsed with PyMuPDF for text, layout and page images — no OCR needed.</li>
+        <li><b>Cleaning:</b> discard documents under 200 characters; detect language with BlingFire and keep a document only if its language score exceeds 0.5.</li>
+        <li><b>Sampling:</b> languages sampled with probability pₗ ∝ (nₗ / n)^0.7, the XLM-style smoothing with the exponent InfoXLM used, to lift low-resource languages. This yields 22M multilingual documents, plus 8M scanned English pages sampled from IIT-CDIP, 30M in total.</li>
+        <li><b>Boxes per token:</b> character-level boxes merged per SentencePiece token (<a href="inputs-v1.html#subwords">sub-words</a>).</li>
+        <li><b>Compute and size:</b> 64 V100 GPUs; about 345M (base) and 625M (large) parameters by the paper's count.</li>
+      </ul>
+      <h4>XFUND</h4>
+      <p>Form templates in Chinese, Japanese, Spanish, French, Italian, German and Portuguese were collected from the web, emptied, filled with synthetic content by annotators (typed or handwritten, each template used once), scanned, OCR'd with the Microsoft Read API and labelled with FUNSD's entity types and key–value links. Each language has 199 forms, 149 for training and 50 for testing — 1,393 in all. Two tasks are defined: semantic entity recognition (SER, BIO labelling) and relation extraction (RE, a biaffine classifier over candidate entity pairs).</p>
+      <h4>Results (LayoutXLM paper, Table 2: fine-tune and test on the same language)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Task</th><th>FUNSD (en)</th><th>ZH</th><th>JA</th><th>ES</th><th>FR</th><th>IT</th><th>DE</th><th>PT</th><th>Avg.</th></tr>
+        <tr><td>XLM-R base</td><td>SER</td><td>0.667</td><td>0.8774</td><td>0.7761</td><td>0.6105</td><td>0.6743</td><td>0.6687</td><td>0.6814</td><td>0.6818</td><td>0.7047</td></tr>
+        <tr><td>InfoXLM base</td><td>SER</td><td>0.6852</td><td>0.8868</td><td>0.7865</td><td>0.6230</td><td>0.7015</td><td>0.6751</td><td>0.7063</td><td>0.7008</td><td>0.7207</td></tr>
+        <tr><td>LayoutXLM base</td><td>SER</td><td>0.794</td><td>0.8924</td><td>0.7921</td><td>0.7550</td><td>0.7902</td><td>0.8082</td><td>0.8222</td><td>0.7903</td><td>0.8056</td></tr>
+        <tr><td>LayoutXLM large</td><td>SER</td><td>0.8225</td><td>0.9161</td><td>0.8033</td><td>0.7830</td><td>0.8098</td><td>0.8275</td><td>0.8361</td><td>0.8273</td><td>0.8282</td></tr>
+        <tr><td>LayoutXLM base</td><td>RE</td><td>0.5483</td><td>0.7073</td><td>0.6963</td><td>0.6896</td><td>0.6353</td><td>0.6415</td><td>0.6551</td><td>0.5718</td><td>0.6432</td></tr>
+        <tr><td>LayoutXLM large</td><td>RE</td><td>0.6404</td><td>0.7888</td><td>0.7255</td><td>0.7666</td><td>0.7102</td><td>0.7691</td><td>0.6843</td><td>0.6796</td><td>0.7206</td></tr>
+      </table>
+      <p>Zero-shot transfer — fine-tune on English FUNSD only, test on each XFUND language — is much harder: LayoutXLM-base averages 0.5561 SER F1 across the eight columns, against 0.4119 for InfoXLM-base, so layout knowledge transfers across languages better than text alone but far from fully.</p>
+      <div class="callout"><b>Takeaway:</b> LayoutXLM shows the v2 recipe transfers to other scripts when the tokenizer, the box granularity and the corpus change with it. For a new language, the OCR engine must cover it too — the model does not read.</div>
+    </section>
+
+    <nav class="pager" aria-label="LayoutLM series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="inputs-v1.html">← LayoutLM: OCR Inputs, 2-D Positions &amp; v1</a>
+      <a href="../layoutlm.html" style="color:var(--muted)">LayoutLM · overview</a>
+      <a href="v3-benchmarks.html">LayoutLM: v3 Patches, Parameters &amp; Benchmarks →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../layoutlm.viz.js"></script>
+</body>
+</html>

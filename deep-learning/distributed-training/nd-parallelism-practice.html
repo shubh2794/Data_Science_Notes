@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · N-D Parallelism, Planning &amp; Checkpointing</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  .tablewrap{overflow-x:auto;max-width:100%}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  pre.code{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:10px 0;overflow-x:auto;font-size:12.5px;line-height:1.5;white-space:pre}
+  pre.code code{background:none;padding:0;border-radius:0;color:var(--ink);font-size:inherit}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../distributed-training.html">Distributed Training</a> · part 5 of 5</p>
+      <h1>N-D Parallelism, Planning &amp; Checkpointing</h1>
+      <p>Putting the axes together and keeping the run alive: composing data, tensor, pipeline and context degrees on a device mesh, choosing degrees for a 70 B model on 64 and 512 GPUs with the page's memory and traffic formulas, what Transformers and Accelerate support, and checkpointing sharded state for fault tolerance at scale.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Distributed Training</span>
+        <span class="pill">Device mesh · placing axes on the network · a 70 B model on 64 and 512 GPUs · Transformers & Accelerate · sharded checkpoints · fault tolerance</span>
+      </div>
+    </header>
+
+    <!-- ═══ 18 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="nd" data-nav="Composing N-D parallelism">
+      <h3><span class="idx">18</span> Composing N-D parallelism: the device mesh</h3>
+      <p class="lede">Large runs use several axes at once. The GPU count factors into a product of degrees, the GPUs are arranged as a multi-dimensional grid (a <b>device mesh</b>), and each axis of the grid runs its own collectives within its own groups. The design question is which axis goes on which link.</p>
+      <div class="formula"><span class="lbl">the bookkeeping identities</span><span class="eq">N GPUs               = TP × CP × PP × DP            (EP is drawn from within DP × CP)
+global batch         = micro-batch × m × DP         (TP, CP and PP do not multiply the batch)
+micro-batches m      = global batch ÷ (micro-batch × DP)   → feeds the pipeline bubble (p−1)/(m+p−1)
+constraints          TP | heads (KV heads with GQA) · PP ≤ layers · CP | sequence · EP | experts</span></div>
+      <p>Each axis has a traffic signature, and the rule is to put the hungriest, least overlappable axis on the fastest, smallest domain:</p>
+      <div class="tablewrap"><table class="grid2">
+        <tr><th>axis</th><th>collective</th><th>volume per step</th><th>overlappable?</th><th>where it goes</th></tr>
+        <tr><td><b>TP</b></td><td>all-reduce (or RS + AG with SP)</td><td>4 × b·s·h per layer per micro-batch</td><td>hardly</td><td>innermost: inside the NVLink domain</td></tr>
+        <tr><td><b>CP</b></td><td>K/V ring or all-gather; Ulysses all-to-all</td><td>≈ 2·s·h_kv per layer (ring)</td><td>ring: yes</td><td>next: inside the node, or across nodes with a ring</td></tr>
+        <tr><td><b>EP</b></td><td>all-to-all ×2</td><td>≈ 2·T·k·h per MoE layer</td><td>partly</td><td>fast all-to-all domain</td></tr>
+        <tr><td><b>PP</b></td><td>send/recv</td><td>b·s·h per boundary per micro-batch</td><td>yes</td><td>across nodes</td></tr>
+        <tr><td><b>DP / FSDP</b></td><td>all-reduce, or RS + AG</td><td>2–3 × Ψ/(TP·PP) per step</td><td>yes (bucketed / prefetched)</td><td>outermost: across nodes and pods</td></tr>
+      </table></div>
+      <p>The Llama 3 paper states this order explicitly: its four dimensions are nested as <b>[TP, CP, PP, DP]</b> from innermost to outermost, with tensor parallelism kept within a server and data parallelism (FSDP) outermost, able to span the slowest links because its traffic overlaps and happens once per step. Its reported configurations for the 405 B model:</p>
+      <div class="tablewrap"><table class="grid2">
+        <tr><th>GPUs</th><th>TP</th><th>CP</th><th>PP</th><th>DP</th><th>sequence</th><th>batch per DP</th><th>tokens per batch</th><th>TFLOP/s per GPU</th><th>BF16 MFU</th></tr>
+        <tr><td class="num">8,192</td><td class="num">8</td><td class="num">1</td><td class="num">16</td><td class="num">64</td><td class="num">8,192</td><td class="num">32</td><td class="num">16 M</td><td class="num">430</td><td class="num">43%</td></tr>
+        <tr><td class="num">16,384</td><td class="num">8</td><td class="num">1</td><td class="num">16</td><td class="num">128</td><td class="num">8,192</td><td class="num">16</td><td class="num">16 M</td><td class="num">400</td><td class="num">41%</td></tr>
+        <tr><td class="num">16,384</td><td class="num">8</td><td class="num">16</td><td class="num">16</td><td class="num">8</td><td class="num">131,072</td><td class="num">16</td><td class="num">16 M</td><td class="num">380</td><td class="num">38%</td></tr>
+      </table></div>
+      <p>The identities check. 8 × 1 × 16 × 64 = 8,192 GPUs, and 32 × 8,192 × 64 ≈ 16.8 M tokens. For long context, CP = 16 takes GPUs away from DP (8 × 16 × 16 × 8 = 16,384) while the tokens per batch stay 16 × 131,072 × 8 ≈ 16.8 M. Doubling GPUs from 8 K to 16 K at a fixed 16 M-token batch halves the batch per DP rank, and utilisation drops from 43% to 41%. That is the fixed-batch squeeze of §07 and §15 showing up in a production run.</p>
+
+      <h4>Building the mesh in code</h4>
+<pre class="code"><code>from torch.distributed.device_mesh import init_device_mesh
+# 64 GPUs = 8 nodes × 8; outermost dim first, so "tp" varies fastest and stays inside a node
+mesh = init_device_mesh("cuda", (8, 8), mesh_dim_names=("dp", "tp"))
+tp_mesh, dp_mesh = mesh["tp"], mesh["dp"]
+# tensor-parallel plan on tp_mesh, then FSDP2 fully_shard(..., mesh=dp_mesh) on each block;
+# a 3-D HSDP layout would be (replicate, shard, tp)</code></pre>
+      <p>Rank <i>r</i> sits at coordinate <code>(r ÷ 8, r mod 8)</code>, so ranks 0–7 form one TP group on node 0 and ranks 0, 8, 16, … form one DP group, one GPU per node. The DTensor placements of §05 (<code>Shard(0)</code> for FSDP) and §20 (<code>Shard</code>, <code>Replicate</code>, <code>Partial</code> for TP) are per mesh dimension, which is what lets one parameter be sharded two ways at once.</p>
+    </section>
+
+    <!-- ═══ 19 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="planner" data-nav="Choosing degrees: worked plans">
+      <h3><span class="idx">19</span> Choosing degrees for real hardware: a 70 B model on 64 and 512 GPUs</h3>
+      <p class="lede">Put the page's formulas together for one model and two cluster sizes. Take a 70 B model (h = 8192, 80 layers, 64 heads), 80 GB GPUs in 8-GPU NVLink nodes with 50 GB/s of InfiniBand per GPU, 4,096-token sequences, a global batch of 4,194,304 tokens (1,024 sequences) and 400 TFLOP/s achieved.</p>
+
+      <h4>64 GPUs (8 nodes)</h4>
+      <div class="formula"><span class="lbl">plan A — FSDP only, DP = 64</span><span class="eq">model state        16 × 70e9 / 64            = 17.5 GB
+activations        selective: 34·s·h × 80 layers = 91 GB   → does not fit
+                   full recompute: 2·s·h × 80    = 5.4 GB  → 22.9 GB, fits (≈ +33% compute for the re-run forward)
+DP traffic         3 · 63/64 · 2 B · 70e9        = 413 GB per GPU → 8.3 s over IB
+compute            6 · 70e9 · 4.19e6 / 64 / 400e12 = 68.8 s        → 12%, hideable</span></div>
+      <div class="formula"><span class="lbl">plan B — TP 8 inside each node × FSDP 8 across nodes</span><span class="eq">model state        16 × 70e9 / (8 × 8)       = 17.5 GB
+activations        SP + selective: 34·s·h/8 × 80 = 11.4 GB  → 28.9 GB, no full recompute
+DP traffic         3 · 7/8 · 2 B · 70e9/8        = 45.9 GB → 0.92 s
+TP traffic         ≈ 17% of layer compute on NVLink (§11), exposed
+micro-batches      1024 / (1 × 8) = 128 per replica</span></div>
+      <p>Both plans fit. A trades a full re-run of the forward for simplicity; B keeps activations without full recompute and moves an order of magnitude less over InfiniBand, paying about 17% exposed TP time instead. At this size either is defensible, and measuring beats arguing.</p>
+
+      <h4>512 GPUs (64 nodes)</h4>
+      <div class="formula"><span class="lbl">same model and batch, 8× the GPUs</span><span class="eq">FSDP 512 only       traffic 3 · 511/512 · 140 GB = 419 GB → 8.4 s   vs compute 8.6 s   → 97%: cannot hide
+TP 8 × FSDP 64      traffic 3 · 63/64 · 17.5 GB   = 51.7 GB → 1.0 s  vs 8.6 s           → 12%
+TP 8 × PP 2 × DP 32 ZeRO-1 state 4·4.4e9 + 12·4.4e9/32 = 19.1 GB; m = 1024/32 = 32 → bubble 1/33 = 3.0%
+                    DP traffic 2 · 31/32 · 8.75 GB = 17 GB → 0.34 s</span></div>
+      <p>The fixed global batch is what changes the answer. At 512 GPUs each GPU gets two sequences per step, so compute per GPU falls 8× while pure FSDP's per-GPU traffic stays at about 3 × the model's 16-bit size. Tensor parallelism divides that traffic by 8, because each DP group now synchronises only a 1/8 slice. Adding a short pipeline trades a 3% bubble for replacing ZeRO-3's per-layer gathers with a once-per-step ZeRO-1 reduce-scatter and all-gather. The planner below evaluates any such layout.</p>
+
+      <div class="viz" id="viz-plan">
+        <div class="vhead">
+          <span class="vtitle">N-D layout planner</span>
+          <span class="vhint">choose degrees; DP is what is left over. Memory, bubble and communication update from the formulas of §04–§17</span>
+        </div>
+        <div class="controls">
+          <label>model <select id="pl-model"><option value="7">7 B</option><option value="13">13 B</option><option value="70" selected>70 B</option><option value="175">175 B</option><option value="405">405 B</option></select></label>
+          <label>GPUs <select id="pl-gpus"><option>8</option><option>16</option><option>32</option><option selected>64</option><option>128</option><option>256</option><option>512</option><option>1024</option><option>2048</option><option>8192</option><option>16384</option></select></label>
+          <label>GPUs per NVLink domain <select id="pl-node"><option selected>8</option><option>72</option></select></label>
+          <label>TP <select id="pl-tp"><option>1</option><option>2</option><option>4</option><option selected>8</option><option>16</option></select></label>
+          <label>PP <select id="pl-pp"><option selected>1</option><option>2</option><option>4</option><option>8</option><option>16</option></select></label>
+          <label>CP <select id="pl-cp"><option selected>1</option><option>2</option><option>4</option><option>8</option><option>16</option></select></label>
+          <label>DP sharding <select id="pl-zero"><option value="z1">ZeRO-1 (shard optimiser)</option><option value="z3" selected>ZeRO-3 / FSDP</option></select></label>
+          <label>sequence <select id="pl-seq"><option>4096</option><option>8192</option><option>32768</option><option>131072</option></select></label>
+          <label>micro-batch <select id="pl-mb"><option selected>1</option><option>2</option><option>4</option></select></label>
+          <label>global batch <select id="pl-gbt"><option value="1">1 Mi tokens</option><option value="2">2 Mi tokens</option><option value="4" selected>4 Mi tokens</option><option value="16">16 Mi tokens</option></select></label>
+          <label>GPU memory <select id="pl-mem"><option value="80" selected>80 GB</option><option value="141">141 GB</option><option value="192">192 GB</option></select></label>
+          <label>activations <select id="pl-ckpt"><option value="sel" selected>SP + selective recompute</option><option value="full">full recompute</option></select></label>
+        </div>
+        <svg id="pl-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Top: a stacked bar of per-GPU memory split into weights, gradients, optimiser state and activations, with a dashed line at the GPU capacity. Below: the first nodes of the device mesh drawn as rows of GPU cells, coloured by pipeline stage, numbered by tensor-parallel rank, with the first data-parallel replica outlined."></svg>
+        <div class="readout" aria-live="polite" id="pl-read"></div>
+        <p class="vcap">Rank order is [TP, CP, PP, DP], innermost first. Model state is 16 bytes per parameter of this GPU's TP × PP shard, sharded over DP per the chosen ZeRO stage. Activations use §12's 34·s·b·h/t (or 2·s·b·h/t) per layer for s/CP local tokens, times L/PP layers, times PP micro-batches in flight on stage 0 under 1F1B. TP communication uses §11's ratio on NVLink if TP fits the domain, otherwise on InfiniBand. DP traffic is 2× (ZeRO-1) or 3× (ZeRO-3) the shard's 16-bit size over InfiniBand once the job spans more than one domain. Compute is 6·Ψ·tokens ÷ GPUs at 400 TFLOP/s. Embedding, logits, all-gather buffers and fragmentation are ignored, so leave headroom.</p>
+      </div>
+      <div class="wrong"><span class="say">Tempting:</span> "More GPUs, same recipe: just raise DP."<br /><span class="fix">Better:</span> at a fixed global batch, raising DP lowers the tokens per GPU and the micro-batches per pipeline. Communication stops hiding and the bubble grows. Past some size, the degrees have to be re-chosen, not scaled.</div>
+    </section>
+
+    <!-- ═══ 20 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="hf" data-nav="Transformers v5.17 and Accelerate">
+      <h3><span class="idx">20</span> In Hugging Face Transformers v5.17 and Accelerate</h3>
+      <p class="lede">What the v5.17.0 documentation says about each scheme on this page, stated as the docs state it. The library's role is to hold the model definition. The distributed mechanics are delegated to Accelerate, PyTorch (DDP, FSDP2, DTensor) or DeepSpeed.</p>
+
+      <h4>Choosing a strategy (the docs' table)</h4>
+      <div class="tablewrap"><table class="grid2">
+        <tr><th>setup</th><th>scenario</th><th>strategy (as listed)</th></tr>
+        <tr><td rowspan="3">single node / multi-GPU</td><td>fits on a single GPU</td><td>DistributedDataParallel or ZeRO</td></tr>
+        <tr><td>doesn't fit on a single GPU</td><td>PipelineParallel, ZeRO or TensorParallel</td></tr>
+        <tr><td>largest model layer doesn't fit</td><td>TensorParallel or ZeRO</td></tr>
+        <tr><td rowspan="2">multi-node / multi-GPU</td><td>fast inter-node connectivity (NVLink or NVSwitch)</td><td>ZeRO or 3D parallelism</td></tr>
+        <tr><td>slow inter-node connectivity</td><td>ZeRO or 3D parallelism</td></tr>
+      </table></div>
+
+      <h4>DDP, FSDP2 and DeepSpeed through the Trainer</h4>
+      <ul class="notes">
+        <li><b>DDP</b> "activates automatically when you launch with a multi-process launcher" such as <code>accelerate launch --num_processes 4 train.py</code>. It is configured by <code>TrainingArguments</code> fields: <code>ddp_bucket_cap_mb</code>, <code>ddp_find_unused_parameters</code> (don't combine with gradient checkpointing), <code>ddp_broadcast_buffers</code>, <code>ddp_backend</code> (<code>"nccl"</code> for NVIDIA GPUs) and <code>ddp_timeout</code>. With <code>gradient_accumulation_steps</code> set, the Trainer "skips the all-reduce on intermediate accumulation steps and runs it only on the final micro-batch".</li>
+        <li><b>FSDP2</b>: set <code>fsdp=True</code> and pass an <code>fsdp_config</code> (or use an Accelerate config with <code>fsdp_version: 2</code>). <code>reshard_after_forward</code> chooses between re-gathering in backward (<code>true</code>, less memory) and keeping parameters gathered (<code>false</code>), the §05 knob. <code>auto_wrap_policy</code> defaults to <code>"TRANSFORMER_BASED_WRAP"</code>. With <code>"NO_WRAP"</code> "the entire model is one FSDP unit and you lose the memory benefit of sharding". <code>state_dict_type</code> defaults to <code>"FULL_STATE_DICT"</code>; <code>"SHARDED_STATE_DICT"</code> writes one file per rank and "only load[s] back into FSDP". <code>cpu_ram_efficient_loading</code> loads on rank 0 and broadcasts. <code>activation_checkpointing</code> should be used instead of the Trainer's gradient checkpointing, and setting both raises an error.</li>
+        <li><b>DeepSpeed</b>: pass a JSON config to <code>TrainingArguments(deepspeed=...)</code>, using <code>"auto"</code> for values the Trainer should fill. The docs warn that mismatched manual values make training "continue silently with the wrong values". For ZeRO-3, <code>TrainingArguments</code> must be created <i>before</i> the model is loaded, or "no memory is saved". <code>offload_optimizer</code> takes <code>cpu</code>, and <code>offload_param</code> is ZeRO-3 only. <code>stage3_gather_16bit_weights_on_model_save</code> is required to save a consolidated 16-bit model. Launch with <code>deepspeed</code>, <code>torchrun</code> or <code>accelerate launch</code>. Accelerate ignores the <code>deepspeed</code> argument in favour of its own config file.</li>
+      </ul>
+
+      <h4>Tensor parallelism: DistributedConfig and tp_plan</h4>
+<pre class="code"><code>import torch
+from transformers import AutoModelForCausalLM, DistributedConfig
+
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-0.6B",
+    dtype=torch.bfloat16,
+    distributed_config=DistributedConfig(tp_size=4),   # uses the model's base_model_tp_plan
+)
+# torchrun --nproc-per-node 4 train_tp.py</code></pre>
+      <ul class="notes">
+        <li>A model supports it if its config defines <code>base_model_tp_plan</code> (check <code>model.supports_tp_plan</code>). A custom plan maps module names to strategy names: <code>"colwise"</code> for q/k/v projections and <code>"rowwise"</code> for the output projection, exactly §10's column-then-row pattern. <code>"colwise"</code> leaves its output sharded for the following <code>"rowwise"</code>, whose <code>Partial()</code> output is all-reduced (or reduce-scattered) on redistribution.</li>
+        <li>Other strategies include <code>"sequence_parallel"</code> for per-token norms (§12), <code>"packed_colwise"</code>/<code>"packed_rowwise"</code> for fused weights such as <code>gate_up_proj</code> (plain column sharding splits them wrongly; see <a href="../transformers/definitions-loading.html#weightconv">Transformers</a>), and <code>"replicated_with_grad_allreduce"</code>. The implementation is DTensor on a <code>DeviceMesh</code>.</li>
+        <li>Passing <code>tp_plan</code> directly to <code>from_pretrained()</code> is deprecated and "will be removed in v5.18". <code>device_map</code> must not be combined with <code>distributed_config</code>.</li>
+        <li>The Trainer "detects the tensor parallel plan, reads <code>tp_size</code> from the model, and creates a <code>ParallelismConfig</code> automatically". To combine TP with FSDP, pass Accelerate's <code>ParallelismConfig(tp_size=...)</code> via <code>TrainingArguments(parallelism_config=...)</code>.</li>
+        <li>The full <code>DistributedConfig</code> signature in v5.17: <code>tp_size</code>, <code>tp_plan</code>, <code>enable_sequence_parallel</code> (documented as "Reserved for sequence parallelism. Not wired up yet."), <code>enable_expert_parallel</code>, <code>fsdp_size</code>, <code>fsdp_cpu_offload</code>, <code>fsdp_mixed_precision</code>, <code>pp_size</code>.</li>
+      </ul>
+
+      <h4>Expert parallelism</h4>
+      <p><code>DistributedConfig(tp_size=WORLD_SIZE, enable_expert_parallel=True)</code> switches an MoE model to the <code>ep_plan</code> in its config. Per the docs, it "automatically enables tensor parallelism for attention layers", expert weights are split "so each device loads only its local experts", the <code>ep_router</code> "routes tokens to experts and an all-reduce operation combines their outputs", and "the number of devices must evenly divide the total number of experts". That is a different mechanism from §17's all-to-all: router scores for non-local experts are masked, and the partial outputs are summed with an all-reduce.</p>
+
+      <div class="callout"><b>Recorded conflicts and gaps, doc against paper.</b>
+      <ul class="notes" style="margin-top:8px">
+        <li>The DeepSpeed page says each additional ZeRO stage reduces memory "at the cost of more inter-GPU communication". The ZeRO paper's analysis (§07) gives stages 1 and 2 the <i>same</i> volume as DDP (2Ψ); only stage 3 adds traffic (3Ψ). The page's own advice, "use ZeRO-3 only when your model doesn't fit across GPUs with ZeRO-2", is consistent with the paper.</li>
+        <li>The strategy table labels fast <i>inter</i>-node connectivity as "NVLink or NVSwitch". On standard servers those are intra-node links, and cross-node traffic uses InfiniBand or Ethernet (rack-scale NVLink systems excepted). Its two multi-node rows also recommend the same strategies, so it does not by itself distinguish fast from slow networks. §18–§19 do.</li>
+        <li>Expert parallelism is documented with an all-reduce combine rather than the all-to-all dispatch/combine of GShard-style systems (§17).</li>
+        <li>The v5.17.0 documentation has no context-parallelism guide (the page exists only in the main-branch docs), and <code>enable_sequence_parallel</code> is marked not wired up. Nothing about context parallelism in Transformers is stated here for that version.</li>
+      </ul></div>
+    </section>
+
+    <!-- ═══ 21 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="checkpoint" data-nav="Fault tolerance and sharded checkpoints">
+      <h3><span class="idx">21</span> Fault tolerance and checkpointing sharded state</h3>
+      <p class="lede">At thousands of GPUs, failure is a routine event, not an exception, and the checkpoint is several times the model's size. How often you save, and in what shape, is part of the parallelism design.</p>
+      <p>The Llama 3 paper reports 466 job interruptions in a 54-day snapshot of pre-training: 47 planned and 419 unexpected. About 78% of the unexpected ones were attributed to confirmed or suspected hardware issues, with GPU issues the largest category at 58.7%. Automation handled all but three, and the team reports higher than 90% effective training time.</p>
+
+      <h4>How often to checkpoint</h4>
+      <div class="formula"><span class="lbl">first-order optimum interval (Young, 1974), save cost <span class="keep">δ</span>, mean time between failures M</span><span class="eq">τ*            ≈ √(2 · δ · M)
+lost fraction ≈ δ/τ + τ/(2M)        (time spent saving + expected recomputation after a failure)
+worked: 419 failures in 54 days → M ≈ 54 × 24 / 419 = 3.1 h = 11,100 s
+        δ = 60 s (blocking save)    → τ* ≈ √(2·60·11,100) ≈ 1,150 s ≈ 19 min, lost ≈ 5.2% + 5.2% = 10.4%
+        δ = 10 s (async to host)    → τ* ≈ 470 s ≈ 8 min,  lost ≈ 2.1% + 2.1% = 4.2%</span></div>
+      <p>The restart itself (rescheduling, re-initialising NCCL, reloading) adds to every failure, so the real loss is higher. The formula shows the lever: making saves cheap shortens the optimal interval and cuts both terms. <b>Asynchronous checkpointing</b> copies the shards to host memory, which blocks training only briefly, and writes them to storage in the background.</p>
+
+      <h4>Sharded, not gathered</h4>
+      <div class="formula"><span class="lbl">what a full training checkpoint holds, 70 B, mixed-precision Adam</span><span class="eq">16 bytes × 70e9 = 1.12 TB   (fp32 master 280 GB + m 280 GB + v 280 GB + 16-bit weights 140 GB + …)
+gathered to rank 0 : one host must hold and write 1.12 TB
+sharded, 64 ranks  : 17.5 GB per rank, written in parallel</span></div>
+      <p>Sharded checkpoints (FSDP's <code>SHARDED_STATE_DICT</code>, DeepSpeed's per-rank files, PyTorch Distributed Checkpoint) have every rank write its own shard plus metadata about where each piece belongs. The metadata is what makes <b>resharding</b> possible: loading onto a different world size or parallel layout by reading, for each new shard, the byte ranges it needs from the old ones. DeepSpeed calls its version universal checkpointing. The weights-only export for inference is a separate step: gather the 16-bit weights once (DeepSpeed's <code>stage3_gather_16bit_weights_on_model_save</code>, or FSDP's full state dict) at the end.</p>
+      <ul class="notes">
+        <li><b>Detect hangs, not only crashes.</b> A dead rank leaves the others blocked inside a collective. A collective timeout (DDP's <code>timeout</code>, the Trainer's <code>ddp_timeout</code>) turns a silent hang into an error that the launcher can act on.</li>
+        <li><b>Restart automatically.</b> torchrun's elastic mode restarts the worker group on failure (<code>--max-restarts</code>), re-running rendezvous, and the script resumes from the last checkpoint.</li>
+        <li><b>Save the data position and RNG state</b> with the model. Resuming at the right weights but re-reading already-seen data changes the run.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Distributed Training series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="pipeline-expert.html">← Pipeline &amp; Expert Parallelism</a>
+      <a href="../distributed-training.html" style="color:var(--muted)">Distributed Training · overview</a>
+      <a href="../distributed-training.html">Distributed Training · overview →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../distributed-training.viz.js"></script>
+</body>
+</html>

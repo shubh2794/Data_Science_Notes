@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · T5: Text-to-Text Format &amp; Architecture</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+.tokrow{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0;font-family:"SF Mono",Menlo,monospace;font-size:11.5px}
+.tokrow span{padding:2px 5px;border-radius:4px;background:rgba(91,156,255,.16);color:#cfe0ff}
+.tokrow span.sp{background:rgba(192,132,252,.2);color:#e9d5ff}
+.tokrow span.bad{background:rgba(248,113,113,.25);color:#fecaca}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../t5.html">T5</a> · part 1 of 4</p>
+      <h1>T5: Text-to-Text Format &amp; Architecture</h1>
+      <p>The model T5 trains: every task cast as a prefixed input string and a target string, the encoder–decoder with bias-free RMS-style pre-norm, 32 log-spaced relative-position buckets, unscaled attention offset by initialisation, the ReLU and GEGLU feed-forward layers, the five configurations, and parameter counts recomputed from them.</p>
+      <div style="margin-top:10px">
+        <span class="pill">T5</span>
+        <span class="pill">Task prefixes · encoder–decoder · RMS-style pre-norm · 32 relative-position buckets · no √d scaling · ReLU → GEGLU · five sizes · parameter count</span>
+      </div>
+    </header>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="text-to-text" data-nav="Text-to-text and task prefixes">
+      <h3><span class="idx">02</span> Text-to-text: every task as a string, named by a prefix</h3>
+      <p class="lede">To tell the model which task to perform, T5 prepends a task-specific text prefix to the input. Classification labels become words, regression becomes a number written as text, and reference-resolution tasks become "name the noun". The paper found the exact wording of the prefix had limited impact and treated it as a hyperparameter.</p>
+      <div class="formula"><span class="lbl">the input is the task name plus each field as "name: value"</span><span class="eq">x = "mnli hypothesis: My feelings towards pigeons are filled with animosity.
+     premise: I hate pigeons."        y = "entailment"</span>
+<span class="lbl">STS-B: a 1–5 similarity score rounded to the nearest 0.2 and written as a string — a 21-way classification</span><span class="eq">y = str(round(5 · s) / 5):    3.25 → "3.2",    2.57 → "2.6"
+classes 1.0, 1.2, …, 5.0  ⇒  (5 − 1) / 0.2 + 1 = 21</span>
+<span class="lbl">an output that is not a valid label is scored as wrong</span><span class="eq">ŷ ∉ {entailment, neutral, contradiction}  ⇒  incorrect    (never observed, per the paper)</span></div>
+      <h4>How each benchmark was cast</h4>
+      <table class="cmp">
+        <tr><th>Task</th><th>Input (Appendix D format)</th><th>Target</th></tr>
+        <tr><td>WMT translation</td><td><code>translate English to German: That is good.</code></td><td><code>Das ist gut.</code></td></tr>
+        <tr><td>CNN/Daily Mail</td><td><code>summarize: state authorities dispatched …</code></td><td>the summary</td></tr>
+        <tr><td>CoLA, SST-2, RTE, MRPC, QQP</td><td><code>cola sentence: …</code>, <code>rte sentence1: … sentence2: …</code></td><td><code>acceptable</code>, <code>positive</code>, <code>not_entailment</code>, <code>equivalent</code>, <code>not_duplicate</code></td></tr>
+        <tr><td>MNLI, CB</td><td><code>mnli hypothesis: … premise: …</code></td><td><code>entailment</code> / <code>neutral</code> / <code>contradiction</code></td></tr>
+        <tr><td>STS-B</td><td><code>stsb sentence1: … sentence2: …</code></td><td><code>3.2</code></td></tr>
+        <tr><td>SQuAD</td><td><code>question: … context: …</code> (no task name)</td><td>the answer text, generated</td></tr>
+        <tr><td>WSC, WNLI, DPR</td><td>the passage with the pronoun marked: <code>… which made *it* pleasant and airy.</code></td><td>the referent noun: <code>stable</code></td></tr>
+      </table>
+      <h4>Details that differ between the paper's text and its code</h4>
+      <ul class="notes">
+        <li><b>Field order.</b> Section 2.4 writes MNLI as "mnli premise: … hypothesis: …", but Appendix D, which shows the actual preprocessed examples, has "mnli hypothesis: … premise: …" — the fields appear in alphabetical order of their names (likewise "cb hypothesis: … premise: …"). Use the Appendix D form with the released checkpoints.</li>
+        <li><b>Label words.</b> Figure 1 shows a CoLA target "not acceptable", but the label names in the dataset code are <code>unacceptable</code> and <code>acceptable</code>, and Appendix D's example target is "acceptable". Multi-word labels use underscores (<code>not_entailment</code>).</li>
+        <li><b>WSC.</b> Only examples labelled True can be trained on (the referent of a False candidate is unknown); at evaluation a prediction counts as True when its words are a subset of the candidate's or vice versa. WNLI overlaps the WSC training set, so the paper never trains on it and excludes it from validation GLUE averages.</li>
+      </ul>
+      <div class="viz" id="viz-task">
+        <div class="vhead">
+          <span class="vtitle">One model, many tasks: inputs and targets as tokens</span>
+          <span class="vhint">pick a task · drag the STS-B score to see the rounding</span>
+        </div>
+        <div class="controls">
+          <label>task <select id="task-pick">
+            <option value="ende">WMT English → German</option>
+            <option value="sum">CNN/DM summarisation</option>
+            <option value="cola">CoLA acceptability</option>
+            <option value="stsb">STS-B similarity</option>
+            <option value="mnli">MNLI inference</option>
+            <option value="rte">RTE inference</option>
+            <option value="wsc">WSC / DPR</option>
+            <option value="squad">SQuAD</option>
+          </select></label>
+          <label>STS-B gold score <input type="range" id="task-sts" min="100" max="500" step="1" value="325" /> <span id="task-stsv"></span></label>
+        </div>
+        <svg id="task-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="The chosen task's input and target strings split into the SentencePiece pieces the model sees, with token counts, and the STS-B rounding to a 0.2 grid"></svg>
+        <div class="readout" aria-live="polite" id="task-read"></div>
+        <p class="vcap">Strings are from the paper's Figure 1, Section 2.4 and Appendix D (the summarisation and SQuAD inputs are shortened). Pieces were produced with the released t5-small tokenizer; <code>▁</code> marks a preceding space, and the tokenizer appends <code>&lt;/s&gt;</code> (counted). The STS-B panel applies the paper's rule: round to the nearest 0.2 and print the number.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> text-to-text removes task-specific heads, so everything learned in pretraining — including the output vocabulary and the decoder — transfers. The cost is that the model must spell its labels, which is why a label must be tokenized and matched exactly, and why a regression target has to be quantised.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="architecture" data-nav="Architecture at a glance">
+      <h3><span class="idx">03</span> Architecture at a glance</h3>
+      <p class="lede">T5 follows the original Transformer encoder–decoder closely. The paper lists three departures: layer normalisation without a bias and without mean-centring, applied to the input of each sub-layer (pre-norm) with the residual path left un-normalised; a simplified relative position scheme in place of sinusoidal embeddings; and no additive biases. The output softmax shares its weights with the input embedding.</p>
+      <div class="formula"><span class="lbl">encoder block (N blocks), then a final norm and dropout</span><span class="eq">h ← h + Dropout(SelfAttn_full(LN(h), bias_enc))          h ← h + Dropout(FF(LN(h)))</span>
+<span class="lbl">decoder block (N blocks), then a final norm and dropout</span><span class="eq">h ← h + Dropout(SelfAttn_causal(LN(h), bias_dec))     h ← h + Dropout(CrossAttn(LN(h), z))
+h ← h + Dropout(FF(LN(h)))</span>
+<span class="lbl">output distribution: the tied embedding E; the Hugging Face code rescales by d_model^(−1/2) when tied</span><span class="eq">p(yₜ | y&lt;ₜ, x) = softmax( E · (d_model^(−1/2) · hₜ) ),     E ∈ ℝ^(32,128 × d_model)</span></div>
+      <h4>What is and is not in a block</h4>
+      <ul class="notes">
+        <li><b>Attention</b> has four bias-free projections: W_Q, W_K, W_V ∈ ℝ^(d_model × h·d_kv) and W_O ∈ ℝ^(h·d_kv × d_model). The inner width h·d_kv need not equal d_model — T5-3B and T5-11B make it 4× and 16× larger (<a href="#configs">configurations</a>).</li>
+        <li><b>Feed-forward</b> is dense–ReLU–dense with no biases (v1.0), or a GEGLU with three matrices (v1.1).</li>
+        <li><b>Position</b> enters only through the bias added to attention logits, computed in the first layer of each stack and reused by every layer of that stack. Cross-attention has no position bias.</li>
+        <li><b>Dropout</b> (0.1 in the study) is applied inside the feed-forward network, on each residual branch, on the attention weights, and at the input and output of each stack.</li>
+      </ul>
+      <div class="viz" id="viz-arch">
+        <div class="vhead">
+          <span class="vtitle">Encoder and decoder blocks with their shapes</span>
+          <span class="vhint">pick a configuration · hover a box for its weight shape</span>
+        </div>
+        <div class="controls">
+          <label>configuration <select id="arch-cfg"></select></label>
+        </div>
+        <svg id="arch-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Block diagram of a T5 encoder block and decoder block with norms, attention, cross-attention and feed-forward sub-layers, labelled with the chosen configuration's weight shapes"></svg>
+        <div class="readout" aria-live="polite" id="arch-read"></div>
+        <p class="vcap">Shapes come from each checkpoint's released config.json (d_model, d_ff, d_kv, num_heads, num_layers, num_decoder_layers, feed_forward_proj, tie_word_embeddings). Parameter counts per block are computed from those shapes; biases are absent everywhere, and each norm has d_model scale parameters.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> architecturally T5 is the 2017 encoder–decoder with modern hygiene: pre-norm residuals, scale-only norms, no biases, relative position biases, tied embeddings. The authors deliberately left these choices out of the study as "orthogonal to the experimental factors".</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="layernorm" data-nav="Scale-only layer norm">
+      <h3><span class="idx">04</span> The simplified layer norm (RMS-style) and pre-norm residuals</h3>
+      <p class="lede">T5's layer normalisation only rescales: it divides each vector by its root-mean-square and multiplies by a learned gain, with no mean subtraction and no additive bias. This is the operation later named RMSNorm; the Hugging Face implementation says so in its comments, and computes the mean square in 32-bit floats even for half-precision inputs.</p>
+      <div class="formula"><span class="lbl">standard LayerNorm, for comparison</span><span class="eq">LN(x) = g ⊙ (x − μ) / √(σ² + ε) + b,      μ = (1/d) Σᵢ xᵢ,   σ² = (1/d) Σᵢ (xᵢ − μ)²</span>
+<span class="lbl">T5 layer norm: no centring, no bias</span><span class="eq">T5LN(x) = g ⊙ x / √( (1/d) Σᵢ xᵢ² + ε ),      g ∈ ℝ^d initialised to 1,   ε = 10⁻⁶</span>
+<span class="lbl">pre-norm residual: the skip path is never normalised</span><span class="eq">h ← h + F(T5LN(h))           (post-norm would be h ← LN(h + F(h)))</span></div>
+      <h4>Worked example</h4>
+      <p>Take x = (2, 4, 6, 8). Its mean square is (4 + 16 + 36 + 64)/4 = 30, so T5LN(x) = x / √30 = (0.365, 0.730, 1.095, 1.461) with g = 1. Standard LayerNorm would first subtract the mean 5, giving (−3, −1, 1, 3) / √5 = (−1.342, −0.447, 0.447, 1.342). Adding a constant c to every coordinate changes T5LN's output (the mean is not removed) but leaves LayerNorm's unchanged; scaling x by any positive factor leaves both unchanged (up to ε).</p>
+      <ul class="notes">
+        <li><b>Parameters.</b> One gain vector of d_model per norm: two per encoder block, three per decoder block, plus one final norm per stack — 768 × (2·12 + 3·12 + 2) = 47,616 parameters in T5-Base, 0.02% of the model.</li>
+        <li><b>Why pre-norm.</b> With the norm inside the branch, the residual stream is a sum of branch outputs plus the embedding; gradients reach early layers through the identity path undisturbed, which is generally credited with making deep pre-norm stacks such as T5's 24 + 24 layers easier to train than post-norm ones.</li>
+        <li><b>A consequence for half precision.</b> Because nothing normalises the residual stream until the final norm, its magnitude can grow with depth — one ingredient of the fp16 overflow problem in <a href="../t5.html#pitfalls">pitfalls</a>.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> T5's norm is RMSNorm before it had a name: cheaper than LayerNorm (no mean, no bias) and, in the pre-norm position, friendly to deep stacks. Loading T5 weights into a LayerNorm-based implementation silently changes the network.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="relpos" data-nav="Relative position bias">
+      <h3><span class="idx">05</span> Relative position bias: 32 log-spaced buckets</h3>
+      <p class="lede">T5 has no position embeddings on its tokens. Instead, each attention head adds a learned scalar to every query–key logit, chosen by the bucketed offset between the key's and the query's positions. There are 32 buckets per head; small offsets get their own bucket, larger ones share logarithmically wider buckets, and everything beyond the last boundary shares one. The table is learned once per stack — in the first layer — and reused by all layers of that stack; the encoder's and the decoder's tables are separate.</p>
+      <div class="formula"><span class="lbl">attention logits of head h: no 1/√d_kv scaling in T5 (see the next section)</span><span class="eq">sᵢⱼ = qᵢ · kⱼ + B_h[ bucket(j − i) ],       B ∈ ℝ^(32 × heads) per stack</span>
+<span class="lbl">bidirectional (encoder): half the buckets for keys after the query, half for keys at or before it</span><span class="eq">n = 32 / 2 = 16,   offset r = j − i,   base = 16 · [r &gt; 0],   a = |r|</span>
+<span class="lbl">causal (decoder): future offsets never occur; all 32 buckets measure the distance into the past</span><span class="eq">n = 32,   base = 0,   a = max(0, −r)</span>
+<span class="lbl">exact buckets for small distances, logarithmic above, capped at the last bucket (max_distance D = 128)</span><span class="eq">e = n / 2;     bucket = base + a                                    if a &lt; e
+       bucket = base + min( n − 1,  e + ⌊ ln(a / e) / ln(D / e) · (n − e) ⌋ )     otherwise</span></div>
+      <h4>Worked example: where each bucket starts</h4>
+      <table class="cmp">
+        <tr><th>Stack</th><th>Exact buckets</th><th>Logarithmic buckets (distance at which each starts)</th><th>Last bucket covers</th></tr>
+        <tr><td>Encoder, per direction (16 buckets)</td><td>0 – 7</td><td>8, 12, 16, 23, 32, 46, 64, 91</td><td>distance ≥ 91</td></tr>
+        <tr><td>Decoder (32 buckets, past only)</td><td>0 – 15</td><td>16, 19, 21, 24, 27, 31, 35, 40, 46, 52, 59, 67, 77, 87, 99, 113</td><td>distance ≥ 113</td></tr>
+      </table>
+      <p>For the encoder, a = 20 is not exact (20 ≥ 8), so bucket = 8 + ⌊ln(20/8)/ln(16) · 8⌋ = 8 + ⌊0.3305 · 8⌋ = 8 + 2 = 10, the bucket that starts at 16. The formula would reach 16 — one past the last bucket — at a = 128, which is where "max distance 128" comes from; but the cap at n − 1 means the last bucket already starts at 91 in the encoder and 113 in the decoder. The paper's sentence "ranges that increase in size logarithmically up to an offset of 128 beyond which we assign all relative positions to the same embedding" is therefore true but loose: offsets from 91 (encoder) or 113 (decoder) upward already share one value. One more quirk of the encoder: offset 0 goes to bucket 0 and a key after the query has distance at least 1, so bucket 16 ("after, distance 0") can never be selected — the encoder uses 31 of its 32 buckets.</p>
+      <h4>Consequences</h4>
+      <ul class="notes">
+        <li><b>Cheap and length-agnostic.</b> The whole position mechanism of T5-Base is 32 × 12 = 384 numbers per stack. Nothing ties the model to 512 positions; the <code>n_positions: 512</code> in the v1.0 configs is informational. Beyond the training length quality is not guaranteed, and attention cost still grows quadratically.</li>
+        <li><b>A single layer is blind beyond the last boundary</b> — it cannot tell a key 200 tokens away from one 2,000 away — but, as the paper notes, stacked layers can combine local information to build sensitivity to larger offsets.</li>
+        <li><b>Padding side does not matter</b> for the encoder, because nothing depends on absolute position (the library documentation says left or right padding both work).</li>
+      </ul>
+      <div class="viz" id="viz-rel">
+        <div class="vhead">
+          <span class="vtitle">From relative offset to bucket</span>
+          <span class="vhint">switch encoder/decoder · change the bucket count and maximum distance</span>
+        </div>
+        <div class="controls">
+          <label>stack <select id="rel-dir">
+            <option value="bi">encoder (bidirectional)</option>
+            <option value="uni">decoder (causal)</option>
+          </select></label>
+          <label>buckets <input type="range" id="rel-nb" min="8" max="64" step="8" value="32" /> <span id="rel-nbv"></span></label>
+          <label>max distance <input type="range" id="rel-md" min="32" max="512" step="32" value="128" /> <span id="rel-mdv"></span></label>
+        </div>
+        <svg id="rel-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Step plot of bucket index against relative offset from minus 160 to plus 160, with bucket start positions marked and a strip showing the query row of a bias matrix"></svg>
+        <div class="readout" aria-live="polite" id="rel-read"></div>
+        <p class="vcap">A port of the released <code>_relative_position_bucket</code> (Hugging Face, adapted from Mesh TensorFlow), evaluated for offsets r = j − i from −160 to +160. The strip below the plot colours one query's row of the bias matrix by bucket; in the decoder, offsets r &gt; 0 are masked by causality and map to bucket 0 only formally.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> T5's position signal is a per-head, per-bucket scalar — fine resolution nearby, coarse far away, nothing beyond the last bucket boundary within a layer. It costs almost no parameters and does not fix a maximum length, which is why T5 checkpoints accept inputs longer than 512 tokens (with no quality guarantee).</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="attention" data-nav="Attention without √d scaling">
+      <h3><span class="idx">06</span> Attention details: no √d_kv scaling, and the initialisation that replaces it</h3>
+      <p class="lede">T5's attention does not divide the logits by √d_kv. The released code (Mesh TensorFlow, and the Hugging Face port, whose comment reads "T5 folds the relative position bias into the attention scores and does not scale the query/key dot product") instead initialises W_Q with a smaller standard deviation so the logits start at the same scale. The paper does not mention this; it is a code-level detail that matters if you port weights.</p>
+      <div class="formula"><span class="lbl">standard scaled dot-product attention</span><span class="eq">A = softmax( Q Kᵀ / √d_kv + mask ) V</span>
+<span class="lbl">T5 attention: no scaling, position bias added</span><span class="eq">A = softmax( Q Kᵀ + B + mask ) V</span>
+<span class="lbl">initialisation in the released code (factor 1): W_Q absorbs the missing 1/√d_kv</span><span class="eq">W_Q ~ N(0, (d_model · d_kv)^(−1)),     W_K, W_V ~ N(0, d_model^(−1))
+W_O ~ N(0, (h · d_kv)^(−1)),     E ~ N(0, 1)</span>
+<span class="lbl">feed-forward initialisation</span><span class="eq">W_in ~ N(0, d_model^(−1)),    W_out ~ N(0, d_ff^(−1))</span></div>
+      <h4>Why the two are equivalent at initialisation</h4>
+      <p>With inputs of unit RMS, a query component qₐ = Σᵢ xᵢ W_Q,ᵢₐ has variance d_model · Var(W_Q) = 1/d_kv under T5's initialisation, versus 1 under the usual one. A logit q · k sums d_kv products, so its variance is d_kv · (1/d_kv) · 1 = 1 — the same as the standard √d_kv-scaled logit. The difference is what happens during training: T5's effective scale is a learned property of W_Q, not a fixed constant.</p>
+      <h4>The tied output projection</h4>
+      <p>Because the embedding E is initialised with unit variance and shared with the softmax layer, v1.0 multiplies the final decoder state by d_model^(−1/2) before the tied projection (768^(−1/2) = 0.0361 for T5-Base). T5 v1.1 unties the two matrices and drops this rescaling; the Hugging Face code decides which to do from the checkpoint's <code>tie_word_embeddings</code> flag. Mixing up the two is a silent error: logits come out √d_model = 27.7 times too large or too small.</p>
+      <div class="callout"><b>Takeaway:</b> when porting T5 to another codebase, three things have no counterpart in a textbook Transformer and each changes outputs silently: no 1/√d_kv in attention, the d_model^(−1/2) rescale before a tied output layer, and the scale-only norm.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="feedforward" data-nav="ReLU vs GEGLU feed-forward">
+      <h3><span class="idx">07</span> The feed-forward layer: ReLU in T5, GEGLU in v1.1</h3>
+      <p class="lede">The original T5 feed-forward network is two bias-free matrices with a ReLU between them. T5 v1.1 replaces it with GEGLU, from Shazeer's "GLU Variants Improve Transformer" (2020): the hidden layer is the elementwise product of a GELU-activated projection and a second, linear projection. The gate adds a third matrix, so v1.1 shrinks d_ff to keep sizes comparable.</p>
+      <div class="formula"><span class="lbl">T5 v1.0: W₁ is d × d_ff, W₂ is d_ff × d — 2 · d · d_ff parameters</span><span class="eq">FF_ReLU(x) = max(0, x W₁) W₂</span>
+<span class="lbl">T5 v1.1 (feed_forward_proj = "gated-gelu", tanh approximation of GELU): W₀, W₁ are d × d_ff′ — 3 · d · d_ff′ parameters</span><span class="eq">FF_GEGLU(x) = ( GELU(x W₀) ⊙ x W₁ ) W₂</span>
+<span class="lbl">same parameter count when</span><span class="eq">3 · d · d_ff′ = 2 · d · d_ff   ⇒   d_ff′ = (2/3) · d_ff</span>
+<span class="lbl">applied to the released shapes</span><span class="eq">Base: 3,072 → 2,048 (released 2,048);    Large: 4,096 → 2,730.7 (released 2,816)</span></div>
+      <h4>What the gate changes</h4>
+      <ul class="notes">
+        <li>A ReLU unit's output depends on one projection and is exactly zero for half its input range. A GEGLU unit multiplies a smooth, mostly-positive GELU of one projection by an unbounded linear value of another, so it can output either sign and its magnitude is modulated by a second direction of the input.</li>
+        <li>The GLU-variants paper reported lower pretraining perplexity for GEGLU and SwiGLU than for ReLU at matched parameters and compute on the T5 setup, and gains on downstream fine-tuning; SwiGLU is the variant most later decoder-only LLMs adopted.</li>
+        <li>The released v1.1 shapes are not all "2/3 of v1.0": Base matches (2,048), Large uses 2,816, and Small changes shape entirely (d_ff 1,024, 6 heads, 8 + 8 layers).</li>
+      </ul>
+      <div class="viz" id="viz-ff">
+        <div class="vhead">
+          <span class="vtitle">One hidden unit: ReLU, GELU and the GEGLU gate</span>
+          <span class="vhint">move the linear branch value · pick a size to compare parameter counts</span>
+        </div>
+        <div class="controls">
+          <label>linear branch x·W₁ <input type="range" id="ff-b" min="-20" max="20" step="1" value="10" /> <span id="ff-bv"></span></label>
+          <label>size <select id="ff-cfg">
+            <option value="base">Base</option>
+            <option value="large">Large</option>
+            <option value="small">Small</option>
+          </select></label>
+        </div>
+        <svg id="ff-svg" width="660" height="280" viewBox="0 0 660 280" role="img" aria-label="Curves of ReLU, GELU and GELU times the linear-branch value against the pre-activation, with a bar comparison of feed-forward parameters for v1.0 and v1.1"></svg>
+        <div class="readout" aria-live="polite" id="ff-read"></div>
+        <p class="vcap">GELU uses the tanh approximation (gelu_new) that the library applies for "gated-gelu". The bar panel computes one feed-forward block's parameters from the released configs: 2·d·d_ff for v1.0 and 3·d·d_ff′ for v1.1, and the d_ff′ that would exactly match v1.0.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> GEGLU is the one architectural change in v1.1 that later models kept; its gated product gives each unit two input directions for 1.5× the matrices, paid for by a narrower hidden layer.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="configs" data-nav="Every configuration">
+      <h3><span class="idx">08</span> Every configuration, and the odd shapes of 3B and 11B</h3>
+      <p class="lede">The paper defines five sizes. Small, Base and Large follow BERT's shape conventions (inner attention width equal to d_model, d_ff = 4 · d_model). The 3B and 11B models keep d_model = 1,024 and grow only the attention inner width and the feed-forward width, because, in the paper's words, TPUs "are most efficient for large dense matrix multiplications like those in the Transformer's feed-forward networks".</p>
+      <table class="cmp">
+        <tr><th>Model</th><th>Layers (enc + dec)</th><th>d_model</th><th>Heads × d_kv (inner)</th><th>d_ff</th><th>FF</th><th>Paper's size</th><th>Recount (HF num_parameters)</th></tr>
+        <tr><td>T5-Small</td><td>6 + 6</td><td>512</td><td>8 × 64 (512)</td><td>2,048</td><td>ReLU</td><td>about 60M</td><td>60,506,624</td></tr>
+        <tr><td>T5-Base</td><td>12 + 12</td><td>768</td><td>12 × 64 (768)</td><td>3,072</td><td>ReLU</td><td>about 220M</td><td>222,903,552</td></tr>
+        <tr><td>T5-Large</td><td>24 + 24</td><td>1,024</td><td>16 × 64 (1,024)</td><td>4,096</td><td>ReLU</td><td>around 770M</td><td>737,668,096</td></tr>
+        <tr><td>T5-3B</td><td>24 + 24</td><td>1,024</td><td>32 × 128 (4,096)</td><td>16,384</td><td>ReLU</td><td>around 2.8B</td><td>2,851,598,336</td></tr>
+        <tr><td>T5-11B</td><td>24 + 24</td><td>1,024</td><td>128 × 128 (16,384)</td><td>65,536</td><td>ReLU</td><td>about 11B</td><td>11,307,321,344</td></tr>
+        <tr><td>v1.1 Small</td><td>8 + 8</td><td>512</td><td>6 × 64 (384)</td><td>1,024</td><td>GEGLU</td><td>—</td><td>76,961,152</td></tr>
+        <tr><td>v1.1 Base</td><td>12 + 12</td><td>768</td><td>12 × 64 (768)</td><td>2,048</td><td>GEGLU</td><td>—</td><td>247,577,856</td></tr>
+        <tr><td>v1.1 Large</td><td>24 + 24</td><td>1,024</td><td>16 × 64 (1,024)</td><td>2,816</td><td>GEGLU</td><td>—</td><td>783,150,080</td></tr>
+        <tr><td>v1.1 XL</td><td>24 + 24</td><td>2,048</td><td>32 × 64 (2,048)</td><td>5,120</td><td>GEGLU</td><td>—</td><td>2,849,757,184</td></tr>
+        <tr><td>v1.1 XXL</td><td>24 + 24</td><td>4,096</td><td>64 × 64 (4,096)</td><td>10,240</td><td>GEGLU</td><td>—</td><td>11,135,332,352</td></tr>
+      </table>
+      <h4>Reading the odd shapes</h4>
+      <ul class="notes">
+        <li><b>T5-3B</b> projects 1,024-wide states to a 4,096-wide attention space (32 heads of 128) and back; each attention layer has 4 · 1,024 · 4,096 = 16.8M parameters, four times a d = 1,024 layer's. Its feed-forward layer is 16 · d_model wide.</li>
+        <li><b>T5-11B</b> goes further: 128 heads of 128 (inner width 16,384) and a 65,536-wide feed-forward layer, 64 · d_model. A single feed-forward matrix is 1,024 × 65,536 = 67.1M parameters; the two of them in one block hold more than all of T5-Small's non-embedding weights.</li>
+        <li><b>v1.1 reverses the trade.</b> XL and XXL widen d_model (2,048 and 4,096) and use ordinary 64-wide heads — "larger d_model and smaller num_heads and d_ff", as the release notes put it. The residual stream, and hence the embedding, gets wider: XXL's two 32,128 × 4,096 embedding tables (untied) are 263M parameters against 11B's single 32.9M.</li>
+        <li><b>Size labels are rounded loosely.</b> "Large ≈ 770M" overstates the configuration by 4.4%; "3B" is 2.85B. The paper's own Section 3.7 text says "around 2.8 billion".</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the five v1.0 sizes are not one shape scaled up — above Large, only the attention inner width and d_ff grow. Any calculation that assumes inner width = d_model or d_ff = 4·d_model is wrong for T5-3B, T5-11B and v1.1 Small.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="params" data-nav="Parameter counts, recomputed">
+      <h3><span class="idx">09</span> Parameter counts, recomputed from the configurations</h3>
+      <p class="lede">Every T5 parameter sits in a bias-free matrix, a norm gain, a relative-position table or the embedding, so the count is a short formula in the config's numbers. The recount reproduces what the Hugging Face library reports for each checkpoint; the checkpoint files hold one extra relative-bias table (in the first decoder layer's cross-attention) that the code never uses.</p>
+      <div class="formula"><span class="lbl">with inner = heads · d_kv and k = 2 for ReLU, 3 for GEGLU</span><span class="eq">P_attn = 4 · d · inner          P_ff = k · d · d_ff          P_norm = d</span>
+<span class="lbl">encoder block, decoder block</span><span class="eq">P_enc_block = P_attn + P_ff + 2d          P_dec_block = 2 · P_attn + P_ff + 3d</span>
+<span class="lbl">stacks: one 32 × heads bias table and one final norm each</span><span class="eq">P_encoder = N_enc · P_enc_block + 32·heads + d
+P_decoder = N_dec · P_dec_block + 32·heads + d</span>
+<span class="lbl">total: shared embedding, plus an output matrix only when untied (v1.1, mT5, ByT5, Flan-T5)</span><span class="eq">P = V·d + [untied] · V·d + P_encoder + P_decoder,          V = 32,128</span></div>
+      <h4>Worked example: T5-Base</h4>
+      <table class="cmp">
+        <tr><th>Component</th><th>Computation</th><th>Parameters</th></tr>
+        <tr><td>Shared embedding (tied to the output)</td><td>32,128 × 768</td><td>24,674,304</td></tr>
+        <tr><td>Encoder block</td><td>4 · 768 · 768 + 2 · 768 · 3,072 + 2 · 768</td><td>7,079,424</td></tr>
+        <tr><td>12 encoder blocks + bias table + final norm</td><td>12 × 7,079,424 + 32 · 12 + 768</td><td>84,954,240</td></tr>
+        <tr><td>Decoder block</td><td>8 · 768 · 768 + 2 · 768 · 3,072 + 3 · 768</td><td>9,439,488</td></tr>
+        <tr><td>12 decoder blocks + bias table + final norm</td><td>12 × 9,439,488 + 32 · 12 + 768</td><td>113,275,008</td></tr>
+        <tr><td><b>Total</b></td><td></td><td><b>222,903,552</b></td></tr>
+        <tr><td>Checkpoint file (+ unused cross-attention bias table)</td><td>+ 32 · 12</td><td>222,903,936</td></tr>
+      </table>
+      <p>Two checks against the paper. Its claim that encoder–decoder attention is "about 10% of the total parameter count" is 12 · 2,359,296 = 28.3M of 222.9M = 12.7% for Base by this count. And its Section 3.2 simplification — an L + L encoder–decoder has about the parameters of a 2L-layer decoder-only model — holds to within that cross-attention share: a 24-layer decoder-only stack of Base width would have 24 × 7,079,424 = 169.9M block parameters against 198.2M for 12 + 12.</p>
+      <div class="viz" id="viz-params">
+        <div class="vhead">
+          <span class="vtitle">Where the parameters are</span>
+          <span class="vhint">pick a checkpoint · compare its stacked breakdown with the family</span>
+        </div>
+        <div class="controls">
+          <label>checkpoint <select id="par-cfg"></select></label>
+          <label><input type="checkbox" id="par-log" checked /> log scale for the family</label>
+        </div>
+        <svg id="par-svg" width="660" height="320" viewBox="0 0 660 320" role="img" aria-label="A stacked bar splitting the chosen checkpoint's parameters into embeddings, encoder attention and feed-forward, decoder self-attention, cross-attention and feed-forward, and norms; below, bars for every checkpoint with the paper's size labels"></svg>
+        <div class="readout" aria-live="polite" id="par-read"></div>
+        <p class="vcap">Configs are the released config.json files (t5-small … t5-11b; t5-v1_1-*; mt5-small/base/xxl; byt5-small/xxl). Counts exclude the unused cross-attention bias table, so they equal what the library's <code>num_parameters()</code> reports; the paper's labels are shown where it gives one (60M, 220M, 770M, 2.8B, 11B; mT5 300M, 580M, 13B).</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> recount before you quote. Of the five v1.0 labels, Large's 770M is the loosest (737.7M); the multilingual models are dominated by vocabulary — mT5-Small is 300M parameters of which 256M are its two 250,112-row tables.</div>
+    </section>
+
+    <nav class="pager" aria-label="T5 series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../t5.html">← T5 · overview</a>
+      <a href="../t5.html" style="color:var(--muted)">T5 · overview</a>
+      <a href="c4-span-corruption.html">T5: C4, SentencePiece &amp; Span Corruption →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../t5.viz.js"></script>
+</body>
+</html>

@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Residual Stream, Norms &amp; FFN</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to the other pages of the series */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../transformers.html">Transformers</a> · part 2 of 7</p>
+      <h1>Residual Stream, Norms &amp; FFN</h1>
+      <p>Everything in the block around attention: the residual stream as a shared bus, pre-norm against post-norm, LayerNorm against RMSNorm, the position-wise FFN, GELU and gated units such as SwiGLU, the FFN read as key–value memory, and the block's backward pass audited.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Transformers</span>
+        <span class="pill">Residual bus · pre/post-norm · RMSNorm · FFN · SwiGLU · backward audit</span>
+      </div>
+    </header>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="residual" data-nav="The residual stream as a bus">
+      <h3><span class="idx">11</span> The residual stream: a shared bus every sub-layer reads from and writes to</h3>
+      <p class="lede">Unroll a pre-norm stack and the output is the input plus a sum of <code>2L</code> writes. Nothing is ever overwritten. That one identity explains why depth is cheap to train, why the stream's norm grows, why a signal added at the bottom is still readable at the top — and why the last norm before the output head is not optional.</p>
+
+      <div class="formula"><span class="lbl">the unrolled stream — every block ADDS, none replaces</span><span class="eq">x⁰ = √d·E[token] + P          (the embedding, §20)
+
+x¹ = x⁰ + a₁(x⁰) + f₁(x⁰ + a₁(x⁰))
+x² = x¹ + a₂(x¹) + f₂(·)
+ …
+xᴸ = x⁰ + ∑ₗ [ aₗ(·) + fₗ(·) ]         2L writes, each a function of the stream BELOW it
+
+every sub-layer READS the whole stream through its norm, N(xˡ), and WRITES a
+vector back onto it. What sub-layer 2 wrote is still present, unchanged, in the
+sum that sub-layer 37 reads — addition commutes, so the writes are superposed,
+not chained — though it is read through a norm that also sees every write since.</span>
+<span class="lbl">the Jacobian, and why depth is trainable</span><span class="eq">∂xˡ⁺¹/∂xˡ  =  I  +  Jₐ  +  J_f·(I + Jₐ)      Jₐ = ∂aₗ/∂xˡ,  J_f = ∂fₗ/∂(xˡ + aₗ)   — the identity is ALWAYS there
+            =  I  +  Jₗ                     with Jₗ everything except the identity
+
+∂xᴸ/∂x⁰  =  ∏ₗ ( I + Jₗ )  =  I + ∑ₗ Jₗ + ∑ₗ&lt;ₘ JₘJₗ + …
+
+with ‖Jₗ‖ small at initialisation the product is dominated by I and the
+first-order terms — a sum over paths of every length, in which the direct
+path is a constant. The RNN page's recurrent product ∏ W had no such constant, and
+that is the whole difference between "depth 96" being trainable and not.</span></div>
+
+      <h4>Three measurable consequences</h4>
+      <p><b>The norm grows.</b> Writes at initialisation are roughly uncorrelated with the stream and with each other, so <code>‖xᴸ‖² ≈ ‖x⁰‖² + ∑ ‖writes‖²</code> and the norm grows like a power of <code>L</code> near <code>½</code> when the writes are of comparable size. The figure measures the root-mean-square of a token's stream after each of <code>L</code> random pre-norm blocks, fits the exponent (about 0.4 at the defaults — the writes are not perfectly uncorrelated), and it rises steadily; the same measurement on a post-norm stack is flat at <code>√d</code>, because the norm sits on the residual path and resets it. <b>The input's share shrinks.</b> The cosine between <code>xᴸ</code> and <code>x⁰</code> falls with depth even though <code>x⁰</code> is still exactly present in the sum — its <i>proportion</i> of the stream is what falls, which is the precise sense in which a door-1 positional signal (§03) "fades": nothing removed it, but the norms it must be read against have grown. <b>The block is near-identity.</b> The relative size of <code>(∂Y/∂X − I)ᵀ·g</code> for a random <code>g</code> is below one — about a half — at initialisation for a pre-norm block and stays there with depth, which is the constant-path statement above made numerical; a post-norm block's Jacobian has no identity term because the residual passes through the norm, and its deviation is of order one.</p>
+
+      <div class="viz" id="viz-rn">
+        <div class="vhead">
+          <span class="vtitle">The stream through L blocks: its norm, its cosine with the input, and the block Jacobian's distance from the identity</span>
+          <span class="vhint">pre-norm grows like √L and stays near-identity; post-norm is pinned at √d and is not near-identity — the weight-scale slider is the initialisation, and scaling it up is the fastest way to see the near-identity property fail</span>
+        </div>
+        <div class="controls">
+          <label>depth L <input type="range" id="rn-L" min="2" max="32" step="2" value="16" /><span id="rn-Lv" style="min-width:20px;display:inline-block">16</span></label>
+          <label>d_model <select id="rn-d"><option value="16">16</option><option value="32" selected>32</option><option value="64">64</option></select></label>
+          <label>weight scale × <input type="range" id="rn-s" min="0.5" max="4" step="0.5" value="1" /><span id="rn-sv" style="min-width:30px;display:inline-block">1.0</span></label>
+          <label>seed <input type="range" id="rn-seed" min="1" max="5" step="1" value="1" /><span id="rn-seedv" style="min-width:16px;display:inline-block">1</span></label>
+        </div>
+        <svg id="rn-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Three panels against layer index. Left: the root-mean-square size of one token's residual-stream vector after each block, for a pre-norm stack and a post-norm stack of the same random weights; at the defaults the pre-norm curve rises from about the input scale steadily with depth, roughly like the square root of the layer index, while the post-norm curve is flat at the square root of d. Middle: the cosine similarity between the stream after each block and the input vector, falling with depth for pre-norm and falling faster for post-norm. Right: for each block, the relative size of the gradient's deviation from passing straight through, computed from the exact backward pass with a random upstream gradient; the pre-norm points sit below one, around a half, the post-norm points near one. The readout prints the final stream norm, the final cosine, the mean deviation for each wiring, and the exponent of the best power-law fit of the pre-norm norm growth."></svg>
+        <div class="readout" aria-live="polite" id="rn-readout"></div>
+      </div>
+
+      <div class="callout"><b>Why the pre-norm stack ends in a norm.</b> Read the unrolled sum once more: the last thing that happened to <code>xᴸ</code> was an addition, and the output head reads it directly. Without a final norm, the logits scale with <code>‖xᴸ‖</code>, which grows with depth and drifts during training; the softmax's temperature would be an accident of the stack's depth. The final norm pins it. A post-norm stack already ends in <code>N₂</code>, so it needs nothing. This is the origin of the pattern "pre-norm blocks + one <code>ln_f</code>" in nearly every decoder built since 2019, and forgetting it is one of §35's bugs that does not crash. The general residual story — bottleneck blocks, pre-activation ordering, stochastic depth — is <a href="../residual-skip-connections.html">Residual / Skip Connections</a>'; this section owns only what the transformer's stream does.</div>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="prepost" data-nav="Pre-norm against post-norm">
+      <h3><span class="idx">12</span> Pre-norm against post-norm: the gradient scale through the stack, and what it does to the learning rate</h3>
+      <p class="lede">§02 showed the two wirings compute legitimate functions and §11 showed their streams behave differently. The practical difference is what the optimiser sees at step zero. Measure the gradient of every layer's weights at initialisation for both wirings, and the reason one of them needs a gentler start is in the plot.</p>
+
+      <div class="formula"><span class="lbl">where the scale comes from — one block, the FFN's second matrix, in both wirings (H = the FFN's hidden activations, (n × d_ff))</span><span class="eq">POST-NORM   U = X₁ + FFN(X₁),   Y = N₂(U)
+   ∂L/∂W₂ = Hᵀ · ∂L/∂U,   ∂L/∂U = ∂L/∂Y · ∂N₂/∂U      the norm's Jacobian is ≈ (1/σ)·(I − …) with
+                                                      σ the row std of U, which is O(1) at every depth
+                                                      at init — so every layer's gradient has ROUGHLY
+                                                      the same scale, set by d rather than by depth
+                                                      (measured: the top/bottom ratio stays near 0.7
+                                                      as L grows)
+PRE-NORM    Y = X₁ + FFN(N₂(X₁)),  and the loss reads N_f(xᴸ) at the top of the stack
+   ∂L/∂W₂ = Hᵀ · ∂L/∂Y,   ∂L/∂Y = ∂L/∂xᴸ (top block)   with ∂L/∂xᴸ = (∂L/∂out)·∂N_f/∂xᴸ ∝ 1/‖xᴸ‖
+                                                      and ‖xᴸ‖ grows like √L (§11): the TOP layer's
+                                                      gradient shrinks like 1/√L, the bottom layers'
+                                                      less so (their writes are read through many
+                                                      near-identity Jacobians and the same 1/‖xᴸ‖)
+these are the leading-order scalings the analyses of the two wirings derive; the figure
+measures them rather than assuming them.</span></div>
+
+      <h4>What the measurement shows, and how far the toy goes</h4>
+      <p>The left panel is that computation done exactly, with the audited backward pass of §17, for a random stack: the parameter-gradient norm of each block's <code>W₂</code>, bottom to top. Post-norm is <b>roughly flat</b> — the top-to-bottom ratio does not fall as the stack deepens. Pre-norm <b>decreases towards the top</b> and the top layer's gradient falls with <code>L</code> as a power between <code>−⅓</code> and <code>−½</code> (<code>−0.35</code> fitted at the defaults, against the <code>−½</code> the leading-order argument predicts), which is the <code>‖xᴸ‖</code> growth of §11 seen from the other side. Neither profile is "better" in isolation; what matters is that under post-norm a large learning rate applied at step zero moves <i>every</i> layer by a large amount at once, through norms whose Jacobians are not near-identity, and the stack can leave the regime where the initialisation's scales hold before the optimiser's statistics have settled. That is the mechanism the analyses of the two wirings propose for a widely reported finding: a post-norm stack trains reliably only with warmup and a smaller peak rate, while a pre-norm stack tolerates a larger rate with little or no warmup. It is a proposed mechanism consistent with the measurement here, not a theorem. Two honest caveats. Post-norm is not simply worse: when it does train, it has repeatedly been reported to reach a slightly lower final loss than pre-norm at the same size, which is why work on very deep post-norm stacks (with down-weighted residual branches) continues. And the 2017 recipe's warmup (§26) was designed for post-norm; the pre-norm recipes of §27 keep a short warmup anyway, because Adam's early statistics (§27) are a second, independent reason for one.</p>
+
+      <p>The right panel reproduces the part of that finding this page's scale can reach: the tiny two-layer copy model of §32, trained live in both wirings at two peak learning rates. At the smaller rate both wirings learn; at the larger one, pre-norm learns faster and post-norm stalls. What the toy does <i>not</i> reproduce — and this is stated rather than fudged — is a clean dependence on warmup: at two layers, 150 steps and <code>d = 16</code>, adding a 30-step warmup changes the post-norm curve only marginally, because the gradient scales that make warmup necessary at <code>d = 4096</code> and <code>L = 96</code> are not large here. The learning-rate ceiling is the toy-scale shadow of the same effect, and it is the one this figure measures.</p>
+
+      <div class="viz" id="viz-pp">
+        <div class="vhead">
+          <span class="vtitle">Gradient norm of every block's W₂ at initialisation, pre- against post-norm; and the two wirings trained live at two learning rates</span>
+          <span class="vhint">raise the depth: post-norm's profile stays flat, pre-norm's top layer keeps shrinking; the right panel is four short live trainings and its claim is only about the peak rate, not warmup</span>
+        </div>
+        <div class="controls">
+          <label>depth L <input type="range" id="pp-L" min="4" max="32" step="4" value="12" /><span id="pp-Lv" style="min-width:20px;display:inline-block">12</span></label>
+          <label>d_model <select id="pp-d"><option value="16">16</option><option value="32" selected>32</option><option value="64">64</option></select></label>
+          <label>seed <input type="range" id="pp-seed" min="1" max="5" step="1" value="1" /><span id="pp-seedv" style="min-width:16px;display:inline-block">1</span></label>
+          <label>live-training rates <select id="pp-lr"><option value="0.01,0.03" selected>0.01 and 0.03</option><option value="0.01,0.05">0.01 and 0.05</option></select></label>
+        </div>
+        <svg id="pp-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left panel: the Euclidean norm of the gradient of each block's second feedforward matrix at initialisation, plotted against block index from the bottom of the stack to the top, for a pre-norm stack and a post-norm stack of the same random weights with a final norm on the pre-norm stack. At the defaults of twelve blocks and width thirty-two the post-norm points fall only mildly across the stack while the pre-norm points fall from the bottom to the top by a factor of about three. Right panel: training loss against step for four live runs of the two-layer copy model — pre-norm and post-norm at each of two peak learning rates — with warmup; at the lower rate both wirings descend, and at the higher rate the pre-norm run descends fastest while the post-norm run stalls at about the chance level. The readout prints the ratio of the top-layer to bottom-layer gradient for each wiring, the fitted power of that ratio in depth for pre-norm, and the final loss of the four live runs."></svg>
+        <div class="readout" aria-live="polite" id="pp-readout"></div>
+      </div>
+
+      <div class="wrong"><span class="say">The mismatch that does not crash.</span> A pre-norm model trained with a post-norm recipe — long warmup, small peak rate — converges, slowly, and wastes the tolerance the wiring bought; a post-norm model trained with a pre-norm recipe — short warmup, large peak rate — diverges in the first few hundred steps or, worse, does not diverge and settles into a bad basin with a loss that looks plausible. Neither raises an error. The wiring and the schedule are one decision, and §26 sets the schedule for the wiring this page defaults to.</div>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="norms" data-nav="LayerNorm against RMSNorm">
+      <h3><span class="idx">13</span> LayerNorm against RMSNorm: what the mean subtraction buys, what it costs, and when the two coincide</h3>
+      <p class="lede">Both normalise a single row of the stream to a fixed scale; one also removes its mean. <a href="../neural-network-training/normalization-regularization.html#layernorm">The training page</a> owns LayerNorm as a layer. This section owns the choice between the two as a transformer design decision, with the formulas side by side, the parameter count, and a measurement of exactly how far apart they are on real rows.</p>
+
+      <div class="formula"><span class="lbl">the two, on one ROW x of d features — every quantity is per token, never per batch</span><span class="eq">LayerNorm   μ = (1/d)∑ⱼ xⱼ      σ² = (1/d)∑ⱼ (xⱼ − μ)²      y = γ ⊙ (x − μ)/√(σ² + ε) + β
+                                                             2d parameters, two passes over x
+RMSNorm     r = √( (1/d)∑ⱼ xⱼ² + ε )                        y = γ ⊙ x / r
+                                                             d parameters, one pass over x
+
+identity:   if μ = 0 then σ² = (1/d)∑xⱼ² = r² − ε ⇒ LayerNorm(x) = RMSNorm(x) at β = 0.
+            in general   ‖LN(x) − RMS(x)‖  grows with |μ|/σ — the figure measures it.
+backward (audited, §17):  ∂L/∂x = (1/σ)·[ g − mean(g) − x̂·mean(g ⊙ x̂) ]     with g = γ ⊙ ∂L/∂y
+                          RMS:  ∂L/∂x = g/r − x·⟨g, x⟩/(d·r³)</span></div>
+
+      <h4>Why RMSNorm won the argument in decoders</h4>
+      <p>The mean subtraction in LayerNorm removes one direction — the all-ones direction — from every row. The claim that this centring is what makes normalisation work has not held up in practice: in the published comparisons, models trained with RMSNorm match LayerNorm models, so the centring does not appear to be load-bearing. What the centring costs is real: a second reduction over <code>d</code> per row per norm, in a layer that is evaluated four times per block per training step (<code>N₁</code> and <code>N₂</code> forward, and their backward passes) and is memory-bound rather than compute-bound, so its cost is the pass over the row, not the arithmetic. Dropping <code>β</code> as well halves the parameters, which at <code>d = 8192</code> and 80 blocks is 1.3 million numbers — negligible against 70 billion, but not nothing when they are also optimiser state. The result is that the 2017 wiring's LayerNorm survives in encoders and in the older decoders, and most large decoders since 2022 use RMSNorm without a bias (a few 2022–23 families kept LayerNorm). The figure applies both to the same rows and prints the gap.</p>
+
+      <h4>Where the norm sits in the models people actually run</h4>
+      <table class="grid2">
+        <tr><th>family</th><th>norm</th><th>wiring</th><th>final norm</th><th>bias in the norm</th><th>what it implies</th></tr>
+        <tr><td><b>2017 encoder–decoder</b></td><td>LayerNorm</td><td>post-norm</td><td>none needed</td><td>yes (β)</td><td>warmup and a small peak rate are mandatory (§12); the schedule of §26 was designed around it</td></tr>
+        <tr><td><b>2018 bidirectional encoders</b></td><td>LayerNorm</td><td>post-norm</td><td>none</td><td>yes</td><td>the same recipe; depth capped at 24 in practice, deeper post-norm encoders needed tricks to train</td></tr>
+        <tr><td><b>2019 decoders (GPT-2 style)</b></td><td>LayerNorm</td><td>pre-norm</td><td><code>ln_f</code> before the head</td><td>yes</td><td>the wiring that made 48-block stacks routine; the origin of "pre-norm plus a final norm"</td></tr>
+        <tr><td><b>T5-style encoder–decoders</b></td><td>RMSNorm</td><td>pre-norm</td><td>yes</td><td>no</td><td>an early large use of RMSNorm without a bias; its implementation also has no biases in the FFN</td></tr>
+        <tr><td><b>2022+ large decoders (Llama style)</b></td><td>RMSNorm</td><td>pre-norm</td><td>yes</td><td>no</td><td>with SwiGLU (§15), RoPE (§06) and no biases anywhere: the current default</td></tr>
+        <tr><td><b>parallel-block variants</b></td><td>either</td><td>pre-norm, attention and FFN read the <i>same</i> normalised input and both add to the stream</td><td>yes</td><td>—</td><td><code>Y = X + Attn(N(X)) + FFN(N(X))</code>: one norm per block, the two sub-layers computed at once; reported roughly 15% faster to train at large scale, with a small quality loss at 8B parameters and none measured at 62B</td></tr>
+      </table>
+      <p>The direction of travel in the table is uniform: post-norm to pre-norm, LayerNorm to RMSNorm, biases dropped. Each step removed something that was not load-bearing and kept the property that was — a normalised input to every sub-layer and an untouched residual path. The parallel-block row is the same principle taken one step further: if the norm's job is only to give each sub-layer a clean read of the stream, one read can serve both.</p>
+
+      <div class="viz" id="viz-ln">
+        <div class="vhead">
+          <span class="vtitle">LayerNorm and RMSNorm on the same rows: outputs, the gap between them, and its dependence on the row mean</span>
+          <span class="vhint">push the row-mean slider away from zero — the two outputs diverge exactly as the identity predicts, and at zero mean they coincide to round-off; γ is the gain both layers expose, and β is held at zero here</span>
+        </div>
+        <div class="controls">
+          <label>row mean μ <input type="range" id="ln-mu" min="-3" max="3" step="0.25" value="1" /><span id="ln-muv" style="min-width:34px;display:inline-block">1.00</span></label>
+          <label>d <select id="ln-d"><option value="8">8</option><option value="16" selected>16</option><option value="64">64</option></select></label>
+          <label>γ <input type="range" id="ln-g" min="0.5" max="2" step="0.25" value="1" /><span id="ln-gv" style="min-width:30px;display:inline-block">1.00</span></label>
+          <label>seed <input type="range" id="ln-seed" min="1" max="9" step="1" value="3" /><span id="ln-seedv" style="min-width:16px;display:inline-block">3</span></label>
+        </div>
+        <svg id="ln-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Upper panel: three horizontal strips of coloured cells for one token row of d features — the raw row with the chosen mean added, its LayerNorm output, and its RMSNorm output — followed by a fourth strip showing their element-wise difference. At the default row mean of one, the LayerNorm strip is centred and the RMSNorm strip is visibly shifted, and the difference strip is nearly uniform. Lower panel: the Euclidean gap between the two outputs plotted against the row mean from minus three to three, a curve that touches zero at mean zero and rises symmetrically on both sides, with the current mean marked. The readout prints the mean and standard deviation of the raw row, the gap at the current mean, the gap at zero mean which is round-off, the parameter counts of the two layers at this d, and the number of reductions each performs per row."></svg>
+        <div class="readout" aria-live="polite" id="ln-readout"></div>
+      </div>
+
+      <div class="callout"><b>Two placement rules that are not stylistic.</b> (1) In pre-norm wiring the norm is applied to the <i>input</i> of a sub-layer and never to the residual path, so the stream keeps its scale; §11 and §12 are consequences. (2) Whatever norm is used inside the blocks, the same one is used as the final norm before the output head, with its own <code>γ</code>: the unembedding of §21 was designed for rows of that scale, and a tied embedding matrix in particular assumes it.</div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ffn" data-nav="The position-wise FFN">
+      <h3><span class="idx">14</span> The position-wise feedforward network: shapes, the width ratio, and two-thirds of the parameters</h3>
+      <p class="lede">Hand-off 2 asked for a per-token non-linearity. The answer is the smallest thing that qualifies — one hidden layer, applied to every row with the same weights — made wide. How wide is the single number that decides most of the parameter count of the model, and this section counts it.</p>
+
+      <div class="formula"><span class="lbl">the sub-layer, in the row convention — the SAME W₁, W₂ at every position</span><span class="eq">FFN(X) = act( X·W₁ + b₁ )·W₂ + b₂          X (n × d),  W₁ (d × d_ff),  W₂ (d_ff × d)
+
+per token:   x (1 × d) → h = act(x·W₁ + b₁) (1 × d_ff) → y = h·W₂ + b₂ (1 × d)
+the widening d → d_ff and the narrowing d_ff → d are what the feedforward page
+called a one-hidden-layer MLP; "position-wise" only says it is applied to each ROW of X
+independently — a (1 × 1) convolution over the sequence, in the convolution page's language.
+
+parameters   2·d·d_ff + d_ff + d          MACs per token   2·d·d_ff
+with d_ff = 4d:      8d² + 5d              against attention's 4d² + (biases)
+FFN share of a block  =  8d² / (8d² + 4d²)  =  2/3         exactly, in the limit</span>
+<span class="lbl">what the same count looks like at real widths</span><span class="eq">d = 768,  d_ff = 3072:   FFN 4 722 432   attention 2 359 296   → FFN is 66.7% of the block
+d = 4096, d_ff = 11008 (gated, 3 matrices):  FFN 135 266 304   attention 67 108 864  → 66.8%
+d = 8192, d_ff = 28672 (gated, GQA g = 8):   FFN 704 643 072   attention 150 994 944 → 82.4%
+the third row is the shape of a 70B-class decoder: grouped-query attention shrank
+W_K and W_V by 8×, and the FFN's share rose accordingly.</span></div>
+
+      <h4>Why four, and why it does not matter much</h4>
+      <p>The ratio <code>d_ff/d = 4</code> is the 2017 choice and it was not derived. Published sweeps since then report a broad, flat optimum: for a fixed parameter budget, moving the ratio anywhere between about 2 and 8 while adjusting depth or width to compensate changes the loss by amounts that are small compared with the effect of the budget itself. What the ratio does decide sharply is <i>where the parameters sit</i>: at ratio 4 the FFN is two-thirds of a block, at ratio 8 it is four-fifths, at ratio 2 it is half. Since the FFN's cost per token is one MAC per parameter and attention's projections are the same, the ratio moves parameters between the token-mixing and the per-token sub-layer at constant cost per token, and the flat optimum says the model does not care much which. The gated variants of §15 change the arithmetic of the ratio but not this conclusion; the sparse variants — several FFNs per block with a router choosing among them — are <a href="../mixture-of-experts.html">Mixture of Experts</a>, and they exist precisely because the FFN is where the parameters are.</p>
+
+      <div class="viz" id="viz-ff">
+        <div class="vhead">
+          <span class="vtitle">The FFN's share of a block's parameters and per-token MACs against the width ratio</span>
+          <span class="vhint">at ratio 4 the share is two-thirds for full multi-head attention; switch to grouped-query attention and the same ratio gives a larger share, because attention got smaller and the FFN did not</span>
+        </div>
+        <div class="controls">
+          <label>d_model <select id="ff-d"><option value="768">768</option><option value="2048">2048</option><option value="4096" selected>4096</option><option value="8192">8192</option></select></label>
+          <label>heads h <select id="ff-h"><option value="12">12</option><option value="32" selected>32</option><option value="64">64</option></select></label>
+          <label>KV heads g <select id="ff-g"><option value="h" selected>= h (MHA)</option><option value="8">8 (GQA)</option><option value="1">1 (MQA)</option></select></label>
+          <label>FFN <select id="ff-k"><option value="u" selected>ungated (2 matrices)</option><option value="g">gated (3 matrices)</option></select></label>
+          <label>ratio to read <input type="range" id="ff-r" min="1" max="8" step="0.5" value="4" /><span id="ff-rv" style="min-width:24px;display:inline-block">4</span></label>
+        </div>
+        <svg id="ff-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Left panel: the feedforward sub-layer's share of a block's parameters plotted against the width ratio d_ff over d from one to eight, as a rising curve that passes through two-thirds at ratio four for full multi-head attention, with a second curve for the current key-value head count that lies above it when grouped-query attention is selected. A vertical marker sits at the chosen ratio and the share there is printed. Right panel: a stacked bar of one block's parameters at the chosen ratio, split into the query, key, value and output projections and the feedforward matrices, with counts printed, and beneath it the same split for the per-token multiply–accumulates, which are identical in proportion because every one of these matrices costs one multiply–accumulate per parameter per token. The readout prints the exact counts and shares."></svg>
+        <div class="readout" aria-live="polite" id="ff-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="gated" data-nav="Activations and gated units">
+      <h3><span class="idx">15</span> ReLU, GELU, and the gated units: three matrices, the ⅔ width correction, and the rounding rule real models use</h3>
+      <p class="lede">The 2017 FFN used ReLU; the encoders of 2018 moved to GELU; the decoders since 2022 use a <i>gated</i> hidden layer, SwiGLU, that multiplies two projections of the input together. The gated form has three matrices instead of two, so its width is cut to two-thirds to hold the parameter count — a rule with a rounding convention that produces the odd-looking <code>d_ff</code> values in published configurations.</p>
+
+      <div class="formula"><span class="lbl">the three FFNs, on one row x</span><span class="eq">ReLU FFN     y = max(0, x·W₁ + b₁)·W₂ + b₂
+GELU FFN     y = gelu(x·W₁ + b₁)·W₂ + b₂          gelu(z) = z·Φ(z), Φ the normal CDF
+                                                   (DL.gelu is the exact form; DL.geluTanh
+                                                    is a DIFFERENT function, gap 4.7e−4)
+gated (GLU family)
+             y = ( act(x·W_g) ⊙ (x·W_u) )·W_d      W_g, W_u (d × d_ff'),  W_d (d_ff' × d)
+             SwiGLU:  act = silu(z) = z·σ(z)       GeGLU:  act = gelu      ReGLU: act = relu
+             no biases, in the configurations that use it</span>
+<span class="lbl">the ⅔ correction, and the rounding real configurations apply</span><span class="eq">ungated parameters   2·d·d_ff            with d_ff = 4d:      8d²
+gated parameters     3·d·d_ff'           equal when  d_ff' = (2/3)·d_ff = (8/3)·d
+
+so a gated FFN "at ratio 4" has hidden width 8d/3, and its MACs per token are the
+same 8d² — the three matrices together cost what the two did.
+
+rounding, as implemented:  d_ff' = multiple · ⌈ (2/3)·4d · m / multiple ⌉
+   d = 4096, m = 1,   multiple = 256:   ⌈10922.7/256⌉·256 = 11 008
+   d = 4096, m = 1.3, multiple = 1024:  ⌈14199.5/1024⌉·1024 = 14 336
+   d = 8192, m = 1.3, multiple = 4096:  ⌈28398.9/4096⌉·4096 = 28 672
+those three numbers are the FFN widths of three well-known 7B-, 8B- and 70B-class
+decoders; none of them is "4d", and each is this formula.</span></div>
+
+      <h4>What the gate buys</h4>
+      <p>An ungated hidden unit is a fixed direction <code>w₁</code> in input space, thresholded: it fires when <code>x·w₁</code> is large. A gated unit is the <i>product</i> of two projections, <code>act(x·w_g)·(x·w_u)</code>: the first decides whether the unit is on, the second decides what it passes, and the product is a bilinear function of <code>x</code> — quadratic in the input where the ungated unit was linear-then-thresholded. That is more expressive per unit, which is the usual explanation for why the ⅔-width gated FFN matches or beats the full-width ungated one at the same parameter count in the published controlled comparisons, by a small but consistent margin. The cost is a third matrix multiply per token (at ⅔ width, so no more MACs) and an element-wise product, and a hidden unit whose output is no longer bounded below the way a GELU unit's is: <code>silu(z)</code> itself has a minimum of <code>−0.278</code>, but its product with <code>x·w_u</code> can take either sign and any size. The choice of <code>act</code> inside the gate matters less than the gate: SwiGLU and GeGLU are within noise of each other, and both are ahead of the ungated forms.</p>
+
+      <div class="viz" id="viz-gl">
+        <div class="vhead">
+          <span class="vtitle">The three activations and their derivatives; a gated unit's response surface; and the width rule applied to real widths</span>
+          <span class="vhint">the ungated unit is a function of one projection, the gated unit of two — the surface is what a product of a sigmoid-gated ramp and a linear term looks like; the table at the right is the rounding formula evaluated, not typed</span>
+        </div>
+        <div class="controls">
+          <label>gate activation <select id="gl-a"><option value="silu" selected>SiLU (SwiGLU)</option><option value="gelu">GELU (GeGLU)</option><option value="relu">ReLU (ReGLU)</option></select></label>
+          <label>d for the rule <select id="gl-d"><option value="2048">2048</option><option value="4096" selected>4096</option><option value="8192">8192</option></select></label>
+          <label>multiplier m <select id="gl-m"><option value="1" selected>1</option><option value="1.3">1.3</option></select></label>
+          <label>multiple <select id="gl-mu"><option value="256" selected>256</option><option value="1024">1024</option><option value="4096">4096</option></select></label>
+        </div>
+        <svg id="gl-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left panel: ReLU, exact GELU and SiLU plotted on the same axes from minus four to four, with their derivatives drawn beneath as thinner lines; GELU and SiLU dip below zero for negative inputs, with their minima marked. Middle panel: the response of one gated unit, the gate activation of the first projection times the second projection, drawn as a heat map over the two projections' values, showing a surface that is near zero when the gate is off and grows linearly along the value axis when the gate is on, changing sign with the value. Right panel: a small table of the gated-width rule evaluated for the chosen model width, multiplier and rounding multiple, showing the raw two-thirds width, the multiplied width, the rounded result, and the parameter count it gives against the ungated four-d count. At the defaults the rounded result is eleven thousand and eight. The readout prints the ratio of gated to ungated parameters at the chosen setting and the minima of the two smooth activations."></svg>
+        <div class="readout" aria-live="polite" id="gl-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 16 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="kvmem" data-nav="The FFN as key–value memory">
+      <h3><span class="idx">16</span> The FFN as a key–value memory: keys are the columns of <code>W₁</code>, values are the rows of <code>W₂</code></h3>
+      <p class="lede">Write the FFN as a sum over hidden units and it is a soft memory with <code>d_ff</code> slots: each slot has a key it compares the token against and a value it writes if the comparison fires. That is the same shape as attention's dictionary lookup in <a href="../attention/query-key-value.html#qkv">the attention page's query/key/value section</a> — but with keys and values that are <i>parameters</i>, fixed at training time, rather than other tokens.</p>
+
+      <div class="formula"><span class="lbl">the rewrite — row convention, so read the columns of W₁ as keys</span><span class="eq">y = act(x·W₁ + b₁)·W₂ = ∑ᵢ₌₁^{d_ff}  act( x·kᵢ + bᵢ ) · vᵢ
+
+   kᵢ = W₁[:, i]   the i-th COLUMN of W₁, a (d × 1) key the token row x is dotted with
+   vᵢ = W₂[i, :]   the i-th ROW of W₂,    a (1 × d) value written onto the stream
+   act(x·kᵢ + bᵢ)  the "match score" of slot i for this token — unnormalised (no softmax),
+                   and zero or near zero for most slots with a rectifying act
+
+(a column-convention source, y = W₂ act(W₁x), reads the ROWS of its W₁ as keys and the
+ COLUMNS of its W₂ as values — the same objects, transposed. Getting this backwards on
+ a square W₁ does not crash; it names the wrong vectors.)</span>
+<span class="lbl">the comparison with attention, slot for slot</span><span class="eq">                     attention                         FFN
+keys                 other tokens' projections          d_ff learned vectors
+values               other tokens' projections          d_ff learned vectors
+match                softmax over keys (sums to 1)      act per slot (no normalisation)
+what it retrieves    something IN the context           something learned FROM THE CORPUS
+capacity             grows with n                       fixed: d_ff slots per layer</span></div>
+
+      <h4>What the slots hold, on a model small enough to read</h4>
+      <p>On the page's trained two-layer copy model the FFN of each block has 32 slots and the vocabulary has 10 symbols, which is small enough to read every slot. The figure computes, for every token type at a chosen position, the match score of every slot — the <code>(V × d_ff)</code> activation matrix — and, for every slot, what its value row does to the output distribution when pushed through the unembedding: the <code>(d_ff × V)</code> "value logits". A slot whose key fires on symbol 3 and whose value raises the logit of symbol 3 is a slot that has learned "when I see a 3, say 3", which is what a copy task rewards in the layer whose job is to produce the answer. Not every slot is legible — several fire on everything and write something small, which is the unhelpful but harmless case — and the point of the figure is not that FFNs are interpretable in general but that the key–value reading is literally what the arithmetic computes, and that the two matrices play the two roles.</p>
+
+      <div class="viz" id="viz-km">
+        <div class="vhead">
+          <span class="vtitle">One trained FFN read as a memory: which slots each token fires, and what each slot's value writes to the logits</span>
+          <span class="vhint">left is act(x·kᵢ + bᵢ) for every token type and slot; right is vᵢ pushed through the output head; pick a slot and the readout names the token it fires most on and the token its value most favours</span>
+        </div>
+        <div class="controls">
+          <label>block <select id="km-l"><option value="0">first</option><option value="1" selected>second</option></select></label>
+          <label>position <input type="range" id="km-p" min="0" max="9" step="1" value="7" /><span id="km-pv" style="min-width:16px;display:inline-block">7</span></label>
+          <label>slot to read <input type="range" id="km-i" min="0" max="31" step="1" value="0" /><span id="km-iv" style="min-width:16px;display:inline-block">0</span></label>
+          <label>task <select id="km-t"><option value="copy" selected>copy</option><option value="reverse">reverse</option></select></label>
+        </div>
+        <svg id="km-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left heat map: rows are the ten token types placed at the chosen position in a context, columns are the thirty-two hidden slots of the chosen block's feedforward sub-layer, and each cell is that slot's activation for that token, with the selected slot's column outlined. Right heat map: rows are the thirty-two slots and columns are the ten vocabulary entries, each cell the change in that vocabulary logit produced by the slot's value row through the output head, with the selected slot's row outlined. Between them a short list names, for the selected slot, the token it fires most on and the token its value most favours, and prints how many slots have a clear single preferred token on each side. The readout prints the selected slot's top key token and top value token, the number of slots that fire on fewer than half the token types, and the mean activation."></svg>
+        <div class="readout" aria-live="polite" id="km-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 17 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="audit" data-nav="The backward pass, audited">
+      <h3><span class="idx">17</span> The backward pass of every new primitive, audited against central differences</h3>
+      <p class="lede">Every figure on this page that trains anything uses the analytic backward passes added to <code>dl-viz.js</code> for this part: the two norms, the ungated and gated FFN, attention with RoPE and per-head biases, the pre-norm and post-norm block, and the whole tiny model. None of them is trusted; each is compared here, live, against the central-difference gradient of the same loss.</p>
+
+      <div class="formula"><span class="lbl">the audit — the same recipe the training page and the attention page used</span><span class="eq">for a scalar loss  L(θ) = ⟨ f(θ), R ⟩   with R a fixed random matrix,
+numeric   ∂L/∂θᵢ ≈ [ L(θ + ε eᵢ) − L(θ − ε eᵢ) ] / 2ε          ε = 10⁻⁵
+report    max over entries of |analytic − numeric| / max |numeric|
+
+expected: 10⁻⁹ … 10⁻¹⁰ for piecewise-linear and polynomial paths (round-off of the
+          O(ε²) central difference), 10⁻⁷ … 10⁻⁸ wherever the exact GELU's erf is on
+          the path (its own evaluation is accurate to about 10⁻⁷). A value above 10⁻⁶
+          is a bug; the figure would print it in red.</span>
+<span class="lbl">the chain each block backward has to get right — pre-norm, one block</span><span class="eq">forward     U = N₁(X);  A = Attn(U);  X₁ = X + A;  V = N₂(X₁);  F = FFN(V);  Y = X₁ + F
+backward    dX₁ = dY + N₂ᵀ( FFNᵀ(dY) )               the residual passes dY straight through,
+            dX  = dX₁ + N₁ᵀ( Attnᵀ(dX₁) )              PLUS the norm's transposed Jacobian
+where N ᵀ(g) = (1/σ)[ g̃ − mean(g̃) − x̂·mean(g̃ ⊙ x̂) ],  g̃ = γ ⊙ g   (LayerNorm)
+and the RoPE inside Attnᵀ is undone by rotating dQ and dK by −(position·θ): the
+rotation is orthogonal, so its transpose is its inverse.</span></div>
+
+      <div class="viz" id="viz-fd">
+        <div class="vhead">
+          <span class="vtitle">Worst relative error of each analytic backward pass against central differences, computed now</span>
+          <span class="vhint">every bar is a fresh audit on seeded random inputs at small sizes; the two horizontal lines are the expected level for erf-free paths and the tolerance above which a bar turns red</span>
+        </div>
+        <div class="controls">
+          <label>ε <select id="fd-e"><option value="1e-4">10⁻⁴</option><option value="1e-5" selected>10⁻⁵</option><option value="1e-6">10⁻⁶</option></select></label>
+          <label>seed <input type="range" id="fd-seed" min="1" max="5" step="1" value="1" /><span id="fd-seedv" style="min-width:16px;display:inline-block">1</span></label>
+          <button id="fd-go">re-run the audit</button>
+        </div>
+        <svg id="fd-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="A horizontal bar chart on a logarithmic axis with one bar per audited backward pass: LayerNorm, RMSNorm, the ungated feedforward with ReLU, GELU and SiLU, the gated feedforward with the same three, attention with rotary embeddings in each of the two pairing conventions plus per-head ALiBi biases, attention with grouped-query heads, the block in pre-norm and post-norm wiring with each norm and with and without gating, and the whole tiny model with each of five positional schemes. Each bar's length is the worst relative error between the analytic gradient and the central-difference gradient; at the defaults every bar lies between ten to the minus eleven and ten to the minus seven, with the GELU paths near the upper end because the error function's own accuracy limits them. Two vertical reference lines mark ten to the minus nine and the failure tolerance of ten to the minus six. Two extra rows record that attention without rotary embeddings reproduces the attention page's implementation exactly and that the cached-norm forward passes match the training page's norms exactly. The readout prints the overall worst error and the name of the pass it belongs to."></svg>
+        <div class="readout" aria-live="polite" id="fd-readout"></div>
+      </div>
+
+      <div class="callout"><b>What the audit does and does not establish.</b> It establishes that each backward pass computes the gradient of the forward pass <i>as implemented</i>, to the precision central differences allow. It does not establish that the forward pass is the intended function — that RoPE pairs the right coordinates, that the mask is on the right axis, that the FFN's keys are the columns — because a wrong-but-consistent forward pass has a perfectly correct gradient. Those are the bugs of §35, and they are caught by the property tests of §04, §06 and §35, not by this figure. Both kinds of check are needed and they are independent.</div>
+    </section>
+
+    <nav class="pager" aria-label="Transformers series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="positional-encodings.html">← Positional Encodings</a>
+      <a href="../transformers.html" style="color:var(--muted)">Transformers · overview</a>
+      <a href="stacks-accounting.html">Transformer Stacks &amp; Accounting →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../transformers.viz.js"></script>
+</body>
+</html>

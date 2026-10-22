@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · CLIP: ALIGN, LiT, SigLIP &amp; Successors</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../clip.html">CLIP</a> · part 5 of 5</p>
+      <h1>CLIP: ALIGN, LiT, SigLIP &amp; Successors</h1>
+      <p>The dual-encoder family after CLIP and how to use it: ALIGN on noisy alt-text, LiT's locked image tower, OpenCLIP on LAION with reproducible scaling laws, SigLIP's pairwise sigmoid loss, data-curation successors, and the preprocessing, tokenisation and logit-scale details that practical use depends on.</p>
+      <div style="margin-top:10px">
+        <span class="pill">CLIP</span>
+        <span class="pill">ALIGN · LiT · OpenCLIP & LAION scaling · SigLIP · data-centric successors · in practice</span>
+      </div>
+    </header>
+
+    <!-- 30 ───────────────────────────────────────────── -->
+    <section class="topic" id="align" data-nav="ALIGN">
+      <h3><span class="idx">30</span> ALIGN: noisier data, more of it</h3>
+      <p class="lede">A contemporaneous paper posted to arXiv in February 2021, ALIGN ("Scaling Up Visual and Vision-Language Representation Learning With Noisy Text Supervision") trained the same kind of dual encoder on 1.8 billion image–alt-text pairs with only "minimal frequency-based filtering", and matched CLIP's zero-shot ImageNet accuracy.</p>
+
+      <h4>What differs from CLIP</h4>
+      <table class="cmp">
+        <tr><th></th><th>CLIP</th><th>ALIGN</th></tr>
+        <tr><td>Data</td><td>400M pairs, query-balanced (WIT)</td><td>1.8B alt-text pairs, frequency-filtered</td></tr>
+        <tr><td>Image tower</td><td>ResNet / ViT from scratch</td><td>EfficientNet-L2, 289 px</td></tr>
+        <tr><td>Text tower</td><td>12-layer GPT-2-style, [EOS] feature</td><td>BERT-Large, [CLS] feature, 100k WordPiece vocabulary, 64 tokens</td></tr>
+        <tr><td>Loss</td><td>symmetric softmax contrastive</td><td>same form ("normalized softmax"), label smoothing 0.1</td></tr>
+        <tr><td>Temperature</td><td>learned, init 1/0.07, scale ≤ 100</td><td>learned, init 1.0, converged to about 1/64</td></tr>
+        <tr><td>Batch / hardware</td><td>32,768 / V100s</td><td>16,384 / 1,024 TPUv3 cores</td></tr>
+        <tr><td>Optimiser</td><td>Adam, decoupled weight decay</td><td>LAMB, ~12 epochs (1.2M steps)</td></tr>
+      </table>
+
+      <h4>The filtering, for contrast with WIT's balancing</h4>
+      <ul class="notes">
+        <li><b>Images:</b> remove pornographic images; keep only images whose shorter side exceeds 200 px and whose aspect ratio is below 3; discard images with more than 1,000 associated alt-texts; remove near-duplicates of downstream test images.</li>
+        <li><b>Text:</b> drop alt-texts shared by more than 10 images ("1920x1080", "alt img"); drop texts with any token outside the 100M most frequent unigrams and bigrams; drop texts shorter than 3 or longer than 20 unigrams.</li>
+      </ul>
+
+      <h4>Zero-shot results (ALIGN paper, Table 4)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>ImageNet</th><th>ImageNet-R</th><th>ImageNet-A</th><th>ImageNet-V2</th></tr>
+        <tr><td>CLIP</td><td>76.2</td><td>88.9</td><td>77.2</td><td>70.1</td></tr>
+        <tr><td>ALIGN</td><td>76.4</td><td>92.2</td><td>75.8</td><td>70.1</td></tr>
+      </table>
+      <p>ALIGN's message is complementary to CLIP's: scale can compensate for noise. Its learned temperature settled near 1/64 — a scale of about 64. ALIGN's ablation found some hand-picked fixed temperatures slightly better than the learned one; the authors kept the learnable temperature because it was competitive and made training easier.</p>
+      <div class="callout"><b>Takeaway:</b> ALIGN reached CLIP-level zero-shot accuracy with 4.5× more, much noisier data and different towers. The dual-encoder contrastive recipe is robust to these choices; data scale and coverage do most of the work.</div>
+    </section>
+
+    <!-- 31 ───────────────────────────────────────────── -->
+    <section class="topic" id="lit" data-nav="LiT: locked-image tuning">
+      <h3><span class="idx">31</span> LiT: lock the image tower, train only the text</h3>
+      <p class="lede">"LiT: Zero-Shot Transfer with Locked-image text Tuning" (2021) asks whether both towers need to learn. Its answer: take a strong pretrained image model, freeze it, and train only a text tower to read out its representations. This "Locked-image Tuning" beat CLIP and ALIGN on zero-shot ImageNet by about 9 points.</p>
+
+      <h4>The design space</h4>
+      <ul class="notes">
+        <li>Each tower can be <b>L</b> (locked, pretrained), <b>U</b> (unlocked, pretrained) or <b>u</b> (unlocked, random). CLIP and ALIGN are <b>uu</b>; LiT is <b>Lu</b>.</li>
+        <li>In a thorough small-scale study on the 15M-image YFCC100M subset, "locking the image tower almost always works best", a pretrained image tower "significantly helps", a pretrained text tower helps only marginally, and locking the text tower "does not work well".</li>
+        <li>The explanation offered: locking gives <i>worse</i> contrastive loss on the tuning data but better loss on out-of-distribution data such as COCO captions — the pretrained image representation, trained on cleaner labels, generalises better than one re-fitted to noisy captions.</li>
+      </ul>
+
+      <h4>Results and efficiency</h4>
+      <ul class="notes">
+        <li>With a ViT-g/14 pretrained on JFT-3B, 32k batch and 18B image–text pairs seen, LiT reached <b>85.2%</b> zero-shot ImageNet and <b>82.5%</b> on ObjectNet (an earlier version reported 84.5%, corrected after a model-loading bug).</li>
+        <li>With only 300M pairs seen, LiT reached 81.7%; the paper notes from-scratch CLIP needed 12.8B pairs, "40 times more", to reach 76.2%.</li>
+        <li>A locked tower needs no image gradients, and without augmentation its embeddings "can be precomputed once", cutting the cost of training further. The paper also reports incremental gains from larger text towers (base → large → huge) — a point CLIP's width-only text scaling did not explore.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> LiT separates representation learning from language alignment: learn the image representation however you like (here supervised on JFT-3B), then teach a text tower to address it. The cost is that the image representation's own biases and gaps are frozen in.</div>
+    </section>
+
+    <!-- 32 ───────────────────────────────────────────── -->
+    <section class="topic" id="openclip" data-nav="OpenCLIP and LAION scaling laws">
+      <h3><span class="idx">32</span> OpenCLIP, LAION and reproducible scaling laws</h3>
+      <p class="lede">OpenAI released CLIP's weights but not WIT. The open reproduction — the OpenCLIP code base trained on the public LAION datasets — made CLIP-style training reproducible, produced larger public models, and measured scaling laws for contrastive image–text learning ("Reproducible scaling laws for contrastive language-image learning", 2022).</p>
+
+      <div class="viz" id="viz-scale">
+        <div class="vhead">
+          <span class="vtitle">Fitted power laws: error = β · C^α</span>
+          <span class="vhint">C = GMACs per sample × samples seen · coefficients from the paper's Figure 1a (Pareto-frontier fits) · slide the compute</span>
+        </div>
+        <div class="controls">
+          <label>task <select id="scale-task"><option value="in">zero-shot ImageNet</option><option value="rob">ImageNet robustness sets</option></select></label>
+          <label>compute log₁₀ C <input type="range" id="scale-c" min="100" max="140" step="1" value="120" /><span id="scale-cv" style="min-width:60px;display:inline-block"></span></label>
+        </div>
+        <svg id="scale-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Log-log plot of fitted error against total compute for OpenCLIP on LAION and OpenAI CLIP on WIT"></svg>
+        <div class="readout" aria-live="polite" id="scale-read"></div>
+      </div>
+
+      <h4>The data</h4>
+      <ul class="notes">
+        <li><b>LAION-5B</b>: 5.85B image–text pairs from Common Crawl, 2.32B of them English (the "LAION-2B" subset); LAION-400M is an earlier English set.</li>
+        <li>LAION was filtered <i>with OpenAI's CLIP ViT-B/32</i>: English pairs with cosine below 0.28 and other pairs below 0.26 were removed, which "removed around 90% of the original 50 billion images". An open CLIP is therefore trained on data selected by the closed one — a circularity worth remembering when comparing them.</li>
+      </ul>
+
+      <h4>The study</h4>
+      <ul class="notes">
+        <li>ViT-B/32 through ViT-g/14, data scales of 80M, 400M and 2B, and 3B, 13B or 34B samples seen; up to 1,520 A100 GPUs. The recipe follows CLIP (InfoNCE, AdamW with β₂ = 0.98 and weight decay 0.2), except that loss spikes at ViT-L/14 and above were fixed "by switching from mixed precision with float16 to mixed precision with bfloat16".</li>
+        <li>Best result: ViT-H/14 on LAION-2B with 34B samples seen, <b>78.0%</b> zero-shot ImageNet. At equal architecture, their ViT-L/14 on LAION-2B scored 75.2 against OpenAI's 75.5 under the paper's evaluation.</li>
+        <li>Fitted exponents on zero-shot ImageNet error: <b>α = −0.11</b> for OpenCLIP/LAION versus <b>−0.16</b> for OpenAI/WIT, and −0.13 versus −0.24 on the robustness sets — a steeper curve for WIT. On retrieval the order reverses (COCO: −0.08 versus −0.05). The authors conclude "the training distribution plays a key role in scaling laws".</li>
+        <li>Bottlenecks: ViT-B models gained nothing from 400M → 2B data at 3B or 13B samples seen; the larger dataset only paid off at 34B samples. Extrapolating, they predicted 79.1% for a ViT-g/14 at 2B/34B and 81.9% for a ViT-G/14 with 68B samples.</li>
+      </ul>
+
+      <h4>A hand check of the fit</h4>
+      <div class="formula"><span class="lbl">OpenCLIP, zero-shot ImageNet error (fraction)</span><span class="eq">E = 5.86 · C^(−0.11)</span>
+<span class="lbl">ViT-H/14: 190.97 GMACs per sample × 34 × 10⁹ samples</span><span class="eq">C = 6.49 × 10¹²      ln C = 29.50
+E = 5.86 · exp(−0.11 × 29.50) = 5.86 × 0.0390 = 0.229   →   accuracy ≈ 77.1% (measured: 78.0%)</span></div>
+      <div class="callout"><b>Takeaway:</b> CLIP-style training obeys power laws in compute, but the exponent depends on the data — WIT scaled better for classification, LAION for retrieval. Open models trained on LAION eventually passed the original CLIP; the data's CLIP-based filtering ties the two together.</div>
+    </section>
+
+    <!-- 33 ───────────────────────────────────────────── -->
+    <section class="topic" id="siglip" data-nav="SigLIP: a pairwise sigmoid loss">
+      <h3><span class="idx">33</span> SigLIP: replacing the softmax with a pairwise sigmoid</h3>
+      <p class="lede">"Sigmoid Loss for Language Image Pre-Training" (2023) treats every (image, text) cell of the N × N matrix as an independent binary question — match or not — scored with a sigmoid. No row or column normalisation, so no cell needs to know about any other.</p>
+
+      <div class="viz" id="viz-sig">
+        <div class="vhead">
+          <span class="vtitle">Softmax InfoNCE and pairwise sigmoid on the same cosines</span>
+          <span class="vhint">the 3 × 3 cosines from the worked example · per-cell loss contributions · move the bias and scale</span>
+        </div>
+        <div class="controls">
+          <label>scale t <input type="range" id="sig-t" min="1" max="30" step="1" value="10" /><span id="sig-tv" style="min-width:30px;display:inline-block"></span></label>
+          <label>bias b <input type="range" id="sig-b" min="-12" max="2" step="0.5" value="-10" /><span id="sig-bv" style="min-width:40px;display:inline-block"></span></label>
+          <label>batch N for the init comparison <input type="range" id="sig-n" min="4" max="20" step="1" value="15" /><span id="sig-nv" style="min-width:60px;display:inline-block"></span></label>
+        </div>
+        <svg id="sig-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Two heatmaps of per-cell loss for softmax contrastive and sigmoid losses on the same similarity matrix"></svg>
+        <div class="readout" aria-live="polite" id="sig-read"></div>
+      </div>
+
+      <div class="formula"><span class="lbl">the sigmoid loss (zᵢⱼ = +1 on the diagonal, −1 elsewhere)</span><span class="eq">ℒ = −(1/N) ∑ᵢ ∑ⱼ log σ( zᵢⱼ · ( t · xᵢ · yⱼ + b ) )</span>
+<span class="lbl">learned scale and bias, and their initialisation</span><span class="eq">t = exp(t′),  t′₀ = ln 10  (t₀ = 10)        b₀ = −10</span>
+<span class="lbl">cost per device with a ring of D devices, local batch n = N / D</span><span class="eq">peak logits in memory: n² instead of N² · no all-gather, D collective permutes</span></div>
+
+      <h4>Worked on the same 3 × 3 cosines</h4>
+      <ul class="notes">
+        <li>At initialisation, <code>t = 10, b = −10</code>: the diagonal logits are 3 − 10 = −7, −7.5 and −7.2, so the positives contribute 7.00, 7.50 and 7.20; each negative contributes at most 0.0003. <b>ℒ = 21.70 / 3 = 7.23.</b> The model starts out believing almost nothing matches — which is correct for a random pair when one in N pairs is positive.</li>
+        <li>With <code>b = −2</code>: positives contribute 0.31, 0.47, 0.37; negatives between 0.15 and 0.69. ℒ = 1.12.</li>
+        <li>With <code>b = 0</code>, the negatives dominate (up to 2.13 each) and ℒ = 2.85. At a real batch of 32,768, each row would carry 32,767 negative terms of about ln 2 = 0.69 at the start of training — about 22,700 nats per row — which is the "heavy imbalance" the bias initialisation exists to avoid.</li>
+      </ul>
+
+      <h4>What the paper reports</h4>
+      <ul class="notes">
+        <li>The sigmoid loss "does not require a global view of the pairwise similarities for normalization", enabling the chunked ring implementation and batch sizes "over 1 million on relatively few devices".</li>
+        <li><b>Batch size:</b> sigmoid "outperforms the softmax loss significantly with small batch sizes, and performs similarly at larger batch sizes"; both saturate — "a more reasonable batch size of 32 k being sufficient". In one SigLIP run (9B examples seen) the sigmoid peaked at 32k while softmax peaked at 98k; very large batches hurt both.</li>
+        <li><b>Cheap training:</b> SigLiT (locked g/14 image tower) reached <b>84.5%</b> zero-shot ImageNet using four TPUv4 chips for two days; a SigLiT B/8 reached 79.7% (Table 1 prints 79.8) in one day on four chips. SigLIP with an unlocked B/16 reached 71.0% on 16 chips in three days.</li>
+        <li>The bias term with −10 initialisation "consistently improves performance"; the paper's corruption experiments (random images, texts or batch alignment) report sigmoid training to be more robust to data noise than softmax.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> SigLIP keeps CLIP's dual encoders and batch-as-negatives, but scores each pair independently with a learned scale and a strongly negative bias. That removes the global softmax, cuts the memory peak from N² to n², and works better at small batches. SigLIP-family towers have since been widely adopted as vision encoders in later vision–language systems.</div>
+    </section>
+
+    <!-- 34 ───────────────────────────────────────────── -->
+    <section class="topic" id="family" data-nav="Data-centric successors">
+      <h3><span class="idx">34</span> The wider family: data-centric and hybrid successors</h3>
+      <p class="lede">After 2022 most gains in CLIP-style models came from data curation, training efficiency and extra objectives rather than from changing the dual-encoder idea. The table places the main open lines side by side; each figure is a headline zero-shot ImageNet number reported in that paper (not always in its abstract).</p>
+      <table class="cmp">
+        <tr><th>Work (year)</th><th>What it changed</th><th>Headline zero-shot ImageNet</th></tr>
+        <tr><td>CLIP (2021)</td><td>the recipe: WIT 400M, symmetric InfoNCE</td><td>76.2% (ViT-L/14@336px)</td></tr>
+        <tr><td>ALIGN (2021)</td><td>1.8B noisy alt-text, EfficientNet-L2 + BERT-Large</td><td>76.4%</td></tr>
+        <tr><td>LiT (2021)</td><td>locked pretrained image tower</td><td>85.2% (ViT-g/14, JFT-3B pretrained)</td></tr>
+        <tr><td>CoCa (2022)</td><td>contrastive + captioning loss in one model</td><td>86.3%</td></tr>
+        <tr><td>OpenCLIP scaling (2022)</td><td>public LAION data, scaling laws</td><td>78.0% (ViT-H/14, LAION-2B)</td></tr>
+        <tr><td>FLIP (2022)</td><td>randomly drop a large share of image patches during training for speed</td><td>improves accuracy and speed over its no-masking baseline</td></tr>
+        <tr><td>SigLIP (2023)</td><td>pairwise sigmoid loss</td><td>84.5% (SigLiT g/14)</td></tr>
+        <tr><td>EVA-CLIP (2023)</td><td>training techniques at scale (initialisation, optimisation, augmentation)</td><td>82.0% (5.0B-parameter E/14+); 80.4% (430M L/14+)</td></tr>
+        <tr><td>DataComp (2023)</td><td>benchmark of filtering methods on a 12.8B-pair pool</td><td>79.2% (ViT-L/14 on DataComp-1B, +3.7 over OpenAI's ViT-L/14)</td></tr>
+        <tr><td>MetaCLIP (2023)</td><td>re-derives WIT's query-and-balance curation on Common Crawl</td><td>70.8% vs CLIP's 68.3% (ViT-B/16, 400M, MetaCLIP's own evaluation); 80.5% ViT-H at 2.5B</td></tr>
+        <tr><td>DFN (2023)</td><td>a learned data-filtering network builds DFN-5B</td><td>84.4% (ViT-H)</td></tr>
+        <tr><td>SigLIP 2 (2025)</td><td>adds captioning, self-distillation, masked prediction, online curation, multilinguality</td><td>improves on SigLIP at all four released sizes</td></tr>
+      </table>
+
+      <h4>Reading the table</h4>
+      <ul class="notes">
+        <li><b>Data dominates.</b> MetaCLIP, DataComp and DFN all hold the architecture fixed and change only the data, and all beat OpenAI's CLIP at matched model size. DFN's key finding is that a good <i>filtering</i> model is not the same as a good <i>downstream</i> model: one "that performs well on ImageNet can yield worse training sets than a model with low ImageNet accuracy that is trained on a small amount of high-quality data".</li>
+        <li><b>Hybrids restore generation.</b> CoCa adds a captioning decoder alongside the contrastive loss — the "joint training of a contrastive and generative objective" the CLIP paper proposed as future work.</li>
+        <li><b>Numbers are not directly comparable.</b> Models differ in size, samples seen, resolution, pretraining (LiT uses a JFT-3B-supervised tower) and evaluation details such as prompts. MetaCLIP's 68.3% for "CLIP ViT-B", for example, is its own evaluation, differing slightly from Table 11's 68.6 for ViT-B/16.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> CLIP's architecture has been remarkably stable; its descendants mostly improved what goes in (curation, balancing, filtering networks), how cheaply it trains (locking, masking, sigmoid loss) and what else is learned alongside (captioning, self-supervision).</div>
+    </section>
+
+    <!-- 35 ───────────────────────────────────────────── -->
+    <section class="topic" id="practice" data-nav="Using CLIP in practice">
+      <h3><span class="idx">35</span> Using CLIP in practice</h3>
+      <p class="lede">Most practical mistakes with CLIP are mismatches with how the released models were trained and evaluated: preprocessing, tokenisation, normalisation, prompt format and the logit scale. The reference implementation pins each of them down.</p>
+
+      <h4>The image side</h4>
+      <ul class="notes">
+        <li><b>Preprocessing</b> (reference <code>clip.load</code>): resize the shorter side to the model's input size with <b>bicubic</b> interpolation, <b>center-crop</b> to a square, convert to RGB, scale to [0, 1], then normalise per channel with mean <code>(0.48145466, 0.4578275, 0.40821073)</code> and standard deviation <code>(0.26862954, 0.26130258, 0.27577711)</code>. These are not the ImageNet statistics; using ImageNet's mean and std or bilinear resizing shifts inputs away from the training distribution.</li>
+        <li><b>Resolution is fixed</b> per model (224, 288, 336, 384 or 448). The center crop discards the edges of non-square images, and small objects or small text may fall below the patch size. For wide images or small details, embed several crops and aggregate, or pick a higher-resolution model.</li>
+      </ul>
+
+      <h4>The text side</h4>
+      <ul class="notes">
+        <li>Use the model's own tokenizer: lower-cased BPE, 77 positions including start and end tokens. Long text raises an error unless truncation is enabled — and truncation silently drops the end of the prompt.</li>
+        <li>Write prompts as captions ("a photo of a {label}.") and, for classification, average a template ensemble per class (normalise each, average, renormalise) — see <a href="zero-shot-evaluation.html#prompts">prompts</a>.</li>
+      </ul>
+
+      <h4>Scoring</h4>
+      <div class="formula"><span class="lbl">zero-shot classification, as in the reference notebook</span><span class="eq">u = normalize( encode_image(x) )          W = [ normalize(prototypeₖ) ]ₖ
+logits = 100 · u · Wᵀ                     P = softmax(logits)</span>
+<span class="lbl">retrieval and similarity</span><span class="eq">score(image, text) = u · v        (cosine; no scale needed for ranking)</span></div>
+      <ul class="notes">
+        <li>Always normalise both embeddings before the dot product; the encoders' raw outputs are not unit length.</li>
+        <li>The factor 100 (the model's learned <code>logit_scale.exp()</code>) matters only if you need probabilities. Omit it and the softmax becomes nearly uniform; the argmax is unchanged.</li>
+        <li>Thresholds on raw cosines are model-specific and modality-pair-specific (the <a href="limits-downstream.html#geometry">modality gap</a>): calibrate them on held-out data for the checkpoint you use.</li>
+      </ul>
+
+      <h4>Adapting to a task</h4>
+      <ul class="notes">
+        <li><b>Few labels:</b> start from zero-shot; if you add a linear probe, expect the first few shots to underperform the zero-shot classifier, as the paper found.</li>
+        <li><b>Many labels:</b> a logistic-regression probe on pre-projection features is a strong, cheap baseline (the paper's protocol). Full fine-tuning gains in-distribution accuracy but can lose robustness — interpolate weights with the zero-shot model (WiSE-FT) or probe before fine-tuning (LP-FT).</li>
+        <li><b>Choosing a checkpoint:</b> ViT-B/32 is the cheapest released model (50 tokens per image); ViT-L/14@336px the most accurate of the original nine. Open successors trained on curated data (see <a href="#family">the family</a>) are usually stronger at equal size; embeddings from different checkpoints are not interchangeable.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> bicubic resize, center crop, CLIP's own mean and std, CLIP's own tokenizer, normalised embeddings, caption-style prompts, and ×100 only when you need probabilities. Get those right before concluding that CLIP "does not work" on a task.</div>
+    </section>
+
+    <nav class="pager" aria-label="CLIP series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="limits-downstream.html">← CLIP: Limitations, Geometry &amp; Downstream Use</a>
+      <a href="../clip.html" style="color:var(--muted)">CLIP · overview</a>
+      <a href="../clip.html">CLIP · overview →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../clip.viz.js"></script>
+</body>
+</html>

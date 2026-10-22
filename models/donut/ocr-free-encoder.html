@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Donut: OCR-Free Design &amp; Swin Encoder</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+.tokrow{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0;font-family:"SF Mono",Menlo,monospace;font-size:11.5px}
+.tokrow span{padding:2px 5px;border-radius:4px;background:rgba(91,156,255,.16);color:#cfe0ff}
+.tokrow span.sp{background:rgba(255,180,84,.2);color:#ffd9a3}
+.tokrow span.ctl{background:rgba(192,132,252,.2);color:#e9d5ff}
+.tokrow span.bad{background:rgba(248,113,113,.25);color:#fecaca}
+textarea.jsin{width:100%;min-height:92px;background:#10131a;color:#e6e9ef;border:1px solid #2a2f3a;border-radius:8px;font-family:"SF Mono",Menlo,monospace;font-size:12px;padding:8px;box-sizing:border-box}
+pre.jsout{background:#10131a;border:1px solid #2a2f3a;border-radius:8px;padding:8px;font-size:11.5px;white-space:pre-wrap;margin:6px 0 0;color:#cbd5e1}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../donut.html">Donut</a> · part 1 of 5</p>
+      <h1>Donut: OCR-Free Design &amp; Swin Encoder</h1>
+      <p>Why Donut removes the OCR stage and how the page enters the model: the two-stage pipeline it replaces, its six datasets across classification, extraction and DocVQA, the encoder–decoder at a glance, fitting each page onto a fixed canvas, the modified Swin-B encoder, and shifted-window attention.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Donut</span>
+        <span class="pill">Why drop OCR · tasks & datasets · encoder–decoder · canvas · Swin-B {2,2,14,2} · shifted windows</span>
+      </div>
+    </header>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="motivation" data-nav="Why remove the OCR stage">
+      <h3><span class="idx">02</span> Why remove the OCR stage</h3>
+      <p class="lede">Before Donut, visual document understanding (VDU) systems were built in two stages: an OCR engine detects text boxes and recognises their characters, and a model such as BERT, LayoutLM or LayoutLMv2 interprets the recognised words. The Donut paper names three problems with making OCR a hard dependency: its computational cost, its inflexibility across languages and document types, and the propagation of its errors into every later stage.</p>
+      <h4>The three problems, as the paper states them</h4>
+      <ul class="notes">
+        <li><b>Cost.</b> High-quality OCR is expensive at inference time, and a strong engine is itself a large model — the paper notes that a recent advanced OCR system requires more than 80M parameters (its references are CRAFT text detection plus a four-stage recognition framework). In its classification table every OCR-based baseline is written "+ α" parameters, because the OCR engine's parameters and time come on top.</li>
+        <li><b>Inflexibility.</b> An off-the-shelf engine rarely adapts to a new language or domain; training one requires large datasets and substantial compute.</li>
+        <li><b>Error propagation.</b> A misread character becomes a wrong input token, and the downstream model has no access to the pixels to correct it. The paper says this is more severe in languages with complex character sets, such as Korean and Chinese, where OCR quality is relatively low. The usual remedy — a post-OCR correction module — adds system size and maintenance cost.</li>
+      </ul>
+      <h4>What the measurements looked like</h4>
+      <p>The paper's own timings put numbers on the cost argument. On RVL-CDIP classification, LayoutLMv2 takes 1,489 ms per page including Microsoft's OCR API, and Donut 752 ms on an NVIDIA P40 — an older and slower GPU than the A100 used for training. On CORD receipt parsing the BERT, BROS, LayoutLM and LayoutLMv2 baselines take 1.6–1.7 s per receipt and Donut 1.2 s. The appendix also shows that the OCR-based baselines' accuracy on CORD varies strongly with which of four engines (EasyOCR, PaddleOCR, Microsoft Azure, CLOVA OCR) supplies the text, with CLOVA OCR the most accurate there. The tables are in <a href="evaluation-limits.html#results">results</a>; the category-level version of the argument, with a probability model of compounding errors, is on the hub's <a href="../document-ai-models.html#pipeline">pipeline versus end-to-end</a> section.</p>
+      <div class="viz" id="viz-pipe">
+        <div class="vhead">
+          <span class="vtitle">One receipt through two systems</span>
+          <span class="vhint">pick an OCR failure · watch it travel through the pipeline</span>
+        </div>
+        <div class="controls">
+          <label>OCR failure <select id="pipe-err">
+            <option value="none">none</option>
+            <option value="sub">character substitution (0 → O)</option>
+            <option value="drop">word missed by the detector</option>
+            <option value="split">one line split into two boxes</option>
+            <option value="order">reading order swaps two words</option>
+          </select></label>
+        </div>
+        <svg id="pipe-svg" width="660" height="330" viewBox="0 0 660 330" role="img" aria-label="Pipeline stages from image through OCR detection, recognition, serialisation and tagging to JSON, beside the single OCR-free path, with fields coloured correct or wrong"></svg>
+        <div class="readout" aria-live="polite" id="pipe-read"></div>
+        <p class="vcap">The receipt content is the example in the Donut paper's Figure 1 (item "3002-Kyoto Choco Mochi", count 2, unit price 14,000, price 28,000; total 50,000, quantity 4). The pipeline's tagger is modelled as perfect — it labels every word it receives correctly — so every wrong field here is caused by the OCR stage alone. Field scores use the Donut evaluation code's field-level F1 (flattened key–value pairs, exact string match). The OCR-free column only shows that OCR errors cannot enter it; Donut makes reading errors of its own, which this figure does not simulate (see <a href="evaluation-limits.html#handwriting">failure cases</a>).</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> the case against OCR is not that OCR is bad but that it is a separate system: its cost is paid on every page, its language coverage caps the whole pipeline's, and its mistakes are invisible to the model that comes after it. Donut's bet is that one network trained end to end can learn to read well enough to make that separation unnecessary.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="tasks" data-nav="Tasks and datasets">
+      <h3><span class="idx">03</span> The tasks and datasets Donut is evaluated on</h3>
+      <p class="lede">The paper evaluates three kinds of task on six datasets: document classification (RVL-CDIP), document information extraction on four datasets — two public (CORD receipts, Chinese train tickets) and two private in-service sets (Japanese business cards, Korean receipts) — and document visual question answering (DocVQA). All of them are posed to Donut as "generate this JSON".</p>
+      <table class="cmp">
+        <tr><th>Dataset</th><th>Task</th><th>Size (train / valid / test)</th><th>Structure</th><th>Metric</th></tr>
+        <tr><td>RVL-CDIP</td><td>page classification</td><td>320K / 40K / 40K images; 16 classes × 25K</td><td>one label</td><td>accuracy</td></tr>
+        <tr><td>CORD</td><td>receipt parsing (Latin script)</td><td>800 / 100 / 100</td><td>30 unique fields; nested groups such as menu → item → {name, count, price}</td><td>field-level F1, TED accuracy</td></tr>
+        <tr><td>Ticket</td><td>Chinese train-ticket parsing</td><td>1.5K train (10% held out as validation) / 0.4K test</td><td>8 fields, each appears once, fixed positions</td><td>field-level F1, TED accuracy</td></tr>
+        <tr><td>Business Card (in-service)</td><td>Japanese business-card parsing</td><td>20K / 0.3K / 0.3K</td><td>11 fields, flat</td><td>field-level F1, TED accuracy</td></tr>
+        <tr><td>Receipt (in-service)</td><td>Korean receipt parsing</td><td>40K / 1K / 1K</td><td>81 unique fields, complex nesting</td><td>field-level F1, TED accuracy</td></tr>
+        <tr><td>DocVQA</td><td>question answering on page images</td><td>50K questions on 12K+ documents; 40K / 5K / 5K questions</td><td>free-text answer</td><td>ANLS (test set via the evaluation server)</td></tr>
+      </table>
+      <h4>Why information extraction is the hard case</h4>
+      <p>The appendix breaks document IE into three sub-skills: (a) reading the text, (b) understanding what it means, and (c) predicting relations and structure among the extracted pieces. Earlier work that extracts a few fixed keys needs only (a) and (b). CORD and the in-service receipt set require (c) as well: which name, count and price belong to the same line item. The paper's Ticket and Business Card sets have depth-1 structure (each key once), CORD depth 2. That is why Donut reports a second, structure-aware metric (<a href="evaluation-limits.html#metrics">tree-edit-distance accuracy</a>) next to field F1.</p>
+      <h4>How the OCR-based baselines solve the same tasks</h4>
+      <ul class="notes">
+        <li><b>Classification:</b> a linear layer and softmax on the [CLS] vector of the encoder.</li>
+        <li><b>IE:</b> BIO tagging of the serialised OCR tokens. For depth-2 structures the paper uses group BIO tags — a pair such as B<sub>g</sub>.I<sub>k</sub> marks both the start or continuation of a group (a menu item) and of a key inside it.</li>
+        <li><b>DocVQA:</b> extractive span prediction — start and end positions over the OCR tokens — so the answer must be a contiguous string of recognised words.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the benchmark set spans a single label (RVL-CDIP), flat records (tickets, business cards), nested records (CORD, Korean receipts) and free-text answers (DocVQA). A generative decoder handles all four with one output interface, where the encoder baselines need a different head for each.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="architecture" data-nav="Architecture at a glance">
+      <h3><span class="idx">04</span> Architecture at a glance</h3>
+      <p class="lede">Donut is a standard encoder–decoder: a vision Transformer encoder (Swin) produces a sequence of image feature vectors, and a text Transformer decoder produces output tokens, reading the image vectors through cross-attention in every layer. Nothing in the network corresponds to text detection, character recognition or reading order; all of that must be learned inside these two modules.</p>
+      <div class="formula"><span class="lbl">shapes through the network (donut-base, one page)</span><span class="eq">pixels 3 × 2560 × 1920  →  patch tokens 640 × 480 × 128  →  …  →  z: 80 × 60 × 1024 = 4,800 vectors</span>
+<span class="lbl">each decoder layer l, for the prefix y₁ … yₜ₋₁</span><span class="eq">h ← h + SelfAttn_causal(LN(h))      h ← h + CrossAttn(LN(h), z)      h ← h + FFN(LN(h))</span>
+<span class="lbl">output distribution over the 57,525-token vocabulary (tied to the input embedding E)</span><span class="eq">p(yₜ | y&lt;ₜ, z) = softmax(E · LN(hₜ))</span></div>
+      <h4>Encoder</h4>
+      <p>The paper says any CNN or Transformer image backbone could serve as the encoder; it chose Swin Transformer because it performed best in a preliminary document-parsing study. Swin first cuts the image into non-overlapping 4 × 4 patches, then applies blocks of window-based multi-head self-attention and a two-layer MLP, with patch-merging layers between stages that halve the grid and double the channel width. The output of the final block — the whole final-stage grid, not a pooled vector — is what the decoder sees.</p>
+      <h4>Decoder</h4>
+      <p>The decoder is BART's decoder, initialised from a publicly available multilingual BART checkpoint (asian-bart-ecjk, an mBART whose vocabulary was pruned to English, Chinese, Japanese and Korean). Only its first four layers are kept, "in further consideration of the speed–accuracy trade-off". It has no encoder of its own on the text side: the image features take the place of BART's text encoder output.</p>
+      <h4>Interface</h4>
+      <p>Training uses teacher forcing: the ground-truth token sequence is fed as decoder input, shifted by one, and every position is a classification. At test time the decoder starts from a task prompt — "inspired by GPT-3", in the paper's words — and generates. New special tokens are added for each task's prompt and for each JSON key; <a href="decoder-output.html#prompts">task prompts</a> and <a href="decoder-output.html#json">the JSON conversion</a> cover them.</p>
+      <div class="viz" id="viz-arch">
+        <div class="vhead">
+          <span class="vtitle">Encoder → decoder, with sizes</span>
+          <span class="vhint">pick a canvas size · hover a block for its shape</span>
+        </div>
+        <div class="controls">
+          <label>canvas (H × W) <select id="arch-res">
+            <option value="2560x1920">2560 × 1920 (pretraining, RVL-CDIP, DocVQA)</option>
+            <option value="1280x960">1280 × 960 (CORD fine-tuning)</option>
+            <option value="960x1280">960 × 1280 (Ticket, Business Card)</option>
+          </select></label>
+        </div>
+        <svg id="arch-svg" width="660" height="250" viewBox="0 0 660 250" role="img" aria-label="Block diagram of the Swin encoder's four stages feeding the four-layer decoder through cross-attention, with token counts and widths for the chosen canvas"></svg>
+        <div class="readout" aria-live="polite" id="arch-read"></div>
+        <p class="vcap">Grid sizes are computed from the canvas: stage k has (H / 2^(k+1)) × (W / 2^(k+1)) tokens of width 128 · 2^(k−1). Depths {2, 2, 14, 2}, heads {4, 8, 16, 32} and the decoder's 4 layers × 16 heads × d = 1,024 are from the donut-base configuration on the Hugging Face Hub.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> architecturally Donut is unremarkable — a Swin encoder, a truncated BART decoder, cross-attention between them. What makes it work is the resolution it runs at, the reading pretraining, and the token interface that turns generation into structured output.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="preprocess" data-nav="From page to canvas">
+      <h3><span class="idx">05</span> From page to canvas: preprocessing</h3>
+      <p class="lede">Donut's encoder is built for one fixed input size, so every page is fitted onto a fixed canvas without distortion: optionally rotated so its long side matches the canvas's, resized so its shorter side equals the canvas's shorter side, shrunk further if it still overflows, and padded to the exact canvas size. Aspect ratio is preserved; any mismatch becomes padding.</p>
+      <div class="formula"><span class="lbl">canvas H × W (height × width); page h × w pixels</span><span class="eq">1. resize:     s₁ = min(H, W) / min(h, w)                       (shorter side → min(H, W))</span>
+<span class="lbl">thumbnail: shrink (never enlarge) to fit inside the canvas, keeping aspect</span><span class="eq">2. thumbnail:  s₂ = min(1, H / (s₁h), W / (s₁w))              final page size ≈ (s₁s₂h) × (s₁s₂w)</span>
+<span class="lbl">pad symmetrically at inference, at a random offset during training</span><span class="eq">3. pad:        top = floor((H − h′) / 2),   left = floor((W − w′) / 2)</span>
+<span class="lbl">normalise each channel (the released Hub processors: mean 0.5, std 0.5)</span><span class="eq">4. x ← (x / 255 − 0.5) / 0.5  ∈ [−1, 1]</span></div>
+      <h4>Worked example: an A4 page scanned at 300 dpi</h4>
+      <p>An A4 page at 300 dpi is 2480 × 3508 pixels (w × h). On the 2560 × 1920 canvas: step 1 scales the shorter side 2480 to 1920, s₁ = 0.7742, giving 1920 × 2715 (w × h). Step 2 finds the height 2715 exceeds 2560 and shrinks by 2560 / 2715 = 0.9429, giving about 1810 × 2560. Step 3 pads (1920 − 1810) = 110 columns, 55 on each side. Overall the page is scaled by 0.73, so 10-point text, whose em is 300 · 10 / 72 = 41.7 pixels in the scan, is about 30 canvas pixels tall — about 7.6 of Swin's 4-pixel patches. The same page on the 1280 × 960 canvas is scaled by 0.365 and its 10-point em shrinks to about 15 pixels, under 4 patches.</p>
+      <h4>Implementation details that matter</h4>
+      <ul class="notes">
+        <li><b>Axis alignment.</b> The original code and the Hugging Face <code>DonutImageProcessor</code> rotate a page by 90° when its orientation disagrees with the canvas's (<code>align_long_axis</code>). donut-base's released processor enables it; the CORD fine-tuned processor and the fine-tuning configurations disable it, since receipts are already upright.</li>
+        <li><b>Random padding</b> places the page at a random offset inside the canvas during training (the original <code>prepare_input(random_padding=True)</code>), a cheap augmentation that stops the model from tying content to absolute canvas position.</li>
+        <li><b>Legacy size order.</b> The released <code>preprocessor_config.json</code> files store <code>size</code> as a list [width, height] — [1920, 2560] for donut-base — while the encoder config's <code>image_size</code> is [2560, 1920] as height, width. The Transformers processor reverses list-valued sizes when it loads them, which maps [1920, 2560] back to height 2560, width 1920.</li>
+        <li><b>Channels and normalisation.</b> The model takes three channels; grayscale scans are converted to RGB first. The processors published with the Hub checkpoints normalise with mean 0.5 and standard deviation 0.5 per channel, whereas the original repository's <code>prepare_input</code> uses the ImageNet statistics (mean 0.485, 0.456, 0.406; std 0.229, 0.224, 0.225). Use the processor that ships with the checkpoint you load, and do not mix the two.</li>
+      </ul>
+      <div class="viz" id="viz-prep">
+        <div class="vhead">
+          <span class="vtitle">Fitting a page onto the canvas</span>
+          <span class="vhint">pick a page and a canvas · toggle long-axis alignment</span>
+        </div>
+        <div class="controls">
+          <label>page <select id="prep-page">
+            <option value="a4">A4 scan, 300 dpi</option>
+            <option value="letter">US Letter scan, 200 dpi</option>
+            <option value="receipt">80 mm receipt, 300 dpi</option>
+            <option value="slide">landscape slide, 144 dpi</option>
+            <option value="ticket">train ticket, 300 dpi</option>
+          </select></label>
+          <label>canvas <select id="prep-canvas">
+            <option value="2560x1920">2560 × 1920</option>
+            <option value="1280x960">1280 × 960</option>
+            <option value="960x1280">960 × 1280</option>
+          </select></label>
+          <label><input type="checkbox" id="prep-align" /> align long axis</label>
+        </div>
+        <svg id="prep-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="The page drawn at its fitted size inside the canvas with padding shaded, and the size of a 10-point letter in canvas pixels and patches"></svg>
+        <div class="readout" aria-live="polite" id="prep-read"></div>
+        <p class="vcap">Page sizes are physical sizes times scan resolution (A4 210 × 297 mm; US Letter 8.5 × 11 in; an 80 × 200 mm receipt; a 13.33 × 7.5 in slide; an 87 × 55 mm ticket, drawn landscape). The steps follow the Transformers DonutImageProcessor: rotate if enabled and the orientations disagree, resize the shorter side to min(H, W) (integer truncation), thumbnail into H × W, pad centred. A 10-point em is 10/72 inch; its canvas height is that times the page's dpi times the overall scale.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> preprocessing decides how many pixels each character gets before the model sees anything. A tall receipt or a landscape page on a portrait canvas loses much of the canvas to padding; choose the canvas orientation, or enable long-axis alignment, to match the documents.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="swin" data-nav="The Swin encoder">
+      <h3><span class="idx">06</span> The Swin encoder: patches, stages and tokens</h3>
+      <p class="lede">Donut's encoder is Swin-B "with slight modification": the stage depths are {2, 2, 14, 2} instead of Swin-B's {2, 2, 18, 2}, and the attention window is 10 × 10 instead of 7 × 7. Everything else follows Swin-B: 4 × 4 patches, a first-stage width C = 128 that doubles at each stage, heads {4, 8, 16, 32} (32 dimensions per head), relative position bias, and no absolute position embedding.</p>
+      <div class="formula"><span class="lbl">stage k of 4 on an H × W canvas (patch 4, one 2 × 2 merge before each of stages 2 – 4)</span><span class="eq">grid_k = (H / 2^(k+1)) × (W / 2^(k+1))        width C_k = 128 · 2^(k−1)        heads = 4 · 2^(k−1)</span>
+<span class="lbl">patch merging: concatenate each 2 × 2 group, normalise, project 4C → 2C (no bias)</span><span class="eq">z′ = Linear₄꜀→₂꜀(LN([z₀₀ ; z₀₁ ; z₁₀ ; z₁₁]))</span>
+<span class="lbl">windows per stage, windows of M × M tokens (feature maps are padded up to a multiple of M)</span><span class="eq">windows_k = ceil(h_k / M) · ceil(w_k / M)</span></div>
+      <h4>Worked example: token counts at 2560 × 1920</h4>
+      <table class="cmp">
+        <tr><th>Stage</th><th>Blocks</th><th>Grid (h × w)</th><th>Tokens</th><th>Width C</th><th>Heads</th><th>10 × 10 windows</th><th>Pixels per token</th></tr>
+        <tr><td>patch embed</td><td>—</td><td>2560/4 × 1920/4</td><td>307,200</td><td>128</td><td>—</td><td>—</td><td>4 × 4</td></tr>
+        <tr><td>1</td><td>2</td><td>640 × 480</td><td>307,200</td><td>128</td><td>4</td><td>64 · 48 = 3,072</td><td>4 × 4</td></tr>
+        <tr><td>2</td><td>2</td><td>320 × 240</td><td>76,800</td><td>256</td><td>8</td><td>32 · 24 = 768</td><td>8 × 8</td></tr>
+        <tr><td>3</td><td>14</td><td>160 × 120</td><td>19,200</td><td>512</td><td>16</td><td>16 · 12 = 192</td><td>16 × 16</td></tr>
+        <tr><td>4</td><td>2</td><td>80 × 60</td><td>4,800</td><td>1,024</td><td>32</td><td>8 · 6 = 48</td><td>32 × 32</td></tr>
+      </table>
+      <p>The decoder receives the 4,800 stage-4 vectors of width 1,024. Every grid side at every stage is divisible by 10 — 640, 480, 320, 240, 160, 120, 80, 60 — so the 2560 × 1920 canvas needs no window padding; the same holds at 1280 × 960 (stage 4: 40 × 30 = 1,200 tokens). A canvas such as Nougat's 896 × 672 is not divisible by 10 at stage 1 (224 × 168), so with a 10 × 10 window the feature map would be padded to 230 × 170.</p>
+      <h4>Why a hierarchical encoder suits pages</h4>
+      <ul class="notes">
+        <li><b>Fine early, coarse late.</b> Stage 1's 4 × 4-pixel tokens can resolve strokes of small print; stage 4's 32 × 32-pixel tokens each summarise a region about one line of 10-point text tall (about 30 canvas pixels for an A4 page, see <a href="#preprocess">preprocessing</a>) and a few characters wide, a sensible unit for the decoder to attend over.</li>
+        <li><b>Depth where tokens are cheap.</b> A standard Swin-B puts 18 of its 24 blocks in stage 3; Donut keeps 14 of its 20 there, where there are 16× fewer tokens than at stage 1.</li>
+        <li><b>A plain ViT would not scale.</b> A ViT-B with 16 × 16 patches on the same canvas would produce 160 × 120 = 19,200 tokens and compute global attention over all of them in every layer; Swin's windowed attention keeps the cost linear in image area (<a href="#windows">next section</a>). The Donut paper's backbone ablation compares ResNet-152, EfficientNetV2, ViT-B and two Swin-B variants, and finds EfficientNetV2 and Swin best, choosing Swin "due to the high scalability of the Transformer-based architecture and higher performance over the EfficientNetV2's".</li>
+      </ul>
+      <div class="viz" id="viz-swin">
+        <div class="vhead">
+          <span class="vtitle">Stages, tokens and attention cost versus canvas size</span>
+          <span class="vhint">pick a canvas and a window size · compare windowed with global attention</span>
+        </div>
+        <div class="controls">
+          <label>canvas (H × W) <select id="swin-res">
+            <option value="2560x1920">2560 × 1920 (donut-base)</option>
+            <option value="2048x1536">2048 × 1536 (donut-proto)</option>
+            <option value="1280x960">1280 × 960 (CORD)</option>
+            <option value="960x1280">960 × 1280 (Ticket)</option>
+            <option value="896x672">896 × 672 (Nougat's canvas)</option>
+            <option value="640x640">640 × 640</option>
+          </select></label>
+          <label>window M <input type="range" id="swin-m" min="4" max="16" step="1" value="10" /> <span id="swin-mv"></span></label>
+          <label><input type="checkbox" id="swin-global" /> show global attention for comparison</label>
+        </div>
+        <svg id="swin-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="Four stage bars showing token counts, windows and attention multiply–accumulates per block, on a log scale, with optional global-attention bars"></svg>
+        <div class="readout" aria-live="polite" id="swin-read"></div>
+        <p class="vcap">Costs use the Swin paper's per-block formulas, counting multiply–accumulates and ignoring softmax: windowed Ω = 4hwC² + 2M²hwC, global Ω = 4hwC² + 2(hw)²C, where hw includes window padding. The MLP adds 8hwC² per block. Stage depths {2, 2, 14, 2} are Donut's (donut-proto used {2, 2, 18, 2} with M = 8, which this figure does not switch). Attention-matrix memory assumes the full score matrices of one block, all heads, stored in 16-bit floats — what a plain implementation materialises.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> at Donut's resolution the encoder handles 307,200 tokens in its first stage and hands 4,800 to the decoder. The 64× reduction comes from three patch merges; the affordability of the first stage comes from windowed attention.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="windows" data-nav="Windows and shifted windows">
+      <h3><span class="idx">07</span> Window attention and shifted windows</h3>
+      <p class="lede">Each Swin block computes self-attention only inside non-overlapping M × M windows of tokens, so a token attends to M² others instead of all hw. Consecutive blocks alternate between the regular window grid (W-MSA) and a grid displaced by (floor(M/2), floor(M/2)) tokens (SW-MSA), which lets information cross window borders. A learned relative position bias B is added to the attention logits inside each window.</p>
+      <div class="formula"><span class="lbl">a pair of consecutive Swin blocks (the Swin paper's Eq. 3)</span><span class="eq">ẑˡ = W-MSA(LN(zˡ⁻¹)) + zˡ⁻¹      zˡ = MLP(LN(ẑˡ)) + ẑˡ      ẑˡ⁺¹ = SW-MSA(LN(zˡ)) + zˡ      zˡ⁺¹ = MLP(LN(ẑˡ⁺¹)) + ẑˡ⁺¹</span>
+<span class="lbl">attention inside one window of M² tokens, head dimension d = 32</span><span class="eq">Attention(Q, K, V) = softmax(QKᵀ / √d + B) V,     B ∈ ℝ^(M² × M²) read from a table B̂ ∈ ℝ^((2M−1) × (2M−1))</span>
+<span class="lbl">cost per attention module (multiply–accumulates, softmax omitted)</span><span class="eq">Ω(MSA) = 4hwC² + 2(hw)²C          Ω(W-MSA) = 4hwC² + 2M²hwC</span></div>
+      <h4>Worked example: stage 1 at 2560 × 1920 with M = 10</h4>
+      <p>Stage 1 has hw = 640 · 480 = 307,200 tokens of width C = 128. The projections cost 4 · 307,200 · 128² = 20,132,659,200 multiply–accumulates in either case. The attention itself costs 2 · 10² · 307,200 · 128 = 7,864,320,000 when windowed, so Ω(W-MSA) ≈ 2.80 × 10¹⁰ per block; computed globally it would cost 2 · 307,200² · 128 ≈ 2.42 × 10¹³, so Ω(MSA) ≈ 2.42 × 10¹³ — about 864 times more. Memory tells the same story: one block's attention scores, 4 heads in 16-bit floats, are 3,072 windows × 4 × 100 × 100 × 2 bytes ≈ 246 MB windowed, against 307,200² × 4 × 2 bytes ≈ 755 GB globally.</p>
+      <table class="cmp">
+        <tr><th>Stage</th><th>hw</th><th>C</th><th>Ω(W-MSA), M = 10</th><th>Ω(MSA)</th><th>Global ÷ windowed</th><th>Scores, windowed</th><th>Scores, global</th></tr>
+        <tr><td>1</td><td>307,200</td><td>128</td><td>2.80 × 10¹⁰</td><td>2.42 × 10¹³</td><td>864×</td><td>246 MB</td><td>755 GB</td></tr>
+        <tr><td>2</td><td>76,800</td><td>256</td><td>2.41 × 10¹⁰</td><td>3.04 × 10¹²</td><td>126×</td><td>123 MB</td><td>94.4 GB</td></tr>
+        <tr><td>3</td><td>19,200</td><td>512</td><td>2.21 × 10¹⁰</td><td>3.98 × 10¹¹</td><td>18×</td><td>61 MB</td><td>11.8 GB</td></tr>
+        <tr><td>4</td><td>4,800</td><td>1,024</td><td>2.11 × 10¹⁰</td><td>6.73 × 10¹⁰</td><td>3.2×</td><td>31 MB</td><td>1.5 GB</td></tr>
+      </table>
+      <p>The windowed cost per block is almost flat across stages (each merge quarters hw and doubles C, so 4hwC² stays the same — 20,132,659,200 at every stage — while 2M²hwC halves), and by stage 4 the global/windowed gap is only about 3× — windowing matters most where the grid is largest.</p>
+      <h4>Shifted windows and the cyclic shift</h4>
+      <p>With only regular windows, no information would ever cross a window border. Shifting the grid by half a window in the next block puts tokens from four neighbouring windows into one window. Naively the shifted grid has (ceil(h/M) + 1) × (ceil(w/M) + 1) windows, some smaller than M × M; Swin instead cyclically rolls the feature map toward the top-left so the number of windows stays the same, and masks attention between tokens that were not neighbours before the roll. The relative-bias table has (2M − 1)² entries per head — 361 at M = 10 — because relative offsets along each axis range over −(M − 1) … M − 1; Swin notes the table can be bicubically interpolated when fine-tuning with a different window size, and the Donut fine-tuning configurations warn that some weights are re-initialised when the input resolution differs from pretraining.</p>
+      <div class="viz" id="viz-window">
+        <div class="vhead">
+          <span class="vtitle">Which tokens a token can attend to</span>
+          <span class="vhint">click a token · switch between regular and shifted windows</span>
+        </div>
+        <div class="controls">
+          <label>block <select id="win-mode">
+            <option value="w">W-MSA (regular windows)</option>
+            <option value="sw">SW-MSA (shifted by floor(M/2))</option>
+            <option value="both">two blocks: W then SW (reach)</option>
+          </select></label>
+          <label>window M <select id="win-m"><option value="4">4</option><option value="5">5</option><option value="3">3</option></select></label>
+        </div>
+        <svg id="win-svg" width="660" height="300" viewBox="0 0 660 300" role="img" aria-label="A small token grid with window borders; the clicked token and the tokens it attends to are highlighted"></svg>
+        <div class="readout" aria-live="polite" id="win-read"></div>
+        <p class="vcap">A 20 × 15 token grid with a small window, for legibility (Donut's is 10 × 10 on grids up to 640 × 480). In SW-MSA mode the highlighted set is the token's shifted window with the cyclic-shift mask applied — tokens that are adjacent only because of the wrap-around are excluded. "Two blocks" shows every token whose information can reach the clicked token after a W-MSA block followed by an SW-MSA block.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> windowed attention makes the cost of the first stage linear in page area and roughly equal per block across stages; the alternating shift is what lets a character's evidence travel beyond its window across depth.</div>
+    </section>
+
+    <nav class="pager" aria-label="Donut series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../donut.html">← Donut · overview</a>
+      <a href="../donut.html" style="color:var(--muted)">Donut · overview</a>
+      <a href="decoder-output.html">Donut: Decoder, Prompts &amp; JSON Tokens →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../donut.viz.js"></script>
+</body>
+</html>

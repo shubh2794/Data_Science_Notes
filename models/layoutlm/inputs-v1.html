@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · LayoutLM: OCR Inputs, 2-D Positions &amp; v1</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../layoutlm.html">LayoutLM</a> · part 1 of 4</p>
+      <h1>LayoutLM: OCR Inputs, 2-D Positions &amp; v1</h1>
+      <p>The input LayoutLM reads and the first model that read it: why position on the page carries meaning, the document-understanding tasks and datasets, OCR words, boxes and reading order, scaling boxes to a 0–1000 grid, v1's 2-D position embeddings from X and Y tables, sub-word boxes, masked visual-language modelling, fine-tuning-only image features, and v1 results.</p>
+      <div style="margin-top:10px">
+        <span class="pill">LayoutLM</span>
+        <span class="pill">Why layout · FUNSD/CORD/DocVQA tasks · OCR & reading order · 0–1000 grid · X/Y tables · sub-word boxes · MVLM · image features · v1 results</span>
+      </div>
+    </header>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="motivation" data-nav="Why layout needs its own signal">
+      <h3><span class="idx">02</span> Why layout needs its own signal</h3>
+      <p class="lede">In a form or an invoice, the meaning of a string often comes from where it is: the number to the right of "Total:" is the total, the text under "Ship to:" is an address. A text-only encoder sees only the order the OCR engine emitted words in, and that order can separate a key from its value or interleave two columns.</p>
+      <h4>What a 1-D token stream loses</h4>
+      <ul class="notes">
+        <li><b>Key–value adjacency is two-dimensional.</b> The v1 paper's example: for a key such as "Passport ID:", the value is much more likely to the right of it or below it than to the left or above. In a serialised stream, "below" can be dozens of tokens away.</li>
+        <li><b>Visual cues carry priority.</b> Headings are larger or bold; totals are often boxed; table rules group cells. The v1 paper lists bold, underline and italic as useful hints for sequence labelling, and the whole-page appearance as a strong cue for classifying the document type.</li>
+        <li><b>Reading order is itself an OCR output.</b> The text encoder's 1-D positions are only as good as the engine's line ordering, which tends to be weakest on the multi-column and tabular pages where layout matters most (see <a href="#ocr">the OCR front end</a>).</li>
+      </ul>
+      <h4>What existed before, and what LayoutLM changed</h4>
+      <p>Before 2019, document AI was split between computer-vision pipelines (table or region detection with Faster R-CNN or Mask R-CNN), grid-based models such as Chargrid that painted characters onto a 2-D map, and graph-convolution models over OCR segments. The v1 paper names two gaps: these methods relied on small human-labelled datasets without using large unlabelled collections, and none jointly pretrained text and layout. LayoutLM's move was to take BERT's recipe — pretrain on a large unlabelled corpus, fine-tune on small labelled sets — and change only the input embedding, so the whole BERT toolkit (initialisation, masked-token objective, heads) carried over.</p>
+      <p>The payoff showed up where labels are scarcest. On FUNSD, whose training split has only 149 forms, the v1 paper reports BERT-base at 60.26 F1 and LayoutLM-base (text + layout) at 78.66 — the same encoder size, pretrained with coordinates.</p>
+      <div class="callout"><b>Takeaway:</b> layout is a second positional signal that a document's text order does not reliably carry. LayoutLM supplies it as extra embeddings rather than as a new architecture, which is why it could start from BERT's weights.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="tasks" data-nav="The VDU task landscape">
+      <h3><span class="idx">03</span> The visually-rich document understanding tasks</h3>
+      <p class="lede">The LayoutLM papers evaluate on a fixed set of public datasets, each standing for a task type: entity labelling on forms (FUNSD) and receipts (SROIE, CORD), long-document field extraction (Kleister-NDA), page classification (RVL-CDIP), question answering on page images (DocVQA), layout analysis (PubLayNet) and multilingual forms (XFUND). Sizes and metrics below are as the papers state them.</p>
+      <table class="cmp">
+        <tr><th>Dataset</th><th>Task</th><th>Size and split</th><th>Labels</th><th>Metric</th><th>Used by</th></tr>
+        <tr><td>FUNSD</td><td>form entity labelling</td><td>199 scanned forms, 9,707 entities, 31,485 words; 149 train / 50 test</td><td>question, answer, header, other</td><td>F1 (v1: word-level; v2: entity-level; v3 does not say)</td><td>v1, v2, v3, LayoutXLM</td></tr>
+        <tr><td>SROIE (Task 3)</td><td>receipt key-information extraction</td><td>626 train / 347 test receipts</td><td>company, date, address, total</td><td>entity F1 (exact match)</td><td>v1, v2</td></tr>
+        <tr><td>CORD</td><td>receipt field labelling</td><td>1,000 receipts; 800 / 100 / 100</td><td>30 fields under 4 categories</td><td>entity-level F1</td><td>v2, v3</td></tr>
+        <tr><td>Kleister-NDA</td><td>long-document extraction</td><td>254 / 83 / 203 non-disclosure agreements from EDGAR</td><td>4 keys</td><td>F1 (validation set in v2)</td><td>v2</td></tr>
+        <tr><td>RVL-CDIP</td><td>page classification</td><td>400,000 grayscale images, 25,000 per class; 320k / 40k / 40k</td><td>16 classes (letter, form, email, invoice, resume, …)</td><td>accuracy</td><td>v1, v2, v3</td></tr>
+        <tr><td>DocVQA</td><td>question answering on page images</td><td>50,000 questions on 12,000+ pages; 10,194 / 1,286 / 1,287 images, 39,463 / 5,349 / 5,188 questions</td><td>free-text answers</td><td>ANLS</td><td>v2, v3</td></tr>
+        <tr><td>PubLayNet</td><td>layout detection</td><td>335,703 / 11,245 / 11,405 research-paper page images</td><td>text, title, list, table, figure</td><td>mAP @ IoU 0.50:0.95</td><td>v3</td></tr>
+        <tr><td>XFUND</td><td>multilingual form labelling and linking</td><td>7 languages × 199 forms = 1,393; 149 / 50 per language</td><td>FUNSD's four entity types + key–value links</td><td>F1 (entity recognition, relation extraction)</td><td>LayoutXLM</td></tr>
+      </table>
+      <h4>Text-centric and image-centric</h4>
+      <p>The v3 paper divides these into <b>text-centric</b> tasks — FUNSD, CORD, DocVQA, where the answer is a set of OCR words — and <b>image-centric</b> tasks — RVL-CDIP and PubLayNet, where appearance dominates. The distinction explains the family's arc: v1 was built for the first group and needed image features bolted on for RVL-CDIP; v3 was the first member evaluated as a backbone for pure layout detection.</p>
+      <h4>What the metrics measure</h4>
+      <ul class="notes">
+        <li><b>Entity-level F1</b> counts an entity correct only if its whole span and label match; word-level F1 (v1's FUNSD metric) scores each word, which is more forgiving. Numbers from the two protocols are not strictly comparable.</li>
+        <li><b>ANLS</b> gives partial credit to near-miss answer strings (normalised Levenshtein similarity, zeroed below 0.5). Its formula and pitfalls are on the hub's <a href="../document-ai-models.html#benchmarks">benchmark section</a>.</li>
+        <li><b>Test sets are small.</b> FUNSD has 50 test forms and CORD 100 test receipts, so a gap of under a point may be within run-to-run variation; none of the four papers' result tables reports variance across seeds.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> read every LayoutLM score together with its dataset's size, its metric's granularity, and whether the task is text-centric or image-centric. The same model can look state-of-the-art or ordinary depending on which column is read.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="ocr" data-nav="OCR front end and reading order">
+      <h3><span class="idx">04</span> The OCR front end and reading order</h3>
+      <p class="lede">Every LayoutLM input begins with an OCR pass (or a born-digital PDF's text layer) that returns words, boxes, and an order. The model inherits all three: misread characters become wrong token ids, loose boxes become wrong coordinates, and the engine's line order becomes the 1-D position of every token.</p>
+      <h4>Which OCR the papers used</h4>
+      <ul class="notes">
+        <li><b>v1 pretraining:</b> the IIT-CDIP collection ships OCR text without word boxes, so the authors re-ran OCR with Tesseract and stored results in hOCR, a hierarchical page → line → word format.</li>
+        <li><b>v2:</b> word-level boxes from the Microsoft Read API for IIT-CDIP and DocVQA ("Microsoft OCR" for RVL-CDIP); the official annotations for FUNSD, CORD and SROIE.</li>
+        <li><b>v3:</b> the Microsoft Read API for RVL-CDIP and DocVQA; the official OCR annotations for FUNSD and CORD; for IIT-CDIP pretraining the paper says only "an off-the-shelf OCR toolkit".</li>
+        <li><b>SROIE in v1:</b> the authors used ground-truth OCR "to eliminate the effect of incorrect OCR results", so the 95.24 F1 is an extraction score, not an end-to-end one.</li>
+        <li><b>LayoutXLM pretraining:</b> 22M born-digital PDFs parsed with PyMuPDF, so text and boxes come from the file rather than from recognition.</li>
+      </ul>
+      <h4>Reading order</h4>
+      <p>An OCR engine typically emits text line by line, top to bottom, left to right within a detected block. On a two-column region, a naive "sort by y, then x" order interleaves the columns — "Bill to: Ship to: Jane Doe Same as billing" — while a block-aware order keeps each column together. The 2-D embeddings mean LayoutLM is not blind to the true geometry, but the 1-D position embedding (and, from v2, the 1-D relative attention bias) is computed from this order, so it pulls the model toward treating stream-adjacent tokens as related.</p>
+      <div class="viz" id="viz-order">
+        <div class="vhead">
+          <span class="vtitle">One page, two serialisations</span>
+          <span class="vhint">pick an ordering · click a word to see its 1-D index and its stream distance to its partner</span>
+        </div>
+        <div class="controls">
+          <label>ordering <select id="order-mode"><option value="raster">line raster (sort by y, then x)</option><option value="block">block-aware (column blocks first)</option></select></label>
+        </div>
+        <svg id="order-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="Mock invoice with numbered words showing the reading order and arrows through the token stream"></svg>
+        <div class="readout" aria-live="polite" id="order-read"></div>
+        <p class="vcap">The page and its word boxes are the mock invoice used throughout this page (A4 at 300 dpi, boxes in pixels, listed in the script). The raster order sorts lines by their top edge (words whose tops differ by under 40 px count as one line) and then by x. The block-aware order is a simple XY-cut: lines less than 100 px apart vertically form a band, a band is split into columns at its widest vertical whitespace gap if that gap exceeds 150 px, and bands are read top to bottom, columns left to right. The readout counts how many stream positions separate each key from its value; note what the XY-cut does to the table rows.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> LayoutLM's accuracy is bounded by its OCR. Check the engine's word accuracy, box tightness and reading order on your own documents before comparing to published scores, which were mostly measured with official or high-quality OCR.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="boxes" data-nav="From pixels to the 0–1000 grid">
+      <h3><span class="idx">05</span> From pixel boxes to the 0–1000 grid</h3>
+      <p class="lede">Pages arrive at different sizes and scan resolutions, so v1 scales every box coordinate to a "virtual" page 1000 units on a side. The integers that result are indices into embedding tables with 1,024 rows (the released configurations' <code>max_2d_position_embeddings</code>), exactly as a token id indexes the vocabulary.</p>
+      <div class="formula"><span class="lbl">normalise a pixel box (x₀, y₀, x₁, y₁) on a W × H page</span><span class="eq">x̂₀ = floor(1000·x₀/W)   ŷ₀ = floor(1000·y₀/H)   x̂₁ = floor(1000·x₁/W)   ŷ₁ = floor(1000·y₁/H)</span>
+<span class="lbl">derived features used by v2, v3 and the open-source v1 code</span><span class="eq">ŵ = x̂₁ − x̂₀        ĥ = ŷ₁ − ŷ₀</span></div>
+      <h4>Worked example: the word "Total:"</h4>
+      <p>On an A4 page scanned at 300 dpi the image is 2480 × 3508 pixels. Suppose OCR returns "Total:" with pixel box (1650, 2900, 1850, 2960).</p>
+      <table class="cmp">
+        <tr><th>Coordinate</th><th>Computation</th><th>Id</th></tr>
+        <tr><td>x̂₀</td><td>floor(1000 · 1650 / 2480) = floor(665.32)</td><td>665</td></tr>
+        <tr><td>ŷ₀</td><td>floor(1000 · 2900 / 3508) = floor(826.68)</td><td>826</td></tr>
+        <tr><td>x̂₁</td><td>floor(1000 · 1850 / 2480) = floor(745.97)</td><td>745</td></tr>
+        <tr><td>ŷ₁</td><td>floor(1000 · 2960 / 3508) = floor(843.79)</td><td>843</td></tr>
+        <tr><td>ŵ, ĥ</td><td>745 − 665, 843 − 826</td><td>80, 17</td></tr>
+      </table>
+      <p>In v1 as the paper describes it, the token's layout contribution is X[665] + Y[826] + X[745] + Y[843]: four rows from two tables of shape 1024 × 768 (base). Rescanning the same page at 150 dpi halves every pixel coordinate and the page size together, so the ids stay the same up to one unit of floor rounding.</p>
+      <div class="viz" id="viz-boxes">
+        <div class="vhead">
+          <span class="vtitle">Box → normalised ids → embedding lookups</span>
+          <span class="vhint">click a word · change the scan · toggle the width/height tables</span>
+        </div>
+        <div class="controls">
+          <label>scan <select id="box-dpi"><option value="300">A4 at 300 dpi (2480 × 3508)</option><option value="200">A4 at 200 dpi</option><option value="150">A4 at 150 dpi</option></select></label>
+          <label><input type="checkbox" id="box-wh" /> add width/height tables (v2, v3, open-source v1 code)</label>
+        </div>
+        <svg id="box-svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="Mock invoice with a selected word, its pixel and normalised coordinates, and the embedding tables each coordinate indexes"></svg>
+        <div class="readout" aria-live="polite" id="box-read"></div>
+        <p class="vcap">Pixel boxes are the page geometry (defined once at 300 dpi) scaled to the chosen resolution and rounded; ids use the floor formula above. With the checkbox off the lookups are the v1 paper's four (two shared tables X, Y). With it on, the figure adds the two extra lookups W[ŵ] and H[ĥ] that the open-source v1 implementation adds (four full-width 1024-row tables summed) and that v2/v3 concatenate as narrower slices instead — see <a href="v2-layoutxlm.html#v2-layout">v2's layout embedding</a>.</p>
+      </div>
+      <h4>Why 1000, and what it costs</h4>
+      <ul class="notes">
+        <li>1000 buckets across an A4 width of 210 mm is one bucket per 0.21 mm — finer than typical OCR box accuracy, so quantisation is rarely the bottleneck.</li>
+        <li>The tables have 1,024 rows, so ids up to 1023 are legal; an id of 1024 or more raises an index error in the reference implementation, which is the usual symptom of passing un-normalised pixel boxes.</li>
+        <li>Normalisation removes page size and resolution, not rotation, skew or perspective. A photographed receipt needs deskewing first, or its "rows" will not share a ŷ.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the layout input is four (or six) small integers per token. Getting them right — dividing by the original page size, not the resized image, and clamping into 0…1000 — is the most common place a LayoutLM pipeline silently goes wrong.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="v1-embed" data-nav="v1: the 2-D position embedding">
+      <h3><span class="idx">06</span> v1: the 2-D position embedding</h3>
+      <p class="lede">LayoutLM v1 keeps BERT's architecture and adds, for each token, four position-embedding lookups from two tables: an X table indexed by x̂₀ and x̂₁ and a Y table indexed by ŷ₀ and ŷ₁. The embedding layers "representing the same dimension share the same embedding table", in the paper's words. The result is summed with BERT's word, 1-D position and segment embeddings.</p>
+      <div class="formula"><span class="lbl">v1 as the paper specifies it</span><span class="eq">eᵢ = Tok(wᵢ) + Pos1D(i) + Seg(sᵢ) + X(x̂₀ᵢ) + Y(ŷ₀ᵢ) + X(x̂₁ᵢ) + Y(ŷ₁ᵢ)</span>
+<span class="lbl">the widely used open-source v1 implementation adds two more tables</span><span class="eq">eᵢ = … + X(x̂₀ᵢ) + Y(ŷ₀ᵢ) + X(x̂₁ᵢ) + Y(ŷ₁ᵢ) + H(ŷ₁ᵢ − ŷ₀ᵢ) + W(x̂₁ᵢ − x̂₀ᵢ)</span>
+<span class="lbl">then LayerNorm and dropout, as in BERT</span><span class="eq">xᵢ⁽⁰⁾ = Dropout(LayerNorm(eᵢ))</span></div>
+      <h4>What two corners encode</h4>
+      <p>The top-left and bottom-right corners determine a box's position and size, so width and height are implicitly available: a network can compute X(x̂₁) − X(x̂₀)-like features in its first layer. Sharing one table between x̂₀ and x̂₁ means "x = 665" has one meaning whether it is a left or a right edge, halving the layout parameters. The explicit width and height tables in the open-source code add those features directly; the paper does not describe them, and its reported 113M base parameter count happens to sit closer to the implementation's total (see <a href="v3-benchmarks.html#params">parameter counts</a>).</p>
+      <h4>Special tokens</h4>
+      <ul class="notes">
+        <li>The v1 paper's architecture figure gives [CLS] the whole page, (0, 0, maxW, maxH), and every word its own box.</li>
+        <li>In common fine-tuning code [CLS] and [PAD] get (0, 0, 0, 0) and [SEP] gets (1000, 1000, 1000, 1000); the Transformers documentation's question-answering example uses this convention, and it is the LayoutLMv2 tokenizer's default. The conventions are not uniform across the family: the v2 paper assigns every special token the empty box (0, 0, 0, 0, 0, 0), and the v3 paper and the LayoutLMv3 tokenizer's default give [SEP] zeros as well. What matters is using at fine-tuning time whatever convention the checkpoint was pretrained with, and the v1 paper does not specify [SEP].</li>
+      </ul>
+      <h4>Initialisation and what is new</h4>
+      <p>All modules except the 2-D tables are initialised from BERT-base (or BERT-large); the 2-D tables start random. That is why the text side works from step one and the layout signal is learned during pretraining. Table 3 of the v1 paper shows the initialisation matters: with 1M pretraining pages, FUNSD F1 is 0.6130 from scratch, 0.7299 from BERT-base and 0.7514 from RoBERTa-base — though the released v1 checkpoints use BERT's uncased 30,522-token vocabulary, consistent with BERT initialisation.</p>
+      <div class="callout"><b>Takeaway:</b> v1 is literally BERT plus four extra table lookups per token. Everything that makes it work — masked-token pretraining, BERT initialisation, fine-tuning heads — is inherited unchanged.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="subwords" data-nav="Sub-words and their boxes">
+      <h3><span class="idx">07</span> Sub-words, and which box each one gets</h3>
+      <p class="lede">OCR produces words; the model consumes sub-word tokens. v1 and v2 give every sub-word of a word the word's box (v3, its segment's box). LayoutXLM instead computes character-level boxes and merges the characters in each SentencePiece token, because "word" is not a well-defined unit in every language.</p>
+      <h4>Worked example: "$1,240.00" in an uncased BERT tokenizer</h4>
+      <p>BERT's basic tokenizer splits on punctuation before WordPiece runs, so the single OCR word "$1,240.00" with box (766, 826, 887, 843) becomes six tokens — "$", "1", ",", "240", ".", "00", each of which is in the released 30,522-entry uncased vocabulary — and all six carry (766, 826, 887, 843). Their 1-D positions differ by one each; their 2-D embeddings are identical. For token classification, the common convention (the Transformers LayoutLMv2 tokenizer's default) labels only the first sub-word with the word's tag and gives the other five the ignore index −100, so the loss counts each word once.</p>
+      <table class="cmp">
+        <tr><th>Token</th><th>1-D position (example)</th><th>Box</th><th>Label (first-sub-word convention)</th></tr>
+        <tr><td>$</td><td>41</td><td>(766, 826, 887, 843)</td><td>B-ANSWER</td></tr>
+        <tr><td>1</td><td>42</td><td>(766, 826, 887, 843)</td><td>−100</td></tr>
+        <tr><td>,</td><td>43</td><td>(766, 826, 887, 843)</td><td>−100</td></tr>
+        <tr><td>240</td><td>44</td><td>(766, 826, 887, 843)</td><td>−100</td></tr>
+        <tr><td>.</td><td>45</td><td>(766, 826, 887, 843)</td><td>−100</td></tr>
+        <tr><td>00</td><td>46</td><td>(766, 826, 887, 843)</td><td>−100</td></tr>
+      </table>
+      <h4>Three levels of box granularity</h4>
+      <ul class="notes">
+        <li><b>Word-level (v1, v2):</b> each OCR word's own box, copied to its sub-words.</li>
+        <li><b>Character-merged (LayoutXLM):</b> SentencePiece (unigram) tokens get the union of their characters' boxes, which works for Chinese and Japanese where OCR "words" may be whole lines.</li>
+        <li><b>Segment-level (v3):</b> every word in an OCR segment (a line or text block) shares the segment's box, on the argument that words in one segment usually express one meaning. The v3 paper notes this may help FUNSD and makes its FUNSD scores not directly comparable with word-level models.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the box a sub-word receives is a design decision, not a detail. Match the granularity the checkpoint was pretrained with — word boxes for v1/v2, segment boxes for v3 if you want its published FUNSD behaviour — or expect a distribution shift.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="mvlm" data-nav="v1 pretraining: MVLM and MDC">
+      <h3><span class="idx">08</span> v1 pretraining: masked visual-language modelling</h3>
+      <p class="lede">Masked visual-language modelling (MVLM) is BERT's masked language modelling with one change: when a token is masked, its 2-D position embeddings are kept. The model must recover "Total" from the surrounding words and from the fact that a token sits at (665, 826, 745, 843), just left of a dollar amount.</p>
+      <div class="formula"><span class="lbl">selection, as in BERT</span><span class="eq">choose 15% of token positions M;  of these, 80% → [MASK], 10% → random token, 10% unchanged</span>
+<span class="lbl">MVLM loss: predict the original token from text and layout context (boxes never masked)</span><span class="eq">ℒ_MVLM = − ∑_(i ∈ M) log p( wᵢ | w_(∖M), b₁ … bₙ )</span>
+<span class="lbl">optional multi-label document classification over IIT-CDIP tags</span><span class="eq">ℒ = ℒ_MVLM + ℒ_MDC        ℒ_MDC = − ∑_c [ y_c log σ(z_c) + (1 − y_c) log(1 − σ(z_c)) ]</span></div>
+      <h4>Worked example: one 512-token window</h4>
+      <p>With 512 positions, 15% selection chooses 76.8 tokens on average — say 77. Of those, about 61.6 become [MASK], 7.7 become a random vocabulary token and 7.7 stay unchanged but must still be predicted. All 77 keep their boxes. The random and unchanged cases are kept from BERT, whose stated reason is to reduce the mismatch between pretraining (which sees [MASK]) and fine-tuning (which never does).</p>
+      <div class="viz" id="viz-mvlm">
+        <div class="vhead">
+          <span class="vtitle">MVLM on the mock invoice</span>
+          <span class="vhint">resample the mask · change the rate · masked words keep their boxes</span>
+        </div>
+        <div class="controls">
+          <label>selection rate <input type="range" id="mvlm-rate" min="5" max="40" step="1" value="15" /><span id="mvlm-rv" style="min-width:40px;display:inline-block"></span></label>
+          <label><input type="checkbox" id="mvlm-v2" /> v2: also blank the masked words' image regions</label>
+          <button class="btn ghost" id="mvlm-new">Resample</button>
+        </div>
+        <svg id="mvlm-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="Mock invoice where selected words are replaced by MASK, a random token or kept, with their boxes still drawn"></svg>
+        <div class="readout" aria-live="polite" id="mvlm-read"></div>
+        <p class="vcap">Selection is drawn per word with a seeded generator; each selected word is then assigned [MASK], random or unchanged with probabilities 0.8, 0.1, 0.1. Boxes are always drawn because the model always sees them. With the v2 box ticked the selected words' page regions are also greyed, following the v2 paper, which blanks the regions of masked tokens "to avoid visual clue leakage" once the image is an input; greying all three cases (not only [MASK]) is this figure's assumption, since the paper does not say.</p>
+      </div>
+      <h4>The multi-label document classification task</h4>
+      <p>IIT-CDIP pages carry metadata tags, so v1 optionally adds a multi-label classification loss (MDC) on [CLS]. The paper's Table 1 reports it helping FUNSD at 1M pages (0.7299 → 0.7372 F1), but it also flags MDC as optional "and may not be used for pretraining larger models in the future", since most corpora lack such tags; the best v1 FUNSD figure used MVLM alone. v2 and v3 drop it.</p>
+      <div class="callout"><b>Takeaway:</b> MVLM teaches the encoder to fill in words from both neighbours and geometry. Keeping the masked token's box is what forces the layout embeddings to become informative.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="v1-image" data-nav="v1: image features at fine-tuning">
+      <h3><span class="idx">09</span> v1: image features, added only at fine-tuning</h3>
+      <p class="lede">v1 is pretrained on text and layout alone. For fine-tuning, the paper optionally adds an image embedding per token: the page is cut into pieces along each word's OCR box, and a Faster R-CNN with a ResNet-101 backbone pretrained on Visual Genome turns each piece into a region-of-interest feature that is combined with that token's LayoutLM output.</p>
+      <div class="formula"><span class="lbl">image embedding for word i: ROI features from the word's own box</span><span class="eq">vᵢ = FasterRCNN_ROI( image, box_i )        [CLS]: ROI = the whole page</span>
+<span class="lbl">combined with the pretrained LayoutLM output before the task head</span><span class="eq">zᵢ = combine(hᵢ, vᵢ)   (the paper's figure shows the image embeddings joining after the pretrained encoder, before task-specific layers)</span></div>
+      <h4>What it bought</h4>
+      <ul class="notes">
+        <li><b>RVL-CDIP:</b> text + layout alone reaches 91.78% (base, 11M pages); adding the image embedding reaches 94.42%. For classification the paper concatenates the LayoutLM output with the whole-image embedding before the softmax.</li>
+        <li><b>FUNSD:</b> 78.66 → 79.27 F1 (base, 11M pages, 2 epochs).</li>
+        <li><b>SROIE:</b> 94.38 → 94.67 F1 (base), while LayoutLM-large without images reaches 95.24.</li>
+        <li><b>Cost:</b> the paper's parameter column rises from 113M to 160M, the Faster R-CNN's share.</li>
+      </ul>
+      <h4>Why this design was replaced</h4>
+      <p>The image branch never interacts with the text during pretraining, so the model cannot learn cross-modal relations from IIT-CDIP's 11M pages — only from the labelled fine-tuning set (149 forms for FUNSD, though 320,000 pages for RVL-CDIP). It also needs an object detector at inference. The paper's own future-work section proposes "involving image embeddings in the pre-training step", which is exactly v2.</p>
+      <div class="callout"><b>Takeaway:</b> v1's image features are a late-fusion add-on: helpful for page classification, marginal for extraction, and absent from the pretraining that gives the family its strength.</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="v1-results" data-nav="v1: configurations and results">
+      <h3><span class="idx">10</span> v1: configurations, training and results</h3>
+      <p class="lede">Two sizes, both initialised from BERT: base (12 layers, width 768, 12 heads) and large (24 layers, width 1024, 16 heads), with a 30,522-token uncased WordPiece vocabulary and 512 positions. The paper reports about 113M and 343M parameters.</p>
+      <h4>Pretraining recipe</h4>
+      <ul class="notes">
+        <li><b>Data:</b> IIT-CDIP Test Collection 1.0 — more than 6 million documents, more than 11 million scanned page images, re-OCR'd with Tesseract.</li>
+        <li><b>Hardware and optimiser:</b> 8 NVIDIA V100 32 GB GPUs, total batch 80, Adam at 5 × 10⁻⁵ with linear decay.</li>
+        <li><b>Time:</b> about 80 hours per epoch over 11M documents for base (roughly 38 pages per second) and nearly 170 hours for large. The best base model ran 2 epochs; the large model 1.</li>
+        <li><b>Fine-tuning:</b> FUNSD 100 epochs, batch 16, learning rate 5 × 10⁻⁵; RVL-CDIP 30 epochs, batch 40, 2 × 10⁻⁵. Form and receipt labelling use {B, I, E, S, O} tags.</li>
+      </ul>
+      <h4>Results (v1 paper, Tables 1, 4 and 5)</h4>
+      <table class="cmp">
+        <tr><th>Model</th><th>Pretraining</th><th>Params (paper)</th><th>FUNSD F1</th><th>SROIE F1</th><th>RVL-CDIP acc.</th></tr>
+        <tr><td>BERT-base</td><td>—</td><td>110M</td><td>0.6026</td><td>0.9099</td><td>89.81%</td></tr>
+        <tr><td>RoBERTa-base</td><td>—</td><td>125M</td><td>0.6648</td><td>0.9107</td><td>90.06%</td></tr>
+        <tr><td>LayoutLM-base, MVLM</td><td>500K pages, 6 epochs</td><td>113M</td><td>0.6985</td><td>0.9388</td><td>91.25%</td></tr>
+        <tr><td>LayoutLM-base, MVLM</td><td>11M, 2 epochs</td><td>113M</td><td>0.7866</td><td>0.9438</td><td>91.78%</td></tr>
+        <tr><td>LayoutLM-base, MVLM + MDC</td><td>11M, 1 epoch</td><td>113M</td><td>0.7475</td><td>0.9460</td><td>91.78%</td></tr>
+        <tr><td>LayoutLM-large, MVLM</td><td>11M, 1 epoch</td><td>343M</td><td>0.7789</td><td>0.9524</td><td>91.90%</td></tr>
+        <tr><td>LayoutLM-base + image</td><td>11M, 2 epochs</td><td>160M</td><td>0.7927</td><td>0.9467</td><td>94.42%</td></tr>
+      </table>
+      <h4>What the table shows</h4>
+      <ul class="notes">
+        <li><b>More pretraining data helps monotonically on FUNSD</b> (Table 2): 0.6985 at 500K pages, 0.7299 at 1M, 0.7592 at 2M (all 6 epochs), 0.7866 at 11M (2 epochs).</li>
+        <li><b>Large is not uniformly better.</b> LayoutLM-large at one epoch scores below base at two epochs on FUNSD (0.7789 vs 0.7866); the paper trained large for fewer epochs.</li>
+        <li><b>The abstract's headline numbers</b> — FUNSD 70.72 → 79.27, SROIE 94.02 → 95.24, RVL-CDIP 93.07 → 94.42 — compare the best LayoutLM variant for each task against the best prior result (RoBERTa-large, the SROIE leaderboard's top entry and a multimodal ensemble, respectively), not one model against one baseline.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> v1's text-plus-layout pretraining lifts FUNSD by about 18 F1 over same-size BERT, with the gain growing with pretraining pages. Image features matter mostly for classification.</div>
+    </section>
+
+    <nav class="pager" aria-label="LayoutLM series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../layoutlm.html">← LayoutLM · overview</a>
+      <a href="../layoutlm.html" style="color:var(--muted)">LayoutLM · overview</a>
+      <a href="v2-layoutxlm.html">LayoutLM: v2 Spatial Attention &amp; LayoutXLM →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../layoutlm.viz.js"></script>
+</body>
+</html>

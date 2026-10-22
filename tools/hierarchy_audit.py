@@ -76,7 +76,7 @@ def html_files(folder):
         return
     for dirpath, _dirnames, filenames in os.walk(d):
         for f in sorted(filenames):
-            if f.endswith(".html"):
+            if f.endswith(".html") and not f.startswith("._"):  # skip macOS AppleDouble forks
                 yield os.path.relpath(os.path.join(dirpath, f), ROOT).replace(os.sep, "/")
 
 
@@ -99,10 +99,18 @@ def audit():
     for dom, kids in tree.items():
         for k in kids:
             id_to_domain[k] = dom
-    # level-3 sub-topics inherit their parent topic's domain
-    for top, kids in subtree.items():
-        for k in kids:
-            id_to_domain[k] = id_to_domain.get(top)
+    # sub-topics (any depth — subtree nests recursively) inherit their ancestor topic's domain;
+    # iterate to a fixpoint so a level-4 child keyed under a level-3 parent resolves too
+    for _ in range(4):
+        changed = False
+        for top, kids in subtree.items():
+            for k in kids:
+                d = id_to_domain.get(top)
+                if d and id_to_domain.get(k) != d:
+                    id_to_domain[k] = d
+                    changed = True
+        if not changed:
+            break
     sub_ids = set(k for kids in subtree.values() for k in kids)
 
     cross_deg = defaultdict(int)
@@ -125,11 +133,19 @@ def audit():
     R["leaf_nodes_not_in_tree"] = sorted(n["id"] for n in nodes
                                          if n["level"] == 2 and n["id"] not in tree_ids)
 
-    # 3b. subtree consistency: parent must be a level-2 topic in the tree, children must be level-3 nodes,
-    #     and every level-3 node must be placed under exactly one parent
-    R["subtree_parent_not_topic"] = sorted(top for top in subtree if top not in tree_ids)
-    R["subtree_child_not_level3"] = sorted(k for k in sub_ids if k not in by_id or by_id[k]["level"] != 3)
-    R["level3_not_in_subtree"] = sorted(n["id"] for n in nodes if n["level"] == 3 and n["id"] not in sub_ids)
+    # 3b. subtree consistency (nesting is recursive): a parent must be a level-2 topic in the
+    #     tree OR itself a subtree child (level-3 hub with level-4 parts); every child must be a
+    #     known node exactly one level below its parent; every level>=3 node must be placed
+    R["subtree_parent_not_topic"] = sorted(top for top in subtree
+                                           if top not in tree_ids and top not in sub_ids)
+    bad_children = []
+    for top, kids in subtree.items():
+        plevel = by_id[top]["level"] if top in by_id else None
+        for k in kids:
+            if k not in by_id or plevel is None or by_id[k]["level"] != plevel + 1:
+                bad_children.append(k)
+    R["subtree_child_not_level3"] = sorted(bad_children)
+    R["level3_not_in_subtree"] = sorted(n["id"] for n in nodes if n["level"] >= 3 and n["id"] not in sub_ids)
 
     # 4. cross edges referencing unknown ids
     R["cross_unknown_ids"] = [f"{s} -> {t}" for s, t, _ in cross

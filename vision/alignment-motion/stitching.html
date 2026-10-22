@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Image Stitching &amp; Panoramas</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses, carried over from parts 1, 2, 4 and 5 */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../alignment-motion.html">Alignment &amp; Motion</a> · part 3 of 4</p>
+      <h1>Image Stitching &amp; Panoramas</h1>
+      <p>Turning pairwise homographies into a panorama: inverse warping and resampling, choosing a flat, cylindrical or spherical compositing surface, the full stitching pipeline, global alignment that closes the loop and removes drift, per-image exposure gains, and seam selection with multi-band blending.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Alignment &amp; Motion</span>
+        <span class="pill">Inverse warping · flat/cylindrical/spherical · pipeline · drift & bundle adjustment · gain · seams & blending</span>
+      </div>
+    </header>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="warp" data-nav="Applying the transformation">
+      <h3><span class="idx">14</span> Applying it: inverse warping, and where the pixels come from</h3>
+      <p class="lede">Estimating <code>H</code> is half the job; the other half is moving pixels with it. <a href="../image-processing/warping.html#warping">Part 2 §26</a> owns this and derives the forward-versus-inverse argument in full. This section states only the three things that bite specifically in alignment.</p>
+
+      <div class="formula"><span class="lbl">always inverse-warp — the rule, restated</span><span class="eq">for every pixel x′ of the OUTPUT:
+    x = H⁻¹ x′                            a real-valued position in the input
+    out(x′) = interpolate(in, x)          one sample, one destination pixel
+
+Forward warping — scatter each input pixel to H x — leaves holes where the map
+expands and collides where it contracts, and needs splatting to repair both.
+Inverse warping has exactly one output value per output pixel by construction.</span></div>
+
+      <ul class="notes">
+        <li><b>Compute the output bounding box first.</b> Warp the four corners of the input through <code>H</code>, take the bounding box of the results, and offset the output by its top-left corner. Skip this and half of every panorama lands at negative coordinates and is silently discarded. The offset is itself a translation, so it composes into <code>H</code> and costs nothing.</li>
+        <li><b>Watch for the horizon.</b> A homography sends the line <code>h₂₀x + h₂₁y + h₂₂ = 0</code> to infinity. If that line crosses the input image, the warped output is unbounded and the bounding box is meaningless. Detect it — evaluate <code>w</code> at the four corners and check the signs agree — and clip before warping. This is the single most common crash in a hand-rolled stitcher.</li>
+        <li><b>Match the filter to the scale change.</b> Where <code>H</code> <i>minifies</i>, bilinear interpolation aliases badly, because one output pixel should average many input pixels and instead reads two. The fix is a mip-map or an elliptically weighted average — <a href="../image-processing/warping.html#mipmap">Part 2 §28</a>. Where <code>H</code> <i>magnifies</i>, bilinear is merely soft and bicubic is better. A homography usually does both within one image, which is why panoramas need a scale-aware resampler and not a single kernel.</li>
+        <li><b>Interpolate once.</b> Chaining <code>n</code> warps by resampling <code>n</code> times costs <code>n</code> generations of blur. Compose the matrices — <code>H₂₀ = H₂₁H₁₀</code>, which is exact and free — and resample from the original once.</li>
+      </ul>
+
+      <div class="callout"><b>The alignment-specific consequence.</b> Every accuracy number on this page is quoted in pixels of the <i>input</i>. Resampling adds its own error on top, and for bilinear interpolation of a band-limited image that error is roughly 0.5–2% of the local contrast — comparable to a tenth of a pixel of displacement on typical texture. So there is little point refining a homography below about 0.05 px on a pipeline that then resamples bilinearly: the warp is the accuracy floor, not the fit.</div>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="surfaces" data-nav="Compositing surfaces">
+      <h3><span class="idx">15</span> Where to put the panorama: flat, cylindrical, spherical</h3>
+      <p class="lede">A wide panorama cannot live on a plane. Choosing the surface it lives on is the one decision in stitching that no amount of good estimation can undo afterwards, and the trade is completely explicit: straight lines against uniform sampling.</p>
+
+      <h4>Why flat stops working, exactly</h4>
+      <div class="formula"><span class="lbl">a ray at angle <span class="keep">θ</span> from the optical axis lands at</span><span class="eq">x = f · tan <span class="keep">θ</span>            so the sampling density is  dx/d<span class="keep">θ</span> = f · sec²<span class="keep">θ</span></span>
+<span class="lbl">measured — the price of a flat compositing surface</span><span class="eq"><span class="keep">θ</span>      x/f       linear stretch sec²<span class="keep">θ</span>    area stretch sec³<span class="keep">θ</span>
+ 0°    0.0000            1.000                 1.000
+15°    0.2679            1.072                 1.110
+30°    0.5774            1.333                 1.540
+45°    1.0000            2.000                 2.828
+60°    1.7321            4.000                 8.000
+70°    2.7475            8.549                24.99
+75°    3.7321           14.928                57.68
+
+field of view    flat width      cylindrical width
+     60°           1.155 f            1.047 f
+     90°           2.000 f            1.571 f
+    120°           3.464 f            2.094 f
+    150°           7.464 f            2.618 f
+    170°          22.860 f            2.967 f
+
+Beyond about 90° the flat surface is spending most of its pixels on the corners.
+At 170° it needs a canvas 7.7× wider than the cylinder to hold the same view.</span></div>
+
+      <h4>The two standard surfaces</h4>
+      <div class="formula"><span class="lbl">cylindrical — parameterise by an angle and a height</span><span class="eq">(sin <span class="keep">θ</span>, h, cos <span class="keep">θ</span>) ∝ (x, y, f)
+
+forward   x′ = s·<span class="keep">θ</span>  = s · atan(x / f)
+          y′ = s·h  = s · y / √(x² + f²)
+
+inverse   x  = f · tan(x′/s)
+          y  = (y′/s) · √(x² + f²) = f · (y′/s) · sec(x′/s)
+
+s is the cylinder's radius in pixels; s = f keeps the centre of the image at
+unit magnification. Round-trip verified to 5.7 × 10⁻¹⁴ px.</span>
+<span class="lbl">spherical — two angles</span><span class="eq">(sin <span class="keep">θ</span> cos <span class="keep">φ</span>, sin <span class="keep">φ</span>, cos <span class="keep">θ</span> cos <span class="keep">φ</span>) ∝ (x, y, f)
+
+forward   x′ = s · atan(x / f)
+          y′ = s · atan( y / √(x² + f²) )
+
+inverse   x  = f · tan(x′/s)
+          y  = tan(y′/s) · √(x² + f²) = f · tan(y′/s) · sec(x′/s)
+
+The x mapping is IDENTICAL to the cylinder's; only the vertical coordinate
+differs, replacing a linear height by a second angle. Round-trip verified to
+5.7 × 10⁻¹⁴ px. Note the pole is at the y axis here, not the z axis, because
+images are viewed with y along gravity.</span></div>
+
+      <div class="callout"><b>The payoff that makes cylinders worth the trouble.</b> If the camera is <b>level</b> and rotates only about its <b>vertical</b> axis, then after warping to cylindrical coordinates the images are related by a <b>pure horizontal translation</b> — one parameter. Not a homography, not an affine map: a shift. That collapses the whole estimation problem to a 1-D search, which is why cylindrical stitching was the first kind that worked reliably and why it is still the right choice for a motorised pan head. The moment the camera tilts, the assumption fails and you are back to §12's rotations.</div>
+
+      <div class="viz" id="viz-surf">
+        <div class="vhead">
+          <span class="vtitle">Three compositing surfaces, the same rotating camera</span>
+          <span class="vhint">widen the field of view and watch the flat panorama tear itself apart while the cylinder does not</span>
+        </div>
+        <div class="controls">
+          <label>surface <select id="sf-s">
+            <option value="flat">flat · perspective</option>
+            <option value="cyl" selected>cylindrical</option>
+            <option value="sph">spherical</option>
+          </select></label>
+          <label>total field of view <input type="range" id="sf-fov" min="40" max="330" step="10" value="150" /><span id="sf-fovv" style="min-width:38px;display:inline-block">150°</span></label>
+          <label>focal length <input type="range" id="sf-f" min="200" max="1200" step="25" value="500" /><span id="sf-fv" style="min-width:48px;display:inline-block">500 px</span></label>
+          <label>camera tilt <input type="range" id="sf-t" min="-25" max="25" step="1" value="0" /><span id="sf-tv" style="min-width:34px;display:inline-block">0°</span></label>
+        </div>
+        <svg id="surf-svg" width="760" height="450" viewBox="0 0 760 450" role="img" aria-label="Top: the panorama canvas for the selected surface, showing five overlapping source frames from a camera rotating about its vertical axis, each drawn as the outline its rectangular sensor maps to on that surface, together with a few of the image's own vertical lines mapped onto it so that their bending is visible. On the flat surface the outer frames become enormous keystones and the canvas width runs away as the field of view grows; on the cylinder each frame is a modest barrel shape of nearly constant width; on the sphere it is the same width but the frames curve vertically as well. Bottom left: the canvas width required, in units of the focal length, plotted against the field of view for all three surfaces, with the current field of view marked, so that the divergence of the flat curve near one hundred and eighty degrees is visible as an asymptote rather than asserted. Bottom right: the local sampling stretch across one frame, which is one everywhere on the cylinder along the horizontal direction and grows as the square of the secant on the flat surface. Tilting the camera adds a vertical offset that the cylinder cannot absorb as a translation, which the readout reports as the residual after the best pure shift."></svg>
+        <div class="readout" aria-live="polite" id="surf-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 16 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="stitch" data-nav="Building a panorama">
+      <h3><span class="idx">16</span> The whole panorama pipeline, once through</h3>
+      <p class="lede">Every part used so far, in the order a real stitcher uses them, with the decision made at each step and the thing that usually goes wrong.</p>
+
+      <table class="grid2">
+        <tr><th style="width:34px">#</th><th style="width:170px">Step</th><th>What happens · which section</th><th>The usual failure</th></tr>
+        <tr><td class="num">1</td><td><b>Undistort</b></td><td>Remove radial distortion first, using <a href="../image-formation/pinhole-camera.html#distortion">Part 1 §17</a>'s model. Only then is a straight line straight, and only then can a projective model be exact.</td><td>Skipped. The residual field curves outward from the centre and every later stage tries to absorb it with parameters that cannot.</td></tr>
+        <tr><td class="num">2</td><td><b>Detect &amp; describe</b></td><td>A scale- and rotation-invariant detector and descriptor per image — <a href="../features/scale-space.html#blobs">Part 4 §18–§24</a>. A few thousand keypoints per megapixel.</td><td>Too few features on sky, water or a blank wall. Those frames register on their edges only and drift.</td></tr>
+        <tr><td class="num">3</td><td><b>Match, and discover the topology</b></td><td>Match every image against every other with the ratio test (<a href="../features/descriptors-matching.html#matching">§25</a>) and an approximate index (<a href="../features/descriptors-matching.html#ann">§26</a>). Keep the <code>m</code> best candidates per image — <i>panorama recognition</i>: which images actually overlap is discovered, not assumed.</td><td>Repeated structure — windows, railings, tiles — produces confident matches between images that do not overlap, and the topology graph gains an edge that welds two ends of the panorama together.</td></tr>
+        <tr><td class="num">4</td><td><b>Verify each pair geometrically</b></td><td>RANSAC a homography per candidate pair (§09). Accept the pair only if the inlier count passes a threshold that grows with the number of putative matches.</td><td>Accepting on inlier <i>count</i> alone. A pair whose inliers all lie in one small region passes the count test and gives a homography that is unconstrained everywhere else.</td></tr>
+        <tr><td class="num">5</td><td><b>Convert to rotations</b></td><td>Each verified homography gives a relative rotation via <code>R = K₁⁻¹HK₀</code> (§12), orthonormalised. Chain them over a spanning tree of the topology graph to get an initial absolute rotation per image.</td><td><code>K₁⁻¹HK₀</code> is only approximately orthogonal, and the error compounds along the chain. Orthonormalise at every step, not at the end.</td></tr>
+        <tr><td class="num">6</td><td><b>Bundle adjust</b></td><td>Refine all rotations and focal lengths together against all inlier correspondences (§17). This is the step that removes drift.</td><td>Omitted, then the 360° gap of §17 appears and gets patched by stretching, which hides the error rather than removing it.</td></tr>
+        <tr><td class="num">7</td><td><b>Choose the surface, choose "up"</b></td><td>Flat, cylindrical or spherical (§15). Straighten by finding the vector most nearly perpendicular to all the camera <code>x</code> axes — for a hand-held pan that is gravity, and it is the smallest singular vector of the stacked <code>x</code> axes.</td><td>Not straightening. A hand-held 360° pan wanders in roll, and the panorama comes out as a sine wave.</td></tr>
+        <tr><td class="num">8</td><td><b>Compensate exposure</b></td><td>Solve for one gain per image so overlapping regions agree (§18).</td><td>Solving without a prior. The gains are determined only up to a global scale and the solution runs to zero.</td></tr>
+        <tr><td class="num">9</td><td><b>Select seams &amp; blend</b></td><td>Choose where each output pixel comes from, then blend across the boundary (§19).</td><td>Averaging. It ghosts wherever registration is imperfect and blurs wherever it is not.</td></tr>
+      </table>
+
+      <div class="callout"><b>Where the labour actually is.</b> Steps 1–6 are this page's subject and are essentially solved: given decent features, a modern pipeline registers a hundred images to a few tenths of a pixel without supervision. Steps 7–9 are where the visible quality lives, and they are <i>not</i> geometry problems — they are about a scene that moved, an exposure that changed, and a parallax you cannot remove. That inversion surprises people: the hard part of stitching is not the alignment.</div>
+    </section>
+
+    <!-- ═══ 17 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="bundle" data-nav="Bundle adjustment &amp; drift">
+      <h3><span class="idx">17</span> Global alignment: drift, gap closing, bundle adjustment</h3>
+      <p class="lede">Registering pairs and chaining them is a recipe for accumulating error. The fix is to stop treating the problem as a sequence of pairs and to solve for all the cameras at once. <a href="../index.html">Part 7</a> owns bundle adjustment properly; this is the rotation-only special case, which is small enough to see whole.</p>
+
+      <div class="formula"><span class="lbl">the pairwise objective, summed over EVERY verified correspondence</span><span class="eq">E = ∑_(pairs jk) ∑_(i ∈ inliers jk) ‖ x̃ᵢʲ − P(Rⱼ, fⱼ ; Rₖ, f_k ; x̃ᵢᵏ) ‖²
+
+unknowns:  R₀ … R_(n−1)  (3 each)  and  f₀ … f_(n−1)  (1 each)
+gauge:     the whole panorama can be rotated freely, so fix R₀ = I — otherwise
+           the Hessian is singular in exactly three directions.</span>
+<span class="lbl">the better-behaved residual: compare RAYS, not pixels</span><span class="eq">r = R_j Kⱼ⁻¹x̃ᵢʲ  −  R_k K_k⁻¹x̃ᵢᵏ          both are unit-ish 3-vectors in the world
+
+Working in ray space rather than in one image's pixels removes the arbitrary
+choice of which image to reproject into, keeps the cost symmetric between the two
+frames, and stays finite for correspondences near 90° apart — where a reprojection
+into a flat image would diverge.</span>
+<span class="lbl">why it is cheap despite the size</span><span class="eq">The Hessian is BLOCK-SPARSE: an entry couples two cameras only if they share a
+correspondence, and a panorama's topology graph is nearly a chain. With n images
+the dense cost is O(n³) and the sparse cost is closer to O(n). A 200-image
+panorama with 4 parameters each is a 800-variable problem that solves in
+milliseconds — which is why bundle adjustment is never the bottleneck here.</span></div>
+
+      <h4>Drift and the 360° gap, quantified</h4>
+      <p>Chain <code>n</code> pairwise rotations around a full circle with a focal length that is wrong by a factor, and the panorama does not close. The error is not random — it is systematic and it tells you the focal length.</p>
+
+      <div class="formula"><span class="lbl">the estimate you get from a wrong focal length</span><span class="eq">A true pan of <span class="keep">Δ</span> moves a central ray to x = f_true · tan <span class="keep">Δ</span>. Registering with an assumed
+focal f you infer <span class="keep">Δ</span>̂ = atan(x / f) = atan( (f_true/f) tan <span class="keep">Δ</span> ) ≈ (f_true/f)·<span class="keep">Δ</span>.
+
+Summing n of them:  total ≈ 360° · f_true/f     ⇒   gap <span class="keep">θ</span>_g ≈ 360°·(1 − f_true/f)
+                                                ⇒   f_true ≈ f · (1 − <span class="keep">θ</span>_g/360°)</span>
+<span class="lbl">measured — true f = 468, ring closed with a wrong assumed focal length</span><span class="eq">assumed f   n = 12                  n = 18                  n = 24
+   420      total 393.05°, gap −33.05°   397.37°, −37.37°   398.98°, −38.98°
+            corrected f = 458.6          463.6              465.5
+   510      total 334.98°, gap +25.02°   332.44°, +27.56°   331.54°, +28.46°
+            corrected f = 474.6          471.0              469.7
+   560      total 309.09°, gap +50.91°   304.53°, +55.47°   302.93°, +57.07°
+            corrected f = 480.8          473.7              471.2
+
+The correction recovers the truth to 1.4% at n = 12 and 0.4% at n = 24, and the
+residual bias is entirely the small-angle approximation — which shrinks as the
+per-frame rotation does. A 9% focal error produces a 25° gap: the gap is a very
+sensitive instrument, and this is how focal length was first recovered from a
+pure pan.</span></div>
+
+      <div class="wrong"><span class="say">The patch that hides the problem.</span> "There is a gap, so distribute it evenly over the frames." <span class="fix">That fixes the symptom of a wrong focal length by corrupting every rotation.</span> Gap closing as an <i>estimator of <code>f</code></i> is legitimate and is what the formula above does; gap closing as a <i>cosmetic redistribution</i> leaves every image slightly mis-rotated, and it only works for a panorama that turns continuously in one direction. Bundle adjustment removes the need for either, because a loop closure is just one more constraint among thousands.</div>
+
+      <div class="viz" id="viz-bundle">
+        <div class="vhead">
+          <span class="vtitle">Drift around a ring, and what closes it</span>
+          <span class="vhint">get the focal length wrong and the panorama refuses to meet itself — then read the true focal off the gap</span>
+        </div>
+        <div class="controls">
+          <label>frames in the ring <input type="range" id="bu-n" min="8" max="36" step="1" value="18" /><span id="bu-nv" style="min-width:26px;display:inline-block">18</span></label>
+          <label>assumed f <input type="range" id="bu-f" min="360" max="620" step="2" value="510" /><span id="bu-fv" style="min-width:48px;display:inline-block">510 px</span></label>
+          <label>per-pair noise <input type="range" id="bu-s" min="0" max="0.6" step="0.02" value="0.1" /><span id="bu-sv" style="min-width:44px;display:inline-block">0.10°</span></label>
+          <label>strategy <select id="bu-m">
+            <option value="chain" selected>chain the pairs</option>
+            <option value="spread">chain, then spread the gap</option>
+            <option value="ba">estimate f from the gap</option>
+          </select></label>
+        </div>
+        <svg id="bundle-svg" width="760" height="430" viewBox="0 0 760 430" role="img" aria-label="Left: the ring of camera orientations drawn from above as wedges around a circle, each wedge covering that frame's horizontal field of view, coloured from the first frame to the last. When the assumed focal length is too large the estimated pans are too small and the wedges fail to reach the whole way round, leaving a visible gap; when it is too small they overshoot and overlap. Right: two things. A plot of the accumulated heading error against frame index, which is a straight line whose slope is the per frame bias introduced by the wrong focal length. And a readout of the total turned angle, the gap in degrees, the focal length recovered from the gap by the formula, and the true focal length used to generate the data, so the accuracy of the recovery can be read directly. Selecting the spread strategy redistributes the gap evenly, the ring closes and the heading error plot collapses onto zero, which looks like success and leaves every individual rotation wrong by the gap divided by the number of frames; selecting the estimate strategy corrects the focal length instead and the heading error collapses to the noise floor."></svg>
+        <div class="readout" aria-live="polite" id="bundle-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 18 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="exposure" data-nav="Exposure compensation">
+      <h3><span class="idx">18</span> Exposure compensation: one gain per image</h3>
+      <p class="lede">Automatic exposure means every frame of a panorama was taken with a different sensitivity. That is a photometric misalignment, and it is solved the same way as the geometric one: write a least-squares problem over all the overlaps at once.</p>
+
+      <div class="formula"><span class="lbl">the model and the objective</span><span class="eq">image k has an unknown gain g_k;  the corrected image is  g_k · I_k
+
+e = ½ ∑ⱼ ∑ₖ N_jk [ (g_j Ī_jk − g_k Ī_kj)² / <span class="keep">σ</span>_N²  +  (1 − g_j)² / <span class="keep">σ</span>_g² ]
+
+Ī_jk  the mean intensity of image j over its overlap with image k
+N_jk  the number of pixels in that overlap — the natural weight
+<span class="keep">σ</span>_N   the tolerated intensity error;   <span class="keep">σ</span>_g the tolerated deviation of a gain from 1</span>
+<span class="lbl">why the prior is not optional</span><span class="eq">Without the (1 − g_j)² term the objective is homogeneous of degree 2 in g, so
+g = 0 is a global minimum with e = 0. The gains are determined only UP TO A
+GLOBAL SCALE, and the prior is what chooses it. Everyone rediscovers this by
+watching their panorama go black.</span>
+<span class="lbl">the solve</span><span class="eq">e is quadratic in g, so ∂e/∂g = 0 is a linear system with one row per image:
+
+  [ 1/<span class="keep">σ</span>_g² + ∑ₖ N_jk Ī_jk²/<span class="keep">σ</span>_N² ] g_j  −  ∑ₖ ( N_jk Ī_jk Ī_kj/<span class="keep">σ</span>_N² ) g_k  =  1/<span class="keep">σ</span>_g²
+
+Sparse, symmetric, positive definite, and the same size as the number of images.</span>
+<span class="lbl">measured — four images in a chain, true exposures (1.00, 1.35, 0.72, 1.10)</span><span class="eq">ideal gains 1/e_k  (up to scale)   1.0000  0.7407  1.3889  0.9091
+solved gains g_k                   0.9383  0.6951  1.3032  0.8530
+g_k · e_k                          0.9383  0.9383  0.9383  0.9383   spread 1.8 × 10⁻⁵
+
+The product g_k·e_k is CONSTANT to five decimal places — the gains are correct
+up to exactly one global factor, and the prior has set that factor to 0.938
+rather than 1 because pulling every gain toward 1 is a compromise, not a
+constraint. Seam mismatches fall from 0.147, 0.347 and 0.118 to under 7 × 10⁻⁶.</span></div>
+
+      <ul class="notes">
+        <li><b>Work in the log domain, or better, in radiance.</b> A gain is multiplicative, so <code>log g</code> makes the problem additive and symmetric in the direction of the error. Better still, undo the camera response curve first and stitch radiances; then a gain is exactly an exposure ratio and the model is <i>physically</i> right rather than merely convenient.</li>
+        <li><b>One gain per image is not enough for vignetting.</b> Lens fall-off is a smooth function of image position, so the correction has to be spatially varying — typically a low-order polynomial in radius, or a coarse spline of block-wise corrections re-estimated a few times against the blended composite. A single scalar cannot represent it, and forcing it to try produces a panorama with periodic dark bands at every frame boundary.</li>
+        <li><b>Use means, not medians, over the overlap — but robustly.</b> The objective above assumes <code>Ī_jk</code> summarises the overlap. If a person walked through it, the mean is wrong. Compute it over the region that survived the geometric verification of §09, or use a robust mean (§10).</li>
+      </ul>
+
+      <div class="viz" id="viz-expo">
+        <div class="vhead">
+          <span class="vtitle">Gain compensation over a chain of images</span>
+          <span class="vhint">change the exposures, then watch the gauge freedom appear when the prior is switched off</span>
+        </div>
+        <div class="controls">
+          <label>images <input type="range" id="ex-n" min="3" max="10" step="1" value="5" /><span id="ex-nv" style="min-width:22px;display:inline-block">5</span></label>
+          <label>exposure spread <input type="range" id="ex-s" min="0" max="90" step="5" value="45" /><span id="ex-sv" style="min-width:34px;display:inline-block">45%</span></label>
+          <label>prior strength 1/<span class="keep">σ</span>_g <input type="range" id="ex-p" min="0" max="40" step="1" value="10" /><span id="ex-pv" style="min-width:38px;display:inline-block">10.0</span></label>
+          <label>overlap noise <input type="range" id="ex-e" min="0" max="10" step="0.5" value="0" /><span id="ex-ev" style="min-width:38px;display:inline-block">0.0%</span></label>
+          <label><input type="checkbox" id="ex-ring" /> close the chain into a ring</label>
+        </div>
+        <svg id="expo-svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-label="Top: a strip of overlapping image tiles rendered at their true exposures, so that the brightness steps at the seams are directly visible, above the same strip after the solved gains have been applied, where the steps disappear. Middle: a bar chart with two bars per image, the true exposure and the reciprocal of the solved gain, which coincide up to one global scale factor; the readout gives the product of gain and exposure for every image and the spread of that product, which is the numerical statement that the solution is right up to a gauge. Bottom: the seam mismatch at each junction before and after compensation, on a logarithmic axis, falling by four to six orders of magnitude when the overlaps are noise free. Reducing the prior strength to zero makes the linear system singular in one direction and the solved gains collapse toward zero, which the readout reports rather than hiding."></svg>
+        <div class="readout" aria-live="polite" id="expo-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 19 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="blend" data-nav="Seams &amp; blending">
+      <h3><span class="idx">19</span> Seams and blending: hiding what is left</h3>
+      <p class="lede">After the best possible registration and the best possible exposure compensation, the overlap still disagrees — because of parallax, because something moved, because the lenses differ. Blending is the admission that this residual cannot be removed, only distributed where the eye will not find it.</p>
+
+      <h4>The compositing equation, and the three choices inside it</h4>
+      <div class="formula"><span class="lbl">weighted compositing</span><span class="eq">C(x) = ∑ₖ w_k(x)·Ĩ_k(x)  ⁄  ∑ₖ w_k(x)          Ĩ_k = image k, warped
+
+Everything is a choice of w_k:
+  w_k = 1 inside image k                    → averaging. Ghosts and blurs.
+  w_k = 1 on k's side of a chosen seam      → hard seam. Sharp, but a visible step.
+  w_k = distance to k's nearest border      → feathering. A smooth ramp of width d.
+  w_k = 1 for a moving object's owner       → de-ghosting: pick ONE source per
+                                              region so a person appears once.</span></div>
+
+      <h4>Why one transition width cannot work</h4>
+      <p>A narrow transition hides high-frequency disagreement (mis-registered texture) but leaves a low-frequency step (exposure, vignetting) visible as an edge. A wide transition removes the step but averages the texture over that width, producing a soft band. Both statements are true simultaneously, so no single width is right — which is the entire argument for making the width <b>depend on frequency</b>.</p>
+
+      <div class="formula"><span class="lbl">multi-band (Laplacian pyramid) blending</span><span class="eq">1 · Build a band-pass pyramid of each warped image (<a href="../image-processing/pyramids.html#pyramids">Part 2 §23</a>).
+2 · Build a Gaussian pyramid of the blending mask.
+3 · Blend each band with the mask AT THAT LEVEL — so the transition is a few
+    pixels wide at the finest band and hundreds of pixels wide at the coarsest.
+4 · Collapse.
+
+One line of intuition: high frequencies get a narrow transition, which does not
+blur them; low frequencies get a wide one, which hides the step. Each band gets
+the width that is right for it, and nothing else changes.</span>
+<span class="lbl">measured — 128 × 128, a smooth photometric difference and a 1.5 px misalignment</span><span class="eq">method                low-frequency step   local contrast kept
+                      at the seam ÷ elsewhere   in the seam band
+hard seam                    6.14                 1.000   ← the reference
+feather, width  2 px         6.14                 1.000
+feather, width  8 px         5.76                 0.998
+feather, width 32 px         3.04                 0.906
+multi-band, 5 levels         1.90                 0.998
+plain averaging              0.96                 0.858
+
+Both columns want to be small and 1 respectively. Read them together:
+  · feathering trades one against the other and never gets both — 32 px is the
+    first width that dents the step, and it costs 9.4% of the local contrast;
+  · averaging kills the step completely and costs 14.2%, because it doubles
+    every misregistered feature across the WHOLE overlap, not just at a line;
+  · multi-band gets the step down to 1.90 for 0.2%.
+These are the figure below at its default settings, so you can watch every row
+of the table appear by moving one control. The step ratios depend on the texture;
+the contrast ratios do not, and an independent run on different noise reproduced
+1.000, 0.999, 0.904, 0.999 and 0.855.</span></div>
+
+      <h4>Choosing the seam, before blending across it</h4>
+      <p>Blending works far better if the seam is put somewhere the two images already agree. Formulate it as a labelling problem — assign each output pixel a source image, penalising a change of label by how much the two sources differ there — and it is exactly the graph-cut energy of <a href="../segmentation/graph-partitioning.html#graphcuts">Part 5 §23</a>, solved with the same machinery. The seam then runs around a moving person rather than through them, and along a wall rather than across a face.</p>
+
+      <div class="formula"><span class="lbl">gradient-domain compositing — the other route</span><span class="eq">Copy GRADIENTS instead of pixels, then integrate:
+
+    min_C ∑_x ‖ ∇C(x) − ∇Ĩ_ℓ(x)(x) ‖²        ℓ(x) = the source chosen at x
+
+which is a sparse linear least-squares problem (a Poisson equation) with one
+unknown per output pixel. Any constant offset between the sources dies in the
+gradient and never appears in C, so exposure differences vanish exactly rather
+than being faded out. The cost is a global solve, and the failure mode is that a
+large true gradient at a seam gets copied and becomes a permanent double edge.</span></div>
+
+      <div class="viz" id="viz-blend">
+        <div class="vhead">
+          <span class="vtitle">Four ways across one seam</span>
+          <span class="vhint">the two metrics move in opposite directions for feathering, and not for multi-band — that is the whole point</span>
+        </div>
+        <div class="controls">
+          <label>method <select id="bl-m">
+            <option value="hard">hard seam</option>
+            <option value="feather" selected>feathering</option>
+            <option value="mb">multi-band, 5 levels</option>
+            <option value="avg">plain averaging</option>
+          </select></label>
+          <label>feather width <input type="range" id="bl-w" min="1" max="48" step="1" value="8" /><span id="bl-wv" style="min-width:38px;display:inline-block">8 px</span></label>
+          <label>exposure difference <input type="range" id="bl-e" min="0" max="80" step="5" value="45" /><span id="bl-ev" style="min-width:34px;display:inline-block">45%</span></label>
+          <label>misregistration <input type="range" id="bl-r" min="0" max="6" step="0.5" value="1.5" /><span id="bl-rv" style="min-width:44px;display:inline-block">1.5 px</span></label>
+        </div>
+        <svg id="blend-svg" width="760" height="450" viewBox="0 0 760 450" role="img" aria-label="Top left: the two source images side by side, the second brighter than the first by the chosen exposure difference and displaced by the chosen misregistration, . Top right: the composite produced by the selected method, drawn a little larger with the seam column marked, so the step or the blur at the seam can be seen directly. Middle: a horizontal profile through the composite, low pass filtered, with the seam column marked, in which a hard seam appears as a step, narrow feathering as a slightly softened step, wide feathering as a smooth ramp and multi-band as a smooth ramp with the high frequency detail still riding on it. Bottom: two measured bars, the low frequency gradient at the seam divided by its value elsewhere, which should be one, and the high frequency detail retained in the seam band relative to bands away from it, which should also be one. Feathering can make either one good but not both at once; multi-band comes closest to both at the same time, and the numbers are printed so the trade can be read rather than judged."></svg>
+        <div class="readout" aria-live="polite" id="blend-readout"></div>
+      </div>
+    </section>
+
+    <nav class="pager" aria-label="Alignment &amp; Motion series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="robust-homographies.html">← Robust Alignment &amp; When Homographies Hold</a>
+      <a href="../alignment-motion.html" style="color:var(--muted)">Alignment &amp; Motion · overview</a>
+      <a href="optical-flow.html">Optical Flow →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../vision-viz.js"></script>
+<script src="../alignment-motion.viz.js"></script>
+</body>
+</html>

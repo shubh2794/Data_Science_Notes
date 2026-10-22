@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · CLIP: Contrastive Pretraining</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../clip.html">CLIP</a> · part 1 of 5</p>
+      <h1>CLIP: Contrastive Pretraining</h1>
+      <p>The objective that defines CLIP: why learn vision from language, two towers that never attend to each other, the symmetric cross-entropy over an N × N similarity matrix worked by hand, its probability-minus-target gradient, the learned logit scale, the batch as the negative set, and sharded similarity computation.</p>
+      <div style="margin-top:10px">
+        <span class="pill">CLIP</span>
+        <span class="pill">Dual encoder · symmetric InfoNCE · worked loss · gradient · logit scale · batch negatives · sharding</span>
+      </div>
+    </header>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="motivation" data-nav="Why learn vision from language">
+      <h3><span class="idx">02</span> Why learn vision from language</h3>
+      <p class="lede">In 2020 the strongest vision models were trained to predict a fixed list of categories chosen by a dataset's designers. Adding a concept meant collecting and labelling more images. Natural-language captions describe a practically open set of concepts and already exist, attached to images, in enormous numbers.</p>
+
+      <h4>The limits of fixed label sets</h4>
+      <ul class="notes">
+        <li><b>A classifier head has a fixed output list.</b> An ImageNet model has 1,000 outputs. The large weakly supervised systems of the time were still label-bound: by the CLIP paper's count, Instagram-hashtag pretraining and JFT-300M pretraining limited their targets to 1,000 and 18,291 classes respectively. The CLIP paper's point was that both "carefully design, and in the process limit, their supervision".</li>
+        <li><b>No dynamic outputs.</b> A static softmax classifier cannot be pointed at a new category without retraining the head, which in turn needs labelled examples of it.</li>
+        <li><b>Supervision cost.</b> Crowd-labelled data demands a "gold label" per image in a format a learner can consume; captions need no annotation at all.</li>
+      </ul>
+
+      <h4>Why earlier language-supervised attempts had not taken off</h4>
+      <ul class="notes">
+        <li>The idea was old — predicting caption words from images goes back to at least 1999 — and 2016–2020 work (bag-of-words prediction on YFCC100M, visual n-grams, VirTex, ICMLM, ConVIRT) showed it produced usable features.</li>
+        <li>But the headline numbers were weak: Visual N-Grams reached only <b>11.5%</b> zero-shot ImageNet accuracy, against the then state of the art of 88.4% and the roughly 50% of classic pre-deep-learning methods.</li>
+        <li>The CLIP paper's diagnosis was <b>scale</b>: VirTex, ICMLM and ConVIRT trained "for accelerator days on one to two hundred thousand images", while the label-bound weakly supervised systems trained for accelerator years on millions to billions. CLIP closed that gap with a 400M-pair dataset and a training objective chosen for efficiency.</li>
+      </ul>
+
+      <h4>What language supervision offers beyond self-supervision</h4>
+      <p>Self-supervised image methods (contrastive or generative) also avoid labels, but they only learn a representation; mapping it to a task still needs labelled data for a classifier. Learning from text "doesn't 'just' learn a representation but also connects that representation to language", which is what makes a classifier specifiable in words at test time.</p>
+      <div class="callout"><b>Takeaway:</b> the motivation was the same bet that GPT made for text — that the aggregate supervision in web-scale raw data beats curated labels — transplanted to vision, with language as the interface that removes the fixed output layer.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="dual-encoder" data-nav="The dual-encoder shape">
+      <h3><span class="idx">03</span> The dual-encoder shape, tensor by tensor</h3>
+      <p class="lede">CLIP is two independent networks that never attend to each other. Each maps its input to a feature vector, a learned matrix projects that vector into the shared space, and normalisation puts it on the unit sphere. Pick a released model to see every shape along both paths.</p>
+
+      <div class="viz" id="viz-pipe">
+        <div class="vhead">
+          <span class="vtitle">Both towers, with the tensor shapes of a real configuration</span>
+          <span class="vhint">choose a model and a mode · shapes are computed from the paper's hyperparameter tables</span>
+        </div>
+        <div class="controls">
+          <label>model <select id="pipe-model"></select></label>
+          <label>mode <select id="pipe-mode"><option value="train">training (N × N)</option><option value="zs">zero-shot (1 image × K classes)</option></select></label>
+          <label>batch N / classes K <input type="range" id="pipe-n" min="1" max="15" step="1" value="15" /><span id="pipe-nv" style="min-width:60px;display:inline-block"></span></label>
+        </div>
+        <svg id="pipe-svg" width="640" height="330" viewBox="0 0 640 330" role="img" aria-label="Diagram of CLIP's image and text towers with tensor shapes, meeting at a similarity matrix"></svg>
+        <div class="readout" aria-live="polite" id="pipe-read"></div>
+      </div>
+
+      <h4>The paper's pseudocode, transcribed</h4>
+      <div class="formula"><span class="lbl">feature extraction (shapes: n images, n texts)</span><span class="eq">I_f = image_encoder(I)         [n, d_i]
+T_f = text_encoder(T)          [n, d_t]</span>
+<span class="lbl">joint embedding — linear projection then L2 normalisation</span><span class="eq">I_e = l2_normalize(I_f · W_i)   [n, d_e]
+T_e = l2_normalize(T_f · W_t)   [n, d_e]</span>
+<span class="lbl">scaled pairwise cosine similarities and the symmetric loss</span><span class="eq">logits = (I_e · T_eᵀ) · exp(t)      [n, n]
+labels = 0, 1, …, n−1
+loss = ( CE(logits, labels, axis 0) + CE(logits, labels, axis 1) ) / 2</span></div>
+
+      <h4>Consequences of "no cross-attention"</h4>
+      <ul class="notes">
+        <li><b>Embeddings can be cached.</b> A text embedding does not depend on which image it will be compared with, so a zero-shot classifier for 1,000 classes is computed once and reused for every image; a gallery of images can be embedded once and searched by any future query.</li>
+        <li><b>Comparison is cheap.</b> Scoring an image against K texts is one K × d_e matrix–vector product. A model that fuses the two inputs with cross-attention (the vision-and-language BERT-style models the paper contrasts itself with) must run a full forward pass per pair.</li>
+        <li><b>Expressiveness is limited.</b> Everything about an image that matters for matching must fit in one d_e-dimensional vector computed without knowing the query. This is one root of the compositional weaknesses discussed in <a href="limits-downstream.html#limitations">Limitations</a>.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the paper states it directly: "the only interaction in a CLIP model between the image and text domain is a single dot product in a learned joint embedding space." That design is what makes CLIP a reusable, cacheable component rather than a pairwise scorer.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="infonce" data-nav="The symmetric contrastive loss">
+      <h3><span class="idx">04</span> The symmetric contrastive loss</h3>
+      <p class="lede">Treat the N × N matrix of scaled cosine similarities as logits. Read along a row and it is an N-way classification problem — "which of these N texts belongs to image i?"; read down a column and it is the reverse problem for text j. CLIP averages the cross-entropy of both.</p>
+
+      <div class="viz" id="viz-mat">
+        <div class="vhead">
+          <span class="vtitle">Live symmetric InfoNCE on a toy 2-D embedding space</span>
+          <span class="vhint">drag any image (square) or text (circle) around the unit circle · the matrix, both softmaxes and the loss recompute</span>
+        </div>
+        <div class="controls">
+          <label>logit scale s <input type="range" id="mat-s" min="1" max="100" step="1" value="10" /><span id="mat-sv" style="min-width:36px;display:inline-block">10</span></label>
+          <label>view <select id="mat-view"><option value="logit">logits s·cos</option><option value="row">row softmax (image → text)</option><option value="col">column softmax (text → image)</option></select></label>
+          <button class="btn ghost" id="mat-reset">Reset</button>
+          <button class="btn ghost" id="mat-shuffle">Mismatch the pairs</button>
+        </div>
+        <svg id="mat-svg" width="640" height="320" viewBox="0 0 640 320" role="img" aria-label="Unit circle with draggable image and text embeddings beside the resulting similarity matrix and loss"></svg>
+        <div class="readout" aria-live="polite" id="mat-read"></div>
+      </div>
+
+      <div class="formula"><span class="lbl">image → text term: each row is a softmax over the N texts</span><span class="eq">ℒ_I = −(1/N) ∑ᵢ log [ exp(Lᵢᵢ) / ∑ₖ exp(Lᵢₖ) ]</span>
+<span class="lbl">text → image term: each column is a softmax over the N images</span><span class="eq">ℒ_T = −(1/N) ∑ⱼ log [ exp(Lⱼⱼ) / ∑ₖ exp(Lₖⱼ) ]</span>
+<span class="lbl">CLIP's loss, and its value when the model knows nothing</span><span class="eq">ℒ = (ℒ_I + ℒ_T) / 2        all logits equal  →  ℒ = ln N</span></div>
+
+      <h4>Where it comes from</h4>
+      <ul class="notes">
+        <li>The paper names its lineage: the batch construction and objective were "first introduced in the area of deep metric learning as the multi-class N-pair loss", "popularized for contrastive representation learning … as the InfoNCE loss", and adapted to (medical) image–text pairs by ConVIRT. CLIP is described as "a simplified version of ConVIRT trained from scratch".</li>
+        <li>Each row term is exactly an InfoNCE loss with the matching caption as the positive and the other N − 1 captions as negatives. Its interpretation as a lower bound on mutual information, <code>I ≥ ln N − ℒ</code>, and the general behaviour of such losses are covered in <a href="../../deep-learning/contrastive-learning.html#nt-xent">Contrastive Learning — the InfoNCE / NT-Xent objective</a>.</li>
+      </ul>
+
+      <h4>Why both directions</h4>
+      <ul class="notes">
+        <li>The two terms normalise over different sets. A row softmax asks an image to prefer its caption over other captions; a column softmax asks a caption to prefer its image over other images. With only one term, loosely speaking, one tower would be trained only as the <i>query</i> side of a retrieval problem and the other only as the <i>key</i> side.</li>
+        <li>Downstream CLIP is used in both directions — image → text for zero-shot classification, text → image for retrieval and search — so training both is the natural match.</li>
+        <li>The terms are not redundant: in the worked example in the next section they differ (0.375 versus 0.369 nats), because a row and a column containing the same diagonal entry have different competitors.</li>
+      </ul>
+
+      <h4>What is <i>not</i> in the loss</h4>
+      <p>There is no margin, no explicit hard-negative mining, no momentum encoder, no memory queue and no label smoothing (ALIGN later added label smoothing; see <a href="successors.html#align">ALIGN</a>). All negatives are simply the other items in the same batch, weighted automatically by the softmax.</p>
+      <div class="callout"><b>Takeaway:</b> CLIP's loss is two batch-wide classification problems sharing one logit matrix. Its floor of difficulty is set by N (a random model scores ln N), and its sharpness by the scale s — the next three sections unpack the arithmetic, the gradient and the scale.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="worked-loss" data-nav="The loss worked by hand">
+      <h3><span class="idx">05</span> The loss worked by hand on a 3 × 3 batch</h3>
+      <p class="lede">Three images, three captions, one cosine-similarity matrix. Multiply by a logit scale, run a softmax along every row and down every column, read off the diagonal probabilities, and average the negative logs. Every number below can be checked with a calculator.</p>
+
+      <h4>Step 1 — cosines and logits</h4>
+      <p>Suppose after normalisation the cosine similarities are as below (rows are images, columns captions; the diagonal holds the true pairs). Use a logit scale <code>s = 10</code> so the arithmetic stays readable; CLIP starts at 14.29 and ends at 100.</p>
+      <div class="formula"><span class="lbl">cosines uᵢ · vⱼ</span><span class="eq">        T₁     T₂     T₃
+I₁  [ 0.30   0.10   0.05 ]
+I₂  [ 0.12   0.25   0.20 ]
+I₃  [ 0.02   0.15   0.28 ]</span>
+<span class="lbl">logits L = 10 · cos</span><span class="eq">        T₁     T₂     T₃
+I₁  [ 3.0    1.0    0.5  ]
+I₂  [ 1.2    2.5    2.0  ]
+I₃  [ 0.2    1.5    2.8  ]</span></div>
+
+      <h4>Step 2 — row softmax (image → text)</h4>
+      <table class="cmp">
+        <tr><th>Row</th><th>exp(logits)</th><th>sum</th><th>softmax</th><th>P(true caption)</th><th>−ln P</th></tr>
+        <tr><td>I₁</td><td>20.09, 2.72, 1.65</td><td>24.45</td><td>0.821, 0.111, 0.067</td><td>0.821</td><td>0.197</td></tr>
+        <tr><td>I₂</td><td>3.32, 12.18, 7.39</td><td>22.89</td><td>0.145, 0.532, 0.323</td><td>0.532</td><td>0.631</td></tr>
+        <tr><td>I₃</td><td>1.22, 4.48, 16.44</td><td>22.15</td><td>0.055, 0.202, 0.742</td><td>0.742</td><td>0.298</td></tr>
+        <tr><td colspan="5"><b>ℒ_I = mean</b></td><td><b>0.375</b></td></tr>
+      </table>
+
+      <h4>Step 3 — column softmax (text → image)</h4>
+      <table class="cmp">
+        <tr><th>Column</th><th>logits down the column</th><th>softmax over images</th><th>P(true image)</th><th>−ln P</th></tr>
+        <tr><td>T₁</td><td>3.0, 1.2, 0.2</td><td>0.816, 0.135, 0.050</td><td>0.816</td><td>0.204</td></tr>
+        <tr><td>T₂</td><td>1.0, 2.5, 1.5</td><td>0.140, 0.629, 0.231</td><td>0.629</td><td>0.464</td></tr>
+        <tr><td>T₃</td><td>0.5, 2.0, 2.8</td><td>0.065, 0.290, 0.645</td><td>0.645</td><td>0.438</td></tr>
+        <tr><td colspan="4"><b>ℒ_T = mean</b></td><td><b>0.369</b></td></tr>
+      </table>
+
+      <h4>Step 4 — combine, and compare with the baselines</h4>
+      <ul class="notes">
+        <li><b>ℒ = (0.375 + 0.369) / 2 = 0.372 nats.</b> A model with all logits equal would score <code>ln 3 = 1.099</code>, so this batch is already well separated.</li>
+        <li>The hardest item is I₂: its row loses 0.631 nats because T₃ is a close competitor (cosine 0.20 versus 0.25). Column T₃ loses 0.438 because I₂ competes for it, and column T₂ loses 0.464 because I₃ competes for it — a different set of rivals from any row. Rows and columns see different competitors, which is why ℒ_I ≠ ℒ_T.</li>
+        <li>Same cosines, different scale: at <code>s = 14.29</code> (CLIP's initial value) the loss is 0.241; at <code>s = 100</code> (CLIP's ceiling) it is 0.0012. The embeddings did not move; only the temperature changed. <a href="#temperature">Temperature</a> explains why this matters.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the loss is nothing more exotic than six small softmaxes over one matrix. With N = 32,768 there are 65,536 of them per step, each 32,768 entries wide.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="gradient" data-nav="What the gradient does">
+      <h3><span class="idx">06</span> What the gradient does to the embeddings</h3>
+      <p class="lede">Differentiate the loss with respect to one logit and the answer is "predicted probability minus target". Every negative is pushed away in proportion to how much probability it steals, so the softmax performs hard-negative weighting automatically — and the logit scale decides how aggressively.</p>
+      <div class="formula"><span class="lbl">gradient of the row term with respect to one logit</span><span class="eq">∂ℒ_I / ∂Lᵢⱼ = (1/N) · ( Pᵢⱼ − 𝟙[i = j] )        Pᵢⱼ = softmaxⱼ(Lᵢ·)</span>
+<span class="lbl">full gradient on a logit, both terms (Qᵢⱼ is the column softmax)</span><span class="eq">∂ℒ / ∂Lᵢⱼ = (1 / 2N) · ( Pᵢⱼ + Qᵢⱼ − 2·𝟙[i = j] )</span>
+<span class="lbl">chain rule to a normalised image embedding</span><span class="eq">∂ℒ / ∂uᵢ = s · ∑ⱼ (∂ℒ / ∂Lᵢⱼ) · vⱼ</span></div>
+
+      <h4>Reading it on the worked example</h4>
+      <ul class="notes">
+        <li>Row I₂ had probabilities 0.145, 0.532, 0.323. The row-term gradient on its logits is <code>(1/3)·(0.145, −0.468, 0.323)</code>: pull T₂ in with weight 0.468, push T₃ away with weight 0.323 and T₁ with only 0.145. T₃, the close competitor, gets more than twice the push of T₁.</li>
+        <li>Because the weights on a row sum to zero, the image embedding moves toward its caption and away from a probability-weighted average of the other captions: <code>Δuᵢ ∝ s · ( vᵢ − ∑ⱼ Pᵢⱼ vⱼ )</code> for the row term.</li>
+        <li>The embedding is then renormalised to the sphere, so only the tangential component of that update survives; this is standard for cosine-similarity losses and is why the similarity, not the norm, carries all information.</li>
+      </ul>
+
+      <h4>Hard-negative weighting is built in</h4>
+      <ul class="notes">
+        <li>A negative whose similarity is already far below the positive receives almost no probability and therefore almost no gradient. The update concentrates on confusable pairs — two photographs of dogs with different captions, say — without any explicit mining step.</li>
+        <li>The concentration grows with <code>s</code>. At a low scale probabilities are spread and every negative is pushed a little; at a high scale almost all of the push goes to the one or two nearest negatives. The <a href="#temperature">temperature explorer</a> shows this share directly.</li>
+        <li>The gradient on a row vanishes when <code>Pᵢᵢ → 1</code>. Once a pair is separated by several units of logit, it stops contributing — which is why the loss, and learning, is dominated by the hardest items in each batch.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> CLIP's loss sends each embedding toward its partner and away from a softmax-weighted mix of the batch's other items. Large batches supply more candidates to be hard; a large logit scale focuses the gradient on them.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="temperature" data-nav="Temperature and the logit scale">
+      <h3><span class="idx">07</span> Temperature and the logit scale</h3>
+      <p class="lede">Cosines live in [−1, 1], so a softmax over raw cosines can never be confident: with N = 32,768 captions, even a perfect +1 against −1 for everything else leaves the correct caption at about 0.02%. CLIP multiplies every cosine by a learned scale <code>s = exp(t) = 1/τ</code> before the softmax, starts it at 1/0.07 and caps it at 100.</p>
+
+      <div class="viz" id="viz-temp">
+        <div class="vhead">
+          <span class="vtitle">One row of logits under different scales</span>
+          <span class="vhint">fixed cosines, one positive and seven negatives · slide the scale · marks at CLIP's initial 14.29 and ceiling 100</span>
+        </div>
+        <div class="controls">
+          <label>logit scale s <input type="range" id="temp-s" min="0" max="100" step="1" value="30" /><span id="temp-sv" style="min-width:60px;display:inline-block"></span></label>
+          <label>positive cosine <input type="range" id="temp-pos" min="10" max="40" step="1" value="30" /><span id="temp-posv" style="min-width:40px;display:inline-block"></span></label>
+        </div>
+        <svg id="temp-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Bar chart of softmax probabilities over eight captions and the loss as a function of the logit scale"></svg>
+        <div class="readout" aria-live="polite" id="temp-read"></div>
+      </div>
+
+      <div class="formula"><span class="lbl">initialisation (reference model.py) and the training-time cap (paper §2.5; the released forward pass applies no clamp)</span><span class="eq">t₀ = ln(1/0.07) = 2.659        s₀ = exp(t₀) = 14.29
+s = min( exp(t), 100 )          ln 100 = 4.605</span>
+<span class="lbl">why a scale is needed: best case with raw cosines, N captions</span><span class="eq">P(correct) ≤ e¹ / ( e¹ + (N−1)·e⁻¹ )      N = 32,768 → 2.3 × 10⁻⁴</span>
+<span class="lbl">the same best case at the ceiling s = 100</span><span class="eq">P(correct) = 1 / ( 1 + (N−1)·e⁻²⁰⁰ ) ≈ 1</span></div>
+
+      <h4>What the paper says, precisely</h4>
+      <ul class="notes">
+        <li>The temperature "is directly optimized during training as a log-parameterized multiplicative scalar to avoid turning as a hyper-parameter" — i.e. the learned variable is <code>t</code> and the multiplier is <code>exp(t)</code>. Optimising the log keeps the scale positive and makes a step in <code>t</code> a proportional change in <code>s</code>.</li>
+        <li>It "was initialized to the equivalent of 0.07" from the instance-discrimination paper it cites, and "clipped to prevent scaling the logits by more than 100 which we found necessary to prevent training instability". Table 18 lists the "maximum temperature" as 100.0 — the paper uses "temperature" loosely there for the multiplier.</li>
+        <li>The reference zero-shot notebook multiplies similarities by a hard-coded 100 — the ceiling value, and the value the released checkpoints' learned scale is commonly reported to have reached.</li>
+      </ul>
+
+      <h4>What the scale controls</h4>
+      <ul class="notes">
+        <li><b>Achievable confidence.</b> The softmax can only be as peaked as <code>s × (cos_pos − cos_neg)</code> allows. Real CLIP cosines are small — the CLIPScore authors report image–caption cosines ranging "from roughly zero to roughly .4" — so without a large <code>s</code> the loss could not approach zero.</li>
+        <li><b>Where the gradient goes.</b> As <code>s</code> grows, the softmax probability — and hence the push (see <a href="#gradient">the gradient</a>) — concentrates on the nearest negatives. Too small and every negative gets a little push; too large and the loss is driven by a handful of pairs, some of which are false negatives (a second photo of the same thing with a different caption).</li>
+        <li><b>Nothing, for ranking.</b> Multiplying all logits by the same positive number does not change which caption wins. Zero-shot accuracy and retrieval rankings are independent of <code>s</code>; only the <i>probabilities</i> (and so calibration and any thresholding) depend on it.</li>
+      </ul>
+
+      <h4>Why cap it?</h4>
+      <p>Nothing in the loss stops <code>t</code> from growing: once the batch is mostly separated, a larger scale always lowers the loss on the separated pairs. The paper says only that clipping was "necessary to prevent training instability"; a plausible reading is that very large logits saturate the softmax, concentrate the gradient on a few (possibly false) negatives and leave little numerical headroom in mixed precision. The cap trades a little achievable sharpness for stability. The general role of temperature in contrastive objectives is discussed in <a href="../../deep-learning/contrastive-learning.html#temperature">Contrastive Learning — temperature</a>; here it is enough that CLIP learns it and bounds it.</p>
+      <div class="callout"><b>Takeaway:</b> <code>exp(t)</code> is a learned inverse temperature, initialised at 14.29 and clipped at 100. It sets how confident CLIP's softmax can be and where the gradient concentrates, but it never changes an argmax — which is why zero-shot top-1 accuracy is unaffected by it and calibrated probabilities are not.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="batch" data-nav="The batch is the negative set">
+      <h3><span class="idx">08</span> The batch is the negative set</h3>
+      <p class="lede">CLIP has no negative sampler. For each image, the negatives are simply the other N − 1 captions in the batch, and vice versa. That makes the batch size a modelling choice as much as a systems one — and CLIP chose 32,768.</p>
+
+      <div class="viz" id="viz-batch">
+        <div class="vhead">
+          <span class="vtitle">Batch size → negatives, loss floor and memory for the similarity matrix</span>
+          <span class="vhint">slide N (powers of two) and the device count · memory is for the N × N logits alone, fp32</span>
+        </div>
+        <div class="controls">
+          <label>batch N = 2^k <input type="range" id="batch-k" min="8" max="20" step="1" value="15" /><span id="batch-kv" style="min-width:70px;display:inline-block"></span></label>
+          <label>devices D = 2^m <input type="range" id="batch-m" min="0" max="10" step="1" value="7" /><span id="batch-mv" style="min-width:50px;display:inline-block"></span></label>
+        </div>
+        <svg id="batch-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Log-log plot of similarity-matrix memory against batch size, full matrix versus per-device shard"></svg>
+        <div class="readout" aria-live="polite" id="batch-read"></div>
+      </div>
+
+      <div class="formula"><span class="lbl">negatives per anchor and per step</span><span class="eq">N − 1 per image (and per text)        N² − N wrong pairings per step</span>
+<span class="lbl">at N = 32,768</span><span class="eq">32,767 negatives each        32,768² = 1,073,741,824 logits = 2³⁰</span>
+<span class="lbl">memory for the full fp32 logit matrix</span><span class="eq">2³⁰ × 4 bytes = 4 GiB</span>
+<span class="lbl">cost of the similarity matmul (one direction, forward)</span><span class="eq">≈ 2 · N² · d_e FLOPs     N = 32,768, d_e = 768 → 1.6 × 10¹² FLOPs</span></div>
+
+      <h4>Why a bigger batch helps</h4>
+      <ul class="notes">
+        <li><b>A harder task.</b> Picking the right caption out of 32,768 is harder than out of 256, so the model must encode finer distinctions to keep the loss down. The paper frames each training step as a "randomly created proxy to a computer vision dataset which contains 1 example per class and has 32,768 total classes defined via natural language descriptions".</li>
+        <li><b>More hard negatives.</b> The softmax focuses the gradient on confusable negatives (see <a href="#gradient">the gradient</a>); a larger batch makes it more likely that confusable ones are present at all.</li>
+        <li><b>A looser ceiling.</b> The InfoNCE bound <code>I ≥ ln N − ℒ</code> caps what the loss can certify at <code>ln N</code>: 5.5 nats at N = 256, 10.4 nats at 32,768. The bound's tightness is debated; see <a href="../../deep-learning/contrastive-learning.html#negatives">Contrastive Learning — negatives</a>.</li>
+      </ul>
+
+      <h4>Why it is not free</h4>
+      <ul class="notes">
+        <li>The similarity matrix grows as <code>N²</code> while the encoders' cost grows as <code>N</code>. At N = 32,768 the encoders still dominate the FLOPs — the OpenCLIP paper lists 87.7 GMACs (about 175 GFLOPs) per sample for ViT-L/14's two towers together, while the similarity matmul adds about <code>2·N·d_e</code> ≈ 50 MFLOPs per image — but the <b>memory</b> of a naive full matrix (4 GiB in fp32 before the softmax's own buffers) is prohibitive on one device, and every device needs every other device's embeddings.</li>
+        <li><b>False negatives</b> become more common: at 32,768 web pairs, a batch will often contain several captions that also describe a given image. The loss still labels them wrong.</li>
+        <li>Later work found the benefit saturates. SigLIP reports that for both its sigmoid loss and a softmax baseline, gains "quickly diminish", with "a more reasonable batch size of 32 k being sufficient" (see <a href="successors.html#siglip">SigLIP</a>).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> in CLIP, "how many negatives" and "how big is the batch" are the same question. 32,768 buys a hard 32,768-way task every step at the price of a 2³⁰-entry similarity matrix that must be sharded — the next section shows how.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="sharding" data-nav="Sharding the similarity matrix">
+      <h3><span class="idx">09</span> Sharding the N × N similarity across devices</h3>
+      <p class="lede">The paper's one-sentence description: "the calculation of embedding similarities was also sharded with individual GPUs computing only the subset of the pairwise similarities necessary for their local batch of embeddings." Each device owns a horizontal strip of the matrix, not the whole of it.</p>
+      <div class="formula"><span class="lbl">with D devices, local batch n = N / D</span><span class="eq">1. each device encodes its n images and n texts           → u_local [n, d_e], v_local [n, d_e]
+2. all-gather embeddings from every device                → U [N, d_e], V [N, d_e]
+3. compute its strips: u_local · Vᵀ and v_local · Uᵀ       → two [n, N] blocks
+4. local loss over those rows; sum the losses across devices</span>
+<span class="lbl">memory per device instead of N²</span><span class="eq">2 · n · N logits        n = 256, N = 32,768 → 2 × 32 MiB = 64 MiB (fp32)</span></div>
+
+      <h4>Details that matter</h4>
+      <ul class="notes">
+        <li><b>The all-gather must pass gradients.</b> The loss on device 1's rows depends on device 2's text embeddings; those gradients must flow back to device 2's encoder. The OpenCLIP reproduction notes that PyTorch's standard <code>torch.distributed.all_gather</code> "can not be differentiated through", while <code>torch.distributed.nn.functional.all_gather</code> can — "imperative for correct gradient calculation". Using the wrong one silently trains with gradients only from local negatives.</li>
+        <li><b>Where the 64 MiB figure comes from.</b> The OpenCLIP paper's appendix gives exactly this arithmetic: before sharding, "4 GB of VRAM in FP32" per worker; after, two <code>n × N</code> matrices, "64 MB" at local batch 256. With 32,768 / 256 = 128 devices, each holds 1/64 of the full matrix (two strips of 1/128).</li>
+        <li><b>Communication</b> is an all-gather of <code>N × d_e</code> numbers per modality — at d_e = 768 and fp16, 32,768 × 768 × 2 bytes ≈ 48 MiB per modality per step — small next to the encoders' gradient all-reduce.</li>
+        <li><b>Other memory savers in CLIP's run.</b> Mixed precision, gradient checkpointing, half-precision Adam statistics, and half-precision stochastically rounded text-encoder weights, all listed in the paper's training section.</li>
+      </ul>
+
+      <h4>An alternative that avoids the gather</h4>
+      <p>SigLIP's pairwise sigmoid loss needs no row normalisation, so each device can compute its block against one neighbour's texts at a time, pass the texts around a ring with collective permutes, and accumulate. Its paper states that "at any point in time only" a <code>b × b</code> block "is materialized in memory", reducing the peak from <code>|B|²</code> to <code>b²</code> and enabling batches above one million. See <a href="successors.html#siglip">SigLIP</a>.</p>
+      <div class="callout"><b>Takeaway:</b> sharding turns the 4 GiB matrix into per-device strips of a few tens of MiB, at the cost of an all-gather that must be differentiable. Getting that detail wrong is a quiet failure: training still runs and the loss still looks plausible.</div>
+    </section>
+
+    <nav class="pager" aria-label="CLIP series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../clip.html">← CLIP · overview</a>
+      <a href="../clip.html" style="color:var(--muted)">CLIP · overview</a>
+      <a href="data-encoders.html">CLIP: Data, Encoders &amp; Training →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../clip.viz.js"></script>
+</body>
+</html>

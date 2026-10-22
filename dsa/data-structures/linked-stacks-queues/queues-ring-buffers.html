@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Queues, Ring Buffers &amp; Deques</title>
+<script src="../../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../linked-stacks-queues.html">Linked Lists, Stacks &amp; Queues</a> · part 4 of 4</p>
+      <h1>Queues, Ring Buffers &amp; Deques</h1>
+      <p>The FIFO discipline: the queue ADT, why a naive array queue drifts, the circular buffer with modular wrap-around, telling full from empty, growing a ring without breaking order, double-ended deques, and the two-stack queue whose amortized O(1) is proved by both banker's and potential arguments.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Linked Lists, Stacks &amp; Queues</span>
+        <span class="pill">Queue ADT · drift · circular buffer · full vs empty · growing a ring · deques · two-stack queue</span>
+      </div>
+    </header>
+
+    <!-- ═══ 20 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="queue-adt" data-nav="What a queue is">
+      <h3><span class="idx">20</span> What a queue is: the FIFO contract</h3>
+      <p class="lede"><b>A queue is a collection with two accessible ends: elements are added at one and removed at the other.</b> The element removed is therefore always the one that has been waiting longest — <b>first in, first out</b>. Like the <a href="stacks-expressions.html#stack-adt">stack</a>, it is deliberately impoverished so that every operation can be constant-time — worst-case constant on a fixed-capacity ring or a linked queue, amortized constant once the storage has to grow; unlike the stack, its two ends are different, and that difference is what makes the implementation interesting rather than obvious.</p>
+
+      <div class="formula"><span class="lbl">the ADT</span><span class="eq">enqueue(v)   add v at the back                                       O(1)</span>
+<span class="eq">dequeue()    remove and return the front;  requires non-empty         O(1)</span>
+<span class="eq">front()      return the front without removing it;  same requirement  O(1)</span>
+<span class="eq">isEmpty()    ·   size()                                              O(1)</span>
+<span class="lbl">the FIFO property, over a whole run</span><span class="eq">if enqueue(a) precedes enqueue(b), then dequeue() returns a before it returns b — always</span>
+<span class="lbl">the one-line difference from a stack, and it is the only difference</span><span class="eq">stack: remove from the end you add to        queue: remove from the OTHER end</span>
+<span class="lbl">what follows from "the other end"</span><span class="eq">a stack needs one moving boundary;  a queue needs two, and they move in the same direction</span>
+<span class="eq">so the occupied region of a queue DRIFTS through its storage — §21, §22</span></div>
+
+      <h4>Why the second boundary changes everything</h4>
+      <p>A stack's occupied region always starts at a fixed place and grows and shrinks at one end. A queue's occupied region has <i>both</i> ends moving forward — enqueues push the back forward, dequeues push the front forward — so over a long run the occupied window marches steadily through the storage, leaving used-and-released space behind it. Every array-backed queue implementation is an answer to the question of what to do about that drift: shuffle the elements back to the start (<a href="#naive-array-queue">§21</a>, and it is quadratic), let the window run off the end and reallocate (unbounded memory for a bounded queue), or wrap the window around (<a href="#circular-buffer">§22</a>, and this is the answer). A node-backed queue sidesteps the question entirely, because nodes have no positions to drift through.</p>
+
+      <h4>Where the shape comes from, and the vocabulary that comes with it</h4>
+      <ul class="notes">
+        <li><b>Scheduling.</b> Any resource shared by more requests than it can serve at once has a queue in front of it: a CPU run queue, a printer spool, a thread pool's work queue, a socket's accept backlog. FIFO here is a <i>fairness</i> property — no request is starved, because every earlier arrival is served first — which is a guarantee a stack conspicuously does not make.</li>
+        <li><b>Buffering between producers and consumers.</b> A queue decouples the rate at which things are produced from the rate at which they are consumed, absorbing bursts. That is what a keyboard buffer, an audio ring, a network receive buffer and a message broker's topic partition all are, and the queue's <i>capacity</i> is the size of burst it can absorb before it must either block the producer or drop.</li>
+        <li><b>Breadth-first exploration.</b> <a href="../graphs/breadth-first-search.html#bfs-dfs">Breadth-first search</a> is depth-first search with the stack replaced by a queue, and the consequence is that vertices are discovered in order of distance from the source — which is what makes BFS a shortest-path algorithm on unweighted graphs. The level-order traversal of a tree is the same algorithm.</li>
+        <li><b>Simulation.</b> Discrete-event simulation of anything with waiting lines — tills, call centres, packets at a router — is a queue plus a clock, and the classical results about how waiting time blows up as utilisation approaches capacity are results about this structure.</li>
+      </ul>
+
+      <h4>The preconditions, and the bounded case</h4>
+      <p>As with the stack, <code>dequeue</code> and <code>front</code> are partial: undefined on an empty queue, and each implementation must choose between raising, returning a sentinel, or offering a total variant. The bounded case is more consequential here than it is for stacks, because queues are so often used as <i>buffers with a fixed capacity</i>, and a full buffer needs a policy: <b>block</b> the producer until space appears (back-pressure — correct when the producer can be slowed), <b>reject</b> the new element (correct when dropping is better than delaying), or <b>overwrite</b> the oldest (correct for a telemetry ring where recent data matters more than complete data). Those three policies are the whole design space, and choosing between them is usually a more important decision than choosing the data structure.</p>
+      <div class="callout"><b>The same code, one word changed.</b> Take a graph traversal, and replace "stack" with "queue" in one line. Nothing else changes — not the visited set, not the loop, not the neighbour expansion — and the algorithm goes from diving down one path to sweeping outwards in rings. That is worth internalising, because it is the sharpest possible demonstration that the choice of ADT <i>is</i> an algorithmic decision, not an implementation detail.</div>
+    </section>
+
+    <!-- ═══ 21 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="naive-array-queue" data-nav="The naive array queue">
+      <h3><span class="idx">21</span> The naive array queue, and why it is quadratic</h3>
+      <p class="lede">The obvious array-backed queue keeps the front at index 0: <code>enqueue</code> appends at the end, <code>dequeue</code> takes <code>data[0]</code> and shifts everything down by one. It is four lines, it is correct, and it turns a sequence of <code>n</code> enqueues and <code>n</code> dequeues from <code><span class="keep">Θ</span>(n)</code> work into <code><span class="keep">Θ</span>(n²)</code>. It is worth deriving that number rather than just asserting it, because the same mistake — an <code>O(1)</code>-looking operation that is secretly linear — recurs in every structure on this page.</p>
+
+      <div class="formula"><span class="lbl">the naive implementation</span><span class="eq">enqueue(v):   data[size] ← v ;  size ← size + 1                       O(1)</span>
+<span class="eq">dequeue():    v ← data[0]</span>
+<span class="eq">              for j = 1 … size−1:   data[j−1] ← data[j]      ← the shift</span>
+<span class="eq">              size ← size − 1 ;  return v                             <span class="keep">Θ</span>(size)</span>
+<span class="lbl">the cost of n enqueues followed by n dequeues</span><span class="eq">enqueues:  n × O(1)  =  <span class="keep">Θ</span>(n)</span>
+<span class="eq">dequeues:  (n−1) + (n−2) + ⋯ + 1 + 0  =  ∑ₖ₌₀ⁿ⁻¹ k  =  n(n−1)/2  =  <span class="keep">Θ</span>(n²) element moves</span>
+<span class="lbl">worked, n = 8</span><span class="eq">7 + 6 + 5 + 4 + 3 + 2 + 1 + 0  =  28  =  8 × 7 / 2 ✓</span>
+<span class="lbl">worked, n = 1000</span><span class="eq">999 × 1000 / 2  =  499 500 element moves, to deliver 1000 elements</span>
+<span class="lbl">what the circular buffer does instead</span><span class="eq">0 element moves, for any n:  every dequeue advances ONE index</span></div>
+
+      <h4>The mistake, named</h4>
+      <p>This is the same error as building a string by repeated concatenation or building a list by repeated tail-append without a tail pointer: <b>a per-operation cost that is proportional to the collection's current size, inside a loop that runs once per element</b>. The sum <code>∑ k</code> is the signature. Whenever a profile shows a quadratic where the algorithm looks linear, the first thing to look for is an operation whose cost depends on <code>size</code> being called <code>n</code> times — and in a dynamic language it is very often a "remove from the front of a list" call that is documented, in small print, as linear.</p>
+
+      <h4>Three repairs, in increasing order of cleverness</h4>
+      <ul class="notes">
+        <li><b>Do not shift; move the front index instead.</b> Keep a <code>front</code> index and leave the departed elements where they are, dead. Now <code>dequeue</code> is <code>O(1)</code> — but the occupied window drifts to the right forever, so the array must keep growing even though the queue's <i>size</i> may stay tiny. A queue holding ten elements that has served a million would occupy a million cells. This is strictly better than the shift and still unacceptable.</li>
+        <li><b>Shift lazily, in batches.</b> Let the front index drift and compact the array only when the wasted prefix exceeds half the capacity. Each compaction is <code><span class="keep">Θ</span>(n)</code> but pays for at least <code>n/2</code> dequeues, so the amortized cost per operation is <code>O(1)</code> by the <a href="../../algorithms/analysis/amortized-analysis.html#amortized">aggregate argument</a>. This works, and it is the same trade as dynamic-array doubling: constant on average, linear in the worst case.</li>
+        <li><b>Wrap the window around.</b> Let the back index run off the end and reappear at index 0, reusing the space the front has vacated. No element ever moves, no compaction ever happens, the memory is exactly the capacity, and <i>every</i> operation is worst-case <code>O(1)</code> — not amortized. That is the circular buffer, and it is strictly better than the other two whenever the capacity can be fixed or grown by doubling.</li>
+      </ul>
+
+      <h4>And the node-backed queue, which has none of these problems</h4>
+      <p>A singly linked list with both a <code>head</code> and a <code>tail</code> pointer implements a queue directly: <code>enqueue</code> is an insert at the tail (<code>O(1)</code>, because <code>tail</code> is held) and <code>dequeue</code> is a delete at the head (<code>O(1)</code>, because the head needs no predecessor). Note the happy accident — this is exactly the pairing of operations that a singly linked list does <i>well</i>, which is why the queue, unlike the <a href="#deques">deque</a>, needs no back-pointers. The costs are the ones <a href="singly-doubly-linked.html#cache-reality">§03</a> priced: one allocation per element, a link per element, and no locality. For a queue whose maximum size is known, the circular buffer wins comfortably; for one that must grow without bound and where worst-case latency matters, the linked queue is the safer choice.</p>
+      <div class="callout"><b>A test that catches this class of bug.</b> Run the structure through <code>n</code> enqueues and <code>n</code> dequeues for <code>n</code>, <code>2n</code> and <code>4n</code>, and count the primitive operations rather than timing them. Linear work quadruples when <code>n</code> quadruples; quadratic work goes up sixteenfold. That ratio test is far more reliable than a stopwatch and it does not depend on the machine — it is the <a href="../../algorithms/analysis/space-empirical-limits.html#empirical">doubling-ratio experiment</a>, and it is the cheapest way to find a hidden linear operation.</div>
+    </section>
+
+    <!-- ═══ 22 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="circular-buffer" data-nav="The circular buffer">
+      <h3><span class="idx">22</span> The circular buffer: wrapping the window instead of moving the data</h3>
+      <p class="lede">A circular buffer — ring buffer, cyclic queue — is a fixed array plus two indices, in which "the next cell" means <code>(i + 1) mod capacity</code> rather than <code>i + 1</code>. The occupied region is a window that moves forward and wraps around the end of the block, so the space a dequeue frees at the front is reused by a later enqueue at the back. No element is ever moved, no memory is ever reallocated, and every operation is worst-case constant — <i>as long as the capacity is fixed</i>, which <a href="#growing-a-ring">§24</a> is about giving up. It is the usual queue implementation in systems code, and it is the array-side dual of the <a href="list-techniques.html#circular-lists">circular list</a> of §08.</p>
+
+      <div class="formula"><span class="lbl">the state</span><span class="eq">data[0 … capacity−1]      front — the index of the oldest element</span>
+<span class="eq">                          back  — the index the NEXT element will be written to</span>
+<span class="lbl">the two operations, in full</span><span class="eq">enqueue(v):   data[back] ← v ;   back ← (back + 1) mod capacity</span>
+<span class="eq">dequeue():    v ← data[front] ;  front ← (front + 1) mod capacity ;  return v</span>
+<span class="lbl">reading the contents — the ONLY correct way, because the window may be split</span><span class="eq">for i = 0 … size−1:   visit data[ (front + i) mod capacity ]</span>
+<span class="lbl">the relation between the three quantities, when size is not stored</span><span class="eq">size  =  (back − front + capacity) mod capacity        ← the +capacity matters: back may be &lt; front</span>
+<span class="eq">valid ONLY while the buffer is never completely full — a full ring has back = front and this returns 0,</span>
+<span class="eq">which is the ambiguity §23 exists to resolve. Store size, or keep a cell empty, and the formula is safe.</span>
+<span class="lbl">cost</span><span class="eq">enqueue, dequeue, front, size:  O(1) WORST CASE — no amortization argument needed</span>
+<span class="eq">element moves over any sequence:  0        ·   memory:  exactly capacity cells, always</span></div>
+
+      <div class="viz" id="viz-ring">
+        <div class="vhead">
+          <span class="vtitle">A ring of eight cells, driven through a wraparound</span>
+          <span class="vhint">the circle and the row are the same eight cells — the wrap is arithmetic, not movement</span>
+        </div>
+        <div class="controls">
+          <label for="ring-mode">full-vs-empty resolution</label>
+          <select id="ring-mode">
+            <option value="count" selected>keep a size counter</option>
+            <option value="gap">leave one cell permanently empty</option>
+            <option value="flag">keep a full flag</option>
+          </select>
+        </div>
+        <svg id="ring-svg" width="720" height="396" viewBox="0 0 720 396" role="img" aria-label="On the left a ring of eight numbered cells with front and back markers arrowed in from outside and the modular step drawn across the wrap edge; on the right the same eight cells as a flat indexed array row with the same markers, and beneath it a live state panel giving front, back, size, the empty and full tests, the number of index computations and the number of elements moved"></svg>
+        <div class="readout" id="ring-readout" aria-live="polite"></div>
+        <div id="ring-table"></div>
+      </div>
+
+      <h4>A hand-traced wraparound, with real indices</h4>
+      <p>Take <code>capacity = 8</code>, start empty with <code>front = back = 0</code>, and follow the scripted run in the figure. After five enqueues the window is <code>[0 … 4]</code> with <code>front = 0</code>, <code>back = 5</code>. Three dequeues advance the front without touching a single element: <code>front = 3</code>, and cells 0, 1 and 2 are now free but sit <i>behind</i> the window. Two more enqueues fill cells 5 and 6, and then the interesting step arrives:</p>
+      <div class="formula"><span class="lbl">the wrap, step by step</span><span class="eq">before:  front = 3,  back = 7,  size = 4,  occupied cells 3 4 5 6</span>
+<span class="eq">enqueue(8):   data[7] ← 8 ;  back = (7 + 1) mod 8 = 0        ← back has wrapped</span>
+<span class="eq">after:   front = 3,  back = 0,  size = 5,  occupied cells 3 4 5 6 7</span>
+<span class="eq">enqueue(9):   data[0] ← 9 ;  back = (0 + 1) mod 8 = 1</span>
+<span class="eq">after:   front = 3,  back = 1,  size = 6,  occupied cells 3 4 5 6 7 0        ← the window is SPLIT</span>
+<span class="lbl">and the size formula still works, which is the check</span><span class="eq">(back − front + capacity) mod capacity  =  (1 − 3 + 8) mod 8  =  6 ✓</span>
+<span class="lbl">while the naive subtraction does not</span><span class="eq">back − front  =  1 − 3  =  −2        ← the bug, and it only appears after a wrap</span>
+<span class="lbl">reading the queue in order</span><span class="eq">data[3], data[4], data[5], data[6], data[7], data[0]   — NOT data[front … back]</span></div>
+      <p>Two of those lines are where implementations actually go wrong. The <b>size formula</b> must add <code>capacity</code> before taking the modulus, because <code>back − front</code> goes negative whenever the window has wrapped and the ring is not completely full — and a test suite that never fills the buffer past the end will never notice. (At completely full it does something worse than go negative: <code>back = front</code>, so the subtraction returns a perfectly plausible <code>0</code>. That is the ambiguity of <a href="#full-vs-empty">§23</a>, and it is why the formula is only safe on a ring that keeps a cell empty or keeps a count.) And <b>any code that reads the contents as a contiguous slice is wrong</b> once the window wraps: <code>data[front … back]</code> is empty or backwards in that state. A bulk read must be done as two slices, <code>data[front … capacity)</code> followed by <code>data[0 … back)</code>, which is exactly how a ring buffer hands a split region to a write system call.</p>
+
+      <h4>Why the modulus is usually not a modulus</h4>
+      <p>A division instruction is slow, and it is on the hot path of every operation. Two standard replacements: constrain the capacity to a <b>power of two</b>, in which case <code>i mod capacity</code> is the bitwise <code>i &amp; (capacity − 1)</code> and costs one cycle; or replace the modulus with a <b>conditional</b>, <code>i = i + 1; if (i == capacity) i = 0;</code>, which is correct for any capacity because the index only ever advances by one and therefore can only overshoot by one. The power-of-two trick is why so many ring buffer APIs insist on a power-of-two capacity, and the conditional is why the ones that do not are still fast. Both are behaviour-preserving; neither changes anything in this section.</p>
+      <div class="callout"><b>Where you have already used one.</b> A ring buffer is the standard structure for a hardware device's transmit and receive descriptors, for an audio callback's sample buffer, for a lock-free single-producer single-consumer channel (where <code>front</code> is owned by the consumer and <code>back</code> by the producer, so the two never write the same word), for a bounded log or telemetry buffer that overwrites its oldest entries, and for the <a href="../arrays-strings/array-techniques.html#sliding-window">fixed-size sliding window</a> over a stream. In every one of those, the property being bought is the same: bounded memory, no allocation after start-up, and no element ever moving.</div>
+    </section>
+
+    <!-- ═══ 23 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="full-vs-empty" data-nav="Full vs empty">
+      <h3><span class="idx">23</span> The full-versus-empty ambiguity, and the ways out of it</h3>
+      <p class="lede">A circular buffer holding only <code>front</code> and <code>back</code> has a genuine ambiguity: <b><code>front = back</code> means both completely empty and completely full</b>, because the window that has wrapped all the way round ends exactly where it started. This is not a subtlety to be coded around carelessly — it is a real information deficit, and the fix is always the same in form: supply the missing bit. Three standard ways do that, each costing something, and production ring buffers use all three depending on what is scarce; a fourth sidesteps the deficit entirely by never throwing the information away. The three-plus-one is not a theorem, only an enumeration of what is actually used — but the <i>counting</i> argument below, that two mod-capacity indices cannot encode <code>capacity + 1</code> sizes, is.</p>
+
+      <div class="formula"><span class="lbl">the ambiguity, stated precisely</span><span class="eq">the pair (front, back) can take capacity² values, but the queue has capacity + 1 distinct sizes</span>
+<span class="eq">and (front, back) with front = back is reachable both at size 0 and at size = capacity</span>
+<span class="lbl">resolution 1 — store the size</span><span class="eq">state: front, size            back = (front + size) mod capacity</span>
+<span class="eq">empty ⇔ size = 0              full ⇔ size = capacity        usable = capacity</span>
+<span class="lbl">resolution 2 — never let the buffer fill; keep one cell always empty</span><span class="eq">state: front, back</span>
+<span class="eq">empty ⇔ front = back          full ⇔ (back + 1) mod capacity = front       usable = capacity − 1</span>
+<span class="lbl">resolution 3 — store one extra bit</span><span class="eq">state: front, back, full</span>
+<span class="eq">empty ⇔ front = back and not full     full ⇔ front = back and full          usable = capacity</span>
+<span class="lbl">resolution 4 — refuse to reduce mod capacity at all, and the ambiguity never arises</span><span class="eq">keep head and tail as monotonically increasing 64-bit counters, never reduced mod capacity</span>
+<span class="eq">size = tail − head (exact, no ambiguity);  the cell is data[head mod capacity]</span></div>
+
+      <h4>Choosing between them</h4>
+      <ul class="notes">
+        <li><b>Store the size</b> when you want <code>size()</code> to be free and you do not mind one more word of state. It is the easiest to reason about — <code>size</code> is the queue's own count, not something derived — and it is the one to write first. Its cost is that <i>two</i> fields change on every operation, which matters in the concurrent case below.</li>
+        <li><b>Leave one cell empty</b> when state must be minimal and losing a cell is acceptable. It is the traditional embedded-systems answer and it has the pleasing property that <code>front</code> and <code>back</code> each change on exactly one kind of operation. Its cost is the wasted cell, which is negligible at capacity 4096 and annoying at capacity 4.</li>
+        <li><b>Store a flag</b> when you need the full capacity and one boolean is cheaper than a word. In practice this is the least used of the three, because the flag has to be updated in both operations and is easy to get wrong at exactly the states nobody tests.</li>
+        <li><b>Use unbounded counters</b> when the buffer is concurrent. This is the version that matters most in real systems: with a monotonic <code>head</code> written only by the consumer and a monotonic <code>tail</code> written only by the producer, there is no shared mutable field at all, <code>size = tail − head</code> is exact, and a single-producer single-consumer ring becomes lock-free almost by accident. The wrap is confined to the indexing expression <code>data[i mod capacity]</code>, and with a power-of-two capacity that is a bitwise and. The one caveat is counter overflow, which at 64 bits is not a practical concern.</li>
+      </ul>
+
+      <h4>What the figure shows when you switch the control</h4>
+      <p>The three options in the <a href="#circular-buffer">§22</a> figure are three genuinely different implementations, not three labels on one. Switch to <b>leave one cell permanently empty</b> and the same scripted run reports the buffer full one element earlier and rejects one more enqueue, because its usable capacity is 7 rather than 8 — the wasted cell is visible as a rejection. Switch between the other two and the behaviour is identical, which is the point: they are two ways to store the same missing bit. In all three the readout confirms that <b>zero elements were moved</b> over the entire run, and that the contents read out by the modular walk match a reference FIFO at every single step.</p>
+      <div class="callout"><b>A generalisable lesson about state.</b> The ambiguity exists because two variables were being asked to encode more states than they can distinguish. The fix, in all three forms, is to add exactly the missing information — a count, a forbidden state, or a bit. When a data structure has a case that "cannot be distinguished", the right question is never "how do I work around it" but "how many states do I need, and how many does my representation have?" Counting those two numbers usually names the fix immediately.</div>
+    </section>
+
+    <!-- ═══ 24 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="growing-a-ring" data-nav="Growing a ring">
+      <h3><span class="idx">24</span> Growing a circular buffer, and why the copy is not a memcpy</h3>
+      <p class="lede">A bounded ring buffer never grows — that is usually the point of choosing one. But an <i>unbounded</i> queue built on a ring must grow when it fills, and the resize is the one place where a circular buffer is harder than a plain dynamic array, because <b>the window may be split across the end of the block</b> and a straight block copy would scramble the order. The fix is three lines, and getting it wrong produces a queue that is correct until the first time it both wraps and resizes, which may be a long way into production.</p>
+
+      <div class="formula"><span class="lbl">the wrong version — correct only while the window is not split</span><span class="eq">newdata ← allocate(2 × capacity)</span>
+<span class="eq">copy data[0 … capacity) into newdata[0 … capacity)          ← preserves POSITIONS, not ORDER</span>
+<span class="eq">capacity ← 2 × capacity                                     ← front and back now mean nothing</span>
+<span class="lbl">the right version — copy in QUEUE order and renormalise the indices</span><span class="eq">newdata ← allocate(2 × capacity)</span>
+<span class="eq">for i = 0 … size−1:   newdata[i] ← data[ (front + i) mod capacity ]</span>
+<span class="eq">front ← 0 ;  back ← size ;  capacity ← 2 × capacity</span>
+<span class="lbl">why this is the natural moment to renormalise</span><span class="eq">the elements are being touched anyway, so straightening the window out costs nothing extra</span>
+<span class="eq">and it leaves the buffer in the simplest possible state: unwrapped, front at 0</span>
+<span class="lbl">cost</span><span class="eq">one resize moves size elements  ⇒  <span class="keep">Θ</span>(n) for that one operation</span>
+<span class="lbl">worked, on the split window §22 left behind — capacity 8, front = 3, back = 1, size = 6</span><span class="eq">contents in queue order:  data[3] data[4] data[5] data[6] data[7] data[0]  =  4 5 6 7 8 9</span>
+<span class="eq">the WRONG version copies cell i to cell i:   new = [9, _, _, 4, 5, 6, 7, 8, …]</span>
+<span class="eq">   and then front = 3, back = 1 in a capacity-16 block reads out as 6 cells starting at 3:  4 5 6 7 8 _</span>
+<span class="eq">   — the 9 is stranded at cell 0 and a hole is read in its place. Order destroyed, no error raised.</span>
+<span class="eq">the RIGHT version, i = 0 … 5, new[i] ← data[(3 + i) mod 8]:</span>
+<span class="eq">   i=0 → data[3]=4    i=1 → data[4]=5    i=2 → data[5]=6</span>
+<span class="eq">   i=3 → data[6]=7    i=4 → data[7]=8    i=5 → data[(3+5) mod 8] = data[0] = 9   ← the wrap, handled</span>
+<span class="eq">   new = [4, 5, 6, 7, 8, 9, …] ;  front ← 0 ;  back ← 6 ;  capacity ← 16</span>
+<span class="eq">   size check: (6 − 0 + 16) mod 16 = 6 ✓,  and the window is no longer split</span>
+<span class="eq">doubling ⇒ O(1) amortized per enqueue, by the same argument as a dynamic array</span>
+<span class="eq">but the worst-case O(1) guarantee of §22 is GONE — that was bought by fixing the capacity</span></div>
+
+      <h4>Three things the resize changes</h4>
+      <ul class="notes">
+        <li><b>The worst case stops being constant.</b> A fixed-capacity ring has worst-case <code>O(1)</code> operations, full stop. A growable one has amortized <code>O(1)</code> with <code><span class="keep">Θ</span>(n)</code> spikes, exactly like the array-backed stack of <a href="stacks-expressions.html#stack-implementations">§14</a>, and for exactly the same reason. If the ring was chosen <i>because</i> of the latency guarantee, making it growable throws away the reason it was chosen.</li>
+        <li><b>The copy is two block moves, not one.</b> In practice the loop above is written as two <code>memcpy</code>s — <code>data[front … capacity)</code> then <code>data[0 … back)</code> — because the split window is exactly two contiguous runs. Same result, and substantially faster on a real machine for the reasons <a href="singly-doubly-linked.html#cache-reality">§03</a> gives — two long sequential runs against a loop with a modulus in it — though how much faster is again a per-machine question and not a number to quote. It is the same two-slice decomposition that a bulk read of a wrapped ring needs.</li>
+        <li><b>Shrinking has the same trap as a dynamic array.</b> If the buffer shrinks when it falls to half full, an alternating fill-and-drain sequence can force a resize on every operation and destroy the amortized bound. The standard fix carries over unchanged: <b>shrink at one quarter full, and shrink to half the capacity</b>, which leaves the new block half full and guarantees <code><span class="keep">Θ</span>(n)</code> operations must pass before the next resize in either direction. That argument is derived in full on the <a href="../../algorithms/analysis/amortized-analysis.html#dynamic-array">Algorithm Analysis</a> page.</li>
+      </ul>
+
+      <h4>When not to grow at all</h4>
+      <p>A great many queues should be bounded, and treating "the buffer is full" as an error to be designed around rather than a limit to be raised is often the better engineering. An unbounded queue in front of a slow consumer does not fix the slow consumer; it converts a visible rejection into an invisible and unbounded memory growth, and turns a fast failure into a slow one. The three bounded-queue policies from <a href="#queue-adt">§20</a> — block the producer, reject the element, overwrite the oldest — are all more honest than growing, and the first of them is the standard mechanism by which back-pressure propagates through a pipeline. Grow when the queue's size is genuinely data-dependent and unbounded; otherwise pick a capacity and a policy.</p>
+      <div class="callout"><b>The linked queue's answer to the same problem.</b> A node-backed queue never resizes, never copies and never rejects, because each element carries its own storage. The costs are the ones this page has priced repeatedly: an allocation per element, a link per element, and no locality. Which is better is a genuine trade — but note that the linked queue's <i>worst case</i> is the allocator, whose own latency is not constant when it has to ask the operating system for more memory. "No copy" is not the same as "predictable".</div>
+    </section>
+
+    <!-- ═══ 25 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="deques" data-nav="Deques">
+      <h3><span class="idx">25</span> Deques: both ends, and the structures that can do it</h3>
+      <p class="lede">A <b>deque</b> — double-ended queue, pronounced "deck" — allows insertion and removal at <i>both</i> ends, and nothing in the middle. It generalises both previous ADTs: use one end only and it is a stack; add at one end and remove at the other and it is a queue. The interesting part is which implementations can support all four operations in <code>O(1)</code>, because two of the structures on this page cannot.</p>
+
+      <div class="formula"><span class="lbl">the ADT — four mutators, two accessors</span><span class="eq">addFirst(v)  ·  addLast(v)  ·  removeFirst()  ·  removeLast()   all O(1)</span>
+<span class="eq">first()  ·  last()  ·  isEmpty()  ·  size()                      all O(1)</span>
+<span class="lbl">which implementations can actually deliver all four</span><span class="eq">singly linked, head + tail      ✗   removeLast is <span class="keep">Θ</span>(n) — the predecessor problem, §05</span>
+<span class="eq">doubly linked, head + tail      ✓   all four are local splices</span>
+<span class="eq">doubly linked circular + sentinel ✓   all four, and with no boundary cases at all</span>
+<span class="eq">circular buffer                 ✓   front and back both move in both directions, mod capacity</span>
+<span class="eq">plain dynamic array             ✗   one end is O(1) amortized, the other is <span class="keep">Θ</span>(n)</span>
+<span class="lbl">the circular buffer's backwards step — the one line people get wrong</span><span class="eq">addFirst:   front ← (front − 1 + capacity) mod capacity ;  data[front] ← v</span>
+<span class="eq">the + capacity is not optional: in many languages (−1) mod 8 is −1, not 7</span>
+<span class="lbl">worked, at the one value of front where it matters — capacity 8, front = 0</span><span class="eq">correct:   front ← (0 − 1 + 8) mod 8  =  7 mod 8  =  7      ⇒  data[7] ← v, the window grows backwards over the wrap</span>
+<span class="eq">naive:     front ← (0 − 1) mod 8      =  −1                 ⇒  data[−1] ← v — an out-of-range write, or in a</span>
+<span class="eq">           language with permissive indexing, a silent write to somewhere that is not the buffer at all</span>
+<span class="eq">at every OTHER value of front the naive line is correct, which is exactly why this survives testing:</span>
+<span class="eq">front = 0 is one state out of eight, and it is the state a fresh buffer starts in</span></div>
+
+      <h4>Why a singly linked list cannot be a deque, restated</h4>
+      <p>Three of the four operations are fine: <code>addFirst</code> and <code>removeFirst</code> are head operations, and <code>addLast</code> is a tail insert with a held <code>tail</code> pointer. The fourth, <code>removeLast</code>, needs to write <code>null</code> into the second-to-last node's link, and no amount of extra external pointers reaches it — <code>tail</code> cannot find its own predecessor. This is the same wall as <a href="singly-doubly-linked.html#predecessor-problem">§05</a> and <a href="singly-doubly-linked.html#singly-linked">§04</a>, and it is why the deque is the operation set that <i>forces</i> the second link. A deque is exactly the ADT that distinguishes a singly from a doubly linked list.</p>
+
+      <h4>The two good implementations, compared</h4>
+      <ul class="notes">
+        <li><b>Doubly linked with sentinels.</b> All four operations are <code>insertBetween</code> or <code>remove</code> from <a href="singly-doubly-linked.html#sentinels">§07</a>, with no case analysis whatsoever, worst-case <code>O(1)</code> with no resize, and references to elements stay valid forever. Costs: two links plus an allocator header per element, an allocation per insertion, and no locality. This is the right choice when elements are large, when references into the deque must stay valid, or when worst-case latency is the binding constraint.</li>
+        <li><b>Circular buffer.</b> All four operations are one index step and one write, worst-case <code>O(1)</code> while the capacity holds, no allocation at all after construction, and the elements are contiguous and cache-friendly. Costs: a fixed capacity, or an amortized resize with the split-window subtlety of <a href="#growing-a-ring">§24</a>, and references invalidated by every resize. This is the right choice for small elements and a known or bounded size — which is most of the time.</li>
+        <li><b>The hybrid that most standard libraries actually ship.</b> A deque of fixed-size <i>blocks</i>, indexed by a small array of block pointers: contiguous within a block, so traversal is nearly as fast as an array's; <code>O(1)</code> worst case at both ends, because growth allocates one block; and no element ever moves, so references stay stable even as the deque grows. It is the same block-chain design that <a href="stacks-expressions.html#stack-implementations">§14</a> suggests for stacks, and it exists precisely because neither pure implementation is acceptable for a general-purpose container.</li>
+      </ul>
+
+      <h4>What deques are for</h4>
+      <p>Beyond being the union of stack and queue, the deque earns its place in two specific patterns. The first is the <b>monotonic deque</b> behind the sliding-window maximum: keep indices in the deque in decreasing order of value, push new elements at the back after popping everything smaller, and pop from the front when an index leaves the window. Each index enters and leaves once, so the whole scan is <code><span class="keep">Θ</span>(n)</code> — it is the <a href="stacks-expressions.html#stack-applications">monotonic stack</a> argument with both ends in play, and it is the standard solution to a problem that looks like it needs a heap. The second is <b>work stealing</b>: each worker thread pushes and pops its own tasks at one end of its deque while idle threads steal from the other end, so the common case touches only the owner's end and contention is rare by construction. Both patterns need genuinely both ends; neither is expressible with a stack or a queue alone.</p>
+      <div class="callout"><b>Name the operations, not the container.</b> "I need a deque" is usually the conclusion of "I need to add here and remove there". Writing down the four operations a piece of code actually performs, and only then choosing the structure, is the habit that avoids both mistakes: reaching for a heavyweight container when a stack would do, and discovering three months later that the queue you chose cannot remove from the front in constant time.</div>
+    </section>
+
+    <!-- ═══ 26 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="two-stack-queue" data-nav="The two-stack queue">
+      <h3><span class="idx">26</span> A queue from two stacks, and the amortization proved</h3>
+      <p class="lede">Two stacks make a queue. Enqueue by pushing onto an <b>inbox</b>; dequeue by popping from an <b>outbox</b>, and whenever the outbox is empty, first pour the entire inbox into it — which reverses the order, turning LIFO into FIFO. A single dequeue can therefore cost <code><span class="keep">Θ</span>(n)</code>, and yet <i>every</i> sequence of operations averages <code>O(1)</code> per operation. That combination — expensive individual steps, cheap totals — is the definition of an amortized bound, and this is the cleanest small example of one that is not the dynamic array.</p>
+
+      <div class="formula"><span class="lbl">the implementation, in full</span><span class="eq">enqueue(v):   inbox.push(v)</span>
+<span class="eq">dequeue():    if outbox is empty:</span>
+<span class="eq">                  while inbox is not empty:  outbox.push( inbox.pop() )     ← the transfer</span>
+<span class="eq">              return outbox.pop()</span>
+<span class="lbl">why the transfer produces FIFO order</span><span class="eq">popping the inbox yields newest-first;  pushing that onto the outbox puts oldest on TOP</span>
+<span class="eq">so the outbox's top is always the oldest element not yet returned — which is FIFO</span>
+<span class="lbl">the key structural fact the whole proof rests on</span><span class="eq">an element moves inbox → outbox AT MOST ONCE, ever;  it is never pushed back</span>
+<span class="lbl">the potential function</span><span class="eq">let <span class="keep">Φ</span> = 2 × |inbox|        (two future stack operations are owed for each waiting element)</span>
+<span class="eq"><span class="keep">Φ</span> ≥ 0 always, and <span class="keep">Φ</span>₀ = 0 on the empty queue — both required for the method to apply</span>
+<span class="lbl">amortized cost = actual cost + <span class="keep">Δ</span><span class="keep">Φ</span>, case by case</span><span class="eq">enqueue                      actual 1        <span class="keep">Δ</span><span class="keep">Φ</span> = +2      amortized 3</span>
+<span class="eq">dequeue, outbox non-empty    actual 1        <span class="keep">Δ</span><span class="keep">Φ</span> =  0      amortized 1</span>
+<span class="eq">dequeue, outbox empty, k in inbox   actual 2k + 1   <span class="keep">Δ</span><span class="keep">Φ</span> = −2k   amortized 1</span>
+<span class="lbl">therefore, for any sequence of m operations starting from empty</span><span class="eq">∑ actual  =  ∑ amortized − (<span class="keep">Φ</span>_m − <span class="keep">Φ</span>₀)  ≤  ∑ amortized  ≤  3m        ⇒  O(1) amortized per operation</span></div>
+
+      <h4>A short sequence, worked operation by operation</h4>
+      <p>Costs are counted in stack pushes and pops, since those are the only primitives the structure uses. Run <code>E(1) E(2) D D E(3) D D</code> from empty:</p>
+      <div class="formula"><span class="lbl">op · what happens · actual · <span class="keep">Φ</span> = 2×|inbox| after · amortized charge · running <span class="keep">Σ</span>actual / <span class="keep">Σ</span>amortized</span><span class="eq">—     start:  inbox [ ]      outbox [ ]            <span class="keep">Φ</span> = 0                       0 / 0</span>
+<span class="eq">E(1)  inbox.push(1)            inbox [1]            actual 1   <span class="keep">Φ</span> = 2   charge 3    1 / 3</span>
+<span class="eq">E(2)  inbox.push(2)            inbox [1,2]          actual 1   <span class="keep">Φ</span> = 4   charge 3    2 / 6</span>
+<span class="eq">D     outbox empty, k = 2:  pop 2, push 2, pop 1, push 1, then pop → returns 1</span>
+<span class="eq">      inbox [ ]  outbox [2]    actual 2k + 1 = 5    <span class="keep">Φ</span> = 0   charge 1    7 / 7</span>
+<span class="eq">D     outbox non-empty: pop → returns 2      outbox [ ]  actual 1   <span class="keep">Φ</span> = 0   charge 1    8 / 8</span>
+<span class="eq">E(3)  inbox.push(3)            inbox [3]            actual 1   <span class="keep">Φ</span> = 2   charge 3    9 / 11</span>
+<span class="eq">D     outbox empty, k = 1:  pop 3, push 3, then pop → returns 3</span>
+<span class="eq">      inbox [ ]  outbox [ ]    actual 2k + 1 = 3    <span class="keep">Φ</span> = 0   charge 1   12 / 12</span>
+<span class="eq">D     both empty — the precondition fails; nothing is charged and nothing is spent   12 / 12</span>
+<span class="lbl">the three things to check in that table</span><span class="eq">1. the returns were 1, 2, 3 — arrival order, i.e. FIFO, out of two LIFO stacks</span>
+<span class="eq">2. <span class="keep">Σ</span>amortized − <span class="keep">Σ</span>actual = <span class="keep">Φ</span> at EVERY row (3−1=2 ✓, 6−2=4 ✓, 7−7=0 ✓, 8−8=0 ✓, 11−9=2 ✓, 12−12=0 ✓)</span>
+<span class="eq">3. <span class="keep">Σ</span>actual = 12 over 6 charged operations ≤ 3 × 6 = 18 ✓ — the 3m bound, with room to spare</span>
+<span class="lbl">and the fact that makes it work, visible in the table</span><span class="eq">elements 1 and 2 crossed inbox → outbox once each, element 3 once. Nothing crossed twice.</span></div>
+
+      <h4>The same bound by the accounting method, in one sentence</h4>
+      <p>Charge every <code>enqueue</code> three coins: one pays for the push onto the inbox, and two are left <i>on the element</i> to prepay its eventual pop from the inbox and push onto the outbox. Charge every <code>dequeue</code> one coin, which pays for the pop off the outbox. Because an element crosses from inbox to outbox at most once, the two prepaid coins are always there when the transfer happens, and no operation is ever unable to pay. Since the credit on every element is non-negative, the total charged is an upper bound on the total spent — which is the whole of the <a href="../../algorithms/analysis/amortized-analysis.html#three-methods">accounting method</a>, and it gives the same <code>3m</code>.</p>
+
+      <div class="viz" id="viz-two">
+        <div class="vhead">
+          <span class="vtitle">Per-operation cost, and the accounting that tames it</span>
+          <span class="vhint">top: what each single operation really cost · bottom: cumulative actual against cumulative amortized, with the gap shaded</span>
+        </div>
+        <div class="controls">
+          <label for="two-seq">operation sequence</label>
+          <select id="two-seq">
+            <option value="batch" selected>all enqueues, then all dequeues</option>
+            <option value="alt">strictly alternating</option>
+            <option value="rand">randomised, enqueue-heavy</option>
+          </select>
+          <label for="two-n">operations = <b id="two-n-out"></b></label>
+          <input type="range" id="two-n" min="20" max="200" step="10" value="80" />
+        </div>
+        <svg id="two-svg" width="720" height="400" viewBox="0 0 720 400" role="img" aria-label="Upper panel: one bar per operation showing the stack pushes and pops that operation actually performed, with transfer dequeues drawn as tall red spikes and the flat amortized charge overlaid as a dashed step line. Lower panel: cumulative actual cost as a solid line, cumulative amortized charge as a dashed line always above it, and the region between them shaded to show the stored potential"></svg>
+        <div class="readout" id="two-readout" aria-live="polite"></div>
+        <div id="two-table"></div>
+      </div>
+
+      <h4>Reading the two panels</h4>
+      <p>The top panel is the reason amortized analysis is needed at all: the per-operation cost is emphatically <i>not</i> constant, and on the <b>all enqueues then all dequeues</b> sequence there is a single red spike whose height is the entire queue. The bottom panel is the resolution. The dashed cumulative-amortized line lies above the solid cumulative-actual line at every prefix, and the shaded gap between them is <b>exactly</b> the potential <code><span class="keep">Φ</span> = 2 × |inbox|</code> — not approximately, exactly, and the readout verifies that identity at every one of the operations rather than at the end. That is what a potential function <i>is</i>: prepaid work, banked during the cheap operations, spent by the expensive one. Switch to the <b>strictly alternating</b> sequence and the spikes almost vanish, because the inbox never accumulates; switch to <b>randomised</b> and the spikes reappear at irregular intervals with the same total bound holding throughout.</p>
+
+      <h4>What it is good for, and what it is not</h4>
+      <ul class="notes">
+        <li><b>It is the standard answer to "implement a queue using only stacks".</b> Beyond the exercise, it is genuinely useful when the only primitive available is a stack — which happens in functional settings, where a queue is naturally a pair of immutable lists. Be careful with the amortization there, though: the argument above assumes each state of the queue is used <b>once</b>. If old versions of the structure are kept and re-used — which is the whole point of a <i>persistent</i> data structure — an adversary can dequeue repeatedly from the same expensive state and pay for the transfer every time, and the <code>O(1)</code> amortized bound collapses. Restoring it needs lazy evaluation plus memoization (the banker's queue) or an incremental rotation that moves a bounded amount of work per operation (a real-time queue). The plain eager pair-of-lists version is the right thing only when the queue is used single-threadedly, ephemerally, one version at a time.</li>
+        <li><b>The worst case is still <code><span class="keep">Θ</span>(n)</code>.</b> Amortized does not mean the spike is gone; it means the spikes are rare enough to pay for. In a latency-sensitive setting the transfer is a real stall, and the fixes are the same as everywhere else on this page: use a structure with a worst-case bound, or spread the transfer out incrementally (which is exactly what a real-time functional queue does, moving a constant number of elements per operation).</li>
+        <li><b>The amortized bound is fragile if the pattern changes.</b> The argument depends on elements crossing at most once. A variant that ever pushes elements <i>back</i> from the outbox into the inbox — a tempting way to implement "peek at the back" — destroys the bound completely and makes the structure quadratic.</li>
+        <li><b>It is a good introduction to the potential method</b>, because the potential has a plain-English meaning — the work owed by the elements still sitting in the inbox — where the dynamic array's <code><span class="keep">Φ</span> = 2·num − size</code> takes more staring at. Both are worked in full on the <a href="../../algorithms/analysis/amortized-analysis.html#amortized">Algorithm Analysis</a> page.</li>
+      </ul>
+      <div class="callout"><b>Amortized is not average-case.</b> Nothing in this section mentions a probability distribution. The bound holds for <i>every</i> sequence of operations, including the worst one an adversary can construct, which is a strictly stronger guarantee than an expected-case bound. The distinction is drawn carefully in <a href="../../algorithms/analysis/amortized-analysis.html#amortized">Algorithm Analysis</a>, and it is the difference between "usually fast" and "cannot be made slow".</div>
+    </section>
+
+    <nav class="pager" aria-label="Linked Lists, Stacks &amp; Queues series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="stacks-expressions.html">← Stacks &amp; Expression Evaluation</a>
+      <a href="../linked-stacks-queues.html" style="color:var(--muted)">Linked Lists, Stacks &amp; Queues · overview</a>
+      <a href="../linked-stacks-queues.html">Linked Lists, Stacks &amp; Queues · overview →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../../data.js"></script>
+<script src="../../../notes.js"></script>
+<script src="../../dsa-viz.js"></script>
+<script src="../linked-stacks-queues.viz.js"></script>
+</body>
+</html>

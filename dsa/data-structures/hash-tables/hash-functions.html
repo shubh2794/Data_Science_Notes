@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Hash Functions &amp; Compression</title>
+<script src="../../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../hash-tables.html">Hash Tables</a> · part 1 of 5</p>
+      <h1>Hash Functions &amp; Compression</h1>
+      <p>From the map ADT to an array index: direct addressing and why it fails for large key universes, the split into hash code then compression, what makes a hash function good and the uniformity hypotheses every bound assumes, and the division (prime m) and multiplication (golden-ratio, power-of-two m) methods.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Hash Tables</span>
+        <span class="pill">Map ADT · direct addressing · hash + compress · uniformity · division · multiplication</span>
+      </div>
+    </header>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="map-adt" data-nav="The map ADT">
+      <h3><span class="idx">02</span> The map ADT, and what it does not promise</h3>
+      <p class="lede">A <b>map</b> (equivalently dictionary, associative array, symbol table) is an abstract type holding a set of <b>(key, value)</b> pairs in which <b>keys are unique</b>. It is defined by behaviour, not by storage: any structure supporting the operations below <i>is</i> a map, and a hash table is one implementation among several. Keeping the ADT and the implementation apart is the discipline that makes the rest of the page legible — the ADT says what must be true, the implementation says what it costs, and a great many arguments about hash tables are really arguments about which of the two is being discussed.</p>
+
+      <div class="formula"><span class="lbl">the core operations</span><span class="eq">get(k)        → the value stored under k, or "absent"</span>
+<span class="eq">put(k, v)     → associate v with k; REPLACE any existing value for k</span>
+<span class="eq">remove(k)     → delete the entry for k, if present</span>
+<span class="eq">contains(k)   → is there an entry for k?</span>
+<span class="eq">size()        → the number of entries</span>
+<span class="lbl">the traversal operation, and the reason it is listed separately</span><span class="eq">iterate()     → visit every (k, v) exactly once, IN NO SPECIFIED ORDER</span>
+<span class="lbl">the uniqueness invariant, which put must maintain</span><span class="eq">at all times:   k ≠ k′  ⇒  the map holds at most one entry for each</span>
+<span class="lbl">what "k ≠ k′" means, and why it is the map's business and not the table's</span><span class="eq">equality is supplied by the key type; the map never invents it</span>
+<span class="lbl">the three standard implementations, for comparison</span><span class="eq">unsorted list       get <span class="keep">Θ</span>(n)        put <span class="keep">Θ</span>(n)        ordered iteration <span class="keep">Θ</span>(n log n)</span>
+<span class="eq">balanced tree       get <span class="keep">Θ</span>(log n)    put <span class="keep">Θ</span>(log n)    ordered iteration <span class="keep">Θ</span>(n)</span>
+<span class="eq">hash table          get O(1) exp.  put O(1) exp.  ordered iteration <span class="keep">Θ</span>(n log n)</span></div>
+
+      <h4>What the ADT promises</h4>
+      <ul class="notes">
+        <li><b>Uniqueness of keys, enforced on <code>put</code>.</b> A second <code>put</code> with an equal key overwrites rather than appends. This is the single behavioural difference between a map and a <b>multimap</b>, and it is why <code>put</code> cannot be implemented as "insert without looking" — it must first search, which is why insertion into a hash table costs a lookup and is not cheaper than one.</li>
+        <li><b>Values are opaque.</b> The map never inspects a value; it neither compares, orders nor hashes it. Only keys are hashed. A <b>set</b> is exactly this ADT with the value omitted, which is why every hash-table technique on this page applies unchanged to hash sets.</li>
+        <li><b>Total lookup.</b> <code>get</code> is defined for every key, answering "absent" when there is no entry. This matters more than it sounds: the <i>unsuccessful</i> search is a first-class case, it is usually the more frequent one in real workloads, and it has its own cost theorem in every scheme here — one that is consistently <i>worse</i> than the successful case, because an unsuccessful search cannot stop early.</li>
+      </ul>
+
+      <h4>What the ADT conspicuously does <i>not</i> promise</h4>
+      <ul class="notes">
+        <li><b>Any order.</b> <code>iterate()</code> visits the entries in whatever order the implementation finds convenient. For a hash table, that order is a function of the hash values and the insertion history, so it can change when the table resizes, and — with a per-process random seed (<a href="modern-hashing-bloom.html#in-practice">§25</a>) — between two runs of the same program on the same data. Code that depends on iteration order is depending on an implementation accident. If order is part of the requirement, the requirement is for a <b>sorted map</b> (key order — a <a href="../trees-bst.html">balanced tree</a>) or an <b>insertion-ordered map</b> (arrival order — a hash table with an auxiliary linked list threaded through the entries). Those are two different ADTs, and a plain hash table is neither.</li>
+        <li><b>Any relationship between keys.</b> No minimum, no maximum, no successor, no "all keys between <code>a</code> and <code>b</code>". A map's keys form a set, not an ordered set, and this is precisely the structure a hash table destroys in exchange for its speed (<a href="modern-hashing-bloom.html#what-hashing-cannot-do">§26</a>).</li>
+        <li><b>Worst-case bounds.</b> The ADT says nothing about cost at all. The <code>O(1)</code> people attach to it is a property of one implementation, holds in expectation, and rests on a hypothesis that an adversary can deliberately falsify.</li>
+      </ul>
+
+      <h4>Where the keys' own contract comes in</h4>
+      <p>A hash table imposes two obligations on the key type that the ADT alone does not, and both are routine sources of bugs that present as "the entry vanished". First, <b><code>h</code> must be consistent with equality</b>: if <code>k</code> equals <code>k′</code> then <code>h(k)</code> must equal <code>h(k′)</code>. The converse need not hold and cannot — that is what a collision <i>is</i> — but this direction is mandatory, because two equal keys that hash apart will be stored in two different slots and the map will contain a duplicate, silently violating its own invariant. Second, <b>keys must be immutable while in the table</b>, or at least the parts of them that <code>h</code> and equality read must be. Mutating a key after insertion moves its correct slot without moving the entry, and the entry becomes unreachable through the front door while remaining visible to iteration — the most confusing failure mode in this whole subject, because the entry is simultaneously present and absent depending on which operation you ask. Languages that only allow immutable types as hash keys are enforcing exactly this, and the restriction is not arbitrary conservatism.</p>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="direct-addressing" data-nav="Direct addressing">
+      <h3><span class="idx">03</span> Direct addressing, and exactly where it fails</h3>
+      <p class="lede">Start from the case where hashing is unnecessary. If the key universe <code>U</code> is small and the keys are integers <code>0 … |U|−1</code>, allocate an array of <code>|U|</code> slots and use the key itself as the index. This is a <b>direct-address table</b>, and it is the ideal hash table: <code>h(k) = k</code>, no collisions ever, <code><span class="keep">Θ</span>(1)</code> <i>worst-case</i> for every operation with no probabilistic hypothesis anywhere. It is worth building the idea from here because the whole of hashing is what you do when the one assumption behind it — that <code>|U|</code> is affordable — is false.</p>
+
+      <div class="formula"><span class="lbl">the direct-address table</span><span class="eq">T[0 … |U|−1],   T[k] = the entry with key k, or NIL</span>
+<span class="eq">get(k)  =  T[k]        put(k,v)  =  (T[k] ← (k,v))        remove(k)  =  (T[k] ← NIL)</span>
+<span class="lbl">the cost, with no small print of any kind</span><span class="eq">every operation:  <span class="keep">Θ</span>(1) WORST case — no expectation, no hypothesis, no adversary</span>
+<span class="lbl">the cost that kills it</span><span class="eq">space  =  <span class="keep">Θ</span>(|U|),  regardless of how many keys n are actually present</span>
+<span class="lbl">the ratio that decides whether it is acceptable</span><span class="eq">occupancy  =  n / |U|</span>
+<span class="lbl">worked: 9-digit identifiers, 1000 of them actually in use</span><span class="eq">|U| = 10⁹ slots × 8 bytes per reference  =  8 GB, to hold 1000 entries</span>
+<span class="eq">occupancy  =  1000 / 10⁹  =  10⁻⁶ — one slot in a million carries anything</span>
+<span class="lbl">what hashing changes, in one line</span><span class="eq">replace the table of size |U| by a table of size m ≈ n,  and h(k) = k by h : U → {0…m−1}</span>
+<span class="eq">space <span class="keep">Θ</span>(|U|) → <span class="keep">Θ</span>(m) = <span class="keep">Θ</span>(n),  at the cost of h no longer being injective</span></div>
+
+      <h4>The failure is about space, and only about space</h4>
+      <p>It is worth being exact, because the argument is often stated loosely as "direct addressing doesn't scale". Time does not degrade at all — a direct-address table of a billion slots answers a lookup in one array access, same as a table of ten. What fails is that the array must be <i>allocated</i>, and its size is set by the universe rather than by the data. The example in the formula block is the canonical one: nine-digit identifiers give a universe of <code>10⁹</code>, and a table of that many machine words costs gigabytes whether it holds a thousand entries or none. The memory is not merely wasted, it is actively harmful — it must be allocated, it must be initialised to NIL, and a traversal of the occupied entries has to walk all <code>10⁹</code> slots to find the thousand, so <code>iterate()</code> degrades from <code><span class="keep">Θ</span>(n)</code> to <code><span class="keep">Θ</span>(|U|)</code>. Direct addressing turns a space problem into a time problem for exactly one operation, and that operation is the one that touches every slot.</p>
+
+      <h4>Where direct addressing is still the right answer</h4>
+      <ul class="notes">
+        <li><b>Small, dense universes.</b> Counting bytes (<code>|U| = 256</code>), bucketing ages, indexing by weekday, tallying the 26 letters of an alphabet, the <b>bad-character table</b> of a <a href="../arrays-strings/string-matching.html#boyer-moore">Boyer-Moore matcher</a>: all of these are direct-address tables, and using a hash table for them would be strictly slower and larger. If <code>|U|</code> is a few thousand and occupancy is above a few per cent, stop here — you have a perfect hash function for free and it is the identity.</li>
+        <li><b>Bit vectors, when there is no value.</b> If the map is really a <i>set</i> of small integers, each slot needs one bit rather than one word, and a universe of <code>10⁶</code> costs 125 KB rather than 8 MB. That is a 64-fold improvement which moves the affordability threshold by a factor of 64 — not by enough to rescue the 9-digit case, but enough to rescue many.</li>
+        <li><b>As the second level of something else.</b> Index arithmetic on a dense small range is what makes <a href="rehashing-universal-perfect.html#perfect-hashing">perfect hashing</a>'s inner tables work, what makes counting sort and radix sort work, and what makes a direct-mapped cache work. The technique does not disappear; it becomes a component.</li>
+      </ul>
+
+      <h4>The intermediate case that motivates everything after</h4>
+      <p>Between "universe small enough to index directly" and "universe astronomically large" there is no interesting middle ground, and that is the real point. Universes in practice are either tiny (a byte, a weekday) or enormous (every string, every 64-bit integer, every tuple) — there is almost never a universe of size <code>3n</code>. So the decision is binary: if the universe is tiny, index it; otherwise the table must be sized by <code>n</code>, which forces <code>m ≪ |U|</code>, which forces <code>h</code> to be non-injective, which forces a collision policy. Everything from <a href="separate-chaining.html#collisions-guaranteed">§09</a> onward is the consequence of this single unavoidable step. The hash function's job, viewed this way, is to simulate the direct-address table's distinct-slot-per-key property as closely as a function into a smaller range can — and the collision policy's job is to handle the gap that remains.</p>
+
+      <div class="callout"><b>A useful reframing.</b> A hash table is a direct-address table on a <i>compressed universe</i>. The compression is lossy, the loss is called a collision, and the load factor <code>n/m</code> measures how hard the compression is being pushed. Hold that picture and the rest of the page organises itself.</div>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="hash-then-compress" data-nav="Hash code, then compression">
+      <h3><span class="idx">04</span> The two halves: hash code, then compression</h3>
+      <p class="lede">In practice <code>h</code> is never written as a single function. It is the composition of a <b>hash code</b>, which maps an arbitrary key to a fixed-width integer and knows nothing about the table, and a <b>compression function</b>, which maps that integer into <code>0 … m−1</code> and knows nothing about the key. The split is not bureaucratic. It puts every key-type-specific decision on one side of a seam and every table-specific decision on the other, so a table can be resized without re-deciding how to hash a string, and a new key type can be supported without touching the table. It also localises blame: <a href="separate-chaining.html#collisions-guaranteed">collisions are inevitable at the compression step</a>, but a <i>bad</i> hash table is almost always one whose <b>hash code</b> was weak and whose compression then faithfully preserved the weakness.</p>
+
+      <div class="formula"><span class="lbl">the composition</span><span class="eq">h(k)  =  compress( code(k) )</span>
+<span class="eq">code : U → ℤ        (or into a w-bit word)     — depends on the KEY TYPE only</span>
+<span class="eq">compress : ℤ → {0 … m−1}                        — depends on the TABLE only</span>
+<span class="lbl">the standard hash code for a sequence — polynomial evaluation in Horner form</span><span class="eq">code(s)  =  ( ⋯ ((s[0]·a + s[1])·a + s[2]) ⋯ )·a + s[L−1]     mod 2^w</span>
+<span class="eq">cost <span class="keep">Θ</span>(L) — derived, with a worked example, in <a href="../arrays-strings.html#string-order">Arrays &amp; Strings §28</a></span>
+<span class="lbl">the two standard compressions</span><span class="eq">division:  compress(c)  =  c mod m                    (§07)</span>
+<span class="eq">MAD:       compress(c)  =  ((a·c + b) mod p) mod m    a ∈ {1…p−1}, b ∈ {0…p−1}, p prime &gt; every code c   (§22)</span>
+<span class="lbl">why the seam is where it is — resizing</span><span class="eq">m changes  ⇒  compress changes,  code(k) does NOT</span>
+<span class="eq">so a cached code per entry survives every rehash; only the fold is redone  (§20)</span>
+<span class="lbl">and the identity that makes a cached code worth caching</span><span class="eq">rehash cost per entry  =  <span class="keep">Θ</span>(1) with a cached code,  <span class="keep">Θ</span>(L) without</span></div>
+
+      <h4>What the hash code must achieve</h4>
+      <p>The hash code's job is to turn "different key" into "different integer" as reliably as a deterministic function into <code>2^w</code> values can, and to do so in a way that <b>destroys the structure in the input</b>. Real key sets are not random: identifiers in a program are <code>i</code>, <code>j</code>, <code>n</code>, <code>tmp</code>, <code>ptr</code>, <code>pt</code>, <code>pts</code>; file paths share long prefixes; timestamps are consecutive; record identifiers are consecutive and often a multiple of something. A code that preserves any of that structure hands it to the compression step, which will convert it into a systematic collision pattern. Three properties are wanted, and they are not the same property:</p>
+      <ul class="notes">
+        <li><b>Determinism.</b> Same key, same code, always, within one process's lifetime. This is a correctness requirement, not a quality one.</li>
+        <li><b>Uniformity.</b> Over the key distribution you actually face, the codes should look spread out. Note the qualifier — uniformity is a joint property of the function <i>and</i> the input distribution, and is therefore not a property you can test once and rely on forever.</li>
+        <li><b>The avalanche property.</b> Flipping one bit of the input should change roughly half the output bits, unpredictably. This is much stronger than uniformity and it is what makes a code robust to <i>near</i>-keys: <code>"pt"</code> and <code>"pts"</code>, or ids <code>1000</code> and <code>1001</code>, should not merely differ in their codes, they should differ everywhere in their codes. The reason it matters for tables specifically is that compression usually keeps a <i>few</i> bits of the code, and a code that concentrates its differences in the bits compression throws away is worthless. The <b>low bits</b> option in the figure of <a href="../hash-tables.html#what-a-hash-table-is">§01</a> keeps exactly those bits, so it is the setting that punishes a code with poor downward diffusion.</li>
+      </ul>
+
+      <h4>What the compression function must achieve, and the failure it must avoid</h4>
+      <p>Compression must fold a wide integer into <code>m</code> values as evenly as possible, and its characteristic failure is <b>preserving a periodicity</b>. If the codes happen to be spaced <code>d</code> apart and <code>m</code> shares a factor with <code>d</code>, the folded values collapse onto a sublattice of the table and a large fraction of slots become unreachable. The clean worked case: codes <code>200, 205, 210, …, 595</code> — 80 values spaced 5 apart — compressed by <code>c mod 100</code> land on only 20 distinct slots, four keys to a slot, so every code collides with exactly three others; compressed by <code>c mod 101</code> they land on 80 distinct slots and collide not at all. Nothing changed but one in the divisor. That is the entire argument for choosing <code>m</code> prime, made precise in <a href="#division-method">§07</a>, and it is also the argument for randomising the compression when the codes are not under your control, which is <a href="rehashing-universal-perfect.html#universal-hashing">§22</a>.</p>
+
+      <h4>Where the responsibility actually lands</h4>
+      <p>A recurring practical confusion is which half to blame when a table performs badly. The test is cheap and worth naming: <b>count the distinct hash codes, then count the distinct slots</b>. If the codes themselves are already colliding — ten keys producing four codes — the key type's hash code is broken, and no table size will rescue it, because compression cannot separate integers that are already equal. If the codes are distinct and the slots are not, the fold is the problem, and the fixes are a different <code>m</code>, a different compression, or more slots. The figure in <a href="../hash-tables.html#what-a-hash-table-is">§01</a> prints both counts for exactly this reason. Its two settings are the two diagnoses side by side: the default polynomial code keeps all ten codes distinct and loses three keys to the fold — a compression collision — while the sum-of-characters code collapses ten keys to three codes before the table is even consulted, which is a code failure that no table can repair.</p>
+
+      <div class="callout"><b>A widespread real-world design.</b> Some library implementations counter a weak low-entropy hash code by mixing the code's high bits down into its low bits before masking — a cheap "finalisation" step applied by the <i>table</i> to whatever code the key type supplied. That is a table-side repair of a code-side weakness, and it is an admission that the seam described here leaks in one specific direction: the compression step is entitled to assume the code is good, and real codes often are not.</div>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="good-hash" data-nav="What makes a hash function good">
+      <h3><span class="idx">05</span> What makes a hash function good</h3>
+      <p class="lede">"Good" is measurable, but only against a stated purpose, and hash functions are used for at least three purposes with incompatible requirements: filling a table evenly, fingerprinting data for equality or integrity, and resisting an adversary. A function that excels at one can be useless at another, and most confusion about hash functions comes from importing a criterion from the wrong column. This section fixes the criteria for the table-addressing job specifically — the job this page is about — and names the others so they can be told apart.</p>
+
+      <div class="formula"><span class="lbl">the four requirements for a TABLE hash, in priority order</span><span class="eq">1. deterministic      same key ⇒ same value, for the table's lifetime      (correctness)</span>
+<span class="eq">2. consistent with =  k = k′ ⇒ h(k) = h(k′)                             (correctness)</span>
+<span class="eq">3. spreading          the induced load on the m slots is near even        (performance)</span>
+<span class="eq">4. cheap              O(1) for fixed-width keys, <span class="keep">Θ</span>(L) for length-L keys   (performance)</span>
+<span class="lbl">the measurable form of "spreading" — the chi-square statistic on the bucket counts</span><span class="eq">X²  =  ∑ⱼ (nⱼ − n/m)² / (n/m)          expected ≈ m − 1 for a uniform spread</span>
+<span class="eq">X² ≫ m  ⇒  clumped;   X² ≪ m  ⇒  suspiciously even (a red flag for a non-random test set)</span>
+<span class="lbl">the OTHER measurable form — the longest chain</span><span class="eq">n keys, m = n slots, ideal random hash ⇒ E[longest chain] = <span class="keep">Θ</span>(log n / log log n)</span>
+<span class="eq">which is NOT O(1) — the worst slot grows, slowly, forever</span>
+<span class="lbl">the avalanche criterion, stated numerically</span><span class="eq">flip one input bit ⇒ each output bit flips with probability ≈ 1/2, near-independently</span>
+<span class="lbl">the tension, which cannot be resolved, only chosen</span><span class="eq">stronger mixing  ⇒  better spread and more adversary resistance  ⇒  more cycles per key</span></div>
+
+      <h4>The three jobs, and why their criteria differ</h4>
+      <ul class="notes">
+        <li><b>Table addressing</b> — this page. The output range is tiny (<code>m</code> slots), collisions are handled rather than fatal, and the function runs on the critical path of every single operation, so speed dominates. A function that collides once in a thousand on your keys is <i>fine</i>; the collision policy absorbs it. What is not fine is a systematic pattern, because a pattern makes many keys collide at once rather than a few at random.</li>
+        <li><b>Fingerprinting</b> — deduplication, content addressing, change detection, the <a href="../arrays-strings/string-matching.html#rabin-karp">rolling hash of a substring matcher</a>. Here the output range is large (64 to 256 bits), there is no collision policy, and a collision is a wrong answer rather than a slow one. The criterion is the <a href="separate-chaining.html#collisions-guaranteed">birthday bound</a>: with a <code>b</code>-bit fingerprint you can afford about <code>2^(b/2)</code> items before a collision becomes likely, so 64 bits is comfortable at millions of items and uncomfortable at billions.</li>
+        <li><b>Adversarial resistance</b> — any table whose keys come from outside the program. The criterion is not statistical at all: it is that <i>no efficient adversary can produce colliding keys</i>, which no fixed fast hash provides. The two real answers are a keyed hash with a per-process secret, and <a href="rehashing-universal-perfect.html#universal-hashing">universal hashing</a>, and they are the same answer wearing different clothes (<a href="modern-hashing-bloom.html#in-practice">§25</a>).</li>
+      </ul>
+
+      <h4>The measurements that tell you whether a hash is spreading</h4>
+      <p>Two numbers are worth computing on a real key set, and they catch different failures. The <b>chi-square statistic</b> on the bucket counts catches a global bias: sum <code>(nⱼ − n/m)²/(n/m)</code> over the slots, and compare against <code>m − 1</code>, which is the expectation under a uniform spread. A value near <code>m</code> means the spread is indistinguishable from random; a value several times <code>m</code> means the function is clumping. The <b>longest chain</b> catches a local one, and it carries a subtlety that is easy to get backwards: even a <i>perfect</i> random hash does not give a flat table. Throwing <code>n</code> keys into <code>n</code> slots leaves the busiest slot holding <code><span class="keep">Θ</span>(log n / log log n)</code> keys in expectation. Be careful with that expression: it is a <i>growth rate</i>, not a value, and evaluating it literally gives 3.0 at <code>n = 100</code> and 5.3 at <code>n = 10⁶</code>, while the expected maximum computed from the bucket distribution itself is <b>4.2</b> and <b>8.8</b> — the suppressed constants are not small at any <code>n</code> you will meet. So an observed maximum chain of 9 in a million-entry table is not evidence of a bad hash, it is what a good one produces; evidence of a bad hash looks like a maximum chain of 500. <a href="separate-chaining.html#load-factor">§11</a> and <a href="separate-chaining.html#chain-costs">§12</a> compute those expected maxima and measure them. <a href="separate-chaining.html#chaining">§10</a>'s figure measures both against their predictions, so the baseline is visible rather than assumed.</p>
+
+      <h4>Cost is part of quality, and it is often the deciding part</h4>
+      <p>The cheapest possible table hash for a machine word is a multiply and a shift; the strongest commonly used one costs tens of nanoseconds per key. Between them lie one or two orders of magnitude, and since <i>every</i> operation pays this cost, the choice can dominate the table's performance more than the collision policy does. The right way to think about it is a budget: a lookup costs <code>(hash cost) + (probes) × (probe cost)</code>, and probes cost roughly a cache miss each at any interesting table size. A stronger hash is worth its cycles precisely when it removes probes — and past the point where the spread is already near-uniform it removes none, so additional strength buys only adversary resistance. That is a real thing to buy, and <a href="modern-hashing-bloom.html#in-practice">§25</a> explains when. It is not a speed improvement.</p>
+
+      <div class="callout"><b>The claim to be suspicious of.</b> "This hash function is good" is not a complete sentence. Good for which job, on which key distribution, against which adversary, at what cost per key? A function that is excellent for a symbol table of identifiers may be a poor fingerprint and is almost certainly not adversary-resistant.</div>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="uniform-hypotheses" data-nav="The uniformity hypotheses">
+      <h3><span class="idx">06</span> The uniformity hypotheses — three different assumptions</h3>
+      <p class="lede">Every expected-cost result on this page is conditional, and the conditions are <b>not the same condition</b>. Three distinct hypotheses circulate, they license different theorems, and the commonest error in this entire subject is proving a bound under one and quoting it under another. They are set out here, together, before any of them is used, so that each theorem later can name its own and be held to it.</p>
+
+      <div class="formula"><span class="lbl">H1 — SIMPLE UNIFORM HASHING   (the chaining hypothesis)</span><span class="eq">each key is equally likely to hash to any of the m slots,</span>
+<span class="eq">independently of where every other key hashed</span>
+<span class="eq">a statement about ONE value h(k) per key — licenses the chaining theorems of §10</span>
+<span class="lbl">H2 — UNIFORM HASHING   (the open-addressing hypothesis)</span><span class="eq">each key's PROBE SEQUENCE ⟨h(k,0), h(k,1), …, h(k,m−1)⟩</span>
+<span class="eq">is equally likely to be any of the m! permutations of ⟨0, 1, …, m−1⟩</span>
+<span class="eq">a statement about a whole permutation per key — licenses the probe theorems of §18</span>
+<span class="lbl">H3 — UNIVERSAL HASHING   (a property of a FAMILY, and provable rather than assumed)</span><span class="eq">a family H is universal iff   for all k ≠ k′:   Pr[h(k) = h(k′)]  ≤  1/m</span>
+<span class="eq">probability over the random CHOICE of h ∈ H — not over the keys, which may be adversarial</span>
+<span class="lbl">the strict logical relations</span><span class="eq">H2 ⇒ H1   (a uniformly random permutation has a uniformly random first element)</span>
+<span class="eq">H1 ⇏ H2   (linear probing satisfies H1 for its first probe and violates H2 badly)</span>
+<span class="eq">H3 is weaker than H1 — pairwise only — and yet suffices for the chaining bounds, §22</span>
+<span class="lbl">and the fact that ruins the neat picture</span><span class="eq">NONE of linear, quadratic or double probing satisfies H2</span>
+<span class="eq">each generates at most m² distinct probe sequences; H2 demands m! of them</span></div>
+
+      <h4>H1: simple uniform hashing</h4>
+      <p>The assumption is that <code>h</code> scatters keys like independent uniform draws: slot <code>j</code> is as likely as slot <code>j′</code> for any key, and knowing where <code>k</code> landed tells you nothing about where <code>k′</code> will land. It is a hypothesis about the <i>pair</i> (hash function, key distribution), and it is therefore not checkable in general — you rarely know the key distribution, and even when you do the keys may not be drawn independently. What it buys is the balls-in-bins model in full: the count <code>nⱼ</code> of keys in slot <code>j</code> is Binomial(<code>n</code>, <code>1/m</code>), its expectation is exactly <code><span class="keep">α</span> = n/m</code>, and every chaining result follows from that one fact by linearity of expectation. Note carefully what H1 does <i>not</i> say: it says nothing about probe sequences, so it cannot by itself justify a single open-addressing bound.</p>
+
+      <h4>H2: uniform hashing</h4>
+      <p>Open addressing needs more, because a key does not have a slot, it has an ordered list of slots to try. H2 upgrades the assumption from "one uniform draw per key" to "one uniform <i>permutation</i> of all <code>m</code> slots per key". This is a genuinely stronger statement — it implies H1 by looking only at the first probe, and it additionally promises that after <code>i</code> failed probes the next one is uniform over the <code>m − i</code> slots not yet examined, which is exactly the step the proof in <a href="open-addressing.html#probe-theorems">§18</a> takes. The awkward truth is that H2 is <b>false for every scheme anyone actually uses</b>. Linear probing has <code>m</code> possible probe sequences, quadratic probing has <code>m</code>, double hashing has about <code>m²</code>; uniform hashing demands <code>m!</code>, which is astronomically more. So the probe theorems are a model, and the right way to read them is: <i>this is how a perfectly randomised scheme would behave, and real schemes are compared against it</i>. Double hashing comes close; linear probing does not, and has its own separate theorems because of it.</p>
+
+      <h4>H3: universality — the one you can actually guarantee</h4>
+      <p>The third is different in kind. H1 and H2 are assumptions about the world, unverifiable and falsifiable by an adversary who picks your keys. H3 is a property of a <i>family</i> of hash functions that can be <b>proved</b> once and for all, and it moves the randomness from the keys to the algorithm: pick <code>h</code> at random from the family when the table is created, and the collision probability bound holds <i>for every fixed key set</i>, including one chosen by an adversary who knows the family but not your draw. It is weaker than H1 in an important way — it only constrains <i>pairs</i> of keys, saying nothing about triples or about the shape of the whole distribution — and yet, remarkably, pairwise is all the chaining analysis ever uses, so H3 recovers the chaining bounds with no assumption about the keys at all. That is the content of <a href="rehashing-universal-perfect.html#universal-hashing">§22</a>, and it is the single most important idea on this page.</p>
+
+      <h4>How to read every bound that follows</h4>
+      <p>From here on, each cost claim is stated in the form <b>(quantity, value, hypothesis)</b>, and the hypothesis is never omitted. The discipline matters because the six probe-cost formulas in <a href="open-addressing.html#probe-theorems">§18</a> look interchangeable and are not. They come in three groups of two — a successful and an unsuccessful figure each. <b>Two</b> are theorems under H2; <b>two</b> hold under a <i>different</i> model specific to linear probing, in which the initial positions are uniform but the sequence is a fixed scan; and <b>two</b> are approximations under a secondary-clustering model for quadratic probing, not theorems at all. Quoting the uniform-hashing formula for linear probing understates linear probing's cost at high load by a factor that the figure there measures at over five. Use the wrong one and you will conclude that a 90%-full linear-probing table costs 10 probes on an unsuccessful search when it costs about 50.</p>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="division-method" data-nav="The division method">
+      <h3><span class="idx">07</span> The division method, and why m should be prime</h3>
+      <p class="lede">The simplest compression is the remainder: <code>h(k) = k mod m</code>. One instruction on most machines, no tuning constants, defined for every key once the key is an integer. Its entire behaviour is governed by number theory rather than by intuition, and the governing fact is short enough to state exactly: <b>the remainder map preserves any arithmetic structure in the keys whose step shares a factor with <code>m</code></b>. Choosing <code>m</code> prime is not a superstition or a rule of thumb — it is the choice that makes that shared factor impossible for every step except multiples of <code>m</code> itself.</p>
+
+      <div class="formula"><span class="lbl">the function</span><span class="eq">h(k)  =  k mod m</span>
+<span class="lbl">the theorem that decides everything — keys in arithmetic progression</span><span class="eq">keys  k₀, k₀+d, k₀+2d, …      let  g = gcd(d, m)</span>
+<span class="eq">then  { (k₀ + i·d) mod m : i ∈ ℤ }  has exactly  m / g  elements</span>
+<span class="lbl">so the fraction of the table such keys can ever reach is</span><span class="eq">reachable fraction  =  1 / g</span>
+<span class="lbl">the two corollaries that are usually quoted as folklore</span><span class="eq">m prime, d not a multiple of m  ⇒  g = 1  ⇒  ALL m slots reachable</span>
+<span class="eq">m = 2^p  ⇒  h(k) is the low p bits of k  ⇒  g = gcd(d, 2^p) is a power of two, often large</span>
+<span class="lbl">and the separate reason to avoid m = 2^p − 1 for radix-2^p string codes</span><span class="eq">permuting the characters of the key does not change k mod (2^p − 1)</span>
+<span class="eq">so "abc", "bca", "cab" collide by construction — an anagram class per slot</span>
+<span class="lbl">the standard sizing rule when m is chosen at build time</span><span class="eq">m  =  a prime near  n / <span class="keep">α</span>_target,  and not near any power of 2</span></div>
+
+      <h4>The theorem, worked by hand on real keys</h4>
+      <p>Take eight record identifiers that are spaced eight apart, which is exactly what happens when a system allocates ids in blocks or stores a fixed-size record's offset as its key: <code>1000, 1008, 1016, 1024, 1032, 1040, 1048, 1056</code>. Here <code>d = 8</code>.</p>
+      <div class="formula"><span class="lbl">with m = 16, a power of two: g = gcd(8, 16) = 8, so m/g = 2 slots reachable</span><span class="eq">1000 mod 16 = 1000 − 62·16 = 1000 − 992 = 8</span>
+<span class="eq">1008 mod 16 = 1008 − 63·16 = 1008 − 1008 = 0</span>
+<span class="eq">1016 mod 16 = 8      1024 mod 16 = 0      1032 mod 16 = 8</span>
+<span class="eq">1040 mod 16 = 0      1048 mod 16 = 8      1056 mod 16 = 0</span>
+<span class="eq">slots used: { 0, 8 }  —  2 of 16,  four keys per slot,  87.5% of the table unreachable</span>
+<span class="lbl">with m = 17, prime: g = gcd(8, 17) = 1, so all 17 slots reachable</span><span class="eq">1000 mod 17 = 1000 − 58·17 = 1000 − 986 = 14</span>
+<span class="eq">1008 mod 17 = 1008 − 59·17 = 1008 − 1003 = 5</span>
+<span class="eq">1016 mod 17 = 1016 − 1003 = 13      1024 mod 17 = 1024 − 60·17 = 1024 − 1020 = 4</span>
+<span class="eq">1032 mod 17 = 1032 − 1020 = 12      1040 mod 17 = 1040 − 61·17 = 1040 − 1037 = 3</span>
+<span class="eq">1048 mod 17 = 1048 − 1037 = 11      1056 mod 17 = 1056 − 62·17 = 1056 − 1054 = 2</span>
+<span class="eq">slots used: { 2, 3, 4, 5, 11, 12, 13, 14 }  —  8 distinct,  ZERO collisions</span>
+<span class="lbl">cross-check on the progression: consecutive slots differ by 8 mod 17 = −9 mod 17</span><span class="eq">14 → 5 → 13 → 4 → 12 → 3 → 11 → 2      each step −9 (mod 17) ✓</span></div>
+      <p>One in the divisor, and the table goes from two usable slots to seventeen. Notice also what the prime case looks like: the slots are not consecutive, they walk the table in a stride of 8, which is the behaviour you want — the progression's structure is still <i>there</i>, it has simply been rotated into a stride that visits everything. That distinction matters again in <a href="open-addressing.html#linear-probing">§14</a>, because a stride of 8 produces scattered singletons while a stride of 1 produces one long cluster, and linear probing cares about the difference enormously even though chaining does not care at all.</p>
+
+      <h4>Why "prime, and not near a power of two"</h4>
+      <p>The primality half is the <code>gcd</code> argument above. The second half — avoid primes just above or below <code>2^p</code> — guards against a different pattern. If the hash code is built by a polynomial in radix <code>2^b</code> (which is what every byte-at-a-time string code is), then codes that differ by a shift or a character permutation differ by multiples of quantities close to powers of two, and a modulus close to a power of two folds those differences into a narrow band of slots. The specific pathological case is <code>m = 2^p − 1</code> with a radix-<code>2^p</code> code: then <code>2^p ≡ 1 (mod m)</code>, so every positional weight in the polynomial collapses to 1 and the code reduces to the <i>sum</i> of the characters, making every anagram of a key collide with it. That is not a mild bias; it is an exact, constructible collision family, and it is the cleanest argument available that the modulus and the hash code must be chosen with knowledge of each other.</p>
+
+      <h4>The honest case for powers of two</h4>
+      <p>Despite all of the above, a great many high-performance tables use <code>m = 2^p</code> and mask instead of dividing, and it is worth saying why rather than treating it as a mistake. An integer division or remainder costs on the order of ten to forty cycles depending on the core generation, against one cycle for a bitwise AND; at small table sizes that difference is comparable to the entire rest of the lookup. The trade those implementations make is explicit: <b>pay for a strong mixing step in the hash code, then mask</b>. If the code has good avalanche, its low bits are as good as any other bits and the <code>gcd</code> argument has nothing to bite on, because the key's arithmetic structure was destroyed before compression saw it. The rule that emerges is a conditional, and it is the accurate form of the folklore: <i>with a weak or identity-like hash code, use a prime modulus; with a strong avalanching code, a power of two and a mask is faster and equally good</i>. What is never safe is a weak code <i>and</i> a power-of-two mask, which is the configuration the figure below shows collapsing.</p>
+
+      <div class="viz" id="viz-div">
+        <div class="vhead">
+          <span class="vtitle">The same keys, three moduli — measured occupancy and spread</span>
+          <span class="vhint">every bar and every statistic is computed by hashing the real key set; nothing is plotted from a formula</span>
+        </div>
+        <div class="controls">
+          <label for="div-keys">key pattern</label>
+          <select id="div-keys">
+            <option value="stride8" selected>ids spaced 8 apart</option>
+            <option value="stride1">consecutive ids</option>
+            <option value="stride100">ids spaced 100 apart</option>
+            <option value="random">unstructured random ids</option>
+            <option value="words">short words, polynomial code</option>
+          </select>
+          <label for="div-n">n = <b id="div-n-out"></b> keys</label>
+          <input type="range" id="div-n" min="16" max="128" step="8" value="64" />
+          <label for="div-mix"><input type="checkbox" id="div-mix" /> mix the code first (avalanche step)</label>
+        </div>
+        <svg id="div-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Three stacked bucket-count charts for the same key set compressed by three different table sizes: a power of two, a composite, and a prime; each chart shows per-slot occupancy as bars, with measured distinct slots used, longest bucket and chi-square statistic reported beside it"></svg>
+        <div class="readout" id="div-readout" aria-live="polite"></div>
+      </div>
+      <p>At the default setting — 64 identifiers spaced 8 apart, no mixing — the three panels show the <code>gcd</code> theorem playing out exactly. The power-of-two table puts all 64 keys on <code>64/gcd(8,64) = 8</code> slots, eight keys deep, leaving seven-eighths of the array untouched. The composite modulus 66 does better but not well: <code>gcd(8,66) = 2</code>, so only 33 of its 66 slots are reachable, and with 64 keys crowded onto them 31 of the 33 hold two keys and two hold one. The prime 67 shares no factor with 8, reaches all 64 keys' worth of distinct slots, and its longest bucket is 1. The readout checks the three measured counts against <code>min(n, m/gcd(8, m))</code> computed independently, and they agree. Note what this shows and does not: <b>being composite is not itself the problem, sharing a factor with the stride is</b> — switch the pattern to <b>ids spaced 100 apart</b> and the power-of-two table improves from 8 slots to 16, because <code>gcd(100,64) = 4</code> rather than 8, while 66 is unchanged at 33 since <code>gcd(100,66) = 2</code> just as <code>gcd(8,66)</code> was. Neither is repaired; only the prime is immune to <i>every</i> stride that is not a multiple of it, which is the whole of its advantage and the reason the rule is stated as "prime" rather than "not a power of two". Now tick <b>mix the code first</b> and all three moduli become indistinguishable, because the avalanche step destroyed the stride before compression ever saw it — which is the conditional rule stated above, demonstrated rather than asserted. Switch to <b>unstructured random ids</b> and the three moduli agree with or without mixing: <i>the choice of <code>m</code> only matters when the keys have structure</i>, and the whole difficulty is that real keys usually do and you usually cannot see it.</p>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="multiplication-method" data-nav="The multiplication method">
+      <h3><span class="idx">08</span> The multiplication method</h3>
+      <p class="lede">The second classical construction multiplies rather than divides: scale the key by an irrational-looking constant, throw away the integer part, and read the slot off the fraction that remains. Its practical attraction is the mirror image of the division method's — here <b>the value of <code>m</code> is not critical</b>, so <code>m</code> can be a power of two and the whole computation becomes a multiply and a shift, with no division anywhere. The structure it destroys is different too: where the remainder rotates an arithmetic progression into a stride, multiplication scatters a progression across the table in a pattern with a provable spacing property.</p>
+
+      <div class="formula"><span class="lbl">the function</span><span class="eq">h(k)  =  floor( m · ( k·A mod 1 ) ),        0 &lt; A &lt; 1</span>
+<span class="eq">where  x mod 1  =  x − floor(x)  is the fractional part</span>
+<span class="lbl">the integer implementation, which is why it is fast — w-bit word, m = 2^p</span><span class="eq">s  =  floor(A · 2^w)          an integer constant, computed once</span>
+<span class="eq">k · s  =  r₁·2^w + r₀          a 2w-bit product: r₁ high word, r₀ low word</span>
+<span class="eq">h(k)  =  the top p bits of r₀   =  floor( r₀ / 2^(w−p) )</span>
+<span class="eq">cost: one multiply, one shift — no division, no modulus</span>
+<span class="lbl">the customary constant, and the reason it is customary</span><span class="eq">A  ≈  (√5 − 1) / 2  =  0.6180339887…      the golden-ratio conjugate</span>
+<span class="eq">it makes successive multiples k·A mod 1 fall in the largest remaining gap each time</span>
+<span class="eq">(the three-distance property: after N points, AT MOST 3 distinct gap lengths occur — for any A)</span>
+<span class="lbl">consequence for the pathological key pattern of §07</span><span class="eq">consecutive keys are spread, NOT placed consecutively — unlike k mod m</span></div>
+
+      <h4>Worked by hand: six consecutive keys, m = 16</h4>
+      <p>Take <code>A = 0.6180339887</code> and <code>m = 16</code> — a power of two, which the division method forbids and this method welcomes — and hash the six consecutive keys <code>123 … 128</code>.</p>
+      <div class="formula"><span class="lbl">k·A, its fractional part, and the slot</span><span class="eq">k = 123:  123·A = 76.0181806…   frac = 0.0181806…   ×16 = 0.2909   ⇒  h = 0</span>
+<span class="eq">k = 124:  124·A = 76.6362146…   frac = 0.6362146…   ×16 = 10.1794  ⇒  h = 10</span>
+<span class="eq">k = 125:  125·A = 77.2542486…   frac = 0.2542486…   ×16 = 4.0680   ⇒  h = 4</span>
+<span class="eq">k = 126:  126·A = 77.8722826…   frac = 0.8722826…   ×16 = 13.9565  ⇒  h = 13</span>
+<span class="eq">k = 127:  127·A = 78.4903166…   frac = 0.4903166…   ×16 = 7.8451   ⇒  h = 7</span>
+<span class="eq">k = 128:  128·A = 79.1083506…   frac = 0.1083506…   ×16 = 1.7336   ⇒  h = 1</span>
+<span class="lbl">the six slots</span><span class="eq">{ 0, 10, 4, 13, 7, 1 }   —  six distinct slots, spread across the table</span>
+<span class="lbl">the same six keys under the division method with the same m = 16</span><span class="eq">{ 11, 12, 13, 14, 15, 0 }  —  also six distinct slots, but CONSECUTIVE</span>
+<span class="lbl">why that difference is invisible to chaining and decisive for linear probing</span><span class="eq">chaining: 6 slots of length 1 either way — identical cost</span>
+<span class="eq">linear probing: one cluster of length 6 versus six isolated singletons — §14</span></div>
+      <p>Each step adds <code>A mod 1</code> to the fraction and wraps, so the successive slots advance by <code>16 × 0.618 ≈ 9.9</code>, landing about ten slots further on each time, modulo 16. That is the golden ratio doing its one trick, and it is worth stating what is and is not special about it. The three-distance property is <i>not</i>: for <b>every</b> irrational <code>A</code>, the first <code>N</code> points cut the unit interval into gaps of at most three distinct lengths. What the golden ratio adds is that those gaps stay close to <i>equal</i>. Because its continued fraction is all ones it is the worst-approximable irrational, so the sequence never settles into a short cycle and never clumps, and the ratio of the longest gap to the shortest never exceeds <code><span class="keep">φ</span>² ≈ 2.618</code> at any prefix length — a bound no other constant improves on. An <code>A</code> that is a good rational approximation, by contrast, still gives three gap lengths, but one of them is enormous and the table has a hole in it.</p>
+
+      <h4>What the method does and does not buy</h4>
+      <ul class="notes">
+        <li><b>It buys freedom in <code>m</code>.</b> This is the headline. Table sizes can be powers of two, so resizing is a doubling and compression is a shift — which removes the awkward business of keeping a table of primes around and dividing on every lookup.</li>
+        <li><b>It buys good behaviour on consecutive keys specifically.</b> Sequential integer keys are extremely common — row ids, timestamps, counters — and this is exactly the pattern <code>k mod 2^p</code> handles worst for open addressing.</li>
+        <li><b>It does not buy adversary resistance.</b> <code>A</code> is a fixed published constant, so an adversary can solve for keys that all land in one slot just as easily as with <code>k mod m</code>. Nothing with a fixed hash function resists an adversary; that requires <a href="rehashing-universal-perfect.html#universal-hashing">§22</a>.</li>
+        <li><b>It does not buy uniformity for all key distributions.</b> The method is a heuristic, not a theorem. Keys whose low bits carry all the entropy, or keys that are themselves multiples of something near <code>2^w/s</code>, can still clump. The constant matters: at <code>A = 1/2</code> or <code>1/3</code> exactly, <code>k·A mod 1</code> takes only two or three values and the whole table collapses to that many slots; at an <code>A</code> merely <i>close</i> to such a rational the collapse is not total but the points cluster in a few tight bands for a long initial run of <code>k</code>, which for the consecutive-key case that motivated the method is just as bad.</li>
+      </ul>
+
+      <h4>The modern descendant, and one honest caveat</h4>
+      <p>The integer form above — multiply by an odd constant, take the high bits of the product — is the skeleton of nearly every fast mixing function in use today. Contemporary mixers iterate it: multiply by a large odd constant, exclusive-or the value with a shifted copy of itself, repeat two or three times, then take the top bits. The multiply provides diffusion from low bits upward, the shift-xor provides it downward, and alternating them gives avalanche in both directions, which a single multiply does not. The caveat worth stating plainly: <b>taking the <i>high</i> bits of the product is not optional</b>. A multiply moves entropy from the low bits of the input toward the high bits of the product, so the low bits of <code>k·s</code> depend only on the low bits of <code>k</code> — masking the product's low bits gives you back a disguised version of the division-by-power-of-two failure of <a href="#division-method">§07</a>. This is a good example of the fourth recurring error in systems reasoning: a plausible-sounding simplification that is exactly backwards.</p>
+    </section>
+
+    <nav class="pager" aria-label="Hash Tables series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../hash-tables.html">← Hash Tables · overview</a>
+      <a href="../hash-tables.html" style="color:var(--muted)">Hash Tables · overview</a>
+      <a href="separate-chaining.html">Separate Chaining &amp; Load Factor →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../../data.js"></script>
+<script src="../../../notes.js"></script>
+<script src="../../dsa-viz.js"></script>
+<script src="../hash-tables.viz.js"></script>
+</body>
+</html>

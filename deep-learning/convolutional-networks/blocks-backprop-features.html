@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Conv Blocks, Backprop &amp; Learned Features</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  /* the small layouts this series uses — identical to parts 1 and 2 */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:9px 12px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  table.grid2 tr.tot td{background:rgba(91,156,255,.06)}
+  .kbox{display:inline-block;font-family:"SF Mono",Menlo,monospace;font-size:12px;background:var(--code);
+        border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:4px 8px 4px 0;white-space:pre;color:var(--ink)}
+  .controls input[type=number]{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+        border-radius:5px;padding:3px 5px;font-size:12px;width:60px;font-family:"SF Mono",Menlo,monospace}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../convolutional-networks.html">CNNs</a> · part 4 of 5</p>
+      <h1>Conv Blocks, Backprop &amp; Learned Features</h1>
+      <p>The convolution as a trainable, computable block: conv, norm and activation and where the norm goes, backpropagation through a convolution derived and audited numerically, convolution as one matrix product via im2col and the Toeplitz view, and what a trained convolutional network actually learns layer by layer.</p>
+      <div style="margin-top:10px">
+        <span class="pill">CNNs</span>
+        <span class="pill">Conv → norm → act · backprop derived · im2col · Toeplitz · what filters learn</span>
+      </div>
+    </header>
+
+    <!-- ═══ 24 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="block" data-nav="The canonical block">
+      <h3><span class="idx">24</span> The canonical block: conv → norm → activation, and where the norm goes</h3>
+      <p class="lede">Nobody writes a bare convolution. The unit of architecture is a three-part block, and the two decisions inside it — where the normalisation goes and whether the convolution keeps its bias — are settled questions with reasons.</p>
+
+      <div class="formula"><span class="lbl">the block, and the two orderings</span><span class="eq">POST-ACTIVATION NORM     x → conv → g → norm → out      (rare, and worse)
+PRE-ACTIVATION NORM      x → conv → norm → g → out      (the standard)
+
+with a residual connection (see Residual &amp; Skip Connections):
+POST-NORM                out = g(x + norm(conv(x)))
+PRE-NORM                 out = x + conv(g(norm(x)))     — the modern default</span>
+<span class="lbl">the two rules that follow immediately</span><span class="eq">1  DROP THE CONVOLUTION'S BIAS when a normalisation layer follows it.
+   Normalisation subtracts the mean, so any constant the bias added is
+   removed on the next line. The bias is not harmful — it is INERT, and its
+   gradient is (almost) zero. Its job is done by the norm's own <span class="keep">β</span> shift.
+   On a 3×3×512→512 layer that is 512 dead parameters out of 2 359 808 —
+   negligible in size and a real source of confusion when reading a
+   parameter count that does not match the reference implementation.
+2  THE NORM GOES BEFORE THE NON-LINEARITY, so that the non-linearity sees a
+   distribution it was designed for. A ReLU applied to something with mean
+   −5 kills nearly everything; the norm is what guarantees it does not.</span></div>
+
+      <h4>The one conv-specific thing about normalisation</h4>
+      <p>Everything else about normalisation layers is <a href="../neural-network-training/normalization-regularization.html#norm">part 2 §29</a> and <a href="../neural-network-training/normalization-regularization.html#layernorm">§30</a> — the train/eval asymmetry, the running statistics, the batch-size dependence, why LayerNorm exists. This page owns exactly one point, and it is the one that is usually stated wrongly:</p>
+
+      <div class="formula"><span class="lbl">BatchNorm in a convolutional layer reduces over THREE axes, not one</span><span class="eq">On an activation of shape (N, C, H, W), BatchNorm computes ONE mean and ONE
+variance PER CHANNEL, reducing over N, H and W together:
+
+        <span class="keep">μ</span>[c]  =  mean over  n, i, j  of  x[n][c][i][j]        N·H·W samples
+        <span class="keep">σ</span>²[c] =  var  over  n, i, j                            per statistic
+
+so there are 2C statistics and 2C learned parameters (<span class="keep">γ</span>[c], <span class="keep">β</span>[c]), not
+2·C·H·W of them.</span>
+<span class="lbl">and this is exactly the parameter-sharing argument again</span><span class="eq">Why reduce over H and W? Because the layer is TRANSLATION EQUIVARIANT and a
+per-position statistic would break that: it would normalise the top-left of
+the image differently from the bottom-right, and the same feature would come
+out differently depending on where it appeared. Normalising per channel is
+the ONLY choice consistent with §07.
+Consequence: the effective batch for BatchNorm's statistics is N·H·W, not N.
+At N = 2 on a 56×56 map that is 6 272 samples per statistic — which is why
+convolutional BatchNorm survives batch sizes that would break it on an MLP.</span></div>
+
+      <div class="callout"><b>The asymmetry that causes most BatchNorm bugs is part 2 §<a href="../neural-network-training/normalization-regularization.html#norm">29</a>'s, and it bites hardest here.</b> In training the layer uses the current batch's statistics; at evaluation it uses a running estimate. A convnet forgotten in training mode at evaluation time produces predictions that depend on which other images happened to be in the batch — and the failure looks like a data problem, not a mode problem. The conv-specific aggravation is that the reduction over <code>H</code> and <code>W</code> makes the training-mode statistics look <i>stable</i>, so the discrepancy is smaller and takes longer to notice.</div>
+
+      <h4>The block, as it is actually written</h4>
+      <table class="grid2">
+        <tr><th style="width:150px">block</th><th>the sequence</th><th>parameters, for <code>Cᵢₙ = Cₒᵤₜ = C</code>, 3×3</th><th>where it is from</th></tr>
+        <tr><td><b>plain</b></td><td><code>conv3×3 → BN → ReLU</code></td><td class="mono">9C² + 2C</td><td>The basic unit of every classification backbone from the 3×3 era onwards.</td></tr>
+        <tr><td><b>residual, basic</b></td><td><code>[conv → BN → ReLU → conv → BN] + x → ReLU</code></td><td class="mono">18C² + 4C</td><td>Two convolutions and a skip. See <a href="../residual-skip-connections.html">Residual &amp; Skip Connections</a>.</td></tr>
+        <tr><td><b>residual, bottleneck</b></td><td><code>1×1 ↓4 → 3×3 → 1×1 ↑4</code>, each with BN and ReLU, plus the skip</td><td class="mono">≈ C²·(1/4 + 9/16 + 1/4) = 1.06C²</td><td>§16's arithmetic. Seventeen times cheaper than two plain 3×3 layers at the same width.</td></tr>
+        <tr><td><b>inverted residual</b></td><td><code>1×1 ↑t → depthwise 3×3 → 1×1 ↓t</code>, with the skip on the <i>narrow</i> ends and no non-linearity on the last 1×1</td><td class="mono">≈ tC²·2 + 9tC</td><td>§21's factorisation. Expands rather than contracts, because a depthwise layer is cheap and wants many channels to work on.</td></tr>
+        <tr class="tot"><td><b>modernised</b></td><td><code>depthwise 7×7 → LayerNorm → 1×1 ↑4 → GELU → 1×1 ↓4</code>, plus the skip</td><td class="mono">≈ 8C² + 49C</td><td>The convolutional block redesigned to match a transformer block's shape: a big depthwise "token mixer", then a two-layer position-wise MLP.</td></tr>
+      </table>
+
+      <div class="viz" id="viz-block">
+        <div class="vhead">
+          <span class="vtitle">The block: which axes each normalisation reduces over, and what the bias does once a norm follows it</span>
+          <span class="vhint">the axis diagram is the whole point — the same four-dimensional tensor, with the cells that share one statistic highlighted, for each of the four normalisation layers</span>
+        </div>
+        <div class="controls">
+          <label>normalisation <select id="bl-n">
+            <option value="bn" selected>BatchNorm — per channel, over N, H, W</option>
+            <option value="ln">LayerNorm — per example, over C, H, W</option>
+            <option value="in">InstanceNorm — per example and channel</option>
+            <option value="gn">GroupNorm — per example, over a channel group</option>
+          </select></label>
+          <label>batch N <input type="range" id="bl-N" min="1" max="8" step="1" value="4" /><span id="bl-Nv" style="min-width:14px;display:inline-block">4</span></label>
+          <label>channels C <input type="range" id="bl-C" min="2" max="8" step="2" value="6" /><span id="bl-Cv" style="min-width:14px;display:inline-block">6</span></label>
+          <label>map side <input type="range" id="bl-H" min="1" max="56" step="1" value="28" /><span id="bl-Hv" style="min-width:22px;display:inline-block">28</span></label>
+          <label>bias in the conv <input type="checkbox" id="bl-b" /></label>
+        </div>
+        <svg id="block-svg" width="760" height="430" viewBox="0 0 760 430" role="img" aria-label="Left: the activation tensor drawn as a grid of small squares, one row per batch element and one column per channel, each square standing for a whole spatial map. The squares that share a single normalisation statistic are filled in one colour and the rest are left grey, so that BatchNorm fills a whole column, LayerNorm fills a whole row, InstanceNorm fills one square, and GroupNorm fills part of a row. Beneath, the count of samples that go into each statistic is written out as the product of the axes reduced, together with the number of statistics and the number of learned scale and shift parameters. Right: a demonstration that a convolution bias followed by a normalisation layer is inert — the same block is evaluated with the bias set to a range of values and the block's output plotted against it, giving a flat line for every normalisation layer, while the same sweep without normalisation gives a line of slope one. The gradient of the loss with respect to that bias is computed and printed, and it is at the level of floating-point round-off. A small table lists the parameter count of each of the five block designs at the current channel count."></svg>
+        <div class="readout" aria-live="polite" id="block-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 25 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="backprop" data-nav="Backprop through a convolution">
+      <h3><span class="idx">25</span> Backpropagation through a convolution, derived — and audited</h3>
+      <p class="lede">This is the one place where this page must do its own calculus. <a href="../neural-network-training/loss-backprop.html#backprop">Part 2 §05</a> derived backpropagation in general and this section specialises it to a convolution, where two facts emerge that are not obvious: the gradient with respect to the <b>input</b> is a convolution with the <b>flipped</b> kernel, and the gradient with respect to the <b>kernel</b> is a correlation of the input with the output gradient. Neither is asserted below; both are derived and then checked against central differences.</p>
+
+      <h4>Set up</h4>
+      <div class="formula"><span class="lbl">forward, in the index form of §11 (correlation, as every framework computes it)</span><span class="eq">Z[c<span class="keep">ₒ</span>][p][q]  =  b[c<span class="keep">ₒ</span>]  +  <span class="keep">∑</span><span class="keep">ᶜ</span> <span class="keep">∑</span><span class="keep">ₘ</span> <span class="keep">∑</span><span class="keep">ₙ</span>  V[c][i(p,m)][j(q,n)] · K[c<span class="keep">ₒ</span>][c][m][n]
+
+with the index map      i(p, m)  =  p·s + m·d − p₀
+                        j(q, n)  =  q·s + n·d − p₀
+and the convention that any V index outside the input reads 0.</span>
+<span class="lbl">given, from the layer above</span><span class="eq">G[c<span class="keep">ₒ</span>][p][q]  =  <span class="keep">∂</span>L / <span class="keep">∂</span>Z[c<span class="keep">ₒ</span>][p][q]</span></div>
+
+      <h4>The kernel gradient</h4>
+      <p>A single kernel entry <code>K[cₒ][c][m][n]</code> appears in <b>every</b> output position <code>(p, q)</code> of channel <code>cₒ</code> — that is what parameter sharing means. The multivariable chain rule therefore sums over all of them:</p>
+
+      <div class="formula"><span class="lbl">∂L/∂K — sum over every position that used the weight</span><span class="eq"><span class="keep">∂</span>L        <span class="keep">∑</span>       <span class="keep">∂</span>L         <span class="keep">∂</span>Z[c<span class="keep">ₒ</span>][p][q]
+────────  =         ─────────── · ────────────────
+<span class="keep">∂</span>K[c<span class="keep">ₒ</span>][c][m][n]   p,q  <span class="keep">∂</span>Z[c<span class="keep">ₒ</span>][p][q]   <span class="keep">∂</span>K[c<span class="keep">ₒ</span>][c][m][n]
+
+and from the forward equation the second factor is simply V[c][i(p,m)][j(q,n)],
+because Z is LINEAR in K. So
+
+<span class="keep">∂</span>L/<span class="keep">∂</span>K[c<span class="keep">ₒ</span>][c][m][n]  =  <span class="keep">∑</span><span class="keep">ₚ</span> <span class="keep">∑</span><span class="keep">ᵩ</span>  G[c<span class="keep">ₒ</span>][p][q] · V[c][p·s + m·d − p₀][q·s + n·d − p₀]</span>
+<span class="lbl">what that IS, for s = 1, d = 1, p₀ = 0</span><span class="eq"><span class="keep">∂</span>L/<span class="keep">∂</span>K[c<span class="keep">ₒ</span>][c][m][n]  =  <span class="keep">∑</span><span class="keep">ₚ</span> <span class="keep">∑</span><span class="keep">ᵩ</span>  V[c][p + m][q + n] · G[c<span class="keep">ₒ</span>][p][q]
+
+Compare with the correlation of §04:  (I ⋆ K)(i,j) = <span class="keep">∑</span> I(i+m, j+n)·K(m,n).
+This is EXACTLY that, with V as the image and G as the kernel — a VALID
+CORRELATION of the input with the output gradient, producing an f × f result.
+NO FLIP.</span></div>
+
+      <h4>The input gradient</h4>
+      <p>Now fix an input position <code>V[c][i][j]</code> and ask which outputs it reached. It contributed to output <code>(p, q)</code> through tap <code>(m, n)</code> whenever <code>i = p·s + m·d − p₀</code>. The chain rule sums over every such <code>(p, m)</code> and <code>(q, n)</code> pair:</p>
+
+      <div class="formula"><span class="lbl">∂L/∂V — sum over every (output, tap) pair that read this position</span><span class="eq"><span class="keep">∂</span>L                <span class="keep">∑</span>            <span class="keep">∑</span>
+────────────  =                              G[c<span class="keep">ₒ</span>][p][q] · K[c<span class="keep">ₒ</span>][c][m][n]
+<span class="keep">∂</span>V[c][i][j]      c<span class="keep">ₒ</span>    (p,m) with p·s + m·d − p₀ = i
+                       (q,n) with q·s + n·d − p₀ = j</span>
+<span class="lbl">what that IS, for s = 1, d = 1, p₀ = 0</span><span class="eq">The constraint becomes p = i − m and q = j − n, so
+
+<span class="keep">∂</span>L/<span class="keep">∂</span>V[c][i][j]  =  <span class="keep">∑</span><span class="keep">ᶜ</span><span class="keep">ₒ</span> <span class="keep">∑</span><span class="keep">ₘ</span> <span class="keep">∑</span><span class="keep">ₙ</span>  G[c<span class="keep">ₒ</span>][i − m][j − n] · K[c<span class="keep">ₒ</span>][c][m][n]
+
+and THAT is the definition of a TRUE CONVOLUTION from §04 —
+        (I ∗ K)(i,j) = <span class="keep">∑</span> I(i−m, j−n)·K(m,n)
+with G as the image and K as the kernel. Indices of G outside its range
+contribute nothing, which is exactly FULL padding of G by f − 1 on each side.
+
+  <b>The forward pass is a CORRELATION. The backward pass to the input is a
+  FULL CONVOLUTION of the output gradient with the SAME kernel — equivalently
+  a full CORRELATION with the FLIPPED kernel. The flip is forced.</b></span></div>
+
+      <p>And the bias, for completeness: <code>Z</code> contains <code>b[cₒ]</code> once per output position, so <code>∂L/∂b[cₒ] = ∑ₚ ∑_q G[cₒ][p][q]</code> — the output gradient summed over both spatial axes.</p>
+
+      <h4>The three claims, verified</h4>
+      <p>Assertion is not enough here, so all three were checked numerically against central differences, <code>(L(θ+h) − L(θ−h)) / 2h</code>, on a loss with a genuinely position-dependent output gradient, across eight geometries — plain, same-padded, strided, dilated, grouped, depthwise, an even kernel with asymmetric padding, and 1×1:</p>
+
+      <div class="formula"><span class="lbl">worst relative error against central differences, h = 10⁻⁶</span><span class="eq">geometry                              <span class="keep">∂</span>L/<span class="keep">∂</span>K      <span class="keep">∂</span>L/<span class="keep">∂</span>V      <span class="keep">∂</span>L/<span class="keep">∂</span>b
+Cᵢₙ2 7×7 Cₒ3 3×3 s1 p0               1.12e−09   7.03e−10   3.21e−10
+Cᵢₙ2 7×7 Cₒ3 3×3 s1 p1 (same)        1.51e−09   2.30e−09   5.96e−10
+Cᵢₙ3 8×8 Cₒ2 3×3 s2 p1               7.54e−10   1.19e−09   3.03e−10
+Cᵢₙ2 9×9 Cₒ2 3×3 s1 d2               2.07e−09   2.22e−09   4.01e−10
+Cᵢₙ4 6×6 Cₒ4 3×3 groups 2            2.84e−09   1.32e−09   2.90e−10
+Cᵢₙ4 6×6 Cₒ4 3×3 depthwise (g = 4)   1.15e−09   6.75e−10   1.86e−10
+Cᵢₙ2 7×7 Cₒ2 4×4 s1 p = (1,2)        2.32e−09   2.86e−09   1.43e−10
+Cᵢₙ3 5×5 Cₒ2 1×1                     2.59e−10   1.46e−10   5.08e−11
+                                     ─────────────────────────────
+WORST OVERALL                                  2.86e−09</span>
+<span class="lbl">and the two structural claims, checked exactly</span><span class="eq">Is <span class="keep">∂</span>L/<span class="keep">∂</span>V the FULL CONVOLUTION of G with K?         max |<span class="keep">Δ</span>| = 0.000e+00   ✓
+Is it instead the full CORRELATION of G with K?     max |<span class="keep">Δ</span>| = 3.826e+00   ✗
+Is <span class="keep">∂</span>L/<span class="keep">∂</span>K the VALID CORRELATION of V with G?        max |<span class="keep">Δ</span>| = 0.000e+00   ✓
+The second line matters: it shows the flip is not an artefact of a symmetric
+kernel. Get it wrong and you do not crash — you train a different network.</span></div>
+
+      <h4>Three consequences that shape how convnets train</h4>
+      <div class="cards">
+        <div class="box"><div class="n">consequence 1</div><div class="t">Shared weights get summed gradients</div><div class="g">A kernel entry's gradient is a sum over <code>H′W′</code> terms. Its <i>magnitude</i> therefore scales with the map area, which is why the same learning rate behaves differently at different resolutions and why <a href="../neural-network-training/gradient-flow-init.html#init">part 2 §12</a>'s variance argument needs the fan-in <code>Cᵢₙ·f²</code>, not the parameter count.</div></div>
+        <div class="box"><div class="n">consequence 2</div><div class="t">Padding costs a gradient</div><div class="g">Gradient that lands on a padded position is discarded — it flows to a zero that no parameter owns. Border input positions therefore receive systematically less gradient than interior ones, which is the backward-pass shadow of §08's border argument.</div></div>
+        <div class="box warn"><div class="n">consequence 3</div><div class="t">The backward pass costs the same twice</div><div class="g"><a href="../neural-network-training.html#loop">Part 2 §01</a>'s 1 : 2 : 3 rule holds exactly: the two backward operations each have the same MAC count as the forward one. A training step on a convolution layer costs three forward passes, and the first layer's <code>∂L/∂V</code> is the only one you can skip.</div></div>
+      </div>
+
+      <div class="viz" id="viz-bp">
+        <div class="vhead">
+          <span class="vtitle">Backpropagation through a convolution: all three gradients, against central differences</span>
+          <span class="vhint">the finite-difference column is computed live from the same layer by perturbing each parameter — the agreement is the audit, and switching the flip off breaks it visibly</span>
+        </div>
+        <div class="controls">
+          <label>geometry <select id="bp-g">
+            <option value="plain" selected>3×3, stride 1, no padding</option>
+            <option value="same">3×3, stride 1, same padding</option>
+            <option value="stride">3×3, stride 2</option>
+            <option value="dil">3×3, dilation 2</option>
+            <option value="even">4×4, asymmetric same padding</option>
+            <option value="grp">3×3, two groups</option>
+          </select></label>
+          <label>show <select id="bp-w">
+            <option value="K" selected>∂L/∂K — the kernel gradient</option>
+            <option value="V">∂L/∂V — the input gradient</option>
+            <option value="b">∂L/∂b — the bias gradient</option>
+          </select></label>
+          <label>the flip <select id="bp-f">
+            <option value="on" selected>as derived (flipped kernel)</option>
+            <option value="off">deliberately unflipped — the bug</option>
+          </select></label>
+          <label>seed <input type="range" id="bp-s" min="1" max="20" step="1" value="5" /><span id="bp-sv" style="min-width:18px;display:inline-block">5</span></label>
+        </div>
+        <svg id="bp-svg" width="760" height="450" viewBox="0 0 760 450" role="img" aria-label="Left: the three tensors involved, drawn as numeric grids on a signed colour scale — the input volume, the kernel, and the incoming output gradient. Centre: the selected gradient computed two ways, side by side. The upper grid is the analytic result from the derived expression, and the lower grid is the same quantity obtained by central differences, perturbing each entry of the corresponding tensor by a small amount and re-running the forward pass twice. Between them a third grid shows the difference, with its maximum absolute and maximum relative values printed, both of which are at the level of floating-point round-off when the derivation is correct. Right: a scatter plot of the analytic value against the finite-difference value for every entry, which lies on the diagonal when the two agree; a fitted slope and the maximum deviation from the diagonal are printed. Switching the flip control to its deliberately wrong setting recomputes the input gradient without the kernel flip, and the scatter immediately leaves the diagonal while the shapes and the code path stay identical, which is why this particular bug does not announce itself. The readout gives the maximum absolute and relative error, states how many entries were checked, and names which of the two operations — correlation or true convolution — the selected gradient turned out to be."></svg>
+        <div class="readout" aria-live="polite" id="bp-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 26 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="im2col" data-nav="Convolution as one matmul">
+      <h3><span class="idx">26</span> Convolution as one matrix product: im2col, and the Toeplitz view</h3>
+      <p class="lede">§03 said a convolution is a matrix. That was a statement about its <i>structure</i>. This section is the practical version: how a convolution is actually executed, which is by rearranging it into a single dense matrix product and calling the same library routine an MLP calls.</p>
+
+      <div class="formula"><span class="lbl">im2col — the lowering, in the series row convention</span><span class="eq">For every output position (p, q), extract the C<span class="keep">ᵢₙ</span> × f × f window it reads and
+flatten it into a ROW. Stack the rows:
+
+        P   is  (H′W′  ×  C<span class="keep">ᵢₙ</span>·f·f)        one PATCH per row
+        W   is  (C<span class="keep">ᵢₙ</span>·f·f  ×  C<span class="keep">ₒᵤₜ</span>)        one FILTER per column
+        Z = P·W + b                        (H′W′ × C<span class="keep">ₒᵤₜ</span>)
+
+Reshape Z back to (C<span class="keep">ₒᵤₜ</span>, H′, W′) and you are done. That is part 1's X·W + b,
+with the pixels playing the role of the batch — the same row convention, the
+same shapes, the same routine.</span>
+<span class="lbl">the trade</span><span class="eq">COST   P holds C<span class="keep">ᵢₙ</span>f² · H′W′ numbers where V held only C<span class="keep">ᵢₙ</span>HW — a memory blow-up
+       of about f² (NINE times for a 3×3 kernel) for the duration of the
+       layer. Every input value is copied f² times.
+BUY    one large dense matrix product, which runs at 60–90% of a machine's
+       peak throughput, instead of a hand-rolled sliding loop, which does
+       not. The blow-up is worth it and every framework does it, in tiles
+       small enough to stay in cache.</span></div>
+
+      <h4>Reading off the counts</h4>
+      <p>The matrix form makes §12's arithmetic obvious rather than derived. The product <code>(H′W′ × Cᵢₙf²)·(Cᵢₙf² × Cₒᵤₜ)</code> costs <code>H′W′ · Cᵢₙf² · Cₒᵤₜ</code> MACs — exactly the count of §12, with no work. The weight matrix has <code>Cᵢₙf²·Cₒᵤₜ</code> entries — exactly the parameter count. And the reuse factor <code>H′W′</code> is just the number of rows in <code>P</code>, i.e. the number of times each column of <code>W</code> is dotted with something.</p>
+
+      <h4>The other two ways, and when they win</h4>
+      <div class="cards">
+        <div class="box"><div class="n">alternative 1</div><div class="t">Direct / implicit GEMM</div><div class="g">Build the patch rows <i>on the fly</i> in registers rather than materialising <code>P</code> in memory. Same arithmetic, none of the blow-up. This is what a modern library actually does; im2col is the mental model and the fallback.</div></div>
+        <div class="box"><div class="n">alternative 2</div><div class="t">The frequency domain</div><div class="g">Convolution is pointwise multiplication of transforms — the <a href="../../vision/frequency-domain/filtering-windowing.html#convthm">convolution theorem</a>. Cost drops from <code>O(n²f²)</code> to <code>O(n² log n)</code>, independent of <code>f</code>. It wins for <b>large</b> kernels and loses badly for 3×3, where the transform overhead dwarfs nine multiplies. It is why large-kernel layers are less expensive than they look.</div></div>
+        <div class="box"><div class="n">alternative 3</div><div class="t">Winograd</div><div class="g">A minimal-filtering algorithm that trades multiplications for additions on small tiles. For 3×3 kernels it cuts multiplications by a factor of 2.25 and is the standard fast path for exactly that case. It is numerically less stable, which matters in low precision (<a href="../neural-network-training/schedules-precision-memory.html#precision">part 2 §27</a>).</div></div>
+      </div>
+
+      <div class="callout"><b>Why this matters beyond implementation.</b> Once you see the layer as <code>P·W</code>, three things follow that are hard to see otherwise. <b>(1)</b> A 1×1 convolution has <code>f = 1</code>, so <code>P</code> is just the activation reshaped and no copying happens at all — which is why 1×1 layers are so cheap in practice as well as in theory (§16). <b>(2)</b> The <i>rank</i> of <code>W</code> is a meaningful quantity, and low-rank factorisation of it is a real compression technique. <b>(3)</b> The doubly block Toeplitz matrix <code>M</code> of §03 and the dense <code>W</code> here are two different matrices doing the same job: <code>M</code> is <code>(H′W′ × HW)</code>, huge and sparse and tied; <code>W</code> is <code>(Cᵢₙf² × Cₒᵤₜ)</code>, small and dense and free. The tying was moved out of the matrix and into the <i>indexing</i>, which is the whole trick.</div>
+
+      <div class="viz" id="viz-im2col">
+        <div class="vhead">
+          <span class="vtitle">im2col: the same layer as a sliding window and as one matrix product</span>
+          <span class="vhint">the two results are computed by different code paths and compared — they must agree exactly, and the memory blow-up is measured rather than quoted</span>
+        </div>
+        <div class="controls">
+          <label>map side <input type="range" id="ic-n" min="4" max="10" step="1" value="6" /><span id="ic-nv" style="min-width:16px;display:inline-block">6</span></label>
+          <label>C in <input type="range" id="ic-ci" min="1" max="4" step="1" value="2" /><span id="ic-civ" style="min-width:14px;display:inline-block">2</span></label>
+          <label>C out <input type="range" id="ic-co" min="1" max="4" step="1" value="2" /><span id="ic-cov" style="min-width:14px;display:inline-block">2</span></label>
+          <label>kernel f <input type="range" id="ic-f" min="1" max="4" step="1" value="3" /><span id="ic-fv" style="min-width:14px;display:inline-block">3</span></label>
+          <label>highlight row <input type="range" id="ic-r" min="0" max="15" step="1" value="0" /><span id="ic-rv" style="min-width:26px;display:inline-block">0</span></label>
+        </div>
+        <svg id="im2col-svg" width="760" height="450" viewBox="0 0 760 450" role="img" aria-label="Left: the input volume drawn as a stack of channel maps with one window outlined, and beside it the same window's values flattened into a single highlighted row. Centre: the full patch matrix, one row per output position and one column per element of a filter, drawn as a heat map with the highlighted row marked; because neighbouring output positions read overlapping windows, the matrix has a visible diagonal band structure of repeated values, which is the memory blow-up made visible. To its right the weight matrix, one column per filter, and the product, one row per output position. Right: the same output computed by the sliding-window routine, and the elementwise difference between the two, whose maximum absolute value is printed and is zero. Beneath, three counts are given as bars — the number of values in the input volume, the number in the patch matrix, and their ratio, which approaches the square of the kernel size — and the multiply-accumulate count of the matrix product, which equals the count from the layer formula."></svg>
+        <div class="readout" aria-live="polite" id="im2col-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 27 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="learns" data-nav="What a convnet learns">
+      <h3><span class="idx">27</span> What a convolutional network actually learns</h3>
+      <p class="lede">The most reproducible empirical fact about convnets: <b>the first layer always learns the same thing</b>. Oriented edges at several scales and orientations, and a few colour-opponent blobs — whatever the dataset, whatever the task, whatever the initialisation. That regularity is not a coincidence and it has an explanation that requires no learning at all.</p>
+
+      <h4>Why the first layer is always oriented edges</h4>
+      <p>Take a large collection of small patches from natural images and compute their covariance. The principal components of that covariance — the directions of maximum variance, computed with no labels, no network and no gradient descent — are <b>localised, oriented, band-pass filters</b>. They look like the first layer of a trained convnet because they are answering the same question: what are the dominant modes of variation in a small window of a natural image? A first layer trained by gradient descent on almost any objective ends up spanning approximately the same subspace, because that is where the signal is.</p>
+
+      <p>Two consequences that matter in practice. <b>(1) First layers transfer perfectly.</b> Because they encode a property of natural images rather than of your task, the first layer of a network trained on one dataset is a good first layer for another — which is the foundation of <a href="../fine-tuning-transfer-learning.html">transfer learning</a> and why "freeze the early layers" is a sensible default. <b>(2) A first layer that does <i>not</i> look like this is a diagnostic.</b> Noisy, high-frequency or dead first-layer filters after training mean the learning rate was too high, the initialisation was wrong, or the layer never received usable gradient — see <a href="../neural-network-training/gradient-flow-init.html#init-wrong">part 2 §14</a> and <a href="../neural-network-training/gradient-flow-init.html#dying-relu">§11</a>. Looking at the first layer is a five-second diagnostic that catches real bugs.</p>
+
+      <h4>The hierarchy, and how far to trust the story</h4>
+      <table class="grid2">
+        <tr><th style="width:110px">depth</th><th>what the units respond to</th><th>receptive field</th><th>how confident should you be</th></tr>
+        <tr><td><b>layer 1</b></td><td>Oriented edges, colour opponency, a few centre-surround blobs.</td><td>A few pixels.</td><td><b>Very.</b> Reproduces across every architecture and dataset, and matches the principal components of natural image patches.</td></tr>
+        <tr><td><b>early</b></td><td>Corners, junctions, curves, simple textures — combinations of a few edges.</td><td>Tens of pixels.</td><td><b>High.</b> Consistently observed and easy to visualise.</td></tr>
+        <tr><td><b>middle</b></td><td>Textures and repeated patterns; recognisable object <i>parts</i> begin to appear.</td><td>Around a hundred pixels.</td><td><b>Moderate.</b> The parts story is partly a selection effect: you find the units that look interpretable and show those.</td></tr>
+        <tr><td><b>late</b></td><td>Whole objects, or configurations of parts, strongly selective for a class.</td><td>Most of the image.</td><td><b>Weakest.</b> Individual units are often <i>not</i> interpretable; the class information lives in a direction in the activation space, not in single units.</td></tr>
+        <tr class="tot"><td><b>the head</b></td><td>Class logits.</td><td>The whole image, by construction.</td><td>The best framing is <b>information distillation</b>: each layer discards more of the input's specifics and keeps more of what predicts the target. A late feature map contains almost nothing about the input's appearance and almost everything about its class.</td></tr>
+      </table>
+
+      <div class="wrong"><span class="say">The tidy story, and where it fails.</span> "Edges, then parts, then objects, cleanly separated by depth." <span class="fix">It is a good first approximation and two things spoil it.</span> <b>(1)</b> The hierarchy is not clean: a late layer still contains low-level information, and skip connections deliberately mix scales. <b>(2)</b> More seriously, an ImageNet-trained convnet turns out to be <b>strongly biased toward texture rather than shape</b>. Present it with a cat silhouette filled with elephant skin and it will say elephant. Measured on cue-conflict images, a standard convnet's decisions follow shape about 20% of the time; human observers follow shape about 95% of the time. So the "parts and objects" reading is at best incomplete: the network is often doing sophisticated texture statistics that <i>correlate</i> with objects on this dataset. Training on style-randomised images raises the shape bias substantially and improves robustness, which is the evidence that the bias is learned from the data rather than forced by the architecture.</div>
+
+      <div class="viz" id="viz-learn">
+        <div class="vhead">
+          <span class="vtitle">Where oriented edge filters come from: the principal components of image patches, and a layer actually trained</span>
+          <span class="vhint">the left bank is computed by eigendecomposition with no learning and no labels; the middle bank is trained live by gradient descent, and the lower-right curve measures how far training pulls it into the left bank’s subspace</span>
+        </div>
+        <div class="controls">
+          <label>patch statistics <select id="ln-s">
+            <option value="pink" selected>natural-like (1/f spectrum)</option>
+            <option value="white">white noise (no structure)</option>
+            <option value="edges">a world made only of edges</option>
+          </select></label>
+          <label>components shown <input type="range" id="ln-k" min="2" max="8" step="1" value="8" /><span id="ln-kv" style="min-width:14px;display:inline-block">8</span></label>
+          <label>training steps <input type="range" id="ln-t" min="0" max="240" step="20" value="240" /><span id="ln-tv" style="min-width:26px;display:inline-block">240</span></label>
+          <label>learning rate <select id="ln-lr">
+            <option value="0.1">0.1</option>
+            <option value="0.5" selected>0.5</option>
+            <option value="8">8 — far too high</option>
+          </select></label>
+        </div>
+        <svg id="learn-svg" width="760" height="440" viewBox="0 0 760 440" role="img" aria-label="Left: a bank of small square filters, the leading principal components of eight by eight patches drawn from a synthetic image with the selected spectral statistics, computed by deflated power iteration on the patch covariance matrix, each drawn on a signed colour scale and labelled with the fraction of total variance it explains. Under natural-like statistics they are localised, oriented and increasingly finely striped, which is the same qualitative family as a trained first layer; under white noise they are unstructured, which is the control showing that the structure comes from the image statistics and not from the method. Centre: a bank of filters from a single convolution layer trained live by gradient descent on a three-way orientation task, at the number of steps given by the slider. Right, upper: the training loss curve with the chance level marked and the selected step marked. Right, lower: the quantity that links the two banks, measured — the fraction of each trained filter’s energy that lies inside the leading five-dimensional principal subspace of this task’s own image patches, plotted against training step. It rises substantially from its value at initialisation, which is the measurable sense in which gradient descent moves the filters toward the directions the data’s statistics single out. The figure deliberately does not claim that the trained filters become visibly oriented: on a six-filter toy task they do not, and the readout says so. At the deliberately excessive learning rate the loss diverges and the filters become high-frequency noise, which is the five-second visual diagnostic described in the text."></svg>
+        <div class="readout" aria-live="polite" id="learn-readout"></div>
+      </div>
+    </section>
+
+    <nav class="pager" aria-label="CNNs series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="pooling-variants.html">← Pooling &amp; Convolution Variants</a>
+      <a href="../convolutional-networks.html" style="color:var(--muted)">CNNs · overview</a>
+      <a href="lineage-capsules-vit.html">CNN Lineage, Capsules &amp; ViTs →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../dl-viz.js"></script>
+<script src="../convolutional-networks.viz.js"></script>
+</body>
+</html>

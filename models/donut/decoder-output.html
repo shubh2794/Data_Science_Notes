@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Donut: Decoder, Prompts &amp; JSON Tokens</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+.tokrow{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0;font-family:"SF Mono",Menlo,monospace;font-size:11.5px}
+.tokrow span{padding:2px 5px;border-radius:4px;background:rgba(91,156,255,.16);color:#cfe0ff}
+.tokrow span.sp{background:rgba(255,180,84,.2);color:#ffd9a3}
+.tokrow span.ctl{background:rgba(192,132,252,.2);color:#e9d5ff}
+.tokrow span.bad{background:rgba(248,113,113,.25);color:#fecaca}
+textarea.jsin{width:100%;min-height:92px;background:#10131a;color:#e6e9ef;border:1px solid #2a2f3a;border-radius:8px;font-family:"SF Mono",Menlo,monospace;font-size:12px;padding:8px;box-sizing:border-box}
+pre.jsout{background:#10131a;border:1px solid #2a2f3a;border-radius:8px;padding:8px;font-size:11.5px;white-space:pre-wrap;margin:6px 0 0;color:#cbd5e1}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../donut.html">Donut</a> · part 2 of 5</p>
+      <h1>Donut: Decoder, Prompts &amp; JSON Tokens</h1>
+      <p>How Donut writes its answer: the four-layer mBART-style decoder initialised from asian-bart, cross-attention over 4,800 encoder vectors as the only path from pixels to text, the 143M and 176M parameter counts recomputed, task-prompt start tokens, and the recursive JSON-to-token serialisation.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Donut</span>
+        <span class="pill">mBART-style decoder · cross-attention · 143M/176M recounted · task prompts · JSON ↔ tokens</span>
+      </div>
+    </header>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="decoder" data-nav="The multilingual decoder">
+      <h3><span class="idx">08</span> The decoder and its multilingual tokenizer</h3>
+      <p class="lede">The decoder is an mBART-style Transformer decoder with 4 layers, width d = 1,024, 16 heads and a 4,096-wide feed-forward layer, initialised from the first four decoder layers of asian-bart-ecjk — a 12 + 12-layer mBART whose embedding table was pruned to the sub-words used by English, Chinese, Japanese and Korean. Its tokenizer is a SentencePiece model loaded as an XLM-RoBERTa tokenizer.</p>
+      <div class="formula"><span class="lbl">decoder input embedding for position t (mBART convention)</span><span class="eq">h⁰ₜ = LN_emb( √d · E[yₜ] + P[t + 2] ),    √d = √1024 = 32,   P has 1,536 + 2 rows</span>
+<span class="lbl">each of the 4 layers (pre-norm), then a final layer norm</span><span class="eq">h ← h + SelfAttn_causal(LN(h));   h ← h + CrossAttn(LN(h), z);   h ← h + W₂ · GELU(W₁ · LN(h))</span>
+<span class="lbl">logits over the vocabulary use the same matrix E (tied weights)</span><span class="eq">logitsₜ = E · LN_final(hₜ)        E ∈ ℝ^(57,525 × 1,024)</span></div>
+      <h4>The configuration</h4>
+      <table class="cmp">
+        <tr><th>Setting</th><th>donut-base</th><th>donut-base-finetuned-cord-v2</th><th>asian-bart-ecjk (initialisation)</th></tr>
+        <tr><td>Layers</td><td>4</td><td>4</td><td>12 encoder + 12 decoder</td></tr>
+        <tr><td>d_model / heads / FFN</td><td>1,024 / 16 / 4,096</td><td>same</td><td>same</td></tr>
+        <tr><td>Vocabulary (rows of E)</td><td>57,525</td><td>57,580</td><td>57,526</td></tr>
+        <tr><td>Max positions</td><td>1,536</td><td>768</td><td>1,024</td></tr>
+        <tr><td>Embedding scale, tied output</td><td>yes, yes</td><td>yes, yes</td><td>yes</td></tr>
+      </table>
+      <p>The base tokenizer has 57,522 entries (the SentencePiece pieces plus <code>&lt;s&gt;</code>, <code>&lt;pad&gt;</code>, <code>&lt;/s&gt;</code>, <code>&lt;unk&gt;</code> and <code>&lt;mask&gt;</code>); donut-base adds <code>&lt;sep/&gt;</code>, <code>&lt;s_iitcdip&gt;</code> and <code>&lt;s_synthdog&gt;</code> (57,525). The CORD fine-tune adds 55 more: the prompt <code>&lt;s_cord-v2&gt;</code> and an opening and closing token for each of 27 CORD keys. The maximum length of 1,536 positions was chosen for pretraining, where the target is the whole page's text; fine-tunes shrink it (CORD 768, tickets 256, DocVQA 128, RVL-CDIP 8), and the original code truncates or interpolates the learned position table when the length changes.</p>
+      <h4>Worked example: how strings tokenize</h4>
+      <table class="cmp">
+        <tr><th>String</th><th>Sub-words (donut-base tokenizer)</th><th>Count</th></tr>
+        <tr><td>Latte</td><td><code>▁La · tte</code></td><td>2</td></tr>
+        <tr><td>3002-Kyoto Choco Mochi</td><td><code>▁300 · 2- · K · yo · to · ▁Cho · co · ▁Mo · chi</code></td><td>9</td></tr>
+        <tr><td>9,000</td><td><code>▁9 · , · 000</code></td><td>3</td></tr>
+        <tr><td>14,000</td><td><code>▁1 · 4,000</code></td><td>2</td></tr>
+        <tr><td>28,000</td><td><code>▁28, · 000</code></td><td>2</td></tr>
+        <tr><td>2017年11月15日</td><td><code>▁2017 · 年 · 11 · 月 · 15 · 日</code></td><td>6</td></tr>
+        <tr><td>广州南站</td><td><code>▁ · 广州 · 南 · 站</code></td><td>4</td></tr>
+      </table>
+      <p>Two things stand out. Numbers split irregularly — "14,000" and "28,000" break at different places, so the model must learn digit strings as several different piece patterns. And CJK text costs roughly one piece per character, where English words often cost one or two pieces, so target length depends on the script as well as the content. (The splits were produced with the released tokenizer; the paper's cross-attention figure shows the model generating "3002-Kyoto Choco Mochi" as exactly these nine pieces.)</p>
+      <div class="callout"><b>Takeaway:</b> the decoder is small (four layers) but wide, and nearly 30% of the whole model's parameters (58.9M of 201.9M) sit in its 57,525 × 1,024 embedding table. The vocabulary, together with the pretraining data, is why Donut is multilingual in four languages and not in others: a script outside it can only be spelled with fall-back pieces or not at all.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="xattn" data-nav="Cross-attention">
+      <h3><span class="idx">09</span> Cross-attention: how the decoder reads the page</h3>
+      <p class="lede">In each decoder layer, every output position forms a query from its hidden state and attends over all 4,800 encoder vectors, which supply the keys and values. This is the only path from pixels to text: to write the next character of an item name, the decoder has to draw its evidence from the region of the page where that name is printed.</p>
+      <div class="formula"><span class="lbl">cross-attention for decoder position t, one head of width 64 (16 heads × 64 = 1,024)</span><span class="eq">αₜ = softmax( (W_Q hₜ) · (W_K z)ᵀ / √64 ) ∈ ℝ^4800,      outputₜ = Σᵢ αₜ,ᵢ · W_V zᵢ</span>
+<span class="lbl">computed once per page and cached for every generated token</span><span class="eq">K, V for 4 layers:  4 × 2 × 4,800 × 1,024 = 39,321,600 values  ≈ 78.6 MB in 16-bit floats</span></div>
+      <h4>What the paper observed</h4>
+      <p>The paper visualises the decoder's cross-attention maps on an unseen receipt while it generates "3002-Kyoto Choco Mochi" and reports that each generated piece attends to the corresponding text region, even though Donut is trained with no localisation supervision. It suggests these maps "can be used as an auxiliary indicator" — a weak, unsupervised form of grounding. They are not boxes: the attention can be diffuse, split across repeated strings, or pulled toward the wrong one of two similar numbers, and nothing in training forces them to be sharp.</p>
+      <h4>Cost of one decoding step</h4>
+      <ul class="notes">
+        <li><b>Cross-attention:</b> per layer, per step, 16 heads × 4,800 scores of 64-dimensional dot products — about 4.9M multiply–accumulates, plus the same again to mix the values; across 4 layers roughly 39M per token, independent of how long the output is so far.</li>
+        <li><b>Self-attention:</b> grows with the prefix length t, but t is at most 768 for CORD and the self-attention KV cache is small compared with the cross-attention cache above.</li>
+        <li><b>Consequence:</b> decoding time grows at least linearly with output length; a long transcription at 1,536 tokens needs roughly 100 times the decoder work of a 15-token record, which is why short targets (a class, a short answer) decode quickly while pretraining-style full-page reading is slow.</li>
+      </ul>
+      <div class="viz" id="viz-xattn">
+        <div class="vhead">
+          <span class="vtitle">What one decoding step looks at</span>
+          <span class="vhint">pick the token being generated · adjust how peaked the attention is</span>
+        </div>
+        <div class="controls">
+          <label>generating <select id="xa-tok"></select></label>
+          <label>focus <input type="range" id="xa-sharp" min="1" max="10" step="1" value="6" /></label>
+        </div>
+        <svg id="xa-svg" width="660" height="330" viewBox="0 0 660 330" role="img" aria-label="A mock receipt with the stage-4 token grid overlaid; cells are shaded by cross-attention weight for the chosen output token"></svg>
+        <div class="readout" aria-live="polite" id="xa-read"></div>
+        <p class="vcap">Illustrative, not model output: the attention map is a softmax over the 4,800-cell (80 × 60) stage-4 grid of a 2560 × 1920 canvas, with logits that fall off with distance from the box of the text being generated (the focus slider scales them), mimicking what the paper's Figure 8 shows. The receipt layout is invented for this note. The readout computes the share of attention mass inside the true box, the entropy, and the effective number of cells attended (e to the entropy).</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> cross-attention is Donut's reading head. It gives a free, unsupervised hint of where each output came from, but it is not a guarantee — which is the root of Donut's grounding and verification problems (<a href="evaluation-limits.html#limitations">limitations</a>).</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="params" data-nav="Parameter count, recomputed">
+      <h3><span class="idx">10</span> Parameter count, recomputed from the configuration</h3>
+      <p class="lede">The Donut paper reports 143M parameters in its classification and IE tables and 176M in its DocVQA table. Both can be reproduced from donut-base's released configuration: the full model has 201,852,024 parameters, of which 58,905,600 are the decoder's token embedding; without that table it has 142,946,424 — the paper's 143M, "parameters for vocabulary omitted for fair comparisons among multi-lingual models".</p>
+      <div class="formula"><span class="lbl">one Swin block of width c, h heads, window M (two layer norms, qkv + output projection, bias table, MLP ×4)</span><span class="eq">P_block = 12c² + 13c + (2M − 1)² · h</span>
+<span class="lbl">patch embedding (4 × 4 × 3 conv + norm) and each patch merge (norm on 4c, linear 4c → 2c without bias)</span><span class="eq">P_embed = 48C + C + 2C        P_merge = 8c + 8c²</span>
+<span class="lbl">one decoder layer of width d, feed-forward f (self-attn, cross-attn, two linears, three norms)</span><span class="eq">P_layer = 8d² + 8d + 2df + f + d + 6d</span>
+<span class="lbl">decoder total (tied output projection adds nothing)</span><span class="eq">P_dec = V·d + (L_pos + 2)·d + 2d + N_layers · P_layer + 2d</span></div>
+      <h4>Worked example: donut-base</h4>
+      <table class="cmp">
+        <tr><th>Component</th><th>Computation</th><th>Parameters</th></tr>
+        <tr><td>Patch embedding</td><td>48 · 128 + 128 + 2 · 128</td><td>6,528</td></tr>
+        <tr><td>Stage 1 (c = 128, 4 heads)</td><td>2 × 199,716 + merge 132,096</td><td>531,528</td></tr>
+        <tr><td>Stage 2 (c = 256, 8 heads)</td><td>2 × 792,648 + merge 526,336</td><td>2,111,632</td></tr>
+        <tr><td>Stage 3 (c = 512, 16 heads)</td><td>14 × 3,158,160 + merge 2,101,248</td><td>46,315,488</td></tr>
+        <tr><td>Stage 4 (c = 1,024, 32 heads)</td><td>2 × 12,607,776</td><td>25,215,552</td></tr>
+        <tr><td><b>Encoder</b></td><td></td><td><b>74,180,728</b></td></tr>
+        <tr><td>Token embedding</td><td>57,525 × 1,024</td><td>58,905,600</td></tr>
+        <tr><td>Position embedding</td><td>1,538 × 1,024</td><td>1,574,912</td></tr>
+        <tr><td>4 decoder layers</td><td>4 × 16,796,672</td><td>67,186,688</td></tr>
+        <tr><td>Embedding and final layer norms</td><td>2 × 2,048</td><td>4,096</td></tr>
+        <tr><td><b>Decoder</b></td><td></td><td><b>127,671,296</b></td></tr>
+        <tr><td><b>Total</b></td><td></td><td><b>201,852,024</b></td></tr>
+        <tr><td>Total without the token embedding</td><td>201,852,024 − 58,905,600</td><td>142,946,424 ≈ 143M</td></tr>
+      </table>
+      <p>These totals match an instantiation of the released configuration in the Transformers library. The paper's 176M for DocVQA is described as counting "token embeddings for English"; the asian-bart project lists its English-only model at a 32k vocabulary (31,999 in that model's configuration), and 31,999 × 1,024 ≈ 32.8M added to 142.9M gives 175.7M ≈ 176M — consistent, though the paper does not state the exact count. DONUT-hole's paper lists DONUT-base as 140M non-embedding + 60M embedding = 200M, which roughly agrees once the 1.57M position table is counted as an embedding (141.4M + 60.5M).</p>
+      <div class="viz" id="viz-params">
+        <div class="vhead">
+          <span class="vtitle">Parameter calculator</span>
+          <span class="vhint">pick a preset or change the configuration · compare with the paper's 143M</span>
+        </div>
+        <div class="controls">
+          <label>preset <select id="par-preset">
+            <option value="base">donut-base</option>
+            <option value="cord">donut-base-finetuned-cord-v2</option>
+            <option value="proto">donut-proto</option>
+            <option value="swinb">standard Swin-B depths and window</option>
+            <option value="custom">custom (use sliders)</option>
+          </select></label>
+          <label>stage-3 depth <input type="range" id="par-d3" min="2" max="18" step="2" value="14" /></label>
+          <label>window <input type="range" id="par-m" min="5" max="12" step="1" value="10" /></label>
+          <label>decoder layers <input type="range" id="par-nl" min="1" max="12" step="1" value="4" /></label>
+          <label>positions <select id="par-pos"><option value="1536">1,536</option><option value="768">768</option><option value="4096">4,096</option></select></label>
+        </div>
+        <svg id="par-svg" width="660" height="240" viewBox="0 0 660 240" role="img" aria-label="Stacked bars splitting parameters into encoder stages, token embedding, position embedding and decoder layers"></svg>
+        <div class="readout" aria-live="polite" id="par-read"></div>
+        <p class="vcap">Every number is computed with the block formulas above from the configuration fields (vocabulary, positions, depths, window, layers). Presets: donut-base and the CORD fine-tune from their Hub configurations; donut-proto from its configuration ({2, 2, 18, 2}, window 8, 768 positions; vocabulary 57,524). Changing a slider switches to "custom". The formula totals for the four presets are 201,852,024; 201,121,912; 213,646,072; 214,412,472. Transformers instantiations of the configurations give the same numbers except for donut-proto, whose configuration loads its encoder as a plain Swin model with a final 2,048-parameter layer norm (213,648,120).</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> a "143M" Donut is really a 202M-parameter network whose largest single tensor is its vocabulary. Encoder, embedding and decoder layers each take roughly a third, which is why compressing Donut (<a href="variants-relatives.html#donut-hole">DONUT-hole</a>) has to shrink more than one part.</div>
+    </section>
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="prompts" data-nav="Task prompts and start tokens">
+      <h3><span class="idx">11</span> Task prompts and start tokens</h3>
+      <p class="lede">Donut tells the decoder which task to perform with a prompt of special tokens placed before the output. A classification model starts from <code>&lt;s_rvlcdip&gt;</code>, a receipt parser from <code>&lt;s_cord-v2&gt;</code>; a question-answering model starts from <code>&lt;s_docvqa&gt;&lt;s_question&gt;</code>, the question's text, <code>&lt;/s_question&gt;&lt;s_answer&gt;</code>, and generates the answer after it. The prompt is input only: its positions are excluded from the loss.</p>
+      <h4>The prompts used by the released code</h4>
+      <table class="cmp">
+        <tr><th>Task</th><th>Prompt (decoder input before generation)</th><th>Target the decoder learns to write</th><th>Extra special tokens</th></tr>
+        <tr><td>Pretraining (reading)</td><td><code>&lt;s_iitcdip&gt;</code> or <code>&lt;s_synthdog&gt;</code> (the start tokens shipped in donut-base's tokenizer; the paper does not name them)</td><td>the page's text in reading order, then <code>&lt;/s&gt;</code></td><td>the two start tokens</td></tr>
+        <tr><td>RVL-CDIP</td><td><code>&lt;s_rvlcdip&gt;</code></td><td><code>&lt;s_class&gt;&lt;memo/&gt;&lt;/s_class&gt;&lt;/s&gt;</code></td><td>16 class tokens such as <code>&lt;memo/&gt;</code>, <code>&lt;invoice/&gt;</code></td></tr>
+        <tr><td>CORD</td><td><code>&lt;s_cord-v2&gt;</code></td><td><code>&lt;s_menu&gt;&lt;s_nm&gt;…&lt;/s_nm&gt;…&lt;/s_menu&gt;…&lt;/s&gt;</code></td><td>open/close pair per key (54) + prompt</td></tr>
+        <tr><td>Train tickets</td><td><code>&lt;s_zhtrainticket&gt;</code></td><td>eight flat key pairs</td><td>open/close pair per key</td></tr>
+        <tr><td>DocVQA</td><td><code>&lt;s_docvqa&gt;&lt;s_question&gt;</code>question<code>&lt;/s_question&gt;&lt;s_answer&gt;</code></td><td>answer<code>&lt;/s_answer&gt;&lt;/s&gt;</code></td><td><code>&lt;yes/&gt;</code>, <code>&lt;no/&gt;</code></td></tr>
+      </table>
+      <p>The paper's Figure 3 draws the prompts as <code>&lt;classification&gt;</code>, <code>&lt;parsing&gt;</code> and <code>&lt;vqa&gt;&lt;question&gt;…</code>, and its text writes key tokens as [START ∗] and [END ∗] and the class as [memo]. The released code names them differently (as in the table), and the fine-tuned checkpoints expect the code's names exactly — a prompt that does not match the checkpoint is a likely reason for a fine-tuned Donut to generate nothing useful.</p>
+      <h4>How the loss mask is built</h4>
+      <p>The training code tokenizes prompt + target + <code>&lt;/s&gt;</code> as one sequence and copies it into the labels, then sets to −100 (ignored by the cross-entropy) every padding position and every position up to and including the <i>prompt end token</i>. For CORD and RVL-CDIP the prompt end token is the task token itself, so only it is masked; for DocVQA it is <code>&lt;s_answer&gt;</code>, so the whole question is masked and the model is trained only to produce the answer, conditioned on the question it reads as input.</p>
+      <h4>Categorical tokens</h4>
+      <p>Where a field has a small closed set of values, a value can be a single added token instead of free text: the 16 RVL-CDIP classes become <code>&lt;advertisement/&gt;</code> … <code>&lt;specification/&gt;</code>, and DocVQA's yes/no answers become <code>&lt;yes/&gt;</code> and <code>&lt;no/&gt;</code>. Classification then takes three generated tokens plus the end token, which fits within the RVL-CDIP fine-tuning configuration's <code>max_length</code> of 8.</p>
+      <div class="callout"><b>Takeaway:</b> the prompt is Donut's task switch and the loss mask decides what is learned. A new task needs only a new start token, new key tokens, and targets written in the same scheme — no new head.</div>
+    </section>
+
+    <!-- 12 ───────────────────────────────────────────── -->
+    <section class="topic" id="json" data-nav="JSON ↔ token sequence">
+      <h3><span class="idx">12</span> The JSON ↔ token-sequence conversion</h3>
+      <p class="lede">A target record is serialised into tokens by a recursive rule: a dictionary becomes, for each key k, <code>&lt;s_k&gt;</code> + its serialised value + <code>&lt;/s_k&gt;</code>; a list becomes its serialised items joined by <code>&lt;sep/&gt;</code>; a leaf becomes its string, or its categorical token if one exists. The generated sequence is parsed back by matching each opening key token with its closing token; the paper calls the mapping "one-to-one invertible" for well-formed sequences.</p>
+      <div class="formula"><span class="lbl">json2token (the released code's rule)</span><span class="eq">τ(dict) = ‖ₖ ( &lt;s_k&gt; τ(value_k) &lt;/s_k&gt; )     τ(list) = τ(item₁) &lt;sep/&gt; τ(item₂) …     τ(leaf) = str(leaf)</span>
+<span class="lbl">key order: sorted in reverse alphabetical order unless sort_json_key = False (the CORD recipe keeps the dataset's order)</span><span class="eq">keys = sorted(dict, reverse=True)     e.g.  total  &gt;  sub_total  &gt;  menu</span>
+<span class="lbl">token2json: a key whose closing token never appears is lost</span><span class="eq">&lt;s_k&gt; x &lt;/s_k&gt;  →  {k: parse(x)}        &lt;s_k&gt; x  (no &lt;/s_k&gt;)  →  key k lost</span></div>
+      <h4>Worked example</h4>
+      <p>The record {"menu": {"nm": "Latte", "cnt": "2"}, "total": {"total_price": "9,000"}}, with the key order kept, serialises to</p>
+      <div class="tokrow"><span class="ctl">&lt;s_cord-v2&gt;</span><span class="sp">&lt;s_menu&gt;</span><span class="sp">&lt;s_nm&gt;</span><span>▁La</span><span>tte</span><span class="sp">&lt;/s_nm&gt;</span><span class="sp">&lt;s_cnt&gt;</span><span>▁2</span><span class="sp">&lt;/s_cnt&gt;</span><span class="sp">&lt;/s_menu&gt;</span><span class="sp">&lt;s_total&gt;</span><span class="sp">&lt;s_total_price&gt;</span><span>▁9</span><span>,</span><span>000</span><span class="sp">&lt;/s_total_price&gt;</span><span class="sp">&lt;/s_total&gt;</span><span class="ctl">&lt;/s&gt;</span></div>
+      <p>— 18 tokens: the prompt, 10 key tokens (5 keys × open and close), 6 text pieces, and the end token. Two-thirds of the 17 predicted tokens are structure. Parsing reverses it: the first opening token is <code>&lt;s_menu&gt;</code>, its content contains further key tokens so it is parsed recursively into {"nm": "Latte", "cnt": "2"}, and so on. With the default reverse-alphabetical sorting the same record would be written total first, then menu.</p>
+      <h4>What the conversion does not preserve</h4>
+      <ul class="notes">
+        <li><b>Types.</b> Every leaf becomes a string; 2 and "2" serialise identically. Numbers keep whatever formatting the ground truth used ("9,000", "Rp. 39.000").</li>
+        <li><b>One-element lists.</b> The parser returns a list only when it sees <code>&lt;sep/&gt;</code>, so ["Latte"] comes back as "Latte" — harmless for evaluation, which normalises both sides, but a schema consumer must handle both shapes.</li>
+        <li><b>Malformed output.</b> If a closing token is missing, that key is lost without an error. At the top level its opening token is simply deleted; inside a group, the enclosing key's value can come back as raw text with the orphaned tag in it — dropping <code>&lt;/s_total_price&gt;</code> yields {"total": "&lt;s_total_price&gt;11,500"}. If no key tokens are found at all the parser returns {"text_sequence": …} with the raw text. The paper states the policy as "if the output token sequence is wrongly structured, we simply treat the field is lost".</li>
+        <li><b>Vocabulary growth.</b> Each new key adds two tokens and two new rows of the 1,024-wide embedding, initialised fresh; keys that are rare in training get little signal.</li>
+      </ul>
+      <div class="viz" id="viz-json">
+        <div class="vhead">
+          <span class="vtitle">JSON ↔ token sequence</span>
+          <span class="vhint">pick a record or edit the JSON · toggle key sorting · break an end token</span>
+        </div>
+        <div class="controls">
+          <label>record <select id="js-preset">
+            <option value="cord1">receipt, one item (CORD keys)</option>
+            <option value="cord2">receipt, two items and totals</option>
+            <option value="kyoto">the paper's Figure 1 receipt</option>
+            <option value="cls">RVL-CDIP class</option>
+            <option value="vqa">DocVQA question and answer</option>
+            <option value="ticket">train ticket (paper's Figure B)</option>
+          </select></label>
+          <label><input type="checkbox" id="js-sort" /> sort keys (reverse alphabetical)</label>
+          <label><input type="checkbox" id="js-break" /> drop the last closing key token</label>
+          <button class="btn ghost" id="js-apply">convert edited JSON</button>
+        </div>
+        <textarea class="jsin" id="js-text" aria-label="JSON record to convert"></textarea>
+        <div class="tokrow" id="js-toks"></div>
+        <svg id="js-svg" width="660" height="60" viewBox="0 0 660 60" role="img" aria-label="Bar splitting the token sequence into prompt, key tokens, text pieces and end token"></svg>
+        <pre class="jsout" id="js-back"></pre>
+        <div class="readout" aria-live="polite" id="js-read"></div>
+        <p class="vcap">Serialisation and parsing are JavaScript ports of the released <code>json2token</code> and <code>token2json</code>. Sub-word splits of text are the released donut-base tokenizer's, precomputed for every string in the preset records (source: running the tokenizer); for text you type that is not in that table, the chip shows the whole string with a "?" and it is not counted as pieces. Amber chips are key tokens, violet are prompt and end tokens, blue are text pieces.</p>
+      </div>
+      <div class="callout"><b>Takeaway:</b> the special key tokens are what turn free generation into a parseable record, at the cost of a sequence that is mostly structure. Invertibility holds for well-formed sequences only; a production system should validate the parsed JSON against its schema instead of trusting the parser's silent drops.</div>
+    </section>
+
+    <nav class="pager" aria-label="Donut series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="ocr-free-encoder.html">← Donut: OCR-Free Design &amp; Swin Encoder</a>
+      <a href="../donut.html" style="color:var(--muted)">Donut · overview</a>
+      <a href="training.html">Donut: Pretraining, SynthDoG &amp; Fine-Tuning →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../donut.viz.js"></script>
+</body>
+</html>

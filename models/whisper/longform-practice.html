@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Whisper: Long-Form Decoding, Releases &amp; Practice</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+.vcap{font-size:12.5px;color:var(--muted);line-height:1.5;margin:8px 0 0}
+.tokrow{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0;font-family:"SF Mono",Menlo,monospace;font-size:11.5px}
+.tokrow span{padding:2px 5px;border-radius:4px;background:rgba(91,156,255,.16);color:#cfe0ff}
+.tokrow span.sp{background:rgba(192,132,252,.2);color:#e9d5ff}
+.tokrow span.ts{background:rgba(255,180,84,.2);color:#ffd9a3}
+.tokrow span.ctl{background:rgba(45,212,191,.18);color:#b5f5e8}
+.tokrow span.prev{background:rgba(107,114,128,.25);color:#cbd5e1;font-style:italic}
+.tokrow span.bad{background:rgba(248,113,113,.25);color:#fecaca}
+textarea.win{width:100%;min-height:54px;background:#10131a;color:#e6e9ef;border:1px solid #2a2f3a;border-radius:8px;font-family:"SF Mono",Menlo,monospace;font-size:12px;padding:8px;box-sizing:border-box;margin:4px 0}
+pre.code{background:#10131a;border:1px solid #2a2f3a;border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.5;white-space:pre-wrap;color:#cbd5e1;overflow-x:auto;margin:10px 0}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../whisper.html">Whisper</a> · part 4 of 4</p>
+      <h1>Whisper: Long-Form Decoding, Releases &amp; Practice</h1>
+      <p>Running Whisper on real audio: sequential and chunked long-form transcription, the beam search, temperature-fallback and compression-ratio heuristics that keep it from looping, the large-v2, large-v3 and turbo releases, Distil-Whisper with speculative decoding, hallucination and other limits, and use through the Transformers library.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Whisper</span>
+        <span class="pill">Sequential vs chunked · temperature fallback · compression-ratio checks · large-v2/v3/turbo · Distil-Whisper · hallucination · Transformers usage</span>
+      </div>
+    </header>
+
+    <!-- 23 ───────────────────────────────────────────── -->
+    <section class="topic" id="longform" data-nav="Long-form transcription">
+      <h3><span class="idx">23</span> Long-form transcription: sequential and chunked</h3>
+      <p class="lede">The model sees 30 seconds at a time, so longer audio needs an algorithm around it. OpenAI's is sequential: transcribe a window with timestamps, move the window to the last complete timestamp, feed the transcribed text as a prompt, repeat. Hugging Face also offers a chunked algorithm that cuts the audio into overlapping pieces, transcribes them independently and stitches the text.</p>
+      <div class="formula"><span class="lbl">sequential (released transcribe()): after decoding the window starting at seek</span><span class="eq">if output ends with a single timestamp (no partial segment):   seek ← seek + 30 s
+otherwise:   seek ← seek + (time of the last timestamp token)          prompt ← text of recent windows (≤ 223 tokens)</span>
+<span class="lbl">chunked (Transformers pipeline, chunk_length_s = c, stride_length_s = s, default s = c / 6)</span><span class="eq">chunk k covers [k(c − 2s), k(c − 2s) + c);   tokens predicted inside each stride region are merged with the neighbour's by longest common sequence</span></div>
+      <div class="viz" id="viz-lf">
+        <div class="vhead">
+          <span class="vtitle">Windows over a long recording</span>
+          <span class="vhint">drag the length · switch algorithm · resample the speech</span>
+        </div>
+        <div class="controls">
+          <label>length <input type="range" id="lf-len" min="30" max="600" step="10" value="180" /><span id="lf-lenv" style="min-width:48px;display:inline-block"></span></label>
+          <label>algorithm <select id="lf-alg"><option value="seq">sequential (OpenAI)</option><option value="chunk">chunked (Transformers pipeline)</option></select></label>
+          <label>chunk <input type="range" id="lf-chunk" min="10" max="30" step="1" value="30" /><span id="lf-chunkv" style="min-width:36px;display:inline-block"></span></label>
+          <label>stride <input type="range" id="lf-stride" min="0" max="8" step="0.5" value="5" /><span id="lf-stridev" style="min-width:40px;display:inline-block"></span></label>
+          <button class="btn ghost" id="lf-seed">New speech</button>
+        </div>
+        <svg id="lf-svg" width="660" height="240" viewBox="0 0 660 240" role="img" aria-label="Speech segments along a long recording with the sequence of sequential decoding windows, or the overlapping chunks of the chunked algorithm with stride regions shaded"></svg>
+        <div class="readout" aria-live="polite" id="lf-read"></div>
+        <p class="vcap">Speech segments are synthetic (seeded random durations and pauses). The sequential windows follow the released seek rule, assuming the model timestamps every segment correctly; a segment still running at the window end sends the next window to its (20 ms-quantised) start. Chunk positions follow <code>chunk_iter</code> in the Transformers pipeline: step = chunk − 2 × stride, no left stride on the first chunk, no right stride on the last. Encoder seconds count every window or chunk as a full 30-s encoder pass, since shorter inputs are padded.</p>
+      </div>
+      <h4>Trade-offs</h4>
+      <ul class="notes">
+        <li><b>Sequential</b> is what the paper evaluated and is generally more accurate: every window starts at a segment boundary and sees the previous text. But window k + 1 cannot start until window k is decoded, and one bad window (a repetition loop, a wrong timestamp) propagates. The Hugging Face model cards describe sequential as "up to 0.5% WER more accurate" and recommend it when accuracy matters or when batching many files.</li>
+        <li><b>Chunked</b> is embarrassingly parallel — all chunks can be batched — which the Distil-Whisper model card quotes as up to 9× faster than OpenAI's sequential implementation for single long files. Chunk boundaries fall mid-word, context is not carried over, and the merge can duplicate or drop words at the seams; the Transformers pipeline itself logs a warning that <code>chunk_length_s</code> is "very experimental with seq2seq models" and points Whisper users to <code>generate</code>'s own long-form algorithm.</li>
+        <li><b>Timestamps are mandatory</b> for sequential decoding: without them the algorithm has no way to know where to move the window. In Transformers, <code>generate</code> requires <code>return_timestamps=True</code> for audio longer than 30 s.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> sequential decoding turns the timestamp tokens into a control signal; chunked decoding ignores them and relies on overlap. Choose sequential for accuracy and batch jobs, chunked for latency on single long files.</div>
+    </section>
+
+    <!-- 24 ───────────────────────────────────────────── -->
+    <section class="topic" id="heuristics" data-nav="Fallback heuristics">
+      <h3><span class="idx">24</span> Heuristics that make long-form work</h3>
+      <p class="lede">The paper found that reliable long-form transcription needed beam search and "temperature scheduling based on the repetitiveness and the log probability of the model predictions". The released <code>transcribe()</code> implements the same heuristics with these defaults: temperatures (0.0, 0.2, 0.4, 0.6, 0.8, 1.0), compression-ratio threshold 2.4, log-probability threshold −1.0, no-speech threshold 0.6, and conditioning on previous text.</p>
+      <div class="formula"><span class="lbl">decode a window at temperature T, then check the result</span><span class="eq">cr = len(utf8(text)) / len(zlib(utf8(text)))        lp = (Σ log p(ŷₜ)) / (|ŷ| + 1)  (text tokens plus the end token)        ns = p(no-speech token at the position after SOT)</span>
+<span class="lbl">retry at the next temperature if</span><span class="eq">(cr &gt; 2.4  or  lp &lt; −1.0)   and not  (ns &gt; 0.6  and  lp &lt; −1.0)</span>
+<span class="lbl">after the ladder: skip the window as silence if</span><span class="eq">ns &gt; 0.6  and  lp ≤ −1.0        →   seek ← seek + 30 s, no text</span>
+<span class="lbl">stop using the text as the next prompt if</span><span class="eq">T &gt; 0.5   (released code;  the paper: condition on previous text when T &lt; 0.5)</span></div>
+      <h4>Why each check works</h4>
+      <ul class="notes">
+        <li><b>Compression ratio catches loops.</b> A decoder stuck repeating a phrase produces highly compressible text; ordinary speech rarely compresses much below half its length. The ratio needs no model internals and is cheap.</li>
+        <li><b>Average log-probability catches low confidence.</b> Hard audio, the wrong language or noise produce low-probability tokens. Raising the temperature samples alternatives; with <code>best_of</code> (5 in the command-line defaults) several samples are drawn and the one with the best mean log-probability kept.</li>
+        <li><b>No-speech needs both signals.</b> The paper found the no-speech probability alone was not a reliable detector, but combined with low log-probability it is: a confident transcript is kept even if no-speech is high.</li>
+        <li><b>Beam search at T = 0</b> (5 beams in the paper and in the command-line defaults) reduces repetition loops, which "happen more frequently in greedy decoding". The Python <code>model.transcribe()</code> default is greedy unless <code>beam_size</code> is passed.</li>
+      </ul>
+      <div class="viz" id="viz-cr">
+        <div class="vhead">
+          <span class="vtitle">The compression-ratio check</span>
+          <span class="vhint">pick a pattern · drag the repetitions · or type text</span>
+        </div>
+        <div class="controls">
+          <label>pattern <select id="cr-preset"><option value="speech">ordinary sentence</option><option value="thanks">"Thank you." repeated</option><option value="loop">a phrase stuck in a loop</option><option value="sub">subtitle sign-off repeated</option></select></label>
+          <label>repetitions <input type="range" id="cr-rep" min="1" max="30" step="1" value="6" /><span id="cr-repv" style="min-width:24px;display:inline-block"></span></label>
+        </div>
+        <textarea class="win" id="cr-text"></textarea>
+        <svg id="cr-svg" width="660" height="220" viewBox="0 0 660 220" role="img" aria-label="Compression ratio of the text as the repeated phrase is repeated more times, with the 2.4 threshold line"></svg>
+        <div class="readout" aria-live="polite" id="cr-read"></div>
+        <p class="vcap">Ratios are computed in the browser with a DEFLATE size estimator written for this page (LZ77 with a 32 KiB window and lazy matching, then the cheaper of fixed and dynamic Huffman codes, plus zlib's 6 bytes of framing). On test sentences like these it agrees with Python's <code>zlib.compress</code>, which the released code calls, to within about 7%, overestimating slightly for highly repetitive text. The threshold 2.4 is the paper's and the released default.</p>
+      </div>
+      <div class="viz" id="viz-fb">
+        <div class="vhead">
+          <span class="vtitle">The temperature ladder and the no-speech rule</span>
+          <span class="vhint">pick a scenario, set the no-speech probability, or click the plot to place a result</span>
+        </div>
+        <div class="controls">
+          <label>scenario <select id="fb-scen"><option value="normal">clean speech</option><option value="loop">repetition loop</option><option value="unsure">hard audio, low confidence</option><option value="silence">silence</option><option value="music">music, confident text</option><option value="fail">every attempt fails</option><option value="custom">custom (click the plot)</option></select></label>
+          <label>no-speech prob. <input type="range" id="fb-ns" min="0" max="1" step="0.01" value="0.02" /><span id="fb-nsv" style="min-width:36px;display:inline-block"></span></label>
+        </div>
+        <svg id="fb-svg" width="660" height="290" viewBox="0 0 660 290" role="img" aria-label="Plane of average log-probability against compression ratio shaded by the decision: accept, retry at the next temperature, or skip as silence, with the attempts of the chosen scenario drawn as a path"></svg>
+        <div class="readout" aria-live="polite" id="fb-read"></div>
+        <p class="vcap">The shading and the decisions are produced by a port of the released rules (<code>decode_with_fallback</code> and the no-speech check in <code>transcribe()</code>) with their default thresholds. The per-attempt log-probabilities and ratios in each scenario are illustrative inputs, not measurements. The "music, confident text" scenario shows a known weakness: a high no-speech probability does not skip a window whose text the model is confident about.</p>
+      </div>
+      <h4>What each heuristic bought (Table 7, long-form WER, large-v2)</h4>
+      <table class="cmp">
+        <tr><th>Added in turn</th><th>TED-LIUM3</th><th>Meanwhile</th><th>Kincaid46</th><th>Rev16</th><th>Earn-21</th><th>Earn-22</th><th>CORAAL</th><th>Average</th></tr>
+        <tr><td>Greedy decoding only</td><td>3.95</td><td>5.16</td><td>9.69</td><td>11.7</td><td>10.7</td><td>14.0</td><td>22.0</td><td>11.0</td></tr>
+        <tr><td>+ Beam search</td><td>4.16</td><td>5.71</td><td>9.42</td><td>11.5</td><td>10.2</td><td>13.4</td><td>20.0</td><td>10.6</td></tr>
+        <tr><td>+ Temperature fallback</td><td>4.16</td><td>5.71</td><td>9.42</td><td>11.5</td><td>10.2</td><td>13.4</td><td>20.0</td><td>10.6</td></tr>
+        <tr><td>+ Voice activity detection</td><td>3.56</td><td>4.61</td><td>9.45</td><td>11.4</td><td>10.1</td><td>13.2</td><td>19.4</td><td>10.2</td></tr>
+        <tr><td>+ Previous text conditioning</td><td>3.42</td><td>6.16</td><td>8.72</td><td>11.0</td><td>9.63</td><td>13.3</td><td>18.1</td><td>10.0</td></tr>
+        <tr><td>+ Initial timestamp constraint</td><td>3.51</td><td>5.26</td><td>8.41</td><td>11.5</td><td>9.73</td><td>12.6</td><td>19.1</td><td>10.0</td></tr>
+      </table>
+      <p>Two things stand out. Each heuristic helps on average but not on every dataset — beam search hurts TED-LIUM3 and Meanwhile; previous-text conditioning helps most sets but hurts Meanwhile by 1.5 points. And temperature fallback changes nothing in this table once beam search is on (identical rows), even though the paper calls temperature scheduling "crucial"; its value is in the rare catastrophic windows that averages hide. The paper calls these heuristics "a workaround for the noisy predictions of the model".</p>
+      <div class="callout"><b>Takeaway:</b> the thresholds are empirical defaults tuned on English long-form sets, not properties of the model. On other languages or domains they can misfire — compression ratios differ between scripts, and log-probabilities differ between languages — so validate them on your audio.</div>
+    </section>
+
+    <!-- 25 ───────────────────────────────────────────── -->
+    <section class="topic" id="releases" data-nav="large-v2, large-v3, turbo">
+      <h3><span class="idx">25</span> The later releases: large-v2, large-v3, turbo</h3>
+      <p class="lede">OpenAI released four generations of the large model: the original (September 2022), large-v2 (December 2022), large-v3 (November 2023) and large-v3-turbo (September 2024). The first three share the architecture; turbo cuts the decoder.</p>
+      <table class="cmp">
+        <tr><th>Release</th><th>What changed</th><th>Source</th></tr>
+        <tr><td>large-v2</td><td>same data and architecture, 2.5× more epochs, SpecAugment, stochastic depth 0.1, BPE dropout 0.1, max LR 2 × 10⁻⁴</td><td>paper footnote 3, Tables 18–19</td></tr>
+        <tr><td>large-v3</td><td>128 mel bins instead of 80; a Cantonese language token; trained for 2.0 epochs on 1M hours of weakly labelled audio plus 4M hours pseudo-labelled by large-v2; reported 10–20% error reduction over large-v2 across languages</td><td>Hub model card</td></tr>
+        <tr><td>large-v3-turbo</td><td>large-v3 with the decoder pruned from 32 to 4 layers, then fine-tuned for two more epochs on large-v3's multilingual transcription data, excluding translation; README: ~8× the speed of large, "minimal degradation in accuracy"; not trained for translation</td><td>Hub model card, README, repository discussion #2363</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>large-v3 moves towards self-training.</b> Four fifths of its training audio was labelled by the previous model — the paper had highlighted achieving its results "without the need for self-supervision or self-training techniques". Pseudo-labels inherit large-v2's errors unless filtered, and OpenAI has not published how they were filtered.</li>
+        <li><b>128 mel bins break drop-in replacement.</b> A large-v3 checkpoint needs a 128-bin feature extractor; feeding it 80-bin features fails at the first convolution. Its vocabulary is also one larger (<a href="tokens-training.html#tokenizer">tokenizer</a>).</li>
+        <li><b>Turbo's design follows Distil-Whisper.</b> The repository discussion credits Distil-Whisper's observation that a smaller decoder greatly improves speed with minimal accuracy loss. Unlike Distil-Whisper, turbo was fine-tuned on real training data rather than distilled.</li>
+        <li><b>Turbo and translation.</b> The README warns that turbo "will return the original language even if <code>--task translate</code> is specified"; use medium or large for translation.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> for new work, large-v3 or turbo is the default for transcription; large-v2 remains the reference for translation and for results in the paper. Check the mel bins and vocabulary before swapping checkpoints.</div>
+    </section>
+
+    <!-- 26 ───────────────────────────────────────────── -->
+    <section class="topic" id="distil" data-nav="Distil-Whisper">
+      <h3><span class="idx">26</span> Distil-Whisper and speculative decoding</h3>
+      <p class="lede">Distil-Whisper (arXiv 2311.00430) keeps Whisper's entire encoder, frozen, and trains a two-layer decoder to imitate the full model on pseudo-labelled data. It reports 5.8× faster inference with 51% fewer parameters, within 1% WER of the teacher on out-of-distribution short-form audio.</p>
+      <div class="formula"><span class="lbl">distillation objective (weights following Shleifer and Rush)</span><span class="eq">L_KD = 0.8 · L_KL + 1.0 · L_PL,     L_KL = Σᵢ KL(Qᵢ ‖ Pᵢ) over the teacher's (Q) and student's (P) next-token distributions,   L_PL = cross-entropy on the teacher's transcript</span>
+<span class="lbl">pseudo-label filter: keep an example only if the teacher's transcript is close to the original transcript</span><span class="eq">WER(normalise(teacher output), normalise(ground truth)) ≤ λ,   λ = 10%</span></div>
+      <ul class="notes">
+        <li><b>Student initialisation.</b> Encoder copied and frozen; the two decoder layers initialised from the teacher's first and last decoder layers. The released English checkpoints are distil-medium.en (2 decoder layers) and distil-small.en (4 layers); distil-large-v2 and distil-large-v3 have 2.</li>
+        <li><b>Data.</b> 21,170 hours of open English speech across 10 domains, labelled by Whisper and filtered with the WER threshold; the paper shows the filter matters, because hallucinated pseudo-labels otherwise enter training.</li>
+        <li><b>Long-form.</b> On long-form audio the distilled model reports 0.1% lower WER than its teacher, attributed to fewer hallucinations and 1.3× fewer repetition errors — a small decoder has less capacity to "invent".</li>
+        <li><b>Speculative decoding.</b> Because it shares the teacher's encoder, the student can serve as the draft model for the full Whisper: the student proposes tokens, the teacher verifies them in one pass, and the output is provably identical to the teacher's. The paper reports 2× faster inference for an 8% increase in parameters.</li>
+        <li><b>distil-large-v3</b> was trained to work with OpenAI's sequential long-form algorithm; its model card reports 6.3× the speed of large-v3 and long-form WER within 1% of it.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> Whisper's decoder is over-provisioned for most English transcription. Distil-Whisper removes it by distillation, turbo by pruning plus fine-tuning; both keep the full encoder, which is where the acoustic robustness lives.</div>
+    </section>
+
+    <!-- 27 ───────────────────────────────────────────── -->
+    <section class="topic" id="hallucination" data-nav="Hallucination and limitations">
+      <h3><span class="idx">27</span> Hallucination and other limitations</h3>
+      <p class="lede">The paper's own limitations section names the failure modes that dominate practice: "getting stuck in repeat loops, not transcribing the first or last few words of an audio segment, or complete hallucination where the model will output a transcript entirely unrelated to the actual audio". The model card attributes hallucination to the decoder combining "trying to predict the next word in audio with trying to transcribe the audio itself".</p>
+      <h4>Failure modes</h4>
+      <ul class="notes">
+        <li><b>Text on non-speech.</b> Silence, music or noise can produce fluent text, often phrases common in web subtitles (sign-offs, thanks, subtitle credits). Voice-activity detection before Whisper, and the no-speech rule, reduce but do not eliminate it.</li>
+        <li><b>Repetition loops.</b> The decoder repeats a phrase until the window or the token budget ends. Beam search and the compression-ratio fallback are the mitigations.</li>
+        <li><b>Dropped words</b> at window starts and ends, addressed partly by the initial-timestamp constraint and by seeking to segment starts.</li>
+        <li><b>Measured harm.</b> "Careless Whisper" (Koenecke et al., FAccT 2024, arXiv 2402.08021), evaluating OpenAI's Whisper API as of 2023, found that roughly 1% of transcriptions contained entire hallucinated phrases or sentences, 38% of which included explicit harms such as violence or false authority, and that hallucinations were more frequent for speakers with longer non-vocal durations, as in aphasia.</li>
+        <li><b>Uneven accuracy.</b> The model card reports lower accuracy on low-resource languages and disparate performance across accents and dialects, possibly including demographic differences; CORAAL (interviews in African American Language) has the highest WER of the paper's seven long-form sets.</li>
+        <li><b>No streaming, no diarisation.</b> Whisper sees fixed 30-s windows and has no notion of who is speaking; both require external systems.</li>
+      </ul>
+      <h4>Intended use, as the model card states it</h4>
+      <p>The primary intended users are researchers studying robustness; the card also expects developer use for English ASR, cautions against transcribing recordings of people without their consent, against using the models for "any kind of subjective classification", and against high-risk decision-making contexts, and notes dual-use concerns around surveillance.</p>
+      <div class="callout"><b>Takeaway:</b> a Whisper transcript can contain text that no one said, and the text will look fluent. Where errors matter — medical, legal, accessibility — gate the input with voice-activity detection, keep the audio, and have transcripts checked.</div>
+    </section>
+
+    <!-- 28 ───────────────────────────────────────────── -->
+    <section class="topic" id="usage" data-nav="Using it in Transformers">
+      <h3><span class="idx">28</span> Using Whisper through Hugging Face Transformers</h3>
+      <p class="lede">Transformers provides <code>WhisperForConditionalGeneration</code>, <code>WhisperProcessor</code> (a <code>WhisperFeatureExtractor</code> plus <code>WhisperTokenizer</code>) and the <code>automatic-speech-recognition</code> pipeline. Whisper has its own <code>generate</code>, which implements the timestamp processor, language detection and the long-form algorithm with fallback.</p>
+      <h4>Short-form (≤ 30 s)</h4>
+      <pre class="code">from transformers import AutoProcessor, WhisperForConditionalGeneration
+
+processor = AutoProcessor.from_pretrained("openai/whisper-large-v3-turbo")
+model = WhisperForConditionalGeneration.from_pretrained(
+    "openai/whisper-large-v3-turbo", device_map="auto", attn_implementation="sdpa")
+
+# audio: 1-D float array at 16 kHz
+inputs = processor(audio, sampling_rate=16_000, return_tensors="pt").to(model.device)
+ids = model.generate(**inputs, language="en", task="transcribe")
+text = processor.batch_decode(ids, skip_special_tokens=True)[0]</pre>
+      <h4>Long-form, sequential, with the paper's heuristics</h4>
+      <pre class="code">inputs = processor(audio, sampling_rate=16_000, return_tensors="pt",
+                   truncation=False, padding="longest", return_attention_mask=True)
+ids = model.generate(**inputs.to(model.device),
+                     return_timestamps=True,           # required above 30 s
+                     condition_on_prev_tokens=True,
+                     temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+                     logprob_threshold=-1.0,
+                     no_speech_threshold=0.6,
+                     compression_ratio_threshold=1.35)  # see the note below
+text = processor.batch_decode(ids, skip_special_tokens=True)[0]</pre>
+      <h4>Chunked, with the pipeline</h4>
+      <pre class="code">from transformers import pipeline
+
+asr = pipeline("automatic-speech-recognition", model="openai/whisper-large-v3-turbo", device=0)
+out = asr("talk.flac", chunk_length_s=30, batch_size=8, return_timestamps=True)
+print(out["text"]); print(out["chunks"])</pre>
+      <h4>Notes that change results</h4>
+      <ul class="notes">
+        <li><b>Compression ratio is computed differently.</b> The Transformers implementation compresses the bytes of the generated <i>token ids</i>, not the UTF-8 text, so its numbers are on a different scale; its documentation gives 1.35 as "a common value" where the original code uses 2.4 on text.</li>
+        <li><b>Truncation is on by default</b> in the feature extractor; pass <code>truncation=False</code> (and an attention mask when batching) for long-form, or the audio is cut at 30 s.</li>
+        <li><b>Pass <code>language</code> and <code>task</code></b> instead of relying on detection when you know them; detection on the first window can be wrong for short or mixed-language audio. These arguments are the documented route; older example code set <code>forced_decoder_ids</code> instead.</li>
+        <li><b>Prompts.</b> <code>prompt_ids</code> (from <code>processor.get_prompt_ids(text)</code>) supplies vocabulary or style; <code>prompt_condition_type</code> chooses whether it applies to the first segment or all segments.</li>
+        <li><b>Timestamps.</b> <code>return_timestamps=True</code> gives segment times; <code>return_timestamps="word"</code> in the pipeline (or <code>return_token_timestamps=True</code> in <code>generate</code>) uses cross-attention alignment for word times.</li>
+        <li><b>Speed.</b> The documentation shows <code>attn_implementation="sdpa"</code> and <code>cache_implementation="static"</code> for a compiled static cache; the model card notes <code>torch.compile</code> is not compatible with the chunked algorithm.</li>
+        <li><b>Fine-tuning.</b> The Hub model cards point to fine-tuning with as little as 5 hours of labelled data for a new domain or language; fine-tuning on one narrow set can erode multilingual and multitask behaviour, so evaluate on held-out general audio too.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> the library reproduces the paper's algorithm only when you ask for it: timestamps on, no truncation, a temperature tuple and the thresholds. The defaults are short-form, greedy and truncating.</div>
+    </section>
+
+    <nav class="pager" aria-label="Whisper series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="evaluation-robustness.html">← Whisper: WER, Robustness &amp; Multilingual Results</a>
+      <a href="../whisper.html" style="color:var(--muted)">Whisper · overview</a>
+      <a href="../whisper.html">Whisper · overview →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="../whisper.viz.js"></script>
+</body>
+</html>
