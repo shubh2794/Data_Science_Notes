@@ -20,6 +20,7 @@
         <span class="pill">Generative Models</span>
         <span class="pill">Adversarial Training</span>
         <span class="pill">Minimax</span>
+        <span class="pill">Image-to-Image Translation</span>
       </div>
     </header>
 
@@ -336,8 +337,7 @@
 
       <h4>Translation GANs: the loss is the design</h4>
       <ul class="notes">
-        <li><b>Pix2Pix</b> pairs an adversarial term with an <code>L1</code> reconstruction term at a large weight (≈100). The <code>L1</code> gets the low frequencies right — overall colour and layout — and the discriminator only has to police high-frequency realism. That division of labour is why the discriminator can be a small <b>patch</b> classifier scoring overlapping local windows rather than the whole image, which also makes it resolution-agnostic and cheap.</li>
-        <li><b>CycleGAN</b> removes the need for paired data by adding two generators and two discriminators plus a <b>cycle-consistency</b> term, <code>‖F(G(x)) − x‖₁ + ‖G(F(y)) − y‖₁</code>, at weight ≈10. Without it, the adversarial loss alone is satisfied by <i>any</i> mapping onto the target domain, including one that ignores the input entirely.</li>
+        <li><b>Pix2Pix</b> and <b>CycleGAN</b> are treated in full in <a href="#pix2pix">§11</a> and <a href="#cyclegan">§12</a>: Pix2Pix pairs an adversarial term with an <code>L1</code> reconstruction at weight ≈100 and judges local patches; CycleGAN replaces the missing pairs with a cycle-consistency term at weight ≈10.</li>
         <li>Both are worth remembering as a general pattern: <b>adversarial loss for realism, a reconstruction or consistency loss for correspondence</b>. Almost every conditional GAN in production is some weighting of those two terms.</li>
       </ul>
 
@@ -363,6 +363,7 @@
         <li><b>Concatenation</b> — append a label embedding to <code>z</code> and to <code>D</code>'s input. Simple; weak with many classes.</li>
         <li><b>Conditional BatchNorm</b> — let the class choose <code>G</code>'s per-layer scale and shift. Cheap, and it scales to a thousand classes.</li>
         <li><b>Projection discriminator</b> — take an inner product between the class embedding and <code>D</code>'s feature vector rather than asking it to classify. Better than an auxiliary classifier head, which rewards easily-classified samples and thereby <i>encourages</i> within-class collapse.</li>
+        <li><b>A whole image as the condition</b> — the dense case, where the input already fixes most of the output. That is image-to-image translation, and it gets its own treatment from <a href="#translation">§10</a> onward.</li>
       </ul>
 
       <h4>Moving through latent space</h4>
@@ -434,8 +435,317 @@
     </section>
 
     <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="translation" data-nav="Image-to-image translation">
+      <h3><span class="idx">10</span> From conditional GANs to image-to-image translation</h3>
+      <p class="lede">Make the condition a whole <b>image</b> instead of a label and the generator stops inventing a sample from noise; it <b>re-renders</b> an input in another domain. The rest of this page, up to the comparison, is about that one change and what it costs.</p>
+
+      <h4>What changes when the condition is an image</h4>
+      <ul class="notes">
+        <li>§08 conditioned on a class <code>y</code>, a few bits of information. Here the condition is an image <code>x</code> (a label map, an edge sketch, a daytime photo) and the output <code>ŷ = G(x)</code> is an image of the same size in a second domain (a photo, a painting, a night scene). Almost all of the output's <b>structure</b> (where the edges are, what is next to what) is already present in the input. The generator's job is to change the <i>appearance</i> while keeping that structure.</li>
+        <li>So the latent <code>z</code> loses its central role. In an unconditional GAN it carries everything; in translation the input carries nearly everything and the residual uncertainty, such as which colour the car is, is small. That is why translation networks often drop <code>z</code> altogether (§11).</li>
+        <li>The discriminator has to judge <b>correspondence</b> as well as realism. If it only asks whether <code>ŷ</code> looks like a photo, the generator can satisfy it with any photo, and the input becomes irrelevant. Two fixes define the two families below: show the discriminator the <b>pair</b> <code>(x, ŷ)</code> and add a reconstruction term against a known target (paired data, §11), or, with no known target, require that the translation can be <b>undone</b> (unpaired data, §12).</li>
+      </ul>
+
+      <table class="cmp">
+        <tr><th>Setting</th><th>Training data</th><th>What pins the output to the input</th><th>Representative method</th></tr>
+        <tr><td>Paired translation</td><td>Aligned pairs <code>(x, y)</code>: label map with its photo, sketch with its rendering</td><td>Conditional discriminator on the pair plus <code>L1</code> to the true <code>y</code></td><td>Pix2Pix (§11)</td></tr>
+        <tr><td>Unpaired translation</td><td>Two unaligned collections <code>{x}</code> and <code>{y}</code></td><td>Cycle consistency: <code>F(G(x)) ≈ x</code></td><td>CycleGAN (§12)</td></tr>
+        <tr><td>Example-based stylisation</td><td>One content image, one style image, a frozen classifier</td><td>Feature-matching losses; no discriminator at all</td><td>Neural style transfer (§13)</td></tr>
+        <tr><td>Identity swap / reenactment</td><td>Video of two people, or one target and a driving video</td><td>A shared encoder or explicit motion keypoints</td><td>Face-swap autoencoders (§14)</td></tr>
+      </table>
+
+      <div class="callout"><b>One idea:</b> translation is conditional generation where the condition carries <b>most of the answer</b>. Every design choice in §11–§14 is a way of keeping the structure the input supplies while replacing the appearance.</div>
+    </section>
+
+    <!-- 11 ───────────────────────────────────────────── -->
+    <section class="topic" id="pix2pix" data-nav="Paired translation (Pix2Pix)">
+      <h3><span class="idx">11</span> Paired translation: Pix2Pix</h3>
+      <p class="lede">With aligned pairs available, the recipe is a conditional GAN with three choices that each fix a specific problem: a <b>U-Net</b> generator, a <b>patch</b> discriminator, and an <b>L1</b> term doing the low-frequency work.</p>
+
+      <h4>The objective, term by term</h4>
+      <ul class="notes">
+        <li>The discriminator sees the <b>input and the output together</b>: <code>D(x, y)</code> concatenates the two images along the channel axis, so it can reject a realistic photo that does not match its label map. An unconditional <code>D(y)</code> would only check realism and leave the input free to be ignored.</li>
+        <li>The <code>L1</code> term compares the output with the known target pixel by pixel. It handles colour and layout, the low frequencies, so the adversarial term only has to supply what <code>L1</code> cannot: sharp, realistic high-frequency detail.</li>
+        <li>The weight <code>λ</code> is large, 100 in the original setting, because the <code>L1</code> term is on the scale of mean absolute pixel error while the adversarial loss is on the scale of a log-likelihood. With <code>L1</code> alone you get reasonable but blurry outputs. With the cGAN term alone you get sharp outputs that drift from the target and show more artefacts. The sum works better than either.</li>
+      </ul>
+      <div class="formula"><span class="lbl">conditional adversarial term (D sees the input x alongside the output)</span><span class="eq">L<sub>cGAN</sub>(G, D) = 𝔼<sub>x,y</sub>[ log D(x, y) ] + 𝔼<sub>x,z</sub>[ log(1 − D(x, G(x, z))) ]</span>
+
+<span class="lbl">reconstruction term against the paired target</span><span class="eq">L<sub>L1</sub>(G) = 𝔼<sub>x,y,z</sub>[ ‖ y − G(x, z) ‖₁ ]</span>
+
+<span class="lbl">full objective, <span class="keep">λ</span> = 100</span><span class="eq">G* = arg min<sub>G</sub> max<sub>D</sub>  L<sub>cGAN</sub>(G, D) + λ · L<sub>L1</sub>(G)</span></div>
+
+      <h4>Why L1 and not L2</h4>
+      <ul class="notes">
+        <li>Translation is <b>multimodal</b>: one label map is consistent with many photos. For each pixel, a per-pixel loss has an optimal constant prediction, and that constant is a statistic of the conditional distribution <code>p(y | x)</code>. For L2 it is the <b>mean</b>, for L1 the <b>median</b>.</li>
+        <li>A mean of two distinct plausible values is a value that <b>never occurs</b>: halfway between black and white is grey, and that grey is the blur. A median is at least one of the values the distribution actually takes when one outcome holds the majority. L1 therefore blurs less, but it still blurs whenever the outcomes are close to evenly split. That leftover blur is what the adversarial term is for. The same mechanism explains <a href="autoencoders-vaes/beta-collapse-vqvae.html#blur">why VAE samples are blurry</a>.</li>
+        <li>L1 also has a constant-magnitude gradient, so large errors from a few outlier pixels do not dominate the update the way they do under L2.</li>
+      </ul>
+      <div class="formula"><span class="lbl">worked example: one pixel that is black 60% of the time, white 40%</span><span class="eq">L2 optimum:  arg min<sub>c</sub> 𝔼[(y − c)²] = 𝔼[y] = 0.6·0 + 0.4·1 = 0.40      ← a grey no real image has</span>
+<span class="eq">L1 optimum:  arg min<sub>c</sub> 𝔼[|y − c|] = median(y) = 0                   ← an outcome that actually occurs</span>
+<span class="eq">at a 50/50 split every c ∈ [0, 1] is L1-optimal, so L1 alone cannot choose; the discriminator must</span></div>
+
+      <h4>The U-Net generator: why skip connections</h4>
+      <ul class="notes">
+        <li>A plain encoder–decoder pushes the whole image through a bottleneck. For a 256×256 input, eight stride-2 layers reduce it to <b>1×1×512</b>. Everything the decoder needs, including the exact position of every edge, has to survive that compression, and fine localisation does not.</li>
+        <li>In translation, the input and the output <b>share low-level structure</b>: the edges of the label map are where the edges of the photo should be. There is no reason to compress that information and reconstruct it. The <a href="residual-skip-connections.html#unet">U-Net long skips</a> concatenate encoder layer <code>i</code> onto decoder layer <code>n − i</code>, so high-resolution detail takes a short path from input to output and the bottleneck only has to carry global context (what kind of scene this is, the overall lighting).</li>
+        <li>Ablations show the effect directly. Without skips, the encoder–decoder produces worse results under L1 alone and under L1 + cGAN. The skips are what make the translation spatially precise.</li>
+        <li><b>Noise as dropout.</b> Feeding Gaussian <code>z</code> as an extra input fails: the generator learns to ignore it, because the input image already explains the target and the noise only gets in the way of the L1 term. Pix2Pix therefore supplies stochasticity only through <a href="neural-network-training/normalization-regularization.html#dropout">dropout</a> in several decoder layers, left on <b>at test time</b>. The result is only mildly stochastic, which means the model is close to deterministic, a real limitation. Later work added an explicit latent code tied to the output by an encoder (a bicycle-style consistency) to recover genuinely different outputs.</li>
+        <li>Normalisation is similar: batch statistics are computed from the test batch at inference too. With batch size 1 this is effectively <b>instance normalisation</b>, which later translation models adopted on purpose.</li>
+      </ul>
+
+      <h4>The PatchGAN discriminator</h4>
+      <ul class="notes">
+        <li>Since L1 already handles low frequencies, the discriminator only needs to judge <b>local</b> realism. A PatchGAN is a fully convolutional classifier that outputs an <b>N×N grid</b> of real/fake scores, not a single number. Each score has a fixed <a href="convolutional-networks/arithmetic-receptive-fields.html#rf">receptive field</a> in the input, so each one judges one patch. The loss averages over the grid.</li>
+        <li>The standard choice is a <b>70×70</b> receptive field: three stride-2 and two stride-1 4×4 convolutions. On a 256×256 image this produces a 30×30 map of overlapping judgements. In the original ablation, 1×1 "pixel" discriminators only improved colour, 16×16 patches gave sharp outputs with tiling artefacts, 70×70 was the best trade-off, and a full-image 286×286 discriminator was no better and harder to train.</li>
+        <li>The modelling assumption is <b>Markovian</b>: pixels farther apart than one patch diameter are treated as independent given the input. The discriminator is effectively a learned <b>texture / style loss</b> applied everywhere, which is also its link to the Gram-matrix losses of §13.</li>
+        <li>Practical side effects: fewer parameters, faster, and <b>resolution-agnostic</b>. The same discriminator can be run convolutionally over an image of any size. Higher-resolution successors stack several PatchGANs at different image scales and add a <b>feature-matching</b> loss on the discriminator's intermediate layers. Semantic-map-to-photo successors inject the label map through <b>spatially varying normalisation parameters</b> instead of only at the input, so normalisation layers cannot wash out the semantics.</li>
+      </ul>
+      <div class="formula"><span class="lbl">receptive field of the 70×70 patchgan, computed from the output back to the input</span><span class="eq">r ← r + (k − 1) · (product of the strides of the layers below)     equivalently, layer by layer from the top: r ← s · (r − 1) + k</span>
+<span class="eq">final 4×4, s=1:  r = 4      C512 4×4, s=1:  r = 1·(4−1)+4 = 7</span>
+<span class="eq">C256 4×4, s=2:  r = 2·(7−1)+4 = 16      C128, s=2:  r = 2·(16−1)+4 = 34      C64, s=2:  r = 2·(34−1)+4 = 70</span>
+<span class="eq">one fewer stride-2 layer → 34;  two more → 286 (larger than a 256 image: an "image GAN")</span></div>
+
+      <div class="viz" id="viz-patch">
+        <div class="vhead">
+          <span class="vtitle">PatchGAN: what one discriminator output can see</span>
+          <span class="vhint">change the depth, then hover or click a cell of the output map to show its receptive field on the 256×256 input</span>
+        </div>
+        <div class="controls">
+          <label>stride-2 layers <input type="range" id="patch-n" min="1" max="5" step="1" value="3"></label>
+          <button class="btn ghost" id="patch-center">Centre cell</button>
+        </div>
+        <svg id="patch-svg" width="640" height="320" viewBox="0 0 640 320" role="img" aria-label="Interactive diagram: a 256 by 256 input image with the receptive field of one PatchGAN output cell, beside the output decision grid"></svg>
+        <div class="readout" aria-live="polite" id="patch-readout"></div>
+      </div>
+
+      <div class="callout"><b>Takeaway:</b> Pix2Pix divides the work by frequency. <b>L1 handles layout, the patch discriminator handles texture, and skips carry edges</b> from input to output without compression. Each part is there because the other two cannot do its job.</div>
+    </section>
+
+    <!-- 12 ───────────────────────────────────────────── -->
+    <section class="topic" id="cyclegan" data-nav="Unpaired translation (CycleGAN)">
+      <h3><span class="idx">12</span> Unpaired translation: CycleGAN and cycle consistency</h3>
+      <p class="lede">Usually nobody has a photo of the same scene as a painting, or the same horse as a zebra. Without pairs there is no L1 target, so the method has to find a different constraint that ties the output to the input.</p>
+
+      <h4>Two generators, two discriminators</h4>
+      <ul class="notes">
+        <li>Learn two mappings, <code>G : X → Y</code> and <code>F : Y → X</code>, with two discriminators: <code>D<sub>Y</sub></code> separates real <code>y</code> from <code>G(x)</code>, and <code>D<sub>X</sub></code> separates real <code>x</code> from <code>F(y)</code>. Each direction is an ordinary unconditional GAN on its target domain.</li>
+        <li>The adversarial terms alone are badly <b>under-determined</b>. They only ask that the <i>distribution</i> of <code>G(x)</code> match the distribution of <code>Y</code>. Infinitely many mappings induce the same output distribution, including ones that ignore <code>x</code> and simply produce plausible <code>y</code>s, and in practice the optimisation often collapses many inputs onto the same output.</li>
+        <li><b>Cycle consistency</b> requires the two mappings to be approximate inverses: horse → zebra → horse should return the original horse. A mapping that throws away information about <code>x</code> cannot be undone, so the cycle term penalises it.</li>
+      </ul>
+      <div class="formula"><span class="lbl">adversarial term for one direction (the other swaps the roles of X and Y)</span><span class="eq">L<sub>GAN</sub>(G, D<sub>Y</sub>, X, Y) = 𝔼<sub>y</sub>[ log D<sub>Y</sub>(y) ] + 𝔼<sub>x</sub>[ log(1 − D<sub>Y</sub>(G(x))) ]</span>
+
+<span class="lbl">cycle consistency, both directions</span><span class="eq">L<sub>cyc</sub>(G, F) = 𝔼<sub>x</sub>[ ‖ F(G(x)) − x ‖₁ ] + 𝔼<sub>y</sub>[ ‖ G(F(y)) − y ‖₁ ]</span>
+
+<span class="lbl">identity term (optional): a target-domain image should pass through unchanged</span><span class="eq">L<sub>id</sub>(G, F) = 𝔼<sub>y</sub>[ ‖ G(y) − y ‖₁ ] + 𝔼<sub>x</sub>[ ‖ F(x) − x ‖₁ ]</span>
+
+<span class="lbl">full objective, <span class="keep">λ</span><sub>cyc</sub> = 10, <span class="keep">λ</span><sub>id</sub> = 0.5 · <span class="keep">λ</span><sub>cyc</sub> when used</span><span class="eq">L = L<sub>GAN</sub>(G, D<sub>Y</sub>, X, Y) + L<sub>GAN</sub>(F, D<sub>X</sub>, Y, X) + λ<sub>cyc</sub> L<sub>cyc</sub>(G, F) + λ<sub>id</sub> L<sub>id</sub>(G, F)</span>
+<span class="eq">G*, F* = arg min<sub>G,F</sub> max<sub>D<sub>X</sub>,D<sub>Y</sub></sub> L</span></div>
+
+      <h4>What is actually run</h4>
+      <ul class="notes">
+        <li><b>Least-squares adversarial loss</b> (the LSGAN row in §06) instead of the log loss. It trains more stably and keeps gradients alive for fakes that are already on the right side of the decision boundary but far from it.</li>
+        <li>Generators are residual networks (a few stride-2 downsampling layers, 6–9 residual blocks, upsampling back) with <b>instance normalisation</b>. Discriminators are the 70×70 PatchGANs of §11.</li>
+        <li>The discriminators are updated from a <b>history buffer</b> of about 50 past generated images rather than only the latest batch. This damps the oscillation from §03, because the discriminator cannot simply chase the generator's most recent move.</li>
+      </ul>
+      <div class="formula"><span class="lbl">lsgan form used in practice (one direction)</span><span class="eq">D<sub>Y</sub> minimises   𝔼<sub>y</sub>[ (D<sub>Y</sub>(y) − 1)² ] + 𝔼<sub>x</sub>[ D<sub>Y</sub>(G(x))² ]</span>
+<span class="eq">G   minimises   𝔼<sub>x</sub>[ (D<sub>Y</sub>(G(x)) − 1)² ]  +  λ<sub>cyc</sub> L<sub>cyc</sub> + λ<sub>id</sub> L<sub>id</sub></span></div>
+
+      <h4>When the identity term matters</h4>
+      <ul class="notes">
+        <li>The cycle term makes <code>G</code> <b>invertible</b>, not <b>faithful</b>. A mapping that swaps sky-blue with sunset-orange is perfectly invertible, and if both colours are common in the target domain, the discriminator has no objection either. Without anything else, painting→photo models often change the overall tint, for example turning daytime paintings into dusk.</li>
+        <li>The identity term says that an image already in the target domain should be left alone. In practice this pulls <code>G</code> toward the identity map wherever the identity is acceptable, which <b>preserves colour composition</b>. It only makes sense when the two domains share a pixel space and much of their appearance (photos and paintings), and it gets in the way when the translation is supposed to change colour (day → night).</li>
+      </ul>
+
+      <p>The figure below reduces this to one dimension. Domain <code>X</code> and domain <code>Y</code> are two distributions of a scalar such as brightness. Every candidate mapping except the collapse pushes <code>X</code> exactly onto <code>Y</code>, so they tie on the adversarial term. Raise the two weights and watch which candidate wins.</p>
+      <div class="viz" id="viz-cycle">
+        <div class="vhead">
+          <span class="vtitle">Cycle and identity losses decide among mappings the discriminator cannot tell apart</span>
+          <span class="vhint">set the two weights; the bars are each candidate's total loss, the lowest wins; click a bar to draw its G and the round trip F(G(x))</span>
+        </div>
+        <div class="controls">
+          <label><span>λ</span><sub>cyc</sub> <input type="range" id="cyc-lc" min="0" max="10" step="0.5" value="0"></label>
+          <label><span>λ</span><sub>id</sub> <input type="range" id="cyc-li" min="0" max="5" step="0.25" value="0"></label>
+          <button class="btn ghost" id="cyc-paper">Typical weights (10, 5)</button>
+          <button class="btn ghost" id="cyc-reset">Reset</button>
+        </div>
+        <svg id="cyc-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="Interactive diagram: candidate mappings from a one-dimensional domain X to domain Y, with bar chart of adversarial, cycle and identity losses for each candidate"></svg>
+        <div class="readout" aria-live="polite" id="cyc-readout"></div>
+      </div>
+      <ul class="notes">
+        <li>With both weights at zero, the monotone map, the reversed map and the 2-to-1 and 3-to-1 folds all tie: each one maps <code>X</code> onto <code>Y</code>'s distribution, and the folds are many-to-one. That is the under-determination the cycle term exists to remove.</li>
+        <li>The cycle term eliminates the folds, because a many-to-one map cannot be inverted. It does <b>not</b> separate the monotone map from the reversed one, since both are bijections. Only the identity term, which prefers mappings close to the identity, picks the order-preserving one. In images, that is the "invertible but recoloured" failure.</li>
+        <li>Push <code>λ<sub>id</sub></code> high with <code>λ<sub>cyc</sub></code> at zero and the <b>collapse</b> wins. The identity term rewards changing as little as possible, and a constant that sits between the two domains changes very little. The identity term only helps on top of a cycle term, never as a replacement for it.</li>
+      </ul>
+
+      <h4>Failure modes</h4>
+      <ul class="notes">
+        <li><b>Geometry is hard.</b> Cycle consistency combined with residual generators and patch discriminators makes changes of texture and colour easy (horse ↔ zebra, summer ↔ winter, photo ↔ painting) and changes of <b>shape</b> hard. Cat ↔ dog translations tend to produce minimal edits, because a large geometric change is expensive to invert and is not what a local patch critic rewards.</li>
+        <li><b>Steganography.</b> The cycle term can be met by cheating. When <code>G</code> must drop information (aerial photo → map: the map has no trees), it can instead <b>hide</b> that information in a low-amplitude, high-frequency signal that no discriminator objects to, and <code>F</code> learns to decode it. The round trip looks perfect, but the reconstruction comes from the hidden signal rather than from the content. As a side effect, the mapping becomes adversarially fragile: a tiny perturbation of <code>G(x)</code> sends <code>F</code>'s output somewhere else entirely. Adding noise or blur inside the cycle, or weakening the cycle constraint, makes hiding information harder.</li>
+        <li><b>Dataset bias becomes content.</b> The model applies whatever co-occurs in the target domain. If the zebra photos never contain riders, a horse with a rider gets a striped rider.</li>
+        <li><b>One answer per input.</b> Like Pix2Pix it is deterministic. Multimodal successors split each image into a <b>shared content code</b> and a <b>domain-specific style code</b> and sample the style.</li>
+      </ul>
+
+      <h4>Successors, conceptually</h4>
+      <ul class="notes">
+        <li><b>Contrastive unpaired translation</b> drops the second generator and the cycle entirely. It enforces correspondence <b>patch by patch</b>: the feature of an output patch should be closer to the feature of the input patch at the same location than to input patches elsewhere. That is an InfoNCE loss over spatial locations (see <a href="contrastive-learning.html">Contrastive Learning</a>). It trains one direction, is cheaper, and is less prone to steganography because it never asks for exact pixel reconstruction.</li>
+        <li><b>Multi-domain</b> variants use one generator conditioned on a target-domain label, with a single discriminator that also classifies the domain, instead of training a pair of networks for every domain pair.</li>
+      </ul>
+
+      <div class="callout"><b>Takeaway:</b> cycle consistency rules out <b>many-to-one</b> maps, not <b>wrong bijections</b>. The identity term, architectural locality (patch critics, residual generators) and dataset curation are what pick the bijection you actually wanted.</div>
+    </section>
+
+    <!-- 13 ───────────────────────────────────────────── -->
+    <section class="topic" id="style-transfer" data-nav="Neural style transfer">
+      <h3><span class="idx">13</span> Neural style transfer: the non-adversarial baseline</h3>
+      <p class="lede">Before translation GANs, stylisation was posed with no discriminator and no generator: <b>optimise the pixels of one image</b> so that a frozen classifier sees one image's content in it and another image's texture statistics.</p>
+
+      <h4>Content and style from one frozen network</h4>
+      <ul class="notes">
+        <li>Take a pretrained image classifier (a VGG-style convnet, frozen) and read off its feature maps. At layer <code>l</code> there are <code>N<sub>l</sub></code> channels over <code>M<sub>l</sub> = H<sub>l</sub>W<sub>l</sub></code> positions, stored as a matrix <code>F<sup>l</sup> ∈ ℝ<sup>N<sub>l</sub>×M<sub>l</sub></sup></code>. Deep layers encode objects and layout; shallow layers encode colours and strokes (see <a href="convolutional-networks/blocks-backprop-features.html#learns">what a convnet learns</a>).</li>
+        <li><b>Content loss</b>: squared error between the generated image's features <code>F</code> and the content image's features <code>P</code> at a single <b>deep</b> layer. At that depth it constrains <i>what is where</i> but not exact pixel values, so the image can be repainted without losing the scene.</li>
+        <li><b>Style loss</b>: compare <b>Gram matrices</b>, the channel-by-channel co-activation statistics summed over every position, at <b>several</b> layers from shallow to deep, so style is matched from fine brush texture up to larger motifs.</li>
+        <li>The Gram sum runs over positions, so it <b>throws away where things are</b>. Permute the positions of a feature map and the Gram matrix does not change. That is why it captures texture rather than layout, and it is exactly the Markovian, patch-statistic view the PatchGAN discriminator learns (§11).</li>
+        <li>Then <b>optimise the image</b> <code>x</code>, starting from noise or from the content image, by gradient descent on <code>α L<sub>content</sub> + β L<sub>style</sub></code> with the network frozen. Every new image is its own optimisation of hundreds of iterations, with no training and no generalisation.</li>
+      </ul>
+      <div class="formula"><span class="lbl">content loss at one deep layer l (F: generated, P: content image)</span><span class="eq">L<sub>content</sub>(x, c) = ½ ∑<sub>i,j</sub> ( F<sup>l</sup><sub>ij</sub> − P<sup>l</sup><sub>ij</sub> )²</span>
+
+<span class="lbl">gram matrix: channel co-activation, summed over positions k</span><span class="eq">G<sup>l</sup><sub>ij</sub> = ∑<sub>k</sub> F<sup>l</sup><sub>ik</sub> F<sup>l</sup><sub>jk</sub>          (N<sub>l</sub> × N<sub>l</sub>; A<sup>l</sup> is the same for the style image)</span>
+
+<span class="lbl">style loss over several layers with weights w<sub>l</sub></span><span class="eq">E<sub>l</sub> = 1 / (4 N<sub>l</sub>² M<sub>l</sub>²) · ∑<sub>i,j</sub> ( G<sup>l</sup><sub>ij</sub> − A<sup>l</sup><sub>ij</sub> )²          L<sub>style</sub>(x, s) = ∑<sub>l</sub> w<sub>l</sub> E<sub>l</sub></span>
+
+<span class="lbl">total, optimised over the pixels of x; <span class="keep">α/β</span> sets content vs style (ratios around 10⁻³ to 10⁻⁴ are typical)</span><span class="eq">x* = arg min<sub>x</sub>  α · L<sub>content</sub>(x, c) + β · L<sub>style</sub>(x, s)</span></div>
+
+      <div class="viz" id="viz-gram">
+        <div class="vhead">
+          <span class="vtitle">The Gram matrix ignores spatial arrangement</span>
+          <span class="vhint">shuffle the image's patches: content loss jumps, the Gram matrix of per-pixel features does not move, and the edge features change only along the cut lines</span>
+        </div>
+        <div class="controls">
+          <label>patch size <select id="gram-p"><option value="1">1 px</option><option value="2">2 px</option><option value="4" selected>4 px</option><option value="8">8 px</option></select></label>
+          <button class="btn" id="gram-shuffle">Shuffle patches</button>
+          <button class="btn ghost" id="gram-reset">Restore</button>
+        </div>
+        <svg id="gram-svg" width="640" height="248" viewBox="0 0 640 248" role="img" aria-label="Interactive diagram: an image and a patch-shuffled copy with their five-channel Gram matrices and the content and style losses between them"></svg>
+        <div class="readout" aria-live="polite" id="gram-readout"></div>
+      </div>
+      <ul class="notes">
+        <li>The colour channels are computed <b>per pixel</b>, so shuffling positions only permutes the columns of <code>F</code>, and <code>F Fᵀ</code> is exactly unchanged. The two gradient channels look at neighbours (a 2-pixel receptive field), so they change only where a cut puts unrelated pixels side by side. Larger patches mean fewer cuts and a smaller change. A deep convnet behaves the same way with a much larger receptive field: shuffling patches bigger than that field leaves the style statistics nearly intact.</li>
+      </ul>
+
+      <h4>From optimisation to one forward pass</h4>
+      <ul class="notes">
+        <li><b>Fast feed-forward stylisation.</b> Train a transformation network (an encoder, residual blocks, a decoder) to minimise the same content + style <b>perceptual loss</b> over a whole dataset of content images, for one fixed style. Inference is then one forward pass, roughly a thousand times faster than per-image optimisation, with slightly lower quality. Replacing batch normalisation with <b>instance normalisation</b> inside that network improves results noticeably: it removes each image's own contrast statistics, which are largely style.</li>
+        <li><b>Conditional instance normalisation</b> lets one network learn many styles by giving each style its own per-channel scale and shift. That observation, that a style is almost entirely captured by per-channel feature statistics, leads straight to AdaIN.</li>
+        <li><b>AdaIN</b> (adaptive instance normalisation) handles arbitrary styles without training per style. Encode content and style with the frozen network, normalise each channel of the content features to zero mean and unit standard deviation over space, rescale them to the <b>style</b> features' mean and standard deviation, and decode. Only the decoder is trained. Interpolating between the content features and the AdaIN output sets the strength of the stylisation at inference time.</li>
+        <li>Matching only means and standard deviations is weaker than matching full Gram matrices, but it captures most of what makes a texture look like itself. Style losses in general can be read as matching <b>distributions of feature vectors</b> across positions, and both mean/std and Gram matching are ways of comparing those distributions. Variants that whiten the content covariance and recolour it with the style covariance sit between the two.</li>
+        <li>StyleGAN's per-layer modulation (§07) is AdaIN with the style statistics produced by a mapping network instead of measured from a style image.</li>
+      </ul>
+      <div class="formula"><span class="lbl">adain, per channel c, statistics over spatial positions</span><span class="eq">AdaIN(x, y) = σ(y) · ( x − μ(x) ) / σ(x) + μ(y)</span>
+
+<span class="lbl">stylise with strength <span class="keep">t</span> ∈ [0, 1], f = frozen encoder, g = trained decoder</span><span class="eq">output = g( (1 − t) · f(c) + t · AdaIN( f(c), f(s) ) )</span>
+
+<span class="lbl">decoder loss: content target is the adain output u, style matched by moments at several layers <span class="keep">φᵢ</span></span><span class="eq">L = ‖ f(g(u)) − u ‖₂ + λ ∑<sub>i</sub> ( ‖ μ(φᵢ(g(u))) − μ(φᵢ(s)) ‖₂ + ‖ σ(φᵢ(g(u))) − σ(φᵢ(s)) ‖₂ )</span></div>
+
+      <table class="cmp">
+        <tr><th>Approach</th><th>Styles per model</th><th>Cost per image</th><th>What defines "style"</th></tr>
+        <tr><td>Per-image optimisation</td><td>Any (no model)</td><td>Hundreds of forward + backward passes</td><td>Gram matrices at several layers</td></tr>
+        <tr><td>Feed-forward network</td><td>One</td><td>One forward pass</td><td>Same losses, learned once</td></tr>
+        <tr><td>Conditional instance norm</td><td>A fixed set</td><td>One forward pass</td><td>A learned scale/shift per style</td></tr>
+        <tr><td>AdaIN</td><td>Any</td><td>One forward pass</td><td>Per-channel mean and std of the style image's features</td></tr>
+        <tr><td>CycleGAN (§12)</td><td>One domain</td><td>One forward pass</td><td>A whole collection, judged by a discriminator</td></tr>
+      </table>
+      <ul class="notes">
+        <li>The real difference from translation GANs is the <b>reference</b>. Style transfer imitates <b>one image's</b> statistics as measured by a fixed network. A translation GAN imitates a <b>whole domain</b> as judged by a learned critic, which is why CycleGAN can make a photo look like "a Monet" rather than like one particular Monet. Feature-space losses never went away: perceptual losses sit alongside adversarial ones in super-resolution and in the <a href="autoencoders-vaes.html#today">autoencoders under latent diffusion</a>.</li>
+      </ul>
+
+      <div class="callout"><b>Takeaway:</b> <b>style is orderless feature statistics, content is ordered features.</b> Gram matrices, AdaIN's moments and the PatchGAN critic are three increasingly learned ways of measuring the first while keeping the second.</div>
+    </section>
+
+    <!-- 14 ───────────────────────────────────────────── -->
+    <section class="topic" id="deepfakes" data-nav="Deepfakes &amp; detection">
+      <h3><span class="idx">14</span> Deepfakes: face swap, reenactment, detection</h3>
+      <p class="lede">"Deepfake" covers two technical problems. <b>Swapping</b> replaces who a face is while keeping what it is doing. <b>Reenactment</b> keeps who a face is and replaces what it is doing. The core of the first is a plain autoencoder with one structural trick; GANs mostly polish the result.</p>
+
+      <h4>The shared-encoder, two-decoder face swap</h4>
+      <ul class="notes">
+        <li>Collect many aligned face crops of person A and of person B, aligned with facial landmarks. Train <b>one encoder</b> <code>E</code> and <b>two decoders</b> <code>D<sub>A</sub></code>, <code>D<sub>B</sub></code>, each reconstructing only its own person. This is an ordinary reconstruction <a href="autoencoders-vaes.html">autoencoder</a> objective; there is no swapping during training at all.</li>
+        <li><b>Why the shared encoder is the trick.</b> The one encoder has to produce codes that both decoders can use. Identity is the thing the two decoders differ on, so the cheapest solution is for each decoder to supply the identity (face shape, skin, features) and for the code to carry what the two datasets share: <b>pose, expression, gaze, lighting</b>. Under the bottleneck the code becomes approximately identity-free. It is a disentanglement obtained from the architecture rather than from a loss term.</li>
+        <li>At swap time, encode a frame of A and decode it with B's decoder: <code>D<sub>B</sub>(E(x<sub>A</sub>))</code> is B's face with A's pose and expression. The face is then masked, colour-corrected and blended back into the original frame, and that step is where most visible artefacts come from.</li>
+        <li>Training uses heavy <b>random warping</b> of the input while the target stays clean, so the decoder learns to produce a correct face from a distorted code rather than copying pixels. Results depend heavily on data: B's decoder can only render poses and lighting it saw in B's footage.</li>
+        <li><b>GAN refinement.</b> A pure reconstruction loss blurs pores, teeth and hair (§11). Adding a patch discriminator, perceptual losses and a face-restoration or super-resolution pass sharpens the output. The adversarial term is a finishing tool here, not the core method.</li>
+        <li><b>Identity-agnostic swapping</b> removes per-pair training. A face-recognition network provides an identity embedding of B, injected into a single generator through AdaIN-style modulation (§13), and the loss requires that the output's embedding match B while attributes match A. One model can swap any pair from a single photo of the target.</li>
+      </ul>
+      <div class="formula"><span class="lbl">training: two reconstruction losses through one shared encoder (warp w is random augmentation)</span><span class="eq">L = 𝔼<sub>x<sub>A</sub></sub>[ ‖ D<sub>A</sub>(E(w(x<sub>A</sub>))) − x<sub>A</sub> ‖₁ ] + 𝔼<sub>x<sub>B</sub></sub>[ ‖ D<sub>B</sub>(E(w(x<sub>B</sub>))) − x<sub>B</sub> ‖₁ ]   (+ perceptual + adversarial terms)</span>
+
+<span class="lbl">inference: cross the decoders</span><span class="eq">swap(x<sub>A</sub>) = D<sub>B</sub>( E(x<sub>A</sub>) )      ← B's identity, A's pose / expression / lighting</span></div>
+
+      <h4>Face reenactment and motion transfer</h4>
+      <ul class="notes">
+        <li>Reenactment drives a target face (one photo or a short clip) with a source's motion. The pipeline is: estimate a <b>motion representation</b> from the driving video, then render the target under it.</li>
+        <li><b>Explicit</b> representations: 2-D facial landmarks, or the parameters of a fitted 3-D morphable face model (shape, expression, pose). Transfer the expression and pose parameters and render, then a conditional generator, effectively a Pix2Pix-style translator from a rendering or landmark map to a photo, makes the result realistic.</li>
+        <li><b>Learned keypoints.</b> Self-supervised models discover their own keypoints, each with a local affine transform, by training to reconstruct one frame of a video from another. At test time the keypoint motion of the driving video becomes a dense warp field plus an occlusion map applied to the target's features, and the generator inpaints whatever the warp cannot explain. Because nothing is face-specific, the same approach animates bodies and other objects.</li>
+        <li><b>Audio-driven</b> talking heads predict mouth motion from speech, the basis of lip-sync dubbing. Paired with a cloned voice, this is the most consequential misuse path.</li>
+      </ul>
+
+      <h4>Detection cues, and why each one decays</h4>
+      <table class="cmp">
+        <tr><th>Cue</th><th>What it exploits</th><th>Why it erodes</th></tr>
+        <tr><td>Blending boundaries</td><td>The pasted face meets the original frame along a mask edge; noise, compression and colour statistics differ across it</td><td>Better masks and colour transfer; whole-frame generation has no seam</td></tr>
+        <tr><td>Temporal inconsistency</td><td>Frame-by-frame swapping flickers: identity, edges and lighting jitter between frames; occlusions (hands, glasses) break the swap</td><td>Temporally aware generators and smoothing</td></tr>
+        <tr><td>Physiology</td><td>Unnatural blink rates, teeth and eye-reflection inconsistencies, missing pulse-induced skin-colour variation, mouth shapes that do not match the phonemes</td><td>Each published cue becomes a training target and is fixed in the next generation</td></tr>
+        <tr><td>Head-pose geometry</td><td>Inner-face landmarks (swapped) and outer head pose (original) disagree slightly in 3-D</td><td>Full-head synthesis and reenactment</td></tr>
+        <tr><td>Frequency fingerprints</td><td>Upsampling layers leave periodic spectral peaks and checkerboard energy; each generator leaves a characteristic high-frequency fingerprint</td><td>Compression and resizing destroy it; alias-free and diffusion generators change it</td></tr>
+        <tr><td>Provenance &amp; watermarking</td><td>Cryptographically signed capture and edit history; invisible watermarks embedded by the generator</td><td>Needs adoption across the whole pipeline; watermarks can be degraded; an unsigned file proves nothing</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>The arms-race caveat.</b> A detector is a discriminator, and a strong discriminator is exactly what a generator trains against (§01). Any detector published as a differentiable model can be used as an extra adversarial loss. Detectors also <b>generalise poorly</b>: trained on one manipulation method, accuracy falls sharply on unseen methods and on heavily compressed social-media video. Treat a detector's score as one piece of evidence, never as proof, and be most suspicious of a confident "real".</li>
+        <li>That is why the field is moving from <b>detecting fakes</b> to <b>authenticating originals</b>. Provenance asks "can this file prove where it came from?" instead of "does this file look generated?", and that question does not get harder as generators improve.</li>
+      </ul>
+
+      <h4>Misuse, consent and disclosure</h4>
+      <ul class="notes">
+        <li>The dominant real-world harm has been <b>non-consensual intimate imagery</b>, overwhelmingly targeting women, followed by <b>fraud</b> (cloned voices and faces in video calls authorising payments or bypassing identity checks) and <b>disinformation</b>. A subtler harm is the <b>liar's dividend</b>: once fakes are plausible, real recordings can be dismissed as fake.</li>
+        <li>Legitimate uses are real too: dubbing and de-ageing in film, privacy-preserving face anonymisation, accessibility, and synthetic training data. They share two requirements: <b>consent</b> of every person whose likeness is used, and <b>disclosure</b> to the audience that the media is synthetic.</li>
+        <li>For practitioners, the norms are: do not build or release identity-swap tooling without consent checks and visible or embedded disclosure, keep training data to people who agreed, and remember that synthesising a real person's likeness is regulated or criminal in a growing number of jurisdictions.</li>
+      </ul>
+
+      <div class="callout"><b>Takeaway:</b> the face swap is an <b>autoencoder whose shared encoder is forced to forget identity</b>, and GANs only sharpen it. Detection is a discriminator in an arms race it structurally loses over time. Provenance and consent are the durable defences.</div>
+    </section>
+
+    <!-- 15 ───────────────────────────────────────────── -->
+    <section class="topic" id="diffusion-translation" data-nav="Translation after diffusion">
+      <h3><span class="idx">15</span> Where diffusion has displaced GANs for translation and editing</h3>
+      <p class="lede">Each of the tasks above now has a diffusion-based counterpart, and for most quality-first uses it is the default. The underlying ideas (conditioning on structure, a constraint that ties output to input) carried over. The <b>single-step generator</b> did not.</p>
+
+      <h4>The three replacements</h4>
+      <ul class="notes">
+        <li><b>Image-conditioned diffusion</b> (paired translation). Concatenate the source image onto the noisy input as extra channels and train the ordinary <a href="diffusion-models.html#training">denoising objective</a>. Colourisation, inpainting, uncropping, restoration and super-resolution all fit this one recipe with no adversarial loss and no task-specific architecture. Because the model learns the whole conditional distribution rather than a near-deterministic map, it produces <b>genuinely diverse</b> outputs, which is the multimodality Pix2Pix could not deliver (§11).</li>
+        <li><b>Inversion-based editing</b> (unpaired translation and editing). Noise the input part of the way along the forward process, then denoise it under a new condition (a new prompt, or a model trained only on the target domain). The noise level is a faithfulness/realism dial: little noise keeps the input's structure, a lot gives the model freedom. Deterministic samplers can be run <b>backwards</b> to find the exact noise that reproduces an image, and editing then works by changing the prompt or the cross-attention maps while replaying that noise. This is diffusion's counterpart to GAN inversion (§08). Running one domain's model forward to noise and another domain's model back to an image gives an unpaired translator that is <b>cycle-consistent by construction</b>, because the deterministic ODE is invertible.</li>
+        <li><b>ControlNet-style conditioning</b> (structure-to-image). Freeze a large pretrained text-to-image backbone, train a copy of its encoder on the structural input (edges, depth, pose, segmentation), and add that copy's features back into the frozen network through <b>zero-initialised</b> layers, so training starts from the unchanged backbone (the same zero-init trick as in <a href="residual-skip-connections.html#init">residual initialisation</a>). This is Pix2Pix's problem solved on top of a pretrained prior trained on billions of images instead of a few thousand pairs. Lighter adapters do the same with a small side network. See <a href="diffusion-models.html#guidance">conditioning &amp; guidance</a>.</li>
+      </ul>
+
+      <table class="cmp">
+        <tr><th>Task</th><th>GAN-era approach</th><th>Diffusion-era approach</th><th>What changed</th></tr>
+        <tr><td>Labels / edges → photo</td><td>Pix2Pix, multi-scale or spatially-normalised successors</td><td>Structure adapters on a frozen text-to-image model</td><td>A huge pretrained prior; text control; diverse outputs</td></tr>
+        <tr><td>Unpaired domain transfer</td><td>CycleGAN, contrastive patch losses</td><td>Partial noising + target-domain denoising; ODE-bridge inversion</td><td>No adversarial game; strength is a single noise-level dial</td></tr>
+        <tr><td>Stylisation</td><td>Feed-forward / AdaIN networks</td><td>Prompted or reference-image-conditioned diffusion</td><td>Semantic styles ("as a watercolour") beyond texture statistics</td></tr>
+        <tr><td>Face swap / reenactment</td><td>Shared-encoder autoencoders + GAN refinement; keypoint warping</td><td>Identity-conditioned diffusion; video diffusion driven by pose or audio</td><td>Fewer seams and better temporal coherence, which also makes detection harder (§14)</td></tr>
+        <tr><td>Real-time, on-device</td><td>Single-pass GAN generators</td><td>Still mostly GANs, or diffusion distilled to 1–4 steps with an adversarial loss</td><td>Latency budget, not quality, decides</td></tr>
+      </table>
+
+      <h4>What GANs keep</h4>
+      <ul class="notes">
+        <li><b>Single-step speed.</b> A translation GAN runs one forward pass per frame. Video-call filters, camera effects, live game upscaling and on-device editing still favour it, or favour a diffusion model distilled into a one-step generator, often with adversarial plus cycle or reconstruction losses on top. At that point the result is structurally a GAN again (§16).</li>
+        <li><b>Small paired datasets in a narrow domain</b> where no suitable pretrained backbone exists: medical modalities, sensor-to-sensor translation, scientific imaging. A Pix2Pix-sized model trained from scratch is cheap and well understood.</li>
+        <li><b>A compact editing latent</b> for faces and other aligned domains (§08), which diffusion editing still reaches only indirectly.</li>
+      </ul>
+
+      <div class="callout"><b>Takeaway:</b> diffusion took the translation tasks by bringing a <b>pretrained prior and an honest conditional distribution</b>. GANs keep the cases where the answer is needed in <b>one pass</b>, and the adversarial loss lives on inside the distilled models that replaced them.</div>
+    </section>
+
+    <!-- 16 ───────────────────────────────────────────── -->
     <section class="topic" id="compare" data-nav="GANs vs diffusion vs VAEs">
-      <h3><span class="idx">10</span> GANs vs diffusion vs VAEs</h3>
+      <h3><span class="idx">16</span> GANs vs diffusion vs VAEs</h3>
       <p class="lede">Diffusion took the crown for open-ended synthesis. Knowing <b>why</b> shows where GANs are still the right answer.</p>
 
       <table class="cmp">
@@ -446,6 +756,7 @@
         <tr><td>Mode coverage</td><td>Weak point — collapse is real</td><td>Strong; likelihood-flavoured objective</td><td>Strong</td></tr>
         <tr><td>Sampling cost</td><td><b>One</b> forward pass</td><td>Tens to hundreds of steps (fewer when distilled)</td><td>One forward pass</td></tr>
         <tr><td>Density available</td><td>No</td><td>Yes, via the ODE formulation</td><td>Lower bound</td></tr>
+        <tr><td>Image-to-image translation</td><td>One pass; near-deterministic; needs task-specific training (§11–§12)</td><td>Pretrained prior + adapters or partial noising; diverse outputs (§15)</td><td>Rarely used alone; blur limits it</td></tr>
         <tr><td>Latent space</td><td>Compact and highly editable</td><td>Same dimension as data; editing is indirect</td><td>Compact, smooth, less expressive</td></tr>
       </table>
 
@@ -454,7 +765,7 @@
         <li><b>Latency.</b> One-step generation matters for real-time, interactive and on-device work. Much of the recent few-step distillation of diffusion models leans on an <b>adversarial</b> loss to recover the sharpness lost at low step counts — the GAN objective survives as a component even where the GAN model does not.</li>
         <li><b>Restoration tasks.</b> Super-resolution, denoising, inpainting and face restoration are conditional problems with a strong input prior; an adversarial term is an efficient way to buy perceptual sharpness that a reconstruction loss alone will always blur away.</li>
         <li><b>Adversarial losses inside other systems.</b> The decoders of the image tokenizers used by latent diffusion models, and most neural audio vocoders and codecs, are trained with a discriminator alongside a reconstruction loss. That is a GAN doing quiet, essential work underneath models that are not GANs.</li>
-        <li><b>Editing.</b> When you want a single vector you can move along an interpretable direction, the latent space of a trained GAN is still unusually convenient — diffusion editing goes through inversion, prompts, or attention surgery instead.</li>
+        <li><b>Editing.</b> When you want a single vector you can move along an interpretable direction, the latent space of a trained GAN is still unusually convenient — diffusion editing goes through inversion, prompts, or attention surgery instead (§15 walks through those replacements task by task, with <a href="#diffusion-translation">a GAN-era vs diffusion-era table</a>).</li>
         <li><b>Narrow domains with limited data.</b> With adaptive augmentation, a GAN can be trained to high quality on a few thousand images of one thing, on one GPU. That is a very different resource profile from training or even fine-tuning a diffusion model.</li>
       </ul>
       <p>Related pages: <a href="diffusion-models.html">Diffusion Models</a> for the likelihood-style alternative, and <a href="contrastive-learning.html">Contrastive Learning</a> for the other major "learn by comparing" objective.</p>
@@ -462,9 +773,9 @@
       <div class="callout"><b>Takeaway:</b> diffusion trades <b>compute at sampling time</b> for <b>stability at training time</b>. GANs make the opposite bet — and that bet still pays whenever you need the sample now.</div>
     </section>
 
-    <!-- 11 ───────────────────────────────────────────── -->
+    <!-- 17 ───────────────────────────────────────────── -->
     <section class="topic" id="practice" data-nav="Practical checklist">
-      <h3><span class="idx">11</span> Practical checklist &amp; pitfalls</h3>
+      <h3><span class="idx">17</span> Practical checklist &amp; pitfalls</h3>
       <p class="lede">A default configuration that works, and the mistakes that waste the most time.</p>
 
       <h4>A sane starting point</h4>

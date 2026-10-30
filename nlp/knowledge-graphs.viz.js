@@ -130,3 +130,269 @@
   selH.on("change",draw); selR.on("change",draw);
   draw();
 })();
+
+/* ───────────────────────── 04 · table row → typed triples ───────────────────────── */
+(function(){
+  const svgEl=document.getElementById("map-svg"), rowSel=document.getElementById("map-row"), modeSel=document.getElementById("map-mode");
+  if(!svgEl||!rowSel||!modeSel||typeof d3==="undefined") return;
+  const C={accent:"#c084fc",a2:"#ffb454",good:"#4ade80",bad:"#f87171",blue:"#5b9cff",muted:"#9aa3b2",ink:"#e6e9ef",line:"#2a2f3a",panel:"#15181f"};
+  const svg=d3.select(svgEl);
+  const cols=["id","name","works_for","born","reports_to"];
+  const people=[
+    {id:101,name:"Ada Ruiz",works_for:7,born:"1984-03-02",reports_to:102},
+    {id:102,name:"Ben Osei",works_for:7,born:"1979-11-20",reports_to:null},
+    {id:103,name:"Chen Li",works_for:9,born:"c. 1990",reports_to:101},
+  ];
+  const orgs=[{id:7,name:"Orbital Labs"},{id:8,name:"Kestrel Bio"}];
+  const isDate=s=>/^\d{4}-\d{2}-\d{2}$/.test(String(s));
+  const personIds=new Set(people.map(p=>p.id)), orgIds=new Set(orgs.map(o=>o.id));
+
+  function triples(r,mode){
+    const out=[];
+    if(mode==="direct"){
+      const s=`<person/id=${r.id}>`;
+      out.push({col:"id",s,p:"rdf:type",o:"<person>",kind:"iri"});
+      out.push({col:"name",s,p:"person#name",o:`"${r.name}"`,kind:"lit"});
+      out.push({col:"works_for",s,p:"person#ref-works_for",o:`<org/id=${r.works_for}>`,kind:"iri"});
+      out.push({col:"born",s,p:"person#born",o:`"${r.born}"`,kind:"lit"});
+      if(r.reports_to!=null) out.push({col:"reports_to",s,p:"person#ref-reports_to",o:`<person/id=${r.reports_to}>`,kind:"iri"});
+      else out.push({col:"reports_to",s:"",p:"",o:"",kind:"none"});
+      return out;
+    }
+    const s=`ex:person/${r.id}`;
+    out.push({col:"id",s,p:"rdf:type",o:"ex:Person",kind:"iri",ok:true});
+    out.push({col:"name",s,p:"ex:name",o:`"${r.name}"`,kind:"lit",ok:true});
+    const okOrg=orgIds.has(r.works_for);
+    out.push({col:"works_for",s,p:"ex:worksFor",o:`ex:org/${r.works_for}`,kind:"iri",ok:okOrg,why:okOrg?"":`worksFor range unmet: no ex:org/${r.works_for}`});
+    const okD=isDate(r.born);
+    out.push({col:"born",s,p:"ex:birthDate",o:okD?`"${r.born}"^^xsd:date`:`"${r.born}"`,kind:"lit",ok:okD,why:okD?"":`"${r.born}" is not a valid xsd:date`});
+    if(r.reports_to!=null){
+      const okP=personIds.has(r.reports_to);
+      out.push({col:"reports_to",s,p:"ex:reportsTo",o:`ex:person/${r.reports_to}`,kind:"iri",ok:okP});
+    } else out.push({col:"reports_to",s:"",p:"",o:"",kind:"none"});
+    return out;
+  }
+
+  const tx=12, ty=40, cw=[38,72,70,82,72], rh=24;
+  const cx=[tx]; cw.forEach((w,i)=>cx.push(cx[i]+w));
+  function draw(){
+    const ri=+rowSel.value, mode=modeSel.value, r=people[ri];
+    const T=triples(r,mode);
+    svg.selectAll("*").remove();
+    // person table
+    svg.append("text").attr("x",tx).attr("y",ty-10).attr("font-size",11).attr("fill",C.muted).text("table person  (PK id; FK works_for → org, reports_to → person)");
+    cols.forEach((c,j)=>{
+      svg.append("rect").attr("x",cx[j]).attr("y",ty).attr("width",cw[j]).attr("height",rh).attr("fill","#1c2030").attr("stroke",C.line);
+      svg.append("text").attr("x",cx[j]+5).attr("y",ty+16).attr("font-size",10).attr("fill",C.ink).attr("font-weight",600).text(c);
+    });
+    people.forEach((p,i)=>{
+      const y=ty+rh*(i+1), sel=i===ri;
+      cols.forEach((c,j)=>{
+        const v=p[c];
+        svg.append("rect").attr("x",cx[j]).attr("y",y).attr("width",cw[j]).attr("height",rh)
+          .attr("fill",sel?"rgba(192,132,252,.16)":C.panel).attr("stroke",sel?C.accent:C.line);
+        svg.append("text").attr("x",cx[j]+5).attr("y",y+16).attr("font-size",10)
+          .attr("fill",v==null?C.muted:(sel?C.ink:C.muted)).attr("font-style",v==null?"italic":"normal").text(v==null?"null":v);
+      });
+    });
+    // org table
+    const oy=ty+rh*5+14;
+    svg.append("text").attr("x",tx).attr("y",oy-8).attr("font-size",11).attr("fill",C.muted).text("table org");
+    [["id","name"]].concat(orgs.map(o=>[o.id,o.name])).forEach((row,i)=>{
+      row.forEach((v,j)=>{
+        const x=tx+(j?38:0), w=j?110:38;
+        svg.append("rect").attr("x",x).attr("y",oy+rh*i).attr("width",w).attr("height",rh).attr("fill",i?C.panel:"#1c2030").attr("stroke",C.line);
+        svg.append("text").attr("x",x+5).attr("y",oy+rh*i+16).attr("font-size",10).attr("fill",i?C.muted:C.ink).attr("font-weight",i?400:600).text(v);
+      });
+    });
+    // triples
+    const X0=372, ry=ty-10;
+    svg.append("text").attr("x",X0).attr("y",ry-14).attr("font-size",11).attr("fill",C.muted).text(mode==="direct"?"emitted triples (table/column vocabulary)":"emitted triples (shared ontology vocabulary)");
+    svg.append("text").attr("x",X0).attr("y",ry).attr("font-size",10).attr("font-family","SF Mono, Menlo, monospace").attr("fill",C.ink).text("s = "+(T[0]&&T[0].s));
+    const selY=ty+rh*(ri+1)+rh/2;
+    T.forEach((t,k)=>{
+      const y=ty+8+k*44;
+      const j=cols.indexOf(t.col);
+      // mapping link from cell to triple
+      svg.append("path").attr("d",`M${cx[j]+cw[j]/2},${selY+rh/2} C${cx[j]+cw[j]/2},${selY+60} ${X0-40},${y+12} ${X0-4},${y+12}`)
+        .attr("fill","none").attr("stroke",t.kind==="none"?C.line:(t.ok===false?C.bad:C.accent)).attr("stroke-opacity",.55).attr("stroke-width",1.2)
+        .attr("stroke-dasharray",t.kind==="none"?"3 3":null);
+      if(t.kind==="none"){
+        svg.append("text").attr("x",X0).attr("y",y+16).attr("font-size",10).attr("fill",C.muted).attr("font-style","italic").text(`${t.col} is null → no triple (unknown, not false)`);
+        return;
+      }
+      svg.append("rect").attr("x",X0).attr("y",y).attr("width",252).attr("height",24).attr("rx",5).attr("fill",C.panel)
+        .attr("stroke",t.ok===false?C.bad:(t.ok?C.good:C.line)).attr("stroke-opacity",.8);
+      const txt=svg.append("text").attr("x",X0+6).attr("y",y+16).attr("font-size",9.5).attr("font-family","SF Mono, Menlo, monospace");
+      txt.append("tspan").attr("fill",C.ink).text("s  ");
+      txt.append("tspan").attr("fill",C.a2).text(t.p+"  ");
+      txt.append("tspan").attr("fill",t.kind==="lit"?C.good:C.blue).text(t.o);
+      if(t.ok!==undefined) svg.append("text").attr("x",X0+258).attr("y",y+16).attr("font-size",12).attr("fill",t.ok?C.good:C.bad).text(t.ok?"✓":"✗");
+      if(t.why) svg.append("text").attr("x",X0+6).attr("y",y+36).attr("font-size",9).attr("fill",C.bad).text(t.why);
+    });
+    // legend
+    const ly=288;
+    [["IRI (entity)",C.blue],["literal (value)",C.good],["predicate",C.a2]].forEach(([l,c],i)=>{
+      svg.append("circle").attr("cx",tx+6+i*118).attr("cy",ly-4).attr("r",4).attr("fill",c);
+      svg.append("text").attr("x",tx+14+i*118).attr("y",ly).attr("font-size",10).attr("fill",C.muted).text(l);
+    });
+    const emitted=T.filter(t=>t.kind!=="none"), bad=emitted.filter(t=>t.ok===false);
+    let msg=`<b>${emitted.length}</b> triples from 1 row`;
+    if(mode==="direct") msg+=` · direct mapping: lossless but table-shaped — <code>person#ref-works_for</code> is not the same predicate as another source's <code>staff#company</code>, and <code>born</code> is an untyped string, so nothing can be checked.`;
+    else if(bad.length) msg+=` · <span style="color:${C.bad}"><b>${bad.length}</b> shape violation${bad.length>1?"s":""}</span>: ${bad.map(b=>b.why).join("; ")}. Quarantine the row rather than load it — a reasoner would not object (open world), only the closed-world shape check does.`;
+    else msg+=` · <span style="color:${C.good}">all shapes pass</span>: rows become typed entities, foreign keys become edges to other entities, values become typed literals.`;
+    d3.select("#map-read").html(msg);
+  }
+  rowSel.addEventListener("change",draw); modeSel.addEventListener("change",draw);
+  draw();
+})();
+
+/* ───────────────────────── 05 · entity linking: prior vs context vs coherence ───────────────────────── */
+(function(){
+  const svgEl=document.getElementById("el-svg"), sel=document.getElementById("el-sel"),
+        lamEl=document.getElementById("el-lam"), tauEl=document.getElementById("el-tau"), cohBtn=document.getElementById("el-coh");
+  if(!svgEl||!sel||!lamEl||!tauEl||!cohBtn||typeof d3==="undefined") return;
+  const C={accent:"#c084fc",a2:"#ffb454",good:"#4ade80",bad:"#f87171",blue:"#5b9cff",muted:"#9aa3b2",ink:"#e6e9ef",line:"#2a2f3a",panel:"#15181f"};
+  const svg=d3.select(svgEl), W=640, H=360, BETA=1.0;
+  // p = prior P(e|m) from an alias table; s = context similarity sim(ctx(m), desc(e)) ∈ [0,1]
+  const S=[
+    {text:"Jordan flew from Paris to Amman for talks.",
+     M:[{m:"Jordan",c:[{e:"Jordan (basketball player)",p:.55,s:.15},{e:"Jordan (country)",p:.30,s:.55},{e:"Jordan River",p:.08,s:.35}]},
+        {m:"Paris",c:[{e:"Paris (France)",p:.85,s:.50},{e:"Paris (mythology)",p:.05,s:.10},{e:"Paris, Texas",p:.04,s:.20}]},
+        {m:"Amman",c:[{e:"Amman (city)",p:.95,s:.60},{e:"Amman Governorate",p:.04,s:.45}]}],
+     rel:{"Jordan (country)|Amman (city)":.9,"Jordan (country)|Amman Governorate":.85,"Jordan River|Amman (city)":.4,"Jordan River|Amman Governorate":.4,
+          "Jordan (country)|Paris (France)":.3,"Paris (France)|Amman (city)":.25,"Paris (France)|Amman Governorate":.1,"Jordan (basketball player)|Paris (France)":.1}},
+    {text:"Jordan scored 40 as Chicago beat Boston.",
+     M:[{m:"Jordan",c:[{e:"Jordan (basketball player)",p:.55,s:.70},{e:"Jordan (country)",p:.30,s:.05},{e:"Jordan River",p:.08,s:.02}]},
+        {m:"Chicago",c:[{e:"Chicago (city)",p:.80,s:.15},{e:"Chicago Bulls (team)",p:.12,s:.80},{e:"Chicago (musical)",p:.05,s:.05}]},
+        {m:"Boston",c:[{e:"Boston (city)",p:.85,s:.15},{e:"Boston Celtics (team)",p:.10,s:.80},{e:"Boston (band)",p:.04,s:.10}]}],
+     rel:{"Jordan (basketball player)|Chicago Bulls (team)":.95,"Jordan (basketball player)|Boston Celtics (team)":.7,"Chicago Bulls (team)|Boston Celtics (team)":.9,
+          "Chicago (city)|Boston (city)":.4,"Jordan (basketball player)|Chicago (city)":.3,"Jordan (basketball player)|Boston (city)":.3,
+          "Chicago Bulls (team)|Boston (city)":.2,"Chicago (city)|Boston Celtics (team)":.2,"Chicago (musical)|Boston (band)":.15}},
+    {text:"Apple unveiled the phone in Paris, near the Seine.",
+     M:[{m:"Apple",c:[{e:"Apple (company)",p:.60,s:.70},{e:"apple (fruit)",p:.35,s:.10},{e:"Apple Records",p:.05,s:.15}]},
+        {m:"Paris",c:[{e:"Paris (France)",p:.85,s:.55},{e:"Paris (mythology)",p:.05,s:.05},{e:"Paris, Texas",p:.04,s:.10}]},
+        {m:"Seine",c:[{e:"Seine (river)",p:.90,s:.60},{e:"Seine (former department)",p:.10,s:.30}]}],
+     rel:{"Paris (France)|Seine (river)":.9,"Paris (France)|Seine (former department)":.8,"Apple (company)|Paris (France)":.15,
+          "apple (fruit)|Paris (France)":.05,"Paris, Texas|Seine (river)":.02}},
+    {text:"Priya Okonkwo joined Apple's Paris office.",
+     M:[{m:"Priya Okonkwo",c:[{e:"Priya (film)",p:.01,s:.05},{e:"Okonkwo (character)",p:.01,s:.12}]},
+        {m:"Apple",c:[{e:"Apple (company)",p:.60,s:.80},{e:"apple (fruit)",p:.35,s:.05},{e:"Apple Records",p:.05,s:.20}]},
+        {m:"Paris",c:[{e:"Paris (France)",p:.85,s:.55},{e:"Paris, Texas",p:.04,s:.15},{e:"Paris (mythology)",p:.05,s:.02}]}],
+     rel:{"Apple (company)|Paris (France)":.15,"apple (fruit)|Paris (France)":.05,"Priya (film)|Paris (France)":.03,"Okonkwo (character)|Apple (company)":.02}},
+  ];
+  let coh=false;
+  const relOf=(d,a,b)=>{ if(a===b) return 0; return d.rel[a+"|"+b] ?? d.rel[b+"|"+a] ?? 0.05; };
+  const local=(c,lam)=>lam*Math.log(Math.max(c.p,.01))+(1-lam)*c.s;
+
+  function solve(d,lam,tau){
+    const n=d.M.length;
+    const loc=d.M.map(x=>x.c.map(c=>local(c,lam)));
+    let active=d.M.map(()=>true), pick=loc.map(L=>L.indexOf(Math.max(...L)));
+    for(let pass=0;pass<3;pass++){
+      if(coh){
+        // exact joint MAP over active mentions (small: ≤ 3^3 combos)
+        const idx=d.M.map((_,i)=>i).filter(i=>active[i]);
+        let best=-Infinity, bestA=null;
+        const rec=(k,acc)=>{
+          if(k===idx.length){
+            let v=0; idx.forEach((i,a)=>v+=loc[i][acc[a]]);
+            for(let a=0;a<idx.length;a++) for(let b=a+1;b<idx.length;b++) v+=BETA*relOf(d,d.M[idx[a]].c[acc[a]].e,d.M[idx[b]].c[acc[b]].e);
+            if(v>best){best=v;bestA=acc.slice();}
+            return;
+          }
+          d.M[idx[k]].c.forEach((_,ci)=>{acc.push(ci);rec(k+1,acc);acc.pop();});
+        };
+        rec(0,[]);
+        idx.forEach((i,a)=>pick[i]=bestA[a]);
+      }
+      // per-candidate totals given the other active picks
+      var tot=d.M.map((x,i)=>x.c.map((c,ci)=>{
+        let bonus=0;
+        if(coh) d.M.forEach((y,j)=>{ if(j!==i&&active[j]) bonus+=BETA*relOf(d,c.e,y.c[pick[j]].e); });
+        return {L:loc[i][ci],B:bonus,T:loc[i][ci]+bonus};
+      }));
+      if(!coh) d.M.forEach((x,i)=>{ const T=tot[i].map(t=>t.T); pick[i]=T.indexOf(Math.max(...T)); });
+      const nextActive=d.M.map((x,i)=>tot[i][pick[i]].T>=tau);
+      const changed=nextActive.some((v,i)=>v!==active[i]);
+      active=nextActive;
+      if(!changed||!coh) break;
+    }
+    return {pick,tot,active};
+  }
+
+  const xs=d3.scaleLinear().domain([-4.7,3]).clamp(true);
+  function draw(){
+    const d=S[+sel.value], lam=+lamEl.value, tau=+tauEl.value;
+    document.getElementById("el-lamval").textContent=lam.toFixed(2);
+    document.getElementById("el-tauval").textContent=(tau<0?"−":"")+Math.abs(tau).toFixed(1);
+    cohBtn.textContent="coherence: "+(coh?"on (β = 1)":"off");
+    const R=solve(d,lam,tau);
+    svg.selectAll("*").remove();
+    // sentence with mention highlights (monospace for predictable widths)
+    const cw=7.4, sx=Math.max(8,(W-d.text.length*cw)/2);
+    d.M.forEach(x=>{
+      const k=d.text.indexOf(x.m);
+      if(k<0) return;
+      svg.append("rect").attr("x",sx+k*cw-2).attr("y",10).attr("width",x.m.length*cw+4).attr("height",22).attr("rx",4)
+        .attr("fill","rgba(255,180,84,.14)").attr("stroke",C.a2).attr("stroke-opacity",.7);
+    });
+    svg.append("text").attr("x",sx).attr("y",26).attr("font-size",12.3).attr("font-family","SF Mono, Menlo, monospace").attr("fill",C.ink).text(d.text);
+
+    const n=d.M.length, colW=W/n, top=70, rowH=46;
+    const chosenPos=[];
+    d.M.forEach((x,i)=>{
+      const x0=i*colW+12, x1=(i+1)*colW-14;
+      xs.range([x0,x1]);
+      svg.append("text").attr("x",x0).attr("y",top-14).attr("font-size",12).attr("font-weight",700).attr("fill",C.a2).text(`“${x.m}”`);
+      // τ line
+      svg.append("line").attr("x1",xs(tau)).attr("x2",xs(tau)).attr("y1",top-4).attr("y2",top+3*rowH+2).attr("stroke",C.bad).attr("stroke-dasharray","4 3").attr("stroke-opacity",.8);
+      svg.append("text").attr("x",xs(tau)+3).attr("y",top+3*rowH+12).attr("font-size",9).attr("fill",C.bad).text("τ");
+      x.c.forEach((c,ci)=>{
+        const y=top+ci*rowH, t=R.tot[i][ci], isPick=ci===R.pick[i], linked=isPick&&R.active[i];
+        svg.append("text").attr("x",x0).attr("y",y+8).attr("font-size",10).attr("fill",linked?C.good:(isPick?C.bad:C.muted)).attr("font-weight",isPick?700:400)
+          .text(c.e.length>32?c.e.slice(0,31)+"…":c.e);
+        svg.append("text").attr("x",x0).attr("y",y+33).attr("font-size",8.5).attr("fill",C.muted).text(`P(e|m) = ${c.p.toFixed(2)}   sim = ${c.s.toFixed(2)}`+(t.B>0?`   coh +${t.B.toFixed(2)}`:""));
+        svg.append("rect").attr("x",x0).attr("y",y+12).attr("width",x1-x0).attr("height",11).attr("rx",3).attr("fill",C.panel);
+        svg.append("rect").attr("x",x0).attr("y",y+12).attr("width",Math.max(1,xs(t.L)-x0)).attr("height",11).attr("rx",3).attr("fill",linked?C.good:C.blue).attr("fill-opacity",.8);
+        if(t.B>0) svg.append("rect").attr("x",xs(t.L)).attr("y",y+12).attr("width",Math.max(0,xs(t.T)-xs(t.L))).attr("height",11).attr("fill",C.accent).attr("fill-opacity",.75);
+        svg.append("text").attr("x",Math.min(x1-2,xs(t.T)+3)).attr("y",y+21).attr("font-size",9).attr("fill",C.ink).attr("text-anchor",xs(t.T)>x1-30?"end":"start").text(t.T.toFixed(2));
+      });
+      // decision tag
+      const ty=top+3*rowH+30, pk=x.c[R.pick[i]], ok=R.active[i];
+      const label=ok?pk.e:"NIL";
+      const tw=Math.min(colW-20,label.length*6.2+16);
+      svg.append("rect").attr("x",x0).attr("y",ty-14).attr("width",tw).attr("height",22).attr("rx",11)
+        .attr("fill",ok?"rgba(74,222,128,.14)":"rgba(248,113,113,.14)").attr("stroke",ok?C.good:C.bad);
+      svg.append("text").attr("x",x0+8).attr("y",ty+1).attr("font-size",10).attr("font-weight",700).attr("fill",ok?C.good:C.bad).text(label.length>30?label.slice(0,29)+"…":label);
+      chosenPos.push({x:x0+tw/2,y:ty+8,e:pk.e,ok});
+    });
+    // coherence arcs between chosen (linked) entities
+    if(coh){
+      for(let a=0;a<chosenPos.length;a++) for(let b=a+1;b<chosenPos.length;b++){
+        const A=chosenPos[a],B=chosenPos[b];
+        if(!A.ok||!B.ok) continue;
+        const r=relOf(d,A.e,B.e), dip=Math.min(H-8,A.y+16+(b-a)*14);
+        svg.append("path").attr("d",`M${A.x},${A.y} Q${(A.x+B.x)/2},${dip+12} ${B.x},${B.y}`).attr("fill","none")
+          .attr("stroke",C.accent).attr("stroke-width",0.8+r*4).attr("stroke-opacity",.35+r*.5);
+        svg.append("text").attr("x",(A.x+B.x)/2).attr("y",Math.min(H-3,dip+4)).attr("text-anchor","middle").attr("font-size",9).attr("fill",C.accent).text(`rel ${r.toFixed(2)}`);
+      }
+    } else {
+      svg.append("text").attr("x",W/2).attr("y",H-14).attr("text-anchor","middle").attr("font-size",10).attr("fill",C.muted)
+        .text("bars: blue = local φ = λ·log P + (1−λ)·sim  ·  purple = coherence bonus  ·  red dashed = τ");
+    }
+    // readout: compare with prior-only choice
+    const parts=d.M.map((x,i)=>{
+      const pk=x.c[R.pick[i]], prior=x.c.reduce((a,b)=>b.p>a.p?b:a);
+      const res=R.active[i]?`<b style="color:${C.good}">${pk.e}</b>`:`<b style="color:${C.bad}">NIL</b>`;
+      const note=R.active[i]&&pk.e!==prior.e&&prior.p>pk.p?` <span style="color:${C.a2}">(overrides prior: ${prior.e})</span>`:"";
+      return `“${x.m}” → ${res} [${R.tot[i][R.pick[i]].T.toFixed(2)}]${note}`;
+    });
+    d3.select("#el-read").html(parts.join(" &nbsp;·&nbsp; ")+`<br>λ = ${lam.toFixed(2)}, τ = ${(tau<0?"−":"")+Math.abs(tau).toFixed(1)}, `+(coh?"collective: exact joint argmax of ∑ φ + β·∑ rel over the non-NIL mentions":"local: each mention decided independently"));
+  }
+  sel.addEventListener("change",draw);
+  lamEl.addEventListener("input",draw);
+  tauEl.addEventListener("input",draw);
+  cohBtn.addEventListener("click",()=>{coh=!coh;draw();});
+  draw();
+})();

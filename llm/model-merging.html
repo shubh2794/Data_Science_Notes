@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Model Merging</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <h1>Model Merging</h1>
+      <p>Take several models fine-tuned from the same base and combine them <b>in weight space</b> — average them, add their deltas, or interpolate between them — to get one model with the skills of all of them, no training data and no gradient steps required. It works far more often than it has any right to, and the reasons why also mark exactly where it breaks.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">LLMs &amp; Generative AI</span>
+        <span class="pill">Fine-tuning</span>
+        <span class="pill">Weight space</span>
+        <span class="pill">Loss landscape</span>
+      </div>
+    </header>
+
+    <section class="topic" id="overview">
+      <h3><span class="idx">01</span> What merging is, and why it is attractive</h3>
+      <p class="lede">A merge is a function from a handful of checkpoints to a new checkpoint — computed with arithmetic on tensors, in minutes, on a CPU.</p>
+      <ul class="notes">
+        <li><b>The setup:</b> one pretrained model <code>θ_pre</code>, and several fine-tunes of it — one for code, one for maths, one for a language, one for chat style. Each lives in its own checkpoint, and serving all of them means hosting all of them.</li>
+        <li><b>The merge:</b> produce one parameter vector <code>θ_merged = f(θ_pre, θ₁, …, θ_K)</code>, using element-wise operations: averages, weighted sums, interpolation, masking. Same architecture, same size, same inference cost as any single input.</li>
+        <li><b>Why it is attractive:</b>
+          <ul>
+            <li><b>No training data.</b> The original fine-tuning sets may be private, lost, or licensed separately; a merge needs only the weights.</li>
+            <li><b>No GPU-days.</b> Merging a 7B model is a few minutes of tensor arithmetic. Multi-task fine-tuning on the union of the datasets is a full training run.</li>
+            <li><b>Composable skills.</b> Fine-tunes trained by different people at different times can be combined after the fact — and recombined with different weights for different products.</li>
+            <li><b>Often a free quality bump.</b> Averaging several fine-tunes of the <i>same</i> task routinely beats the best single one, and is more robust under distribution shift.</li>
+          </ul>
+        </li>
+        <li><b>The catch:</b> it only works when the models are <b>close in weight space</b> — in practice, when they were fine-tuned from the same pretrained checkpoint. Section 02 is about why.</li>
+      </ul>
+      <div class="callout"><b>One sentence:</b> fine-tuning moves a model a short distance from a shared starting point; merging adds those short moves together, betting that they don't get in each other's way.</div>
+    </section>
+
+    <section class="topic" id="geometry">
+      <h3><span class="idx">02</span> Why it works: loss-landscape geometry</h3>
+      <p class="lede">Averaging two neural networks' weights is usually nonsense. It stops being nonsense when both networks sit in the same low-loss basin — and a shared pretrained initialisation is what puts them there.</p>
+
+      <h4>Linear mode connectivity</h4>
+      <p>Two solutions <code>θ_A</code> and <code>θ_B</code> are <b>linearly mode connected</b> if the loss stays low along the straight line between them. The quantity to watch is the <b>barrier</b>: how far the loss along the path rises above the straight-line mix of the endpoint losses.</p>
+      <div class="formula"><span class="lbl">interpolation path</span><span class="eq">θ(t) = (1 − t)·θ<sub>A</sub> + t·θ<sub>B</sub></span>,   <span class="eq">t ∈ [0, 1]</span>
+<span class="lbl">loss barrier</span><span class="eq">barrier = max<sub>t</sub> [ L(θ(t)) − ((1 − t)·L(θ<sub>A</sub>) + t·L(θ<sub>B</sub>)) ]</span>
+<span class="lbl">connected</span><span class="eq">barrier ≈ 0</span>   <span class="eq">→ every point on the segment is (roughly) as good as the ends</span></div>
+      <ul class="notes">
+        <li>Two networks trained <b>from different random initialisations</b> almost always show a large barrier: the midpoint of their weights is about as good as a random network.</li>
+        <li>Two networks that share the <b>first part of training</b> — in the limit, a whole pretraining run — and only diverge afterwards are typically linearly connected. Fine-tuning from a large pretrained model is the extreme case: every fine-tune starts from the same point and moves only a little.</li>
+        <li>Pretraining seems to place the model in a wide, flat basin; fine-tuning on different tasks moves to different points in that basin, and the region between them stays low-loss for <i>all</i> of the tasks often enough to be useful.</li>
+      </ul>
+
+      <div class="viz" id="viz-landscape">
+        <div class="vhead">
+          <span class="vtitle">Interpolating between two fine-tunes on an illustrative loss surface</span>
+          <span class="vhint">Brighter = lower loss. The origin is the all-zeros weight vector; the arc keeps the norm, the chord cuts inside</span>
+        </div>
+        <div class="controls">
+          <label>Scenario <select id="mm-scn">
+            <option value="shared" selected>shared pretrained init</option>
+            <option value="indep">independent inits</option>
+            <option value="aligned">independent, then permutation-aligned</option>
+          </select></label>
+          <label>Path <select id="mm-path">
+            <option value="lerp" selected>linear (lerp)</option>
+            <option value="slerp">spherical (SLERP)</option>
+          </select></label>
+          <label>t <input type="range" id="mm-t" min="0" max="1" step="0.01" value="0.5"> <span id="mm-t-v">0.50</span></label>
+        </div>
+        <svg id="mm-land-svg" width="640" height="340" viewBox="0 0 640 340" role="img" aria-label="Interactive diagram: interpolation path between two fine-tuned models on a loss surface, with the loss profile along the path"></svg>
+        <div class="readout" aria-live="polite" id="mm-land-read"></div>
+      </div>
+
+      <h4>The shared-initialisation requirement: permutation symmetry</h4>
+      <p>Why do independently initialised networks fail? Because a network's weights are only defined <b>up to a relabelling of its hidden units</b>. Swap two neurons in a hidden layer — permute the rows of the incoming weights and the columns of the outgoing ones — and the function is identical, but the weight vector is different.</p>
+      <div class="formula"><span class="lbl">a two-layer block and a permutation matrix P</span><span class="eq">f(x) = W<sub>2</sub> · σ(W<sub>1</sub>x + b<sub>1</sub>)</span>
+<span class="lbl">same function, different weights</span><span class="eq">W<sub>1</sub> → P·W<sub>1</sub></span>,  <span class="eq">b<sub>1</sub> → P·b<sub>1</sub></span>,  <span class="eq">W<sub>2</sub> → W<sub>2</sub>·Pᵀ</span>   <span class="eq">(σ is element-wise, so σ(Pz) = P·σ(z), and PᵀP = I)</span>
+<span class="lbl">symmetries per hidden layer of width n</span><span class="eq">n!</span></div>
+      <ul class="notes">
+        <li>Two independently trained networks have, in effect, assigned their features to hidden units in unrelated orders. Averaging them averages unit 17 of one with unit 17 of the other — two unrelated features — and destroys both.</li>
+        <li><b>Re-basin (weight matching / activation matching):</b> before averaging, solve for permutations that line up network B's units with network A's (a linear-assignment problem per layer, on weight or activation similarity). For sufficiently wide networks, the aligned pair is often close to linearly connected. This is the "independent, then permutation-aligned" scenario in the figure.</li>
+        <li>Re-basin is mostly demonstrated on small vision models; for LLMs nobody bothers, because <b>fine-tunes of one base already share the same unit ordering</b> — the pretrained init fixes it, and short fine-tuning never reshuffles it.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> merging is not "averaging networks", it is "averaging small perturbations of one network". Without a shared base (or an explicit alignment) the premise is false.</div>
+    </section>
+
+    <section class="topic" id="task-arithmetic">
+      <h3><span class="idx">03</span> Task vectors and task arithmetic</h3>
+      <p class="lede">Subtract the base from a fine-tune and you get a direction in weight space that "means" the task. Directions can be added, negated and scaled.</p>
+      <div class="formula"><span class="lbl">task vector for task i</span><span class="eq">τ<sub>i</sub> = θ<sub>i</sub><sup>ft</sup> − θ<sub>pre</sub></span>
+<span class="lbl">addition (multi-task)</span><span class="eq">θ = θ<sub>pre</sub> + ∑<sub>i</sub> λ<sub>i</sub> · τ<sub>i</sub></span>
+<span class="lbl">negation (forgetting)</span><span class="eq">θ = θ<sub>pre</sub> − λ · τ<sub>forget</sub></span>
+<span class="lbl">analogy  a : b :: c : d</span><span class="eq">τ<sub>d</sub> ≈ τ<sub>c</sub> + (τ<sub>b</sub> − τ<sub>a</sub>)</span>
+<span class="lbl">scaling coefficients <span class="keep">λ</span></span><span class="eq">typically 0.3 – 1.0 each, tuned on held-out data</span></div>
+      <ul class="notes">
+        <li><b>Addition:</b> adding the code vector and the maths vector gives a model that is decent at both — usually a little worse at each than the specialist, much better than the base.</li>
+        <li><b>Negation:</b> fine-tune on the behaviour you want <i>less</i> of (e.g. toxic text), then subtract that task vector. Performance on control tasks is largely preserved. This is a cheap "unlearning" heuristic, not a guarantee — the behaviour is suppressed, not provably removed.</li>
+        <li><b>Analogies:</b> with tasks related as <i>a : b :: c : d</i> (e.g. sentiment on domain A : language modelling on domain A :: sentiment on B : language modelling on B), combining three vectors can approximate the fourth without any data for it.</li>
+        <li><b>λ matters.</b> Summing K vectors at <code>λ = 1</code> moves K times further than any fine-tune did — often off the basin. Using <code>λ = 1/K</code> recovers plain averaging (section 04). Values in between are the usual sweet spot.</li>
+        <li>Task arithmetic works because, near the pretrained point, the network behaves <b>approximately linearly in its weights</b>, and task vectors from unrelated tasks are close to <b>orthogonal</b> in a space with billions of dimensions — so adding them interferes surprisingly little.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> a task vector is a learned edit. Merging is editing with several of them at once — and the scale of each edit is a hyperparameter you must not forget to tune.</div>
+    </section>
+
+    <section class="topic" id="soups">
+      <h3><span class="idx">04</span> Weight averaging and model soups</h3>
+      <p class="lede">The simplest merge: average the weights. When the inputs are fine-tunes of the same task with different hyperparameters, the average is often better than any of them.</p>
+      <div class="formula"><span class="lbl">uniform soup of K fine-tunes</span><span class="eq">θ<sub>soup</sub> = (1/K) · ∑<sub>k=1..K</sub> θ<sub>k</sub></span>   <span class="eq">= θ<sub>pre</sub> + (1/K) · ∑<sub>k</sub> τ<sub>k</sub></span>
+<span class="lbl">greedy soup</span><span class="eq">sort ingredients by held-out accuracy; start with the best; add the next one only if the average with it improves held-out accuracy</span>
+<span class="lbl">ema of one run (<span class="keep">β</span> ≈ 0.999)</span><span class="eq">θ̄<sub>t</sub> = β · θ̄<sub>t−1</sub> + (1 − β) · θ<sub>t</sub></span></div>
+      <ul class="notes">
+        <li><b>Model soups:</b> run a hyperparameter sweep of fine-tunes from one base; instead of keeping only the winner, average them. Inference cost is one model, unlike an output ensemble of K models.</li>
+        <li><b>Uniform vs greedy:</b> the uniform soup is hurt by bad ingredients (a run with too-high learning rate that left the basin). The greedy soup filters them out using a held-out set, and is the more reliable recipe. Note that the greedy loop is itself a small optimisation on the held-out set — keep a separate test set.</li>
+        <li><b>Same idea, one trajectory:</b> <b>stochastic weight averaging (SWA)</b> averages checkpoints from late in a single training run (often with a cyclic or constant learning rate), and an <b>exponential moving average (EMA)</b> of weights does it continuously. Both find flatter, better-generalising points near the centre of a basin; soups do the same across runs.</li>
+        <li><b>Interpolating with the base</b> — <code>θ = (1 − α)·θ_pre + α·θ_ft</code> — is the two-ingredient soup, and it is the standard fix for robustness lost during fine-tuning (see <a href="../deep-learning/fine-tuning-transfer-learning.html#forgetting">Fine-Tuning &amp; Transfer Learning</a>).</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> averaging is the base case of every merge method. Most of what follows is about the case where averaging fails: different tasks whose deltas collide.</div>
+    </section>
+
+    <section class="topic" id="slerp">
+      <h3><span class="idx">05</span> SLERP: interpolating on the sphere</h3>
+      <p class="lede">Spherical linear interpolation walks along the arc between two weight vectors instead of the chord, so the interpolated weights keep the size of the originals.</p>
+      <div class="formula"><span class="lbl">angle between the two models (per tensor)</span><span class="eq">cos Ω = (θ<sub>0</sub> · θ<sub>1</sub>) / (‖θ<sub>0</sub>‖ ‖θ<sub>1</sub>‖)</span>
+<span class="lbl">slerp</span><span class="eq">slerp(θ<sub>0</sub>, θ<sub>1</sub>; t) = [sin((1 − t)·Ω) / sin Ω] · θ<sub>0</sub> + [sin(t·Ω) / sin Ω] · θ<sub>1</sub></span>
+<span class="lbl">checks</span><span class="eq">t = 0 → θ<sub>0</sub></span>,  <span class="eq">t = 1 → θ<sub>1</sub></span>,  <span class="eq">Ω → 0 → (1 − t)·θ<sub>0</sub> + t·θ<sub>1</sub>  (fall back to lerp)</span>
+<span class="lbl">norm loss of lerp, equal norms</span><span class="eq">‖½θ<sub>0</sub> + ½θ<sub>1</sub>‖ = ‖θ<sub>0</sub>‖ · cos(Ω/2)</span>   <span class="eq">slerp keeps ‖θ(t)‖ = ‖θ<sub>0</sub>‖ for all t</span></div>
+      <ul class="notes">
+        <li><b>Why norm preservation matters:</b> the linear midpoint of two vectors that point in different directions is shorter than either. In weight space that shrinks the scale of the weights, which changes activation magnitudes layer after layer. Normalisation layers absorb some of this, but not all; SLERP sidesteps it. Switch the figure in section 02 to SLERP and watch the path follow the low-loss ring instead of cutting inside it.</li>
+        <li>In practice it is applied <b>tensor by tensor</b> (each weight matrix flattened to one vector, with its own <code>Ω</code>), often with different <code>t</code> for different layer types — e.g. a ramp that favours one parent in early layers and the other in late layers.</li>
+        <li>For fine-tunes of one base, <code>Ω</code> between full weight tensors is tiny (the deltas are small relative to the weights), so SLERP and lerp barely differ. SLERP's advantage shows up when the two parents have drifted far apart — longer fine-tunes, continued pretraining.</li>
+        <li><b>Limitation: exactly two models.</b> SLERP is defined for a pair. Merging more means chaining pairwise merges (order-dependent) or switching to a task-vector method.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> SLERP is the "blend two parents smoothly" tool. Its whole point is to stay on the sphere where the weights live; its limit is that it only ever has two parents.</div>
+    </section>
+
+    <section class="topic" id="ties-dare">
+      <h3><span class="idx">06</span> Interference: TIES-merging and DARE</h3>
+      <p class="lede">When you add several task vectors, two things go wrong: many entries are tiny noise that piles up, and on the important entries the tasks pull in opposite directions. TIES and DARE attack each in turn.</p>
+
+      <h4>TIES-merging: trim, elect sign, disjoint merge</h4>
+      <div class="formula"><span class="lbl">1 · trim (per task, keep top-k by magnitude)</span><span class="eq">τ̂<sub>i</sub> = keep the largest k% of |τ<sub>i</sub>| entries, zero the rest</span>   <span class="eq">(k ≈ 20 is common)</span>
+<span class="lbl">2 · elect a sign per parameter p</span><span class="eq">γ<sub>p</sub> = sgn( ∑<sub>i</sub> τ̂<sub>i,p</sub> )</span>   <span class="eq">(the side with more total mass wins)</span>
+<span class="lbl">3 · disjoint mean over agreeing tasks</span><span class="eq">A<sub>p</sub> = { i : τ̂<sub>i,p</sub> ≠ 0 and sgn(τ̂<sub>i,p</sub>) = γ<sub>p</sub> }</span>
+<span class="eq">τ<sub>m,p</sub> = (1 / |A<sub>p</sub>|) · ∑<sub>i ∈ A<sub>p</sub></sub> τ̂<sub>i,p</sub></span>
+<span class="lbl">4 · apply</span><span class="eq">θ = θ<sub>pre</sub> + λ · τ<sub>m</sub></span></div>
+      <ul class="notes">
+        <li><b>Trim</b> removes redundant small updates — fine-tuning changes many weights a little for no particular reason, and summed across tasks that noise becomes signal-sized.</li>
+        <li><b>Elect</b> resolves sign conflicts: if two tasks push parameter <i>p</i> up and one pushes it down hard, a plain average lands near zero and serves nobody. TIES picks a direction and discards the dissenters at that parameter.</li>
+        <li><b>Disjoint mean</b> averages only over tasks that actually updated the parameter in the elected direction, so a delta that only one task cares about is kept at full size instead of being divided by K.</li>
+      </ul>
+
+      <h4>DARE: drop and rescale</h4>
+      <div class="formula"><span class="lbl">random mask, drop rate p</span><span class="eq">m<sub>j</sub> ~ Bernoulli(1 − p)</span>
+<span class="lbl">rescale the survivors</span><span class="eq">τ̃ = (m ⊙ τ) / (1 − p)</span>
+<span class="lbl">expectation preserved</span><span class="eq">E[τ̃<sub>j</sub>] = (1 − p) · τ<sub>j</sub> / (1 − p) = τ<sub>j</sub></span>
+<span class="lbl">but variance grows</span><span class="eq">Var[τ̃<sub>j</sub>] = τ<sub>j</sub>² · p / (1 − p)</span></div>
+      <ul class="notes">
+        <li>Empirically, the delta of a supervised fine-tune is extremely <b>redundant</b>: you can randomly drop 90% of its entries and rescale the rest with little loss on the task. Each sparsified vector then overlaps far less with the others, so adding them interferes less.</li>
+        <li>DARE is a <b>pre-processing step</b> on each task vector, combined with task arithmetic ("DARE-linear") or with TIES' sign election ("DARE-TIES"). It only works on <i>deltas</i>: dropping 90% of the raw weights would destroy the model.</li>
+        <li>It degrades when deltas are large and dense — long fine-tunes or continued pretraining — because the variance term <code>τ² · p/(1 − p)</code> is no longer negligible. One random draw is one sample; results can vary with the seed.</li>
+      </ul>
+
+      <div class="viz" id="viz-ties">
+        <div class="vhead">
+          <span class="vtitle">TIES / DARE explorer: three task vectors over 24 parameters</span>
+          <span class="vhint">Thin bars = per-task deltas after DARE and trimming (faded = removed). Wide outline = merged delta. Red dot = surviving sign conflict</span>
+        </div>
+        <div class="controls">
+          <label>Merge rule <select id="mm-rule">
+            <option value="sum">sum (task arithmetic)</option>
+            <option value="mean">mean (averaging)</option>
+            <option value="ties" selected>TIES: elect sign + disjoint mean</option>
+          </select></label>
+          <label>Trim % <input type="range" id="mm-trim" min="0" max="90" step="10" value="50"> <span id="mm-trim-v">50</span></label>
+          <label>DARE drop p <input type="range" id="mm-p" min="0" max="0.9" step="0.1" value="0"> <span id="mm-p-v">0.0</span></label>
+          <label><span class="keep">λ</span> <input type="range" id="mm-lam" min="0.2" max="1.5" step="0.1" value="1"> <span id="mm-lam-v">1.0</span></label>
+          <button id="mm-resample">resample DARE mask</button>
+        </div>
+        <svg id="mm-ties-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Interactive diagram: per-parameter task deltas from three tasks and the merged delta under trimming, DARE dropping and sign election"></svg>
+        <div class="readout" aria-live="polite" id="mm-ties-read"></div>
+      </div>
+      <div class="callout"><b>Takeaway:</b> TIES is deterministic surgery on conflicts; DARE is random sparsification that is unbiased on average. They solve different problems and are routinely stacked.</div>
+    </section>
+
+    <section class="topic" id="lora">
+      <h3><span class="idx">07</span> Merging LoRA adapters vs full weights</h3>
+      <p class="lede">A LoRA adapter stores its update as two thin factors. The update is their product — and products do not average like sums.</p>
+      <div class="formula"><span class="lbl">a lora update (see peft)</span><span class="eq">ΔW<sub>i</sub> = B<sub>i</sub> · A<sub>i</sub></span>   <span class="eq">B<sub>i</sub> ∈ ℝ<sup>d×r</sup>, A<sub>i</sub> ∈ ℝ<sup>r×k</sup></span>
+<span class="lbl">right: merge the products</span><span class="eq">ΔW = ½ (B<sub>1</sub>A<sub>1</sub> + B<sub>2</sub>A<sub>2</sub>)</span>
+<span class="lbl">wrong: average the factors</span><span class="eq">½(B<sub>1</sub> + B<sub>2</sub>) · ½(A<sub>1</sub> + A<sub>2</sub>) = ¼ (B<sub>1</sub>A<sub>1</sub> + B<sub>2</sub>A<sub>2</sub> + B<sub>1</sub>A<sub>2</sub> + B<sub>2</sub>A<sub>1</sub>)</span>
+<span class="lbl">exact sum as a bigger adapter</span><span class="eq">[B<sub>1</sub>  B<sub>2</sub>] · [A<sub>1</sub> ; A<sub>2</sub>] = B<sub>1</sub>A<sub>1</sub> + B<sub>2</sub>A<sub>2</sub></span>   <span class="eq">rank ≤ r<sub>1</sub> + r<sub>2</sub></span></div>
+      <ul class="notes">
+        <li><b>Factor averaging is wrong</b> because of the cross terms <code>B₁A₂ + B₂A₁</code>: they pair the output basis of one adapter with the input basis of the other, which never trained together. They are not small, just meaningless. (LoRA factors also have a gauge freedom — <code>BA = (BM)(M⁻¹A)</code> for any invertible <code>M</code> — so two adapters' factors are not even in comparable coordinates.)</li>
+        <li><b>Safe recipes:</b> compute each <code>ΔWᵢ = BᵢAᵢ</code>, merge those as task vectors (any method above, including TIES/DARE), then add to <code>W</code>. Or <b>concatenate</b> the factors into one rank-<code>r₁+r₂</code> adapter, which reproduces the weighted sum exactly while staying detachable. If the result must be low rank again, refactorise with a truncated SVD (lossy).</li>
+        <li><b>Adapters vs full fine-tunes:</b> LoRA deltas are low-rank and already small, so they tend to merge cleanly with each other; but a LoRA delta and a full fine-tune of the same base can also be merged, because both are just <code>ΔW</code>s relative to the same <code>W</code>. Adapters trained on <i>different</i> bases (or quantised bases) cannot be mixed.</li>
+        <li><b>Keep them separate instead?</b> Serving many adapters on one base and switching per request (see <a href="parameter-efficient-fine-tuning.html#serving">PEFT serving</a>) avoids interference entirely — at the price of needing to know which adapter each request wants. Learned routing over adapters is the bridge to section 09.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> always merge <code>ΔW = BA</code>, never <code>A</code> and <code>B</code> separately. Concatenation is the lossless way to keep the merged result in adapter form. Background: <a href="parameter-efficient-fine-tuning.html#lora">LoRA</a>.</div>
+    </section>
+
+    <section class="topic" id="passthrough">
+      <h3><span class="idx">08</span> Frankenmerging: passthrough layer stacking</h3>
+      <p class="lede">Instead of blending weights, copy whole layers from one or more models and stack them into a deeper network. Odd, crude, and sometimes surprisingly good.</p>
+      <div class="formula"><span class="lbl">depth up-scaling of an L-layer model, overlap m</span><span class="eq">copy 1: layers 1 … L − m</span>   <span class="eq">copy 2: layers m + 1 … L</span>
+<span class="lbl">stacked depth</span><span class="eq">2·(L − m)</span>   <span class="eq">e.g. L = 32, m = 8 → 48 layers, ≈ 1.5× the parameters</span></div>
+      <ul class="notes">
+        <li><b>Passthrough</b> merges take layer ranges verbatim — no averaging — and concatenate them, so the result is <b>larger</b> than its parents. Sources can be one model (self-stacking) or several fine-tunes of a shared base.</li>
+        <li><b>Why it sometimes works:</b> in a pre-norm transformer each block adds a residual update to a shared residual stream, and adjacent middle layers compute similar, incremental refinements. Repeating a stretch of middle layers is close to "iterating the refinement a few more times", which the stream tolerates. The seams are worst at the very first and last layers, which is why the overlap drops those.</li>
+        <li><b>Why it needs healing:</b> immediately after stacking, the seam is a distribution shift — layer <i>m+1</i> of copy 2 receives a residual stream that has already passed through <i>L − m</i> layers, not <i>m</i>. Performance typically drops at first; a round of continued pretraining or fine-tuning recovers it, and then the extra depth can pay off. Without that healing step, gains are anecdotal and fragile.</li>
+        <li>This is an architecture change, so everything downstream (inference cost, memory, quantisation) grows with it. It is a way to <b>initialise</b> a bigger model cheaply, not a free lunch.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> passthrough stacking is weight-reuse for scaling up, not skill-combination. Treat it as a warm start that must be trained, and evaluate it as a new model.</div>
+    </section>
+
+    <section class="topic" id="relatives">
+      <h3><span class="idx">09</span> Relatives: mixture-of-experts and distillation</h3>
+      <p class="lede">Merging is one of three ways to turn several specialists into one system. The other two keep the specialists apart at run time, or retrain a student on their outputs.</p>
+      <ul class="notes">
+        <li><b>Mixture-of-experts.</b> An <a href="../deep-learning/mixture-of-experts.html">MoE</a> keeps experts separate and routes each token to a few of them, so there is no interference — but memory holds every expert, and the router must be trained. Merging is the static, zero-routing end of the same spectrum.</li>
+        <li><b>Merging <i>into</i> an MoE.</b> Dense fine-tunes of one base can be stitched together as the expert FFNs of a new MoE layer, with the attention and embedding weights (which they mostly share) averaged; a router is then trained briefly. Similarly, a <b>mixture of adapters</b> keeps several LoRA modules on one base and learns per-input weights over them — merging coefficients that depend on the input.</li>
+        <li><b>Distillation.</b> <a href="../deep-learning/knowledge-distillation.html">Knowledge distillation</a> combines several teachers by training one student to match their outputs. It needs data and compute, but it has a superpower merging lacks: it does not care about weight space at all, so teachers can differ in <b>architecture, size and tokenizer</b>.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th></th><th>Merging</th><th>Mixture-of-experts</th><th>Multi-teacher distillation</th></tr>
+        <tr><td>Training needed</td><td>none (or a λ search)</td><td>router training (plus experts)</td><td>full student training</td></tr>
+        <tr><td>Data needed</td><td>held-out set for tuning only</td><td>yes</td><td>yes (or teacher-generated)</td></tr>
+        <tr><td>Result size</td><td>one model</td><td>all experts in memory</td><td>any size you choose</td></tr>
+        <tr><td>Interference</td><td>yes, the central problem</td><td>avoided by routing</td><td>resolved by training</td></tr>
+        <tr><td>Different architectures / tokenizers</td><td>impossible</td><td>impossible within one layer</td><td>possible</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="methods">
+      <h3><span class="idx">10</span> Choosing a method, and when merging beats multi-task fine-tuning</h3>
+      <p class="lede">Each method answers a different failure of plain averaging. Pick by how many models, how far apart they are, and whether they conflict.</p>
+      <table class="cmp">
+        <tr><th>Method</th><th>Inputs</th><th>Operation</th><th>Fixes</th><th>Watch out for</th></tr>
+        <tr><td><b>Uniform / greedy soup</b></td><td>K fine-tunes, usually one task</td><td>mean of weights; greedy filters on held-out data</td><td>picking one run; robustness</td><td>bad ingredients (uniform); overfitting the selection set (greedy)</td></tr>
+        <tr><td><b>Task arithmetic</b></td><td>base + K task vectors</td><td><code>θ_pre + ∑ λᵢτᵢ</code></td><td>multi-skill; negation for forgetting</td><td>λ too large leaves the basin; conflicts</td></tr>
+        <tr><td><b>SLERP</b></td><td>exactly 2 models</td><td>arc interpolation per tensor</td><td>norm shrinkage of lerp</td><td>pairwise only; chained merges are order-dependent</td></tr>
+        <tr><td><b>TIES</b></td><td>base + K task vectors</td><td>trim, elect sign, disjoint mean</td><td>redundant noise, sign conflicts</td><td>trim % and λ need tuning; minority tasks lose contested parameters</td></tr>
+        <tr><td><b>DARE</b> (+ linear / TIES)</td><td>base + K task vectors</td><td>random drop p, rescale 1/(1 − p)</td><td>overlap between dense deltas</td><td>seed variance; fails on large deltas</td></tr>
+        <tr><td><b>Fisher / regression-based</b></td><td>K models + some data or statistics</td><td>weight each parameter by its importance (Fisher) or solve a per-layer least-squares match of activations</td><td>uniform weighting of unequal parameters</td><td>needs data or activation statistics</td></tr>
+        <tr><td><b>Passthrough</b></td><td>1+ models, same family</td><td>stack layer ranges</td><td>wants a deeper model cheaply</td><td>needs healing training; bigger model</td></tr>
+        <tr><td><b>LoRA concat / ΔW merge</b></td><td>adapters on one base</td><td>merge <code>BᵢAᵢ</code>, or concatenate factors</td><td>keeps adapter form</td><td>never average A and B separately</td></tr>
+      </table>
+
+      <h4>When merging wins</h4>
+      <ul class="notes">
+        <li>The inputs are fine-tunes of <b>one base</b>, with <b>modest</b> deltas (short SFT, LoRA), on <b>reasonably different but compatible</b> skills — a language plus a domain plus a style.</li>
+        <li>The training data is <b>unavailable</b>, or retraining on the union is too expensive, or you need many different mixtures cheaply (a merge per customer).</li>
+        <li>Same-task soups: the merge is close to free and frequently beats the best single run.</li>
+      </ul>
+      <h4>When it doesn't</h4>
+      <ul class="notes">
+        <li><b>Interference.</b> Merged multi-task models generally land <b>below</b> the individual specialists on each task, and below a model trained jointly on all the data. The gap grows with the number of tasks and with how much they compete for the same parameters.</li>
+        <li><b>Distant tasks or large deltas.</b> Long fine-tunes and continued pretraining move far from the base; the linear approximation fails and barriers appear. Two models fine-tuned from <i>different versions</i> of a base count as distant.</li>
+        <li><b>Impossible cases:</b> different architectures, different hidden sizes, or <b>different tokenizers / vocabularies</b>. There is no element-wise correspondence to merge — the embedding row for token 5000 means different things. Use distillation instead.</li>
+        <li>If you do have the data and the compute, <b>multi-task fine-tuning remains the stronger baseline</b>; merging is the cheaper approximation to it, not a replacement.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="evaluation">
+      <h3><span class="idx">11</span> Evaluation pitfalls</h3>
+      <p class="lede">Merging makes it trivially cheap to produce thousands of candidate models — which turns every benchmark into a target to search against.</p>
+      <ul class="notes">
+        <li><b>Contamination inherits.</b> A merge contains whatever its parents learned. If any ancestor was fine-tuned on benchmark test items (deliberately or not), every descendant carries it, and the lineage of community merges is often several generations deep and poorly documented. Public leaderboards were flooded with merges of merges in 2024 for exactly this reason. Prefer fresh, held-out or private evaluations.</li>
+        <li><b>Overfitting the coefficients.</b> λ values, trim percentages, layer-wise SLERP ramps and greedy-soup selection are all tuned on some evaluation set. Search over enough recipes — automated evolutionary searches over merge configurations make this easy — and you are fitting that set. Tune on a validation split and report on an untouched test split.</li>
+        <li><b>Regressions on what you didn't test.</b> A merge evaluated on the two skills you combined may have silently lost a third (long-context recall, multilingual quality, tool-call formatting). Run a broad regression suite, not just the target tasks.</li>
+        <li><b>Safety alignment erodes.</b> Safety behaviour is itself a delta — the refusal and harmlessness training layered on by <a href="policy-preference-optimization.html">preference optimisation</a>. Merging an aligned chat model with an unaligned domain fine-tune dilutes that delta (with <code>λ = ½</code>, halves it), and TIES can trim or out-vote it outright. Re-run red-teaming and jailbreak evaluations after every merge (see <a href="llm-security.html">LLM Security</a>); adding back a "safety vector" is a mitigation, not a proof.</li>
+        <li><b>Seed variance.</b> DARE masks are random; two draws of the same recipe can differ by more than the gap you are trying to measure. Report the spread across seeds.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> a merge is a new model. It needs the full evaluation — capabilities, regressions, safety — that any new model needs, on data its recipe was not tuned on.</div>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">12</span> Pitfalls &amp; what to remember</h3>
+      <ul class="notes">
+        <li><b>Shared base or nothing.</b> Merging works because fine-tunes of one pretrained model sit in one linearly connected basin; independent inits need permutation alignment first, and different architectures or tokenizers cannot be merged.</li>
+        <li><b>Think in task vectors</b> <code>τ = θ_ft − θ_pre</code>: add them for skills, subtract for forgetting, scale them with λ — and tune λ.</li>
+        <li><b>Averaging is the baseline</b>; soups of same-task runs are almost free wins. SWA and EMA are the single-run versions.</li>
+        <li><b>SLERP</b> preserves weight norms along the arc but merges only two models.</li>
+        <li><b>TIES</b> trims noise and resolves sign conflicts; <b>DARE</b> drops and rescales deltas, unbiased but noisy. They stack.</li>
+        <li><b>LoRA:</b> merge <code>ΔW = BA</code>, or concatenate factors — never average <code>A</code> and <code>B</code> separately.</li>
+        <li><b>Passthrough stacking</b> builds a bigger model that needs healing training.</li>
+        <li><b>Evaluate the merge as a new model</b>, including safety, on data the recipe never saw.</li>
+      </ul>
+      <div class="callout"><b>Threads to pull:</b> the starting point is <a href="../deep-learning/fine-tuning-transfer-learning.html">Fine-Tuning &amp; Transfer Learning</a>; the adapters most often merged come from <a href="parameter-efficient-fine-tuning.html">PEFT</a>; the run-time alternative is <a href="../deep-learning/mixture-of-experts.html">Mixture of Experts</a>, the trained alternative is <a href="../deep-learning/knowledge-distillation.html">Knowledge Distillation</a>; and what a merge can quietly break is covered in <a href="policy-preference-optimization.html">Policy / Preference Optimization</a> and <a href="llm-security.html">LLM Security</a>.</div>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="model-merging.viz.js"></script>
+</body>
+</html>

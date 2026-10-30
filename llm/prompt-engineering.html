@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Prompt Engineering</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <h1>Prompt Engineering</h1>
+      <p>A frozen model can be steered into a classifier, an extractor, a planner or a formatter purely by what you write to it. Prompt engineering is the craft of writing that instruction — examples, structure, reasoning cues, output contracts — and then measuring whether it actually works.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">LLMs &amp; Generative AI</span>
+        <span class="pill">Prompting</span>
+        <span class="pill">In-context learning</span>
+        <span class="pill">Structured outputs</span>
+        <span class="pill">Evaluation</span>
+      </div>
+    </header>
+
+    <section class="topic" id="overview">
+      <h3><span class="idx">01</span> What prompt engineering is — and where it stops</h3>
+      <p class="lede">Prompt engineering crafts the instruction. Context engineering assembles everything that surrounds it. The two share a window but answer different questions.</p>
+      <ul class="notes">
+        <li>A pretrained-then-instruction-tuned model is a conditional distribution <code>P(output | prompt)</code>. The weights are fixed at inference; the <b>prompt is the only control surface you own per call</b>. Prompt engineering is the discipline of choosing that conditioning text so the distribution concentrates on what you want.</li>
+        <li><b>Prompt engineering</b> asks: <i>how should the task be stated?</i> — the instruction wording, the role, the delimiters, the examples that demonstrate the pattern, the reasoning cue, the output contract. It is mostly authored by a person and changes slowly.</li>
+        <li><b><a href="context-engineering.html">Context engineering</a></b> asks: <i>what else must be in the window, and in what order?</i> — retrieved documents, tool schemas, history, memory, caching layout, token budgets. It is mostly assembled by code at request time. The instruction is one component of that payload (<a href="context-engineering.html#prompting">its §04</a>).</li>
+        <li>The boundary matters because the fixes differ. If the model <b>has the facts but answers in the wrong shape</b>, that is a prompt problem. If the model <b>lacks the facts</b>, no rewording helps — that is retrieval and context. If the model <b>can't do it reliably at any wording</b>, that is a training problem (<a href="#decision">§12</a>).</li>
+        <li>It is also an empirical craft, not a bag of magic phrases. Behaviour shifts across model versions, so every claim on this page should be read as "a strong default to <i>test</i>", and every prompt should ship with an eval set (<a href="#evaluation">§10</a>).</li>
+      </ul>
+      <table class="cmp">
+        <tr><th></th><th>Prompt engineering</th><th>Context engineering</th></tr>
+        <tr><td>Unit of work</td><td>The instruction + its examples</td><td>The whole window, per request</td></tr>
+        <tr><td>Main question</td><td>How is the task stated and what shape is the answer?</td><td>Which facts, tools and state are present, and where?</td></tr>
+        <tr><td>Who writes it</td><td>A person, versioned like code</td><td>Code, from retrievers, memory and tool results</td></tr>
+        <tr><td>Typical bug</td><td>Ambiguous task, unparseable output, brittle examples</td><td>Missing or buried facts, overflow, cache thrash</td></tr>
+      </table>
+      <div class="callout"><b>One sentence:</b> prompt engineering = stating the task so that the model's most likely continuation is the output you need, in a format your code can consume — and proving it with an eval.</div>
+    </section>
+
+    <section class="topic" id="icl">
+      <h3><span class="idx">02</span> Zero-shot, few-shot &amp; in-context learning</h3>
+      <p class="lede">Describe the task, or show it. Either way, nothing is trained — the model conditions on the prompt and the pattern emerges in the forward pass.</p>
+      <div class="formula"><span class="lbl">zero-shot</span><span class="eq">ŷ = argmax<sub>y</sub> P<sub>θ</sub>(y | I, x)</span>
+<span class="lbl">k-shot in-context learning</span><span class="eq">ŷ = argmax<sub>y</sub> P<sub>θ</sub>(y | I, (x<sub>1</sub>, y<sub>1</sub>), …, (x<sub>k</sub>, y<sub>k</sub>), x)</span>   <span class="eq">(I = instruction, θ frozen)</span></div>
+      <ul class="notes">
+        <li><b>Zero-shot</b> relies on instruction tuning: the model has seen millions of "do X to this input" pairs and generalises to a new X stated in words. It is the default for well-known tasks (summarise, translate, classify sentiment) on modern chat models.</li>
+        <li><b>Few-shot</b> adds <code>k</code> demonstrations. It wins when the output format is idiosyncratic, the label boundary is hard to put into words, or the house style must be copied exactly. See <a href="large-language-models.html#incontext">In-context learning</a> for where the ability comes from.</li>
+        <li>What the examples actually teach is mostly the <b>format, label space and input distribution</b>. A well-known ablation found that randomising the <i>labels</i> in demonstrations hurt far less than expected, while removing the format or the label vocabulary hurt a lot. Larger models are more sensitive to the labels themselves — they can learn genuinely new (even flipped) mappings in context — so "labels don't matter" is a small-model result, not a law.</li>
+        <li>One useful mental model: demonstrations <b>locate</b> a task the model already half-knows rather than teach a new one from scratch. That explains both why a handful of examples is enough and why ICL struggles on tasks truly absent from pretraining.</li>
+        <li>Returns diminish fast. Most of the gain arrives with the first few examples; beyond that, each extra demonstration costs tokens on every call (<a href="#cost">§11</a>) and can crowd out retrieved context. Long-context models make "many-shot" (hundreds of examples) feasible, which sometimes rivals light fine-tuning — at a per-call price.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> start zero-shot with a precise instruction; add examples when the <i>shape</i> of the answer is what's going wrong. Examples are the most expensive tokens in a prompt because they are paid for on every single call.</div>
+    </section>
+
+    <section class="topic" id="anatomy">
+      <h3><span class="idx">03</span> Anatomy of a prompt</h3>
+      <p class="lede">A production prompt is a structured document, not a sentence. Each block has a job, and the boundaries between them should be unmistakable.</p>
+      <table class="cmp">
+        <tr><th>Block</th><th>Lives in</th><th>Job</th><th>Common mistake</th></tr>
+        <tr><td>Role / persona</td><td>System</td><td>Sets register, expertise level, audience</td><td>Expecting a role to add knowledge it doesn't have</td></tr>
+        <tr><td>Task &amp; success criteria</td><td>System</td><td>What to do, for whom, what "good" means</td><td>Vague goal ("make it better") with no criterion</td></tr>
+        <tr><td>Rules &amp; constraints</td><td>System</td><td>Scope, refusals, tone, length, grounding policy</td><td>Long lists of contradictory or negative-only rules</td></tr>
+        <tr><td>Examples</td><td>System or early user turn</td><td>Demonstrate format and edge cases</td><td>All easy cases; one label over-represented</td></tr>
+        <tr><td>Input data</td><td>User turn, fenced</td><td>The document / record / question to process</td><td>Unfenced, so data reads as instructions</td></tr>
+        <tr><td>Output contract</td><td>End of prompt or schema</td><td>Exact fields, types, allowed values</td><td>"Return JSON" with no schema</td></tr>
+      </table>
+      <h4>System vs user instructions</h4>
+      <ul class="notes">
+        <li>Chat models are trained with a role hierarchy: the <b>system</b> message carries operator intent that persists across turns; <b>user</b> messages carry the per-turn request. Put stable policy, persona and output contract in the system block; put the variable input in the user turn. This also lines up with prefix caching (<a href="context-engineering.html#caching">stable first, volatile last</a>).</li>
+        <li>The hierarchy is a <i>training-time tendency</i>, not a security boundary. A forceful enough user message, or instructions smuggled into input data, can still override it — see <a href="llm-security.html">LLM Security</a> for prompt injection and its defences.</li>
+      </ul>
+      <h4>Delimiters and output-format constraints</h4>
+      <ul class="notes">
+        <li><b>Fence every piece of data</b> with unambiguous markers — XML-style tags (<code>&lt;document&gt;…&lt;/document&gt;</code>), triple-backtick blocks, or clearly headed sections. Then refer to them by name: "summarise the text inside &lt;document&gt;". This stops the model treating a pasted email's "ignore the above" as a command, and makes prompts diffable.</li>
+        <li><b>State the output shape concretely</b>: field names, types, allowed enum values, length limits, what to emit when the answer is unknown. An explicit escape value ("<code>"label": "unsure"</code>") is cheaper than a hallucinated guess — compare the abstention techniques in <a href="hallucination-factuality.html#abstention">Hallucination &amp; Factuality</a>.</li>
+        <li>For long documents, a common layout is <b>documents first, instruction and question last</b> — the model reads the evidence, then the task, right before it starts writing.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> separate <i>instructions</i> from <i>data</i> structurally, keep policy in the system block, and end with an output contract specific enough that a parser could be written from it.</div>
+    </section>
+
+    <section class="topic" id="instructions">
+      <h3><span class="idx">04</span> Writing the instruction: roles, specificity, framing</h3>
+      <p class="lede">Most prompt bugs are specification bugs. Write the instruction you would give a capable new colleague who has zero context on your project.</p>
+      <ul class="notes">
+        <li><b>Role prompting</b> ("You are a senior tax accountant reviewing…") reliably shifts <i>register</i> — vocabulary, assumed audience, level of caution, what counts as relevant. It does not reliably add <i>knowledge</i> or accuracy on factual benchmarks; treat it as a style and focus lever, and pair it with the actual criteria the role implies.</li>
+        <li><b>Say why.</b> "Keep answers under 80 words — they are read aloud on a phone line" generalises better than "keep answers short", because the model can infer the cases you didn't enumerate (no tables, no URLs).</li>
+        <li><b>Positive over negative.</b> "Answer only from the provided documents; if they don't contain the answer, say so" beats "don't make things up". Prohibitions name the unwanted behaviour without saying what to do instead.</li>
+        <li><b>Be explicit about scope and effort.</b> Modern instruction-tuned models tend to do exactly what is asked; if you want them to go beyond the literal request (suggest fixes, cover edge cases), say so.</li>
+        <li><b>Decompose the criteria, not just the task.</b> A numbered checklist of what the output must satisfy doubles as the rubric for your eval (<a href="#evaluation">§10</a>) — write it once, use it twice.</li>
+        <li><b>Avoid emphasis inflation.</b> Capitals and "CRITICAL" scattered through a prompt were a workaround for older models; on current ones they tend to cause over-application of the shouted rule. Use them for the one rule that truly dominates, if any.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> roles set tone; criteria set quality. A prompt that states the goal, the audience, the reason behind each constraint and what to do when unsure needs far fewer clever tricks.</div>
+    </section>
+
+    <section class="topic" id="examples">
+      <h3><span class="idx">05</span> Choosing and ordering examples</h3>
+      <p class="lede">With few examples, <i>which</i> ones and <i>in what order</i> can swing accuracy as much as the instruction itself. The figure is a toy model of those effects.</p>
+
+      <div class="viz" id="viz-fewshot">
+        <div class="vhead">
+          <span class="vtitle">Few-shot sensitivity explorer (illustrative simulation)</span>
+          <span class="vhint">Each dot = one random draw of examples and order; the band is mean ± 1 sd across draws</span>
+        </div>
+        <div class="controls">
+          <label>Shots k <input type="range" id="fs-k" min="0" max="16" step="1" value="4"></label>
+          <label>Selection <select id="fs-sel"><option value="random">Fixed / random pool</option><option value="similar">Similarity-retrieved</option></select></label>
+          <label>Share of positive labels <input type="range" id="fs-bal" min="0" max="100" step="10" value="50"></label>
+          <label>Ordering <select id="fs-ord"><option value="shuffled">Shuffled</option><option value="interleaved">Interleaved labels</option><option value="block">Same-label block at the end</option></select></label>
+          <label><input type="checkbox" id="fs-cal"> Contextual calibration</label>
+        </div>
+        <svg id="fs-svg" width="640" height="280" viewBox="0 0 640 280" role="img" aria-label="Interactive diagram: simulated accuracy versus number of few-shot examples, with a variance band and individual draws, responding to selection, label balance, ordering and calibration"></svg>
+        <div class="readout" aria-live="polite" id="fs-read"></div>
+      </div>
+
+      <p>The simulation encodes, qualitatively, the effects reported repeatedly in the in-context learning literature. The numbers are invented; the <i>shape</i> is the point.</p>
+      <h4>What the figure is encoding</h4>
+      <ul class="notes">
+        <li><b>Diminishing returns in k.</b> Mean accuracy rises steeply over the first few shots, then flattens.</li>
+        <li><b>High variance at small k.</b> With 1–4 examples, a different draw or a different permutation of the <i>same</i> examples can move accuracy from near-chance to near-best. Variance shrinks with k but doesn't vanish — report a spread over several draws, never a single prompt's score.</li>
+        <li><b>Similarity-retrieved examples</b> (embed the query, pull its nearest labelled neighbours from a pool) usually beat a fixed set: they demonstrate the edge case the current input actually resembles. The cost is a retrieval step per call and a prompt that no longer caches as a fixed prefix.</li>
+        <li><b>Majority-label bias.</b> If most demonstrations carry one label, predictions drift toward it. Balance the label distribution (or match the expected test distribution deliberately).</li>
+        <li><b>Recency bias.</b> Labels near the end of the prompt are over-predicted. A block of same-label examples right before the query is the worst ordering; interleaving labels is a cheap fix.</li>
+        <li><b>Contextual calibration</b> estimates the model's prior bias by feeding a content-free input (e.g. "N/A") through the same prompt, then rescales the label probabilities so that input would come out uniform. It reduces both bias and spread — when you have access to label probabilities.</li>
+      </ul>
+      <div class="formula"><span class="lbl">contextual calibration (per prompt)</span><span class="eq">p<sub>cf</sub> = P(y | prompt, "N/A")</span>     <span class="eq">W = diag(p<sub>cf</sub>)⁻¹</span>     <span class="eq">p̂ = softmax(log(W · p))  ≈  normalise(p ⊘ p<sub>cf</sub>)</span>
+<span class="lbl">similarity-retrieved demonstrations</span><span class="eq">D(x) = top-k<sub>(x<sub>i</sub>, y<sub>i</sub>) ∈ pool</sub>  cos(e(x), e(x<sub>i</sub>))</span>   <span class="eq">cos(a, b) = (a·b) / (‖a‖ ‖b‖)</span></div>
+      <ul class="notes">
+        <li>Practical recipe: <b>cover the edge cases</b> (the boundary between labels, the empty input, the malformed record), keep examples <b>diverse</b> so the model doesn't copy one surface pattern, and check that no example leaks specifics (names, numbers) the model will paste into unrelated answers.</li>
+        <li>For generation tasks, three varied examples usually beat one perfect one — a single example is read as a template and copied too literally.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> treat the example set as a hyper-parameter. Balance labels, interleave them, prefer retrieved neighbours when the input space is broad, and measure the spread across permutations before trusting any single score.</div>
+    </section>
+
+    <section class="topic" id="cot">
+      <h3><span class="idx">06</span> Chain-of-thought and its variants (summary)</h3>
+      <p class="lede">Ask for the working, not just the answer. The mechanics, the evidence and the trained-reasoning story live in <a href="reasoning-in-llms.html">Reasoning in LLMs</a>; this is the prompt-writer's view.</p>
+      <table class="cmp">
+        <tr><th>Variant</th><th>What the prompt does</th><th>Cost</th><th>Reach for it when</th></tr>
+        <tr><td>Zero-shot CoT</td><td>Appends a cue like "think step by step" before the answer</td><td>More output tokens</td><td>Multi-step arithmetic/logic on a non-reasoning model</td></tr>
+        <tr><td>Few-shot CoT</td><td>Demonstrations include worked rationales, not just answers</td><td>Longer prompt + output</td><td>You need a particular style of working</td></tr>
+        <tr><td><a href="reasoning-in-llms.html#self-consistency">Self-consistency</a></td><td>Samples N chains at T &gt; 0, majority-votes the final answer</td><td>≈ N× generation</td><td>Answers are short and checkable for equality</td></tr>
+        <tr><td><a href="reasoning-in-llms.html#structured">Least-to-most</a></td><td>First lists sub-problems, then solves them in order, each feeding the next</td><td>Two-stage or longer output</td><td>Problems harder than any example shown</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">self-consistency: marginalise over rationales by voting</span><span class="eq">r<sub>i</sub>, a<sub>i</sub> ~ P<sub>θ</sub>(r, a | prompt),  i = 1…N</span>     <span class="eq">â = argmax<sub>a</sub> ∑<sub>i</sub> 𝟙[a<sub>i</sub> = a]</span></div>
+      <ul class="notes">
+        <li><b>Separate thinking from answer.</b> Ask for the reasoning inside one tagged block and the final answer inside another, so code can parse the answer without the rationale — and so the rationale never leaks into a user-facing field.</li>
+        <li><b>Reasoning-trained models change the calculus.</b> Models that already produce an internal reasoning trace usually gain little from "think step by step" and may just get slower; give them a clear goal and success criteria and, where the API exposes it, a reasoning-effort or thinking-budget setting instead. See <a href="reasoning-in-llms.html#trained-reasoning">trained reasoning</a>.</li>
+        <li>A written rationale is <b>not a faithful explanation</b> of how the answer was computed. Use it for accuracy and debugging, not as an audit trail.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> CoT buys accuracy with output tokens. Use it on genuinely multi-step problems, keep the answer in its own parseable slot, and drop explicit CoT cues on models that reason by default.</div>
+    </section>
+
+    <section class="topic" id="chaining">
+      <h3><span class="idx">07</span> Prompt chaining: decompose into stages</h3>
+      <p class="lede">One prompt that does five things does each of them worse. Split the job into a pipeline of narrow prompts whose outputs feed the next.</p>
+      <ul class="notes">
+        <li>A typical chain: <b>extract</b> (pull the relevant clauses from a contract) → <b>analyse</b> (classify each clause's risk) → <b>draft</b> (write the summary) → <b>check</b> (verify the draft cites only extracted clauses). Each stage has one job, one output schema and its own eval.</li>
+        <li>Why it helps: every stage gets the model's full attention on a smaller problem; intermediate outputs are <b>inspectable and testable</b>; failures localise to a stage; and stages can use different models — a small, cheap one for extraction, a stronger one for the hard judgement.</li>
+        <li>Gates between stages turn a chain into a program: validate stage <i>i</i>'s output (schema, non-empty, within bounds) before spending tokens on stage <i>i+1</i>, and route failures to a retry or a fallback.</li>
+        <li>The cost is latency and compounding error. If each stage succeeds independently with probability <code>pᵢ</code>, the chain succeeds with <code>∏ pᵢ</code> — five 95% stages give ≈ 77%. Gates and retries are what claw that back.</li>
+        <li>Chaining is the simplest of the fixed-path <a href="../agentic/agentic-design-patterns.html#workflows">agentic workflow patterns</a>; when the next step depends on what was observed, you have crossed into <a href="../agentic/agents.html">agents</a>.</li>
+      </ul>
+      <div class="formula"><span class="lbl">end-to-end reliability of an ungated chain</span><span class="eq">P(chain ok) = ∏<sub>i=1…m</sub> p<sub>i</sub></span>     <span class="eq">e.g. 0.95⁵ ≈ 0.77</span></div>
+      <div class="callout"><b>Takeaway:</b> decompose until each prompt has one job and one schema. You trade a little latency for stages you can test, swap and debug independently.</div>
+    </section>
+
+    <section class="topic" id="structured">
+      <h3><span class="idx">08</span> Output parsing &amp; structured outputs</h3>
+      <p class="lede">When the output feeds code, "usually valid JSON" is a bug. There are three tiers of guarantee.</p>
+      <table class="cmp">
+        <tr><th>Tier</th><th>Mechanism</th><th>Guarantee</th><th>Residual risk</th></tr>
+        <tr><td>Instructed format</td><td>Describe the schema and show an example in the prompt</td><td>None — usually works</td><td>Stray prose, trailing commas, missing fields</td></tr>
+        <tr><td>Validate-and-retry</td><td>Parse; on failure, re-prompt with the error message</td><td>Probabilistic, bounded by retries</td><td>Extra latency and cost on failures</td></tr>
+        <tr><td>Constrained decoding</td><td>At each step, mask tokens that would violate a grammar / JSON schema</td><td>Syntactically valid by construction</td><td>Content can still be wrong; schema features may be limited</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Constrained decoding</b> compiles the schema to a grammar or finite-state machine; at each decoding step, logits for tokens that cannot extend a valid prefix are set to −∞ before sampling. The output parses by construction. Many APIs expose this as a "structured output" or strict tool-schema mode; with open models it is a library-level feature of the inference server.</li>
+        <li>Validity is not correctness. A schema guarantees <code>"amount": number</code>, not that the number is the one in the invoice. Keep semantic validators (ranges, cross-field consistency, "value appears in source") after the parser.</li>
+        <li><b>Field order is a reasoning order.</b> Because the model generates left to right, putting a <code>"reasoning"</code> field before <code>"answer"</code> in the schema gives you CoT inside structured output; putting the answer first forces it to commit before thinking.</li>
+        <li>Heavily restrictive grammars can hurt quality slightly on reasoning-heavy tasks, since the model can't "think out loud". The common workaround is a free-text reasoning field, or a two-step chain: reason freely, then format.</li>
+        <li>On retries, feed back the <b>specific</b> validation error ("field <code>date</code>: expected YYYY-MM-DD, got 'next Tuesday'") rather than "invalid, try again".</li>
+      </ul>
+      <div class="formula"><span class="lbl">validate-and-retry with per-attempt validity p and at most R attempts</span><span class="eq">P(valid within R) = 1 − (1 − p)<sup>R</sup></span>     <span class="eq">E[attempts] = (1 − (1 − p)<sup>R</sup>) / p</span>   <span class="eq">(p = 0.9, R = 3 → 99.9% valid, ≈ 1.11 calls)</span></div>
+      <div class="callout"><b>Takeaway:</b> when output feeds code, use schema-constrained decoding if available, keep semantic validators after it, and order schema fields so the model reasons before it commits.</div>
+    </section>
+
+    <section class="topic" id="sampling">
+      <h3><span class="idx">09</span> Sampling parameters and the prompt</h3>
+      <p class="lede">The prompt shapes the distribution; sampling decides how much of it you see. The decoding mathematics is derived in <a href="../deep-learning/transformers/training-decoding.html#sampling">Decoding: temperature, top-k, top-p</a> and visualised in <a href="large-language-models.html#decoding">LLM decoding</a>.</p>
+      <div class="formula"><span class="lbl">temperature rescales the logits; top-p truncates the tail</span><span class="eq">P<sub>T</sub>(t) = softmax(z / T)<sub>t</sub></span>     <span class="eq">V<sub>p</sub> = smallest set with ∑<sub>t ∈ V<sub>p</sub></sub> P<sub>T</sub>(t) ≥ p</span></div>
+      <ul class="notes">
+        <li><b>Low temperature (≈ 0–0.3)</b> for extraction, classification, code and anything you will evaluate for exact match. <b>Higher (≈ 0.7–1)</b> for brainstorming, diverse drafts, and for generating the N samples that self-consistency votes over.</li>
+        <li><b>Tune one knob.</b> Temperature and top-p both control tail mass; adjusting both makes behaviour hard to reason about, and some APIs now reject or ignore setting both. Some reasoning-model APIs fix sampling parameters entirely.</li>
+        <li><b>T = 0 is not a determinism guarantee.</b> Batched inference, floating-point non-associativity and server-side changes can still vary outputs. If an eval needs repeatability, measure the run-to-run spread rather than assuming zero.</li>
+        <li>A good prompt narrows the distribution so that sampling matters less. If quality swings wildly between samples at moderate temperature, the instruction is under-specified — fix the prompt before turning the temperature down to hide it.</li>
+        <li>Stop sequences and max-token limits are part of the contract too: a stop on the closing tag of your answer block saves tokens and prevents trailing commentary.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> sampling settings are task-specific, not global. Low and fixed for anything evaluated by exact match; higher only where diversity is the goal.</div>
+    </section>
+
+    <section class="topic" id="evaluation">
+      <h3><span class="idx">10</span> Evaluating and iterating on prompts</h3>
+      <p class="lede">A prompt edit is a code change. Without an eval set you cannot tell an improvement from noise — and small eval sets are much noisier than they feel.</p>
+      <h4>The loop</h4>
+      <ul class="notes">
+        <li><b>Write success criteria first</b> — specific, measurable (exact-match accuracy, schema validity, rubric score, latency, cost per call).</li>
+        <li><b>Build an eval set</b> of representative inputs, deliberately over-sampling the hard and adversarial cases. Start with tens of examples to iterate fast; grow to hundreds before trusting small differences. Version it alongside the prompt.</li>
+        <li><b>Grade</b> by code where possible (exact match, regex, parser, unit test); by an <a href="llm-as-a-judge.html">LLM judge</a> with a written rubric for open-ended output — watching for its <a href="llm-as-a-judge.html#biases">position, length and self-preference biases</a>; and by humans on a sample to keep the judge honest.</li>
+        <li><b>Regression-test</b> every change against the full set, not just the case that motivated it. Prompt fixes are notorious for repairing one failure and silently breaking three others. Re-run the suite when the underlying model version changes, too.</li>
+        <li><b>A/B in production</b> for what offline evals can't see — user edits, task completion, escalations — with the prompt version logged on every request.</li>
+      </ul>
+      <h4>How big a difference is real?</h4>
+      <div class="formula"><span class="lbl">standard error of an accuracy estimated on n items</span><span class="eq">SE = √( p (1 − p) / n )</span>     <span class="eq">95% CI ≈ p ± 1.96 · SE</span>
+<span class="lbl">example</span><span class="eq">p = 0.80, n = 100  →  SE = 0.04  →  CI ≈ ±7.8 points</span>     <span class="eq">n = 1000  →  ±2.5 points</span></div>
+      <ul class="notes">
+        <li>On 100 items, a 3-point gain between two prompts is well inside the noise. Compare prompts <b>on the same items</b> (a paired test such as McNemar's on the items where they disagree) — it is far more sensitive than comparing two independent accuracies.</li>
+        <li>Because of the variance in <a href="#examples">§05</a>, also measure across a few example permutations or seeds; a prompt that wins on one ordering and loses on another hasn't won.</li>
+        <li>Automated prompt optimisation — having a model propose rewrites or select demonstrations and keeping whatever scores best on a dev set — works, but overfits small dev sets exactly like hyper-parameter search does. Hold out a test split.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> criteria → eval set → graders → regression suite → A/B. Size the eval so the differences you care about exceed the confidence interval, and compare prompts paired on the same items.</div>
+    </section>
+
+    <section class="topic" id="cost">
+      <h3><span class="idx">11</span> Prompt compression, caching &amp; API cost</h3>
+      <p class="lede">A prompt is paid for on every call. A long system prompt that costs fractions of a cent once becomes a real line item at a million calls a day.</p>
+
+      <div class="viz" id="viz-cost">
+        <div class="vhead">
+          <span class="vtitle">Prompt cost calculator (illustrative prices)</span>
+          <span class="vhint">Baseline vs optimised daily cost; prices are placeholders — substitute your provider's</span>
+        </div>
+        <div class="controls">
+          <label>Static prefix tokens <input type="range" id="pc-static" min="0" max="20000" step="500" value="4000"></label>
+          <label>Per-call input tokens <input type="range" id="pc-dyn" min="50" max="5000" step="50" value="600"></label>
+          <label>Output tokens <input type="range" id="pc-out" min="20" max="2000" step="20" value="300"></label>
+          <label>Calls / day <input type="range" id="pc-calls" min="1000" max="1000000" step="1000" value="100000"></label>
+          <label>Compression keep-ratio <input type="range" id="pc-comp" min="0.2" max="1" step="0.05" value="1"></label>
+          <label><input type="checkbox" id="pc-cache" checked> Prefix caching</label>
+        </div>
+        <svg id="pc-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Interactive diagram: stacked bars comparing daily API cost of a baseline prompt with an optimised prompt using compression and prefix caching"></svg>
+        <div class="readout" aria-live="polite" id="pc-read"></div>
+      </div>
+
+      <div class="formula"><span class="lbl">cost per day, no caching</span><span class="eq">C = N · ( (n<sub>s</sub> + n<sub>d</sub>) · c<sub>in</sub> + n<sub>out</sub> · c<sub>out</sub> )</span>
+<span class="lbl">with a cached static prefix (price multipliers <span class="keep">ρ<sub>r</sub></span> for a cached read, <span class="keep">ρ<sub>w</sub></span> for a cache write; W writes per day)</span><span class="eq">C = N · ( n<sub>s</sub> · ρ<sub>r</sub> · c<sub>in</sub> + n<sub>d</sub> · c<sub>in</sub> + n<sub>out</sub> · c<sub>out</sub> ) + W · n<sub>s</sub> · (ρ<sub>w</sub> − ρ<sub>r</sub>) · c<sub>in</sub></span></div>
+      <ul class="notes">
+        <li>The figure's defaults are placeholders: input at $3 per million tokens, output at 5× input, cached reads at 0.1× and cache writes at 1.25× the input rate, refreshed 288 times a day (every 5 minutes). Real ratios vary by provider and model, but <b>output priced several times above input</b> and <b>cached reads priced at a small fraction of input</b> are common patterns.</li>
+        <li><b>Caching</b> only works on a byte-identical prefix, so the static part must come first and contain nothing that changes per call — no timestamps, no per-user names, no shuffled examples. Similarity-retrieved examples (<a href="#examples">§05</a>) belong after the cache boundary. Layout rules are in <a href="context-engineering.html#caching">Context Engineering §08</a>.</li>
+        <li><b>Compression</b> comes in three flavours: <i>editorial</i> (delete redundant rules, merge overlapping examples — free and usually the biggest win), <i>learned token pruning</i> (a small model drops low-information tokens, with aggressive ratios reported on long retrieved contexts), and <i>summarisation</i> of history or documents. The last two trade accuracy for tokens: quality is flat at mild ratios and then falls off, with exact strings (IDs, numbers, code) the first casualties.</li>
+        <li><b>Output tokens</b> are the expensive side per token and dominate latency; once the prefix is cached they often dominate the bill as well (in the figure's defaults, output goes from about a quarter of the baseline cost to well over half of the optimised one). CoT, verbose prose and repeated JSON keys all add up. Ask for concise output, set max-tokens and stop sequences, and prefer short enum values.</li>
+        <li><b>Model routing</b> is a cost lever too: send easy calls to a small model and escalate only the hard ones, measured per route with the eval from §10.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> cost ≈ calls × (input tokens × input price + output tokens × output price). Cache the static prefix, edit the prompt down before compressing it algorithmically, and watch output length — per token it is the more expensive side, and after caching it is often most of the bill.</div>
+    </section>
+
+    <section class="topic" id="decision">
+      <h3><span class="idx">12</span> Prompting vs RAG vs fine-tuning</h3>
+      <p class="lede">Each fixes a different gap. Diagnose the gap first; then pick the cheapest tool that closes it.</p>
+
+      <div class="viz" id="viz-tri">
+        <div class="vhead">
+          <span class="vtitle">The decision triangle (illustrative heuristic)</span>
+          <span class="vhint">Describe the gap; the point moves toward the approach that addresses it</span>
+        </div>
+        <div class="controls">
+          <label>Knowledge gap <input type="range" id="tri-know" min="0" max="100" step="5" value="20"></label>
+          <label>Behaviour / format gap <input type="range" id="tri-beh" min="0" max="100" step="5" value="30"></label>
+          <label>Volume / latency pressure <input type="range" id="tri-vol" min="0" max="100" step="5" value="10"></label>
+        </div>
+        <svg id="tri-svg" width="640" height="320" viewBox="0 0 640 320" role="img" aria-label="Interactive diagram: triangle with vertices prompting, retrieval-augmented generation and fine-tuning; sliders for knowledge gap, behaviour gap and volume pressure move a point and highlight the recommended approach"></svg>
+        <div class="readout" aria-live="polite" id="tri-read"></div>
+      </div>
+
+      <table class="cmp">
+        <tr><th></th><th>Prompting</th><th>RAG</th><th>Fine-tuning</th></tr>
+        <tr><td>Fixes</td><td>Task statement, format, tone, simple behaviour</td><td>Missing, private or fresh <b>knowledge</b></td><td>Persistent <b>skill, style or behaviour</b> the prompt can't reliably induce</td></tr>
+        <tr><td>Does not fix</td><td>Facts the model never saw</td><td>Style, format, reasoning skill</td><td>Fresh facts (frozen at training time); reliable recall of rare facts</td></tr>
+        <tr><td>Time to change</td><td>Minutes</td><td>Re-index: minutes to hours</td><td>Data collection + training: days</td></tr>
+        <tr><td>Per-call cost</td><td>Grows with prompt length</td><td>Retrieval + longer context</td><td>Shorter prompts; can use a smaller model</td></tr>
+        <tr><td>Upfront cost</td><td>An eval set</td><td>Index, chunking, retriever eval</td><td>Labelled data, training, serving the adapter</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Always start with prompting</b> plus an eval set — it is the baseline every other option must beat, and the eval is reused by all three.</li>
+        <li>Reach for <a href="../nlp/retrieval-augmented-generation.html">RAG</a> when failures trace to <b>facts the model doesn't have</b>: private documents, anything after the training cutoff, things that change. It also enables citations, which helps against <a href="hallucination-factuality.html#mitigation">hallucination</a>.</li>
+        <li>Reach for <a href="parameter-efficient-fine-tuning.html">fine-tuning</a> (usually a parameter-efficient adapter) when a <b>behaviour</b> is needed consistently and a prompt only gets it most of the time, when the few-shot block has grown into thousands of tokens paid on every call, or when latency demands a smaller model distilled to the task. Fine-tuning is a poor way to inject facts.</li>
+        <li>They compose. A common mature stack is a fine-tuned model for format and domain register, RAG for facts, and a prompt that ties them together. The <a href="../nlp/retrieval-augmented-generation.html#rag-vs-ft">RAG vs fine-tuning</a> comparison covers that pairing.</li>
+      </ul>
+      <div class="callout"><b>Diagnostic:</b> show the model the right answer's evidence in the prompt. If it now succeeds, you had a knowledge gap → RAG. If it still fails with the evidence present and a clear instruction, you have a capability or behaviour gap → better examples, decomposition, a stronger model, or fine-tuning.</div>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">13</span> Limits, pitfalls &amp; what to remember</h3>
+      <h4>Limits of prompting</h4>
+      <ul class="notes">
+        <li><b>Brittleness.</b> Semantically equivalent prompts — reordered examples, a changed delimiter, different whitespace — can produce measurably different accuracy, especially on smaller models. Robustness has to be measured, not assumed.</li>
+        <li><b>Version drift.</b> A prompt tuned for one model version is not portable; when the model changes, re-run the eval before redeploying.</li>
+        <li><b>No new knowledge, bounded new skill.</b> Prompts surface what the weights can already do. They cannot add facts (that's retrieval) or reliably install skills far beyond the model's ability (that's training or a stronger model).</li>
+        <li><b>Not a security boundary.</b> Instructions can be overridden by adversarial input; anything with side effects needs controls outside the prompt — see <a href="llm-security.html">LLM Security</a>.</li>
+      </ul>
+      <h4>What to remember</h4>
+      <ul class="notes">
+        <li><b>Instruction vs context:</b> prompt engineering states the task; <a href="context-engineering.html">context engineering</a> decides what surrounds it. Diagnose which one is failing.</li>
+        <li><b>Structure the prompt:</b> role and policy in the system block, data fenced in tags, an explicit output contract with an "unsure" escape.</li>
+        <li><b>Examples are hyper-parameters:</b> balanced, interleaved, diverse, edge-case heavy; retrieved per query when the input space is broad; variance measured across permutations.</li>
+        <li><b>CoT costs output tokens:</b> use it for multi-step problems on non-reasoning models; keep the answer in its own slot. Details in <a href="reasoning-in-llms.html">Reasoning in LLMs</a>.</li>
+        <li><b>Decompose:</b> chains of narrow prompts with gates beat one prompt doing everything.</li>
+        <li><b>Outputs that feed code:</b> constrained decoding plus semantic validation plus targeted retries.</li>
+        <li><b>Evaluate like code:</b> criteria, eval set, paired comparisons, regression suite, confidence intervals.</li>
+        <li><b>Price it:</b> cache the stable prefix, trim before compressing, cap output length.</li>
+        <li><b>Escalate deliberately:</b> prompting → RAG for knowledge, → fine-tuning for persistent behaviour or cost at volume.</li>
+      </ul>
+      <div class="callout"><b>Threads to pull:</b> the ability itself is <a href="large-language-models.html#incontext">in-context learning</a> in <a href="large-language-models.html">Large Language Models</a>; the window around the prompt is <a href="context-engineering.html">Context Engineering</a>; reasoning prompts deepen into <a href="reasoning-in-llms.html">Reasoning in LLMs</a>; knowledge gaps go to <a href="../nlp/retrieval-augmented-generation.html">RAG</a>, behaviour gaps to <a href="parameter-efficient-fine-tuning.html">PEFT</a>; grading prompts is <a href="llm-as-a-judge.html">LLM-as-a-Judge</a>; and keeping them safe is <a href="llm-security.html">LLM Security</a>.</div>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="prompt-engineering.viz.js"></script>
+</body>
+</html>
