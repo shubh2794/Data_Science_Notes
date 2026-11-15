@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes &middot; LLM Serving &amp; Inference Optimization</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>LLM Serving &amp; Inference Optimization</h1>
+      <p>A trained model is a file. Making it answer millions of requests per day at acceptable latency and cost is <b>serving</b> &mdash; a separate engineering discipline from training, with its own bottlenecks, metrics, and tricks. This page covers the full stack: hardware limits, quantization, memory management, batching, parallelism, frameworks, and scaling.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">MLOps &amp; Deployment</span>
+        <span class="pill">Inference</span>
+        <span class="pill">LLM Serving</span>
+        <span class="pill">Efficiency</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="why-serving" data-nav="Why serving is its own problem">
+      <h3><span class="idx">01</span> Why serving is its own problem</h3>
+      <p class="lede">Training touches each example once; inference touches every user request forever. A 1% efficiency gain in serving compounds into millions of dollars saved per year.</p>
+      <ul class="notes">
+        <li><b>Inference dominates lifetime cost.</b> Training a frontier model is a one-time (or few-time) expense. Inference runs 24/7 at scale, and for popular models the cumulative inference spend vastly exceeds training spend within months.</li>
+        <li><b>Two computational bottlenecks.</b> Every operation is either <b>compute-bound</b> (limited by FLOPS &mdash; the GPU cannot multiply fast enough) or <b>memory-bandwidth-bound</b> (limited by how fast you can read weights from HBM). The <b>roofline model</b> draws the boundary.</li>
+        <li><b>Arithmetic intensity</b> is the ratio of operations to bytes transferred. If a workload's arithmetic intensity exceeds the hardware's ops-per-byte ceiling, it is compute-bound; below that ceiling, it is memory-bound.</li>
+        <li><b>Prefill phase</b> &mdash; processes all input tokens in parallel. Large matrix multiplications with high arithmetic intensity &rarr; <b>compute-bound</b>. This is why longer prompts increase TTFT.</li>
+        <li><b>Decode phase</b> &mdash; generates one token at a time, autoregressively. Each step loads the full weight matrices but performs relatively few operations per weight &rarr; <b>memory-bandwidth-bound</b>. This is the fundamental bottleneck for token throughput.</li>
+        <li><b>Online vs. batch.</b> Online APIs optimize latency (respond fast). Batch APIs optimize cost (queue requests, fill GPU utilization &mdash; often ~50% cheaper). Many providers now offer both tiers.</li>
+      </ul>
+      <div class="formula">
+        <span class="lbl">arithmetic intensity (roofline model)</span>
+        <span class="eq">I = FLOPs / bytes_accessed</span><br/>
+        <span class="lbl">regime boundary</span>
+        <span class="eq">if I &gt; peak_FLOPS / peak_BW &rarr; compute-bound</span><br/>
+        <span class="eq">if I &lt; peak_FLOPS / peak_BW &rarr; memory-bound</span>
+      </div>
+
+      <div class="viz" id="viz-roofline">
+        <div class="vhead">
+          <span class="vtitle">Roofline model &mdash; prefill vs. decode</span>
+          <span class="vhint">Drag the slider to change batch size and see how decode shifts</span>
+        </div>
+        <div class="controls">
+          <label>decode batch size <input type="range" id="roof-bs" min="1" max="128" step="1" value="1"> <span id="roof-bs-v">1</span></label>
+        </div>
+        <svg id="roof-svg" width="640" height="280" viewBox="0 0 640 280" role="img" aria-label="Interactive roofline chart showing compute-bound and memory-bound regions"></svg>
+        <div class="readout" aria-live="polite" id="roof-read"></div>
+      </div>
+
+      <div class="callout"><b>Key insight:</b> prefill and decode have fundamentally different hardware profiles. This asymmetry motivates almost every optimization on this page &mdash; from batching (raise decode's arithmetic intensity) to disaggregated serving (put each phase on its ideal hardware).</div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="metrics" data-nav="Performance metrics">
+      <h3><span class="idx">02</span> Performance metrics</h3>
+      <p class="lede">You cannot optimize what you do not measure. LLM serving has its own metric vocabulary, distinct from training metrics.</p>
+      <ul class="notes">
+        <li><b>TTFT (Time to First Token).</b> How long the user waits before any output appears. Dominated by prefill time. Target: &lt;500ms for interactive apps, &lt;200ms for conversational feel.</li>
+        <li><b>TPOT (Time per Output Token).</b> The interval between consecutive generated tokens. Dominated by decode speed. Target: &lt;50ms for real-time streaming (&gt;20 tokens/sec feels fluid).</li>
+        <li><b>End-to-end latency.</b> TTFT + (n_output_tokens &times; TPOT). For a 500-token response: TTFT + 500 &times; TPOT.</li>
+        <li><b>Throughput.</b> Tokens per second across the whole system (all concurrent requests). The primary cost metric &mdash; higher throughput means more work per GPU-hour.</li>
+        <li><b>Latency percentiles.</b> p50 tells you the typical experience. p95 and p99 tell you the tail &mdash; which is what SLOs are usually written against. Head-of-line blocking in static batching makes tails worse.</li>
+        <li><b>Streaming.</b> Return tokens as generated rather than waiting for the full response. Reduces perceived latency dramatically even if total latency is unchanged. Most production APIs default to streaming.</li>
+        <li><b>Goodput.</b> Throughput of requests that actually meet the SLO. A system can have high raw throughput but low goodput if too many requests miss their latency target.</li>
+      </ul>
+      <div class="formula">
+        <span class="lbl">end-to-end latency</span>
+        <span class="eq">T<sub>e2e</sub> = T<sub>prefill</sub> + n<sub>output</sub> &times; T<sub>decode_step</sub></span><br/>
+        <span class="lbl">throughput</span>
+        <span class="eq">tokens/sec = concurrent_requests &times; tokens_per_request / T<sub>e2e</sub></span>
+      </div>
+      <table class="cmp">
+        <tr><th>Metric</th><th>Measures</th><th>Bottleneck</th><th>Typical target</th></tr>
+        <tr><td>TTFT</td><td>Time to first token</td><td>Prefill (compute)</td><td>&lt;500ms interactive</td></tr>
+        <tr><td>TPOT</td><td>Inter-token interval</td><td>Decode (memory BW)</td><td>&lt;50ms streaming</td></tr>
+        <tr><td>Throughput</td><td>System tokens/sec</td><td>GPU utilization</td><td>Maximize per $</td></tr>
+        <tr><td>p99 latency</td><td>Tail experience</td><td>Batching, queuing</td><td>SLO-dependent</td></tr>
+        <tr><td>Goodput</td><td>SLO-meeting throughput</td><td>All of the above</td><td>&gt;95% of throughput</td></tr>
+      </table>
+      <div class="callout"><b>The fundamental trade-off:</b> throughput and latency are at odds. Larger batches raise throughput but increase per-request latency. Every serving configuration is a point on this Pareto frontier, chosen by your SLO.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="quantization" data-nav="Quantization for serving">
+      <h3><span class="idx">03</span> Quantization for serving</h3>
+      <p class="lede">The single biggest lever for serving cost. Fewer bits per weight means smaller models, less memory bandwidth consumed, and faster decode &mdash; often with negligible quality loss. See also <a href="model-acceleration.html">Model Acceleration</a> for the broader picture.</p>
+      <ul class="notes">
+        <li><b>Why it helps decode so much.</b> Decode is memory-bandwidth-bound: you load the entire weight matrix to produce one token. Halving weight precision roughly halves the bytes loaded per step &rarr; roughly 2x decode speedup.</li>
+        <li><b>GPTQ</b> &mdash; post-training quantization using second-order (Hessian) information to minimize layer-wise reconstruction error. Processes one layer at a time, quantizes weights to 4-bit or 3-bit. Requires a small calibration set. Produces GPU-friendly quantized weights.</li>
+        <li><b>AWQ (Activation-Aware Weight Quantization)</b> &mdash; observes that a small fraction of weight channels matter disproportionately (because their corresponding activations are large). Protects those salient channels with per-channel scaling before quantizing to 4-bit. Often better quality than GPTQ at the same bit width.</li>
+        <li><b>SmoothQuant</b> &mdash; migrates the quantization difficulty from activations (which have outlier channels) to weights (which are easier to quantize) via mathematically equivalent per-channel scaling. Enables W8A8 (8-bit weights and activations) with minimal loss.</li>
+        <li><b>GGUF</b> &mdash; the quantization format used by llama.cpp. CPU-optimized with various quantization levels (Q4_K_M, Q5_K_S, etc.). Popular for local/edge deployment. Supports mixed quantization: more bits for attention layers, fewer for FFN.</li>
+        <li><b>bitsandbytes</b> &mdash; integrates directly with HuggingFace Transformers. <b>LLM.int8()</b> uses mixed-precision decomposition: outlier features stay in FP16, the rest go to INT8. <b>NF4 (4-bit NormalFloat)</b> quantizes weights to a 4-bit data type optimized for normally-distributed weights &mdash; the format behind QLoRA.</li>
+        <li><b>FP8</b> &mdash; native 8-bit floating point on NVIDIA Hopper (H100) and newer GPUs. Two variants: E4M3 (more precision, for weights/activations) and E5M2 (more range, for gradients). Hardware-accelerated &mdash; no custom kernels needed. The default for new deployments on Hopper.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Method</th><th>Bits</th><th>What it quantizes</th><th>Hardware</th><th>Quality vs FP16</th><th>Speed gain</th><th>Notes</th></tr>
+        <tr><td>FP8 (E4M3)</td><td>8</td><td>Weights + activations</td><td>Hopper GPU</td><td>~lossless</td><td>~1.5&ndash;2x</td><td>Hardware-native; easiest path</td></tr>
+        <tr><td>SmoothQuant</td><td>W8A8</td><td>Weights + activations</td><td>GPU (INT8 cores)</td><td>~lossless</td><td>~1.5x</td><td>Channel-wise migration trick</td></tr>
+        <tr><td>GPTQ</td><td>4 (3)</td><td>Weights only</td><td>GPU</td><td>Small loss</td><td>~2&ndash;3x</td><td>Hessian-based; needs calibration</td></tr>
+        <tr><td>AWQ</td><td>4</td><td>Weights only</td><td>GPU</td><td>Slightly better than GPTQ</td><td>~2&ndash;3x</td><td>Activation-aware; salient channels</td></tr>
+        <tr><td>bitsandbytes NF4</td><td>4</td><td>Weights only</td><td>GPU</td><td>Small loss</td><td>~2x</td><td>Easy HF integration; QLoRA base</td></tr>
+        <tr><td>GGUF (Q4_K_M)</td><td>4&ndash;5 mixed</td><td>Weights only</td><td>CPU / Apple Silicon</td><td>Small loss</td><td>N/A (CPU target)</td><td>llama.cpp ecosystem</td></tr>
+      </table>
+      <div class="callout"><b>Practical rule:</b> on Hopper GPUs, start with FP8 &mdash; it is nearly free quality-wise and hardware-native. On older GPUs, AWQ or GPTQ at 4-bit is the default. For CPU/edge, GGUF. Always benchmark on your actual eval set &mdash; "negligible loss" averages hide task-specific regressions.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="kv-cache" data-nav="KV cache &amp; memory">
+      <h3><span class="idx">04</span> KV cache &amp; memory</h3>
+      <p class="lede">During decode, the model recomputes attention over all previous tokens. The <b>KV cache</b> stores the key and value projections so they are computed once and reused. It is also the largest dynamic memory consumer &mdash; and the main bottleneck for concurrent requests. See also <a href="../deep-learning/transformers/kv-cache-generation.html">KV Cache &amp; Generation</a>.</p>
+      <ul class="notes">
+        <li><b>Memory formula.</b> For standard multi-head attention, the KV cache for one sequence consumes the amount shown below. For a 70B model (80 layers, 8 KV heads GQA, d=128, FP16, 4K context): 2 &times; 80 &times; 8 &times; 128 &times; 4096 &times; 2 bytes &approx; 1.3 GB per sequence. Serving 32 concurrent requests = ~42 GB just for KV cache.</li>
+      </ul>
+      <div class="formula">
+        <span class="lbl">KV cache size per sequence</span>
+        <span class="eq">2 &times; n<sub>layers</sub> &times; n<sub>kv_heads</sub> &times; d<sub>head</sub> &times; seq_len &times; bytes_per_param</span>
+      </div>
+      <ul class="notes">
+        <li><b>Multi-Query Attention (MQA).</b> All query heads share a single KV head. Reduces KV cache by n_heads&times; (e.g. 32x for a 32-head model). Used by PaLM, Falcon. Slight quality loss.</li>
+        <li><b>Grouped-Query Attention (GQA).</b> A compromise: a few KV head groups (e.g. 8 groups for 32 query heads &rarr; 4x reduction). Used by Llama 2 70B, Llama 3, Mistral. Near-MHA quality with most of the MQA memory savings.</li>
+        <li><b>PagedAttention (vLLM).</b> Instead of pre-allocating a contiguous KV cache for the maximum sequence length, PagedAttention manages KV cache in fixed-size <b>blocks</b> (like virtual memory pages). A <b>block table</b> per sequence maps logical positions to physical blocks. Benefits:
+          <ul>
+            <li>Eliminates internal fragmentation &mdash; near-zero wasted memory</li>
+            <li>Enables memory sharing &mdash; beam search candidates and parallel samples share common prefix blocks (copy-on-write)</li>
+            <li>Dynamic allocation &mdash; sequences only consume memory they actually need</li>
+          </ul>
+          In practice, PagedAttention increases concurrent batch size by 2&ndash;4x over naive allocation, directly boosting throughput.</li>
+        <li><b>Token eviction / attention sinking.</b> Drop KV entries for middle tokens, keeping the first few (attention sinks) and recent tokens (sliding window). StreamingLLM showed attention sinks are critical for stable perplexity on long sequences.</li>
+        <li><b>KV cache quantization.</b> Quantize cached keys/values to INT8 or INT4, halving or quartering cache memory. Modest quality impact since the cache is used in attention softmax, which is somewhat robust to noise.</li>
+      </ul>
+      <div class="callout"><b>Why this matters for cost:</b> KV cache memory directly limits how many requests you can serve concurrently. Halving KV cache size (via GQA, quantization, or paging) roughly doubles your throughput for the same GPU. Every optimization on this page is ultimately about fitting more concurrent sequences in memory.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="batching" data-nav="Continuous batching">
+      <h3><span class="idx">05</span> Continuous batching</h3>
+      <p class="lede">The difference between a GPU sitting 30% idle and one running at 90% utilization is usually just the batching strategy.</p>
+      <ul class="notes">
+        <li><b>Static (naive) batching.</b> Group N requests, run them together, return results when the <em>slowest</em> sequence finishes. Short sequences pad and waste compute. The batch cannot accept new requests until all sequences complete. GPU utilization drops as sequences finish at different times.</li>
+        <li><b>Continuous (in-flight) batching.</b> Operate at the <b>iteration level</b>: after each decode step, evict finished sequences and insert waiting ones. Every decode iteration runs with the maximum feasible batch size. Pioneered by Orca (2022), now the default in all major serving frameworks.</li>
+        <li><b>Why it matters so much.</b> In static batching, if one sequence generates 500 tokens and another generates 50, the 50-token sequence holds a GPU slot for 10x longer than it needs. Continuous batching reclaims that slot immediately. Throughput improvements of 2&ndash;8x over static batching are typical.</li>
+        <li><b>Iteration-level scheduling.</b> The scheduler decides at each step: which sequences to continue, which new requests to admit (constrained by available KV cache memory), and which to preempt if memory runs low (swap KV cache to CPU or recompute later).</li>
+        <li><b>Prefill interference.</b> A new request's prefill (compute-heavy) can stall ongoing decode steps (memory-bound) if they share the GPU. Solutions: chunked prefill (break prefill into smaller chunks interleaved with decode steps), or disaggregated serving (separate machines for prefill and decode).</li>
+      </ul>
+
+      <div class="viz" id="viz-batch">
+        <div class="vhead">
+          <span class="vtitle">Static vs. continuous batching &mdash; GPU utilization</span>
+          <span class="vhint">Watch how continuous batching fills gaps left by finished sequences</span>
+        </div>
+        <div class="controls">
+          <label><input type="radio" name="batch-mode" value="static" checked> static batching</label>
+          <label><input type="radio" name="batch-mode" value="continuous"> continuous batching</label>
+          <button id="batch-run">run simulation</button>
+        </div>
+        <svg id="batch-svg" width="640" height="240" viewBox="0 0 640 240" role="img" aria-label="Interactive diagram comparing static and continuous batching GPU slot utilization"></svg>
+        <div class="readout" aria-live="polite" id="batch-read"></div>
+      </div>
+
+      <div class="callout"><b>Bottom line:</b> continuous batching is free throughput. There is no reason to use static batching in production. Every modern serving framework (vLLM, TGI, TensorRT-LLM, SGLang) implements it by default.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="disaggregated" data-nav="Disaggregated serving">
+      <h3><span class="idx">06</span> Disaggregated serving</h3>
+      <p class="lede">Prefill and decode have opposite hardware appetites. Why force them onto the same machine?</p>
+      <ul class="notes">
+        <li><b>The mismatch.</b> Prefill is compute-bound &mdash; it wants high FLOPS (dense matrix multiplies on all input tokens in parallel). Decode is memory-bandwidth-bound &mdash; it wants fast memory reads (loading full weight matrices for one token at a time). A single GPU configuration is a compromise for both.</li>
+        <li><b>Disaggregated architecture.</b> Run prefill on compute-optimized machines (maybe fewer GPUs with higher FLOPS). Run decode on memory-bandwidth-optimized machines (maybe more GPUs with high HBM bandwidth). Transfer the KV cache from prefill to decode machines after the prefill completes.</li>
+        <li><b>Benefits.</b> Each phase runs on ideal hardware. Prefill machines can use larger batch sizes (no decode contention). Decode machines are not stalled by prefill compute. Independent scaling: scale prefill and decode pools separately based on workload mix.</li>
+        <li><b>Chunked prefill</b> (a lighter alternative): break the prefill into fixed-size chunks and interleave them with decode iterations on the same GPU. This smooths out latency spikes from long prompts arriving mid-decode. Used by Sarathi, vLLM, and SGLang.</li>
+        <li><b>Trade-offs.</b> KV cache transfer introduces network latency and complexity. Requires a scheduler that routes requests through both pools. More operational surface area. Worthwhile at large scale when the efficiency gains exceed the overhead.</li>
+      </ul>
+      <div class="callout"><b>When to disaggregate:</b> if your workload has high variance in prompt length (some requests have 100 tokens, others have 100K), disaggregation prevents long prefills from blocking decode. For uniform workloads on a few GPUs, chunked prefill is usually sufficient.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="parallelism" data-nav="Model parallelism for inference">
+      <h3><span class="idx">07</span> Model parallelism for inference</h3>
+      <p class="lede">When the model does not fit on one GPU &mdash; or when you need lower latency than one GPU can deliver &mdash; you split it across multiple GPUs. See also <a href="../deep-learning/distributed-training.html">Distributed Training</a> for the training-side view.</p>
+      <ul class="notes">
+        <li><b>Tensor parallelism (TP).</b> Split individual layers (weight matrices) across GPUs. Each GPU computes part of the matrix multiply, then an all-reduce synchronizes. Reduces per-GPU memory and compute. Best within a node (needs fast interconnect &mdash; NVLink). Common: TP=2, 4, or 8 across GPUs in one node.</li>
+        <li><b>Pipeline parallelism (PP).</b> Put different layers on different GPUs. Requests flow through the pipeline. Lower interconnect requirements (only activations between stages, not all-reduce). Higher latency due to pipeline bubbles. Best across nodes. Often combined with TP: TP within a node, PP across nodes.</li>
+        <li><b>Expert parallelism (EP).</b> For Mixture-of-Experts models: distribute experts across GPUs. Each token is routed to its assigned expert's GPU. Reduces per-GPU memory proportional to the number of expert shards. Introduces all-to-all communication for token routing. Key for serving large MoE models like Mixtral and DeepSeek.</li>
+        <li><b>When to use what.</b> TP for latency reduction on models that fit on a few GPUs. PP for models spanning multiple nodes. EP specifically for MoE architectures. In practice, large deployments combine all three.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Strategy</th><th>Splits</th><th>Communication</th><th>Best for</th><th>Latency impact</th></tr>
+        <tr><td>Tensor (TP)</td><td>Weight matrices within a layer</td><td>All-reduce per layer</td><td>Intra-node, latency-sensitive</td><td>Reduces (more GPUs = less work each)</td></tr>
+        <tr><td>Pipeline (PP)</td><td>Layers across stages</td><td>Activations between stages</td><td>Cross-node, throughput-focused</td><td>Increases (pipeline bubbles)</td></tr>
+        <tr><td>Expert (EP)</td><td>MoE experts across GPUs</td><td>All-to-all token routing</td><td>Large MoE models</td><td>Depends on routing balance</td></tr>
+      </table>
+      <div class="callout"><b>Practical rule:</b> for a 70B dense model, TP=4 on one 4&times;H100 node is the sweet spot. For a 405B model, TP=8 within a node and PP=2 across two nodes. For MoE (Mixtral 8x22B), add EP. Over-parallelizing (e.g. TP=8 for a 7B model) wastes interconnect bandwidth on communication overhead.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="frameworks" data-nav="Serving frameworks">
+      <h3><span class="idx">08</span> Serving frameworks</h3>
+      <p class="lede">You almost never write a serving stack from scratch. The frameworks below implement most of the optimizations on this page out of the box.</p>
+      <ul class="notes">
+        <li><b>vLLM.</b> The most widely adopted open-source LLM serving engine. Introduced PagedAttention. Continuous batching, tensor parallelism, quantization support (AWQ, GPTQ, FP8), OpenAI-compatible API. Strong community and ecosystem. The default starting point.</li>
+        <li><b>SGLang.</b> Focuses on structured generation and multi-turn efficiency. RadixAttention for prefix caching (shared prefixes across requests). Compressed finite-state machines for constrained decoding. Fast for workloads with repeated system prompts or structured outputs.</li>
+        <li><b>TensorRT-LLM (NVIDIA).</b> NVIDIA's optimized serving engine. Compiles models to TensorRT for maximum kernel efficiency on NVIDIA GPUs. FP8 support on Hopper. In-flight batching, paged KV cache. Highest raw throughput on NVIDIA hardware but less flexible and slower iteration cycle.</li>
+        <li><b>TGI (Text Generation Inference, HuggingFace).</b> Production-ready serving with tight HuggingFace ecosystem integration. Continuous batching, tensor parallelism, quantization. Good for teams already in the HF ecosystem. Production-tested at HuggingFace's own inference endpoints.</li>
+        <li><b>llama.cpp / Ollama.</b> CPU-first inference via GGUF quantization. llama.cpp is the engine; Ollama wraps it in a user-friendly CLI and API. Great for local development, edge deployment, and Apple Silicon (Metal acceleration). Not designed for high-throughput GPU serving.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Framework</th><th>PagedAttention</th><th>Continuous batching</th><th>Quantization</th><th>Parallelism</th><th>Best for</th></tr>
+        <tr><td>vLLM</td><td>Yes (original)</td><td>Yes</td><td>AWQ, GPTQ, FP8, bitsandbytes</td><td>TP, PP</td><td>General-purpose GPU serving</td></tr>
+        <tr><td>SGLang</td><td>Yes</td><td>Yes</td><td>AWQ, GPTQ, FP8</td><td>TP</td><td>Structured output, multi-turn</td></tr>
+        <tr><td>TensorRT-LLM</td><td>Yes</td><td>Yes</td><td>FP8, INT8, INT4</td><td>TP, PP</td><td>Max throughput on NVIDIA</td></tr>
+        <tr><td>TGI</td><td>Yes</td><td>Yes</td><td>AWQ, GPTQ, bitsandbytes</td><td>TP</td><td>HuggingFace ecosystem</td></tr>
+        <tr><td>llama.cpp</td><td>No</td><td>Limited</td><td>GGUF (Q2&ndash;Q8)</td><td>No (single device)</td><td>CPU / edge / local dev</td></tr>
+      </table>
+      <div class="callout"><b>Framework choice heuristic:</b> start with vLLM. If you need structured outputs heavily, try SGLang. If you are on NVIDIA and need every last token/sec, evaluate TensorRT-LLM. If you are deploying locally or on CPU, use llama.cpp/Ollama.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="scaling" data-nav="Scaling &amp; routing">
+      <h3><span class="idx">09</span> Scaling &amp; routing</h3>
+      <p class="lede">A single GPU serving instance is a building block. Production systems need autoscaling, request routing, and queue management to handle variable load while meeting SLOs.</p>
+      <ul class="notes">
+        <li><b>SLO-aware autoscaling.</b> Scale on latency percentiles (p95 TPOT, p99 TTFT), not just CPU/GPU utilization. A GPU at 80% utilization might already be violating latency SLOs due to queuing delay. Scale up <em>before</em> the SLO is breached, not after.</li>
+        <li><b>Request routing.</b> Route requests to replicas considering: current queue depth, model already loaded (avoid cold starts), GPU memory available for KV cache, and request characteristics (long prompts to machines with more prefill headroom). Shortest-queue routing is a reasonable default.</li>
+        <li><b>Queue management.</b> When all replicas are at capacity: queue with bounded wait time, shed load gracefully (return 429 with retry-after), or degrade (route to a smaller, faster model). Never queue unboundedly &mdash; queuing delay compounds under load.</li>
+        <li><b>Prefix caching.</b> Many requests share common system prompts. Cache their KV states and reuse across requests. SGLang's RadixAttention organizes this as a radix tree. vLLM also supports automatic prefix caching. This reduces redundant prefill work substantially for multi-turn conversations and shared-prompt deployments.</li>
+        <li><b>Cost optimization.</b> Use spot/preemptible instances for batch workloads. Right-size GPU types (do not use H100s for a 7B model). Batch APIs for non-latency-sensitive workloads. Model routing: send simple queries to a small model, hard queries to the large one (a form of the routing pattern from <a href="../agentic/agentic-design-patterns.html#workflows">agentic design patterns</a>).</li>
+        <li><b>Multi-model serving.</b> Load multiple models (or LoRA adapters) on the same GPU, swapping as needed. Reduces cost when serving many fine-tuned variants. vLLM and SGLang both support dynamic LoRA loading.</li>
+      </ul>
+      <div class="callout"><b>The operational reality:</b> serving LLMs at scale is as much a systems engineering problem as an ML one. The difference between a demo and a production system is graceful degradation under load, observable metrics, and an autoscaler that acts on the right signal.</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="takeaways" data-nav="Pitfalls &amp; what to remember">
+      <h3><span class="idx">10</span> Pitfalls &amp; what to remember</h3>
+      <h4>Pitfalls</h4>
+      <ul class="notes">
+        <li><b>Optimizing the wrong phase.</b> If TTFT is fine but TPOT is slow, quantization helps (decode is memory-bound). If TTFT is slow but TPOT is fine, you need to speed up prefill (more compute, shorter prompts, prefix caching). Measure before you optimize.</li>
+        <li><b>Ignoring KV cache memory.</b> Teams budget GPU memory for model weights and forget that KV cache scales with sequence length &times; batch size. A 128K context window can consume more memory than the model itself.</li>
+        <li><b>Benchmarking at low concurrency.</b> A framework looks great serving one request at a time. Production means 50&ndash;500 concurrent requests. Always benchmark at realistic concurrency and measure tail latency.</li>
+        <li><b>Quantization without eval.</b> "4-bit is fine" is true on average and false for specific tasks. Always run your evaluation suite on the quantized model. Watch for degradation on reasoning, math, and long-context tasks.</li>
+        <li><b>Over-parallelizing.</b> Tensor parallelism across more GPUs than needed wastes interconnect bandwidth. A 13B model on 8 GPUs will be slower than on 2 GPUs because communication overhead dominates.</li>
+        <li><b>No graceful degradation.</b> Without load shedding and queue bounds, a traffic spike turns latency violations into cascading timeouts across your whole system.</li>
+      </ul>
+      <h4>What to remember</h4>
+      <ul class="notes">
+        <li><b>Prefill is compute-bound; decode is memory-bandwidth-bound.</b> This asymmetry drives every optimization on this page.</li>
+        <li><b>Quantization</b> (4-bit or FP8) is the single biggest lever. Start here.</li>
+        <li><b>Continuous batching</b> is free throughput &mdash; never use static batching.</li>
+        <li><b>KV cache</b> is the memory bottleneck. GQA, PagedAttention, and cache quantization are the levers.</li>
+        <li><b><a href="speculative-decoding.html">Speculative decoding</a></b> speeds up decode without quality loss &mdash; a small model drafts, the big model verifies.</li>
+        <li><b>Measure at production concurrency</b> with tail latency metrics before declaring victory.</li>
+        <li>Neighbours: <a href="model-acceleration.html">Model Acceleration</a> (broader compression), <a href="speculative-decoding.html">Speculative Decoding</a> (decode speedup), <a href="llmops.html">LLMOps</a> (operational lifecycle), <a href="../deep-learning/transformers/kv-cache-generation.html">KV Cache &amp; Generation</a> (attention mechanics).</li>
+      </ul>
+      <div class="callout"><b>The whole page in one line:</b> LLM serving is a memory-bandwidth game &mdash; quantize the weights, page the KV cache, batch continuously, and scale on the right signal.</div>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="llm-serving.viz.js"></script>
+</body>
+</html>

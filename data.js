@@ -452,6 +452,7 @@ const nodes = [
   {id:"Agentic RL", group:"agent", level:2, link:"agentic/agentic-rl.html", desc:"Training agents with reinforcement learning over multi-step tool use and environment feedback — optimizing reward over trajectories, not single responses."},
   {id:"Agent Skills", group:"agent", level:2, link:"agentic/agent-skills.html", desc:"Reusable, composable capabilities an agent can invoke — packaged tools and procedures that extend what an agent can do."},
   {id:"Agentic Design Patterns", group:"agent", level:2, link:"agentic/agentic-design-patterns.html", desc:"Recurring architectures for agent systems — reflection, planning, tool use, and multi-agent collaboration."},
+  {id:"Multi-Agent Systems", group:"agent", level:2, link:"agentic/multi-agent-systems.html", desc:"Architecture, coordination, and communication patterns for systems with multiple LLM-based agents — topologies, the CWD model, task allocation, debate, orchestration frameworks, and failure handling."},
 
   // ===== curated expansion (substantial topics; micro-concepts live as sections of these) =====
   // Machine Learning
@@ -507,8 +508,10 @@ const nodes = [
   // MLOps
   {id:"LLMOps", group:"mlops", level:2, link:"mlops/llmops.html", desc:"Operating LLM apps in production — prompt/version management, evaluation, guardrails, caching, and cost/latency monitoring."},
   {id:"Model Acceleration", group:"mlops", level:2, link:"mlops/model-acceleration.html", desc:"Serve models faster and cheaper — quantization, pruning, compilation, and speculative decoding."},
+  {id:"LLM Serving", group:"mlops", level:2, link:"mlops/llm-serving.html", desc:"Serving LLMs efficiently in production — roofline model, quantization (GPTQ/AWQ/FP8), KV cache management (PagedAttention, GQA), continuous batching, disaggregated serving, model parallelism, frameworks (vLLM, TensorRT-LLM, SGLang), and autoscaling."},
   {id:"Speculative Decoding", group:"mlops", level:2, link:"mlops/speculative-decoding.html", desc:"Speed up autoregressive decoding losslessly: a small draft model proposes several tokens that the large target model verifies in one parallel pass, with a modified rejection-sampling rule that provably preserves the target's output distribution. Covers the acceptance-rate/speedup math and variants (self-speculative, Medusa, EAGLE, lookahead)."},
   // LLMs & Generative AI
+  {id:"AI Engineering", group:"llm", level:2, link:"llm/ai-engineering.html", desc:"Building, evaluating, and operating production AI/LLM applications — the 5-layer architecture (context, guardrails, routing, caching, agents), evaluation-driven development, cost optimization, observability, and the user-feedback data flywheel."},
   {id:"Reasoning in LLMs", group:"llm", level:2, link:"llm/reasoning-in-llms.html", desc:"Eliciting multi-step thinking — chain-of-thought, self-consistency, tree/graph-of-thought, and reasoning-trained models."},
   {id:"Hallucination & Factuality", group:"llm", level:2, link:"llm/hallucination-factuality.html", desc:"Why LLMs fabricate and how to catch it — measuring factuality, detecting hallucinations, and grounding/abstention mitigations."},
   {id:"Context-Length Extension", group:"llm", level:2, link:"llm/context-length-extension.html", desc:"Pushing the context window longer — positional interpolation, RoPE scaling, and efficient long-context attention."},
@@ -589,10 +592,10 @@ const tree = {
   "Deep Learning":["Feedforward / MLP","CNNs","Autoencoders & VAEs","RNNs & LSTMs","Attention","Transformers","Mixture of Experts","GANs","Diffusion Models","Graph Neural Networks","Neural Network Training","Fine-Tuning & Transfer Learning","Knowledge Distillation","Distributed Training","Encoder vs Decoder Models","State Space Models","World Models & JEPA","DL Architectures Compared","Residual / Skip Connections","Contrastive Learning","End-to-End Deep Learning","Classical Neural Networks","Deep Learning in Practice"],
   "Computer Vision":["Classical Vision","Vision Transformers","Image Classification","Object Detection"],
   "NLP":["Tokenization","Embeddings","Language Models","RAG","Text Preprocessing","Named Entity Recognition","Machine Translation","Textual Entailment","Document Intelligence","Knowledge Graphs","Hidden Markov Models & CRFs","Text Classification","Text Summarization","Question Answering","NLP Evaluation Metrics","Topic Modeling"],
-  "MLOps & Deployment":["Model Deployment","Monitoring & Drift","CI/CD","Experiment Tracking","LLMOps","Model Acceleration","Speculative Decoding","A/B Testing","Federated Learning"],
+  "MLOps & Deployment":["Model Deployment","Monitoring & Drift","CI/CD","Experiment Tracking","LLMOps","Model Acceleration","LLM Serving","Speculative Decoding","A/B Testing","Federated Learning"],
   "Data Viz & Communication":["Dashboards","Data Storytelling"],
-  "LLMs & Generative AI":["Large Language Models","Context Engineering","Parameter-Efficient Fine-Tuning","Policy / Preference Optimization","LLM-as-a-Judge","Diffusion LLMs","Vision-Language Models","Reasoning in LLMs","Hallucination & Factuality","Context-Length Extension","Prompt Engineering","LLM Security","Model Merging"],
-  "Agentic AI":["Agents","Agentic RL","Agent Skills","Agentic Design Patterns","Computer Control"],
+  "LLMs & Generative AI":["Large Language Models","Context Engineering","Parameter-Efficient Fine-Tuning","Policy / Preference Optimization","LLM-as-a-Judge","Diffusion LLMs","Vision-Language Models","AI Engineering","Reasoning in LLMs","Hallucination & Factuality","Context-Length Extension","Prompt Engineering","LLM Security","Model Merging"],
+  "Agentic AI":["Agents","Agentic RL","Agent Skills","Agentic Design Patterns","Multi-Agent Systems","Computer Control"],
   "Speech & Audio":["Speech Processing"],
   "Model Architectures":["Vision Models","NLP Models","LLM Families","Audio Models","Multimodal Models","Document AI Models"],
 };
@@ -1202,6 +1205,7 @@ const cross = [
   ["Agentic RL","Reinforcement Learning"],["Agentic RL","Agents"],["Agentic RL","Policy / Preference Optimization"],
   ["Agent Skills","Agents"],["Agent Skills","Context Engineering"],["Agent Skills","Computer Control"],
   ["Agentic Design Patterns","Agents"],["Agentic Design Patterns","Reasoning in LLMs"],["Agentic Design Patterns","Agentic RL"],
+  ["Multi-Agent Systems","Agents"],["Multi-Agent Systems","Agentic Design Patterns"],["Multi-Agent Systems","Context Engineering"],["Multi-Agent Systems","LLM-as-a-Judge"],["Multi-Agent Systems","LLM Security"],
 
   // domain bridges (builds-on)
   ["LLMs & Generative AI","Deep Learning","isa"],["Agentic AI","LLMs & Generative AI","isa"],
@@ -1278,7 +1282,9 @@ const cross = [
   ["LLMOps","Model Deployment"],["LLMOps","Large Language Models"],["LLMOps","LLM-as-a-Judge"],
   ["LLMOps","Monitoring & Drift"],["LLMOps","Model Acceleration"],["LLMOps","RAG"],["LLMOps","A/B Testing"],["LLMOps","Context Engineering"],
   ["Model Acceleration","Model Deployment"],["Model Acceleration","Mixture of Experts"],
+  ["LLM Serving","Model Acceleration"],["LLM Serving","Speculative Decoding"],["LLM Serving","LLMOps"],["LLM Serving","Large Language Models"],["LLM Serving","Distributed Training"],
   ["Speculative Decoding","Model Acceleration"],["Speculative Decoding","Large Language Models"],["Speculative Decoding","Knowledge Distillation"],["Speculative Decoding","LLMOps"],["Speculative Decoding","Attention"],
+  ["AI Engineering","Prompt Engineering"],["AI Engineering","Context Engineering"],["AI Engineering","LLM-as-a-Judge"],["AI Engineering","LLM Security"],["AI Engineering","Large Language Models"],["AI Engineering","RAG"],["AI Engineering","Agents"],["AI Engineering","LLMOps"],["AI Engineering","Monitoring & Drift"],["AI Engineering","Model Acceleration"],["AI Engineering","A/B Testing"],
   ["Reasoning in LLMs","Large Language Models"],["Reasoning in LLMs","Policy / Preference Optimization"],
   ["Hallucination & Factuality","Large Language Models"],["Hallucination & Factuality","RAG"],["Hallucination & Factuality","LLM-as-a-Judge"],
   ["Context-Length Extension","Large Language Models"],["Context-Length Extension","Attention"],
