@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · QLoRA: Fine-Tuning on a 4-bit Base</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../parameter-efficient-fine-tuning.html">Parameter-Efficient Fine-Tuning</a> · deep dive</p>
+      <h1>QLoRA: Fine-Tuning on a 4-bit Base</h1>
+      <p>Keep the frozen pretrained model in 4 bits, dequantize each weight matrix on the fly to 16-bit for the matmul, and backpropagate only into 16-bit <a href="lora.html">LoRA</a> adapters. This page follows the original study from the memory problem to the three pieces that make it work — the NormalFloat4 data type, double quantization of the scaling constants, and paged optimizers — then through the ablations showing it matches 16-bit fine-tuning, the instruction-tuning study built on top of it, and what that study found about data quality and about judging chatbots.</p>
+      <div style="margin-top:10px">
+        <span class="pill">LLMs &amp; Generative AI</span>
+        <span class="pill">Fine-tuning</span>
+        <span class="pill">blockwise absmax · NF4 · double quantization · paged optimizers · all-linear LoRA · memory arithmetic · data quality · judge vs humans</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="motivation" data-nav="The memory wall">
+      <h3><span class="idx">01</span> The memory wall: more than 780 GB down to under 48 GB</h3>
+      <p class="lede"><b>Regular 16-bit fine-tuning of a 65B-parameter model needs more than 780 GB of GPU memory. QLoRA fine-tunes the same model on a single 48 GB GPU</b>, and the original study reports it does so without degrading runtime or predictive performance relative to a 16-bit fully fine-tuned baseline.</p>
+
+      <ul class="notes">
+        <li><b>Where 780 GB comes from.</b> The paper gives the total, not a breakdown. It is exactly what you get at 12 bytes per parameter — 2 for the 16-bit weight, 2 for its gradient, 8 for Adam's two 32-bit moments: <code>65 × 10⁹ × 12 B = 780 GB</code> (our arithmetic), before any activations.</li>
+        <li><b>LoRA already removes most of it.</b> Frozen weights need no gradient and no optimiser state (see <a href="lora.html#savings">LoRA §06</a>). What remains is the frozen model itself: 2 bytes per parameter, about 130 GB at 65B in 16-bit — still several GPUs.</li>
+        <li><b>The frozen base only has to be read.</b> It is never updated, so it does not need the precision an optimiser step would. That is the opening QLoRA uses: store the base in 4 bits (about 0.5 bytes per parameter) and keep everything that is <i>trained</i> — the adapters — in 16-bit.</li>
+      </ul>
+
+      <div class="formula"><span class="lbl">the bet, in one line per tensor</span><span class="eq">frozen base W         stored in 4-bit NF4, dequantized to BF16 when used, never updated
+adapters L₁, L₂       stored and trained in BF16, receive all the gradients
+optimizer state       only for the adapters; paged to CPU memory on spikes</span></div>
+
+      <p>The study's three named contributions each attack one part of the footprint that is left once LoRA is used: <b>NF4</b> (§03) makes 4-bit storage of the weights accurate enough; <b>double quantization</b> (§04) shrinks the per-block scaling constants that 4-bit storage needs; <b>paged optimizers</b> (§05) absorb the short memory spikes that would otherwise crash a run sized right at the limit. The method was used to train more than 1,000 models, across 8 instruction datasets, several model families and scales from 80M to 65B parameters.</p>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="blockwise" data-nav="Blockwise absmax quantization">
+      <h3><span class="idx">02</span> Background: blockwise absmax quantization, and why blocks</h3>
+      <p class="lede">To fit a real-valued tensor into <code>k</code> bits, rescale it so its largest magnitude lands on the edge of the target range, then round. One outlier sets that scale for everyone, so the tensor is cut into small blocks that are each scaled on their own.</p>
+
+      <div class="formula"><span class="lbl">absmax quantization to Int8 (the paper's worked example)</span><span class="eq">c        =  127 / absmax(X)                  the quantization constant (FP32)
+X_Int8   =  round( c · X )
+dequant  :  X ≈ X_Int8 / c</span>
+<span class="lbl">blockwise: one constant per block of B values</span><span class="eq">flatten X, cut into n = (number of values) / B contiguous blocks
+quantize each block b with its own c_b = 127 / absmax(block b)
+
+storage  =  k bits per value  +  32 bits per block  =  k + 32/B  bits per value</span></div>
+
+      <ul class="notes">
+        <li><b>The outlier problem.</b> If one value in the tensor is much larger than the rest, <code>c</code> is small, and nearly all values map onto the few codes nearest zero; the paper's wording is that the quantization bins are then "not utilized well", with few or no numbers in some bins. Every other value effectively loses bits.</li>
+        <li><b>Blocks contain the damage.</b> Each block is normalized by its own absmax, so an outlier only coarsens the <code>B − 1</code> values that share its block. Smaller blocks mean less damage and more constants to store — the trade-off double quantization (§04) addresses.</li>
+        <li><b>k = 4 has very little room.</b> At 4 bits there are 16 codes for each block. Where those 16 levels sit inside <code>[−1, 1]</code> now matters a great deal, which is the question NF4 answers.</li>
+      </ul>
+      <div class="callout"><b>LoRA itself is not re-derived here.</b> The adapter parameterisation <code>h = W₀x + (α/r)·BAx</code>, its zero initialisation and its scaling are on the <a href="lora.html#method">LoRA deep dive</a>. The paper writes the same thing as <code>Y = XW + s·XL₁L₂</code> with <code>L₁ ∈ ℝ^(h×r)</code>, <code>L₂ ∈ ℝ^(r×o)</code> and a scalar <code>s</code>; this page uses its notation. Quantization for <i>inference</i> (GPTQ, AWQ, Int8 serving) is on <a href="../../mlops/model-acceleration.html#quant">model acceleration</a>.</div>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="nf4" data-nav="NormalFloat4">
+      <h3><span class="idx">03</span> NormalFloat4: put the 16 levels where normal weights are</h3>
+      <p class="lede"><b>Pretrained weights are roughly zero-centred and normally distributed. So choose the 16 levels as quantiles of a standard normal: then, in expectation, every code is used equally often.</b> The paper calls the resulting NF4 data type information-theoretically optimal for normally distributed weights.</p>
+
+      <h4>Quantile quantization</h4>
+      <p>A <code>k</code>-bit quantile quantizer spaces its <code>2ᵏ</code> levels so that each bin holds the same probability mass of the input distribution. Exact quantiles are expensive to estimate for an arbitrary tensor, but if the distribution is known up to a scale, the levels can be computed once. Weights normalized by absmax into <code>[−1, 1]</code> are then a fixed distribution, so one table serves every block.</p>
+      <div class="formula"><span class="lbl">levels from standard-normal quantiles (the paper's estimate)</span><span class="eq">qᵢ  =  ½ · ( Q_X( i / (2ᵏ + 1) )  +  Q_X( (i + 1) / (2ᵏ + 1) ) )
+
+Q_X  =  quantile function (inverse CDF) of the standard normal N(0, 1)
+each level is the midpoint of two neighbouring quantiles
+the levels are then normalized into [−1, 1]</span></div>
+
+      <h4>The asymmetric construction that gives an exact zero</h4>
+      <p>A symmetric set of 16 quantiles has no level at zero — 8 negative, 8 positive. But zero matters: padding and other zero-valued elements must be represented without error. NF4 therefore builds the two halves separately: <b>2ᵏ⁻¹ levels for the negative side and 2ᵏ⁻¹ + 1 for the positive side</b>, both including zero, then unifies them and drops one of the two zeros. For <code>k = 4</code>: 7 negative levels, zero, and 8 positive levels — one more on the positive side.</p>
+
+      <table class="grid2">
+        <tr><th>index</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th></tr>
+        <tr><td><b>NF4</b></td><td class="num">−1.0000</td><td class="num">−0.6962</td><td class="num">−0.5251</td><td class="num">−0.3949</td><td class="num">−0.2844</td><td class="num">−0.1848</td><td class="num">−0.0911</td><td class="num">0.0000</td></tr>
+        <tr><th>index</th><th>8</th><th>9</th><th>10</th><th>11</th><th>12</th><th>13</th><th>14</th><th>15</th></tr>
+        <tr><td><b>NF4</b></td><td class="num">0.0796</td><td class="num">0.1609</td><td class="num">0.2461</td><td class="num">0.3379</td><td class="num">0.4407</td><td class="num">0.5626</td><td class="num">0.7230</td><td class="num">1.0000</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">The paper's appendix lists the exact values (given there to full float precision; rounded to four places here). Note the asymmetry: the smallest negative step is −0.0911, the smallest positive 0.0796.</p>
+
+      <div class="callout"><b>Reproducing the table (our arithmetic).</b> The midpoint formula above cannot be used literally at the ends, because <code>Q_X(0) = −∞</code>; the paper does not state how the extremes are clipped. The published table is reproduced to within about 10⁻⁷ by taking, for the positive half, the normal quantiles at 8 evenly spaced probabilities from <code>δ</code> down to (but excluding) 0.5, for the negative half the negated quantiles at 7 evenly spaced probabilities from <code>δ</code> to 0.5 (excluding 0.5), adding 0, and dividing by <code>Q_X(δ)</code> — with <code>δ = ½·((1 − 1/32) + (1 − 1/30)) ≈ 0.9677</code>, the average of the outer probabilities implied by 2·16 and 2·15 bins. The figure below computes NF4 this way and checks it against the table.</div>
+
+      <h4>Is the normality assumption true?</h4>
+      <p>The paper's appendix tests it per neuron: about 7.5% of neurons were non-normal at a 5% significance threshold, roughly 2.5 points above the 5% false-positive rate expected if all of them were normal. So the bulk of pretrained weights fit the assumption well, with a minority that does not.</p>
+
+      <div class="viz" id="viz-qz">
+        <div class="vhead">
+          <span class="vtitle">Int4 vs FP4 vs NF4 on blockwise-normalized Gaussian weights</span>
+          <span class="vhint">turn on outliers, then grow the block size: watch the histogram collapse onto the middle codes and the error curves rise</span>
+        </div>
+        <div class="controls">
+          <label>levels drawn <select id="qz-f">
+            <option value="nf4" selected>NF4 (normal quantiles)</option>
+            <option value="fp4">FP4 (E2M1 layout)</option>
+            <option value="int4">Int4 (uniform, absmax)</option>
+          </select></label>
+          <label>block size B <input type="range" id="qz-b" min="0" max="8" step="1" value="2" /><span id="qz-bv" style="min-width:36px;display:inline-block">64</span></label>
+          <label><input type="checkbox" id="qz-o" /> inject outliers</label>
+          <button id="qz-new" type="button">new sample</button>
+        </div>
+        <svg id="qz-svg" width="760" height="440" viewBox="0 0 760 440" role="img" aria-label="Top: a histogram of 16,384 simulated normally distributed weights after each block of B weights has been divided by its own absolute maximum, so every value lies between minus one and one. Vertical tick marks overlaid on the histogram show the sixteen levels of the selected 4-bit format: Int4 levels are evenly spaced, FP4 levels crowd near zero and thin out towards the edges, and NF4 levels follow the bell shape of the histogram, denser in the middle. With outliers injected and a large block size, the histogram collapses into a narrow spike around zero, covering only the few levels nearest zero. Bottom: simulated reconstruction error, the mean squared error divided by the weight variance on a logarithmic axis, plotted against block size from 16 to 4096 on a logarithmic axis, with one line per format and a vertical rule at the selected block size. Without outliers NF4 has the lowest error at every block size and all three rise slowly with block size; Int4 is better than FP4 at the smallest blocks and worse from block size 64 upward, because the uniform grid suffers most as each block's maximum grows. With outliers injected all three rise steeply with block size, Int4 fastest, and at block sizes of about a thousand and above FP4 edges slightly ahead of NF4, since the normalized values are then no longer bell-shaped. The readout gives each format's error, the share of codes in use and their entropy in bits, and the memory cost of the per-block constants with and without double quantization."></svg>
+        <div class="readout" aria-live="polite" id="qz-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>The error numbers are simulated, not reported.</b> The weights are a seeded Gaussian sample, quantized to the nearest level of each grid. The NF4 levels are computed from normal quantiles and checked against the paper's table; the <b>Int4</b> grid is the 4-bit analogue of the paper's absmax formula (levels <code>j/7</code>, <code>j = −7…7</code>); the <b>FP4</b> grid is a generic E2M1 layout (magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6, scaled by 1/6). The paper does not list its FP4 values, so this grid is our choice.</li>
+        <li><b>What the simulation shows.</b> On clean Gaussian blocks NF4 has the lowest error at every block size. At <code>B = 64</code> the ordering is NF4, then FP4, then Int4 — the same order as the paper's perplexity table in §09 — but Int4 beats this FP4 grid at the smallest blocks. With outliers and large blocks, the normalized values pile up near zero and stop looking normal; there FP4's dense levels near zero catch up with and slightly pass NF4. NF4's advantage depends on the normalized block actually being bell-shaped, which small blocks help ensure.</li>
+        <li><b>"Optimal" here means equal-use codes, not minimum squared error.</b> Equal-probability bins maximise the entropy of the code stream; a minimum-MSE (Lloyd–Max) quantizer would place levels differently. The code entropy in the readout gets close to the 4-bit maximum for NF4 on clean Gaussian data (Int4's 15 levels cap it at log₂ 15 ≈ 3.91 bits). (Our gloss on the term; the paper uses the phrase without the distinction.)</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="double-quant" data-nav="Double quantization">
+      <h3><span class="idx">04</span> Double quantization: quantize the quantization constants</h3>
+      <p class="lede">Small blocks are needed for accurate 4-bit storage, but each block carries a 32-bit constant. At block size 64 that is half a bit per parameter of pure overhead. Double quantization treats those constants as just another tensor and quantizes them too.</p>
+
+      <div class="formula"><span class="lbl">cost of the constants, block size 64 for the weights</span><span class="eq">single quantization:   32 / 64                       =  0.5    bits per parameter
+
+double quantization:   first-level constants c₂ → 8-bit floats, blocks of 256
+                       one FP32 second-level constant c₁ per 256 of them
+                       8 / 64  +  32 / (64 · 256)    =  0.127  bits per parameter
+
+saving                 0.5 − 0.127                   =  0.373  bits per parameter
+on a 65B model         ≈ 3 GB   (65 × 10⁹ × 0.373 / 8 bytes ≈ 3.03 GB, our arithmetic)</span></div>
+
+      <ul class="notes">
+        <li><b>Centring first.</b> The absmax constants are all positive. Before the second quantization the paper subtracts their mean, so the values are centred around zero and a symmetric quantizer can be used.</li>
+        <li><b>No accuracy cost found.</b> The paper reports that double quantization reduces the memory footprint without degrading performance (§09: in the data-type comparisons NF4 with and without it behave the same, and it gives only minor further gains in zero-shot accuracy).</li>
+        <li><b>Why it matters at the margin.</b> 3 GB is under 7% of a 48 GB card, but a run sized at the limit lives or dies by margins like that; the memory figure in §07 lets you switch it off and see the total move. Exact: <code>8/64 + 32/16384 = 0.126953…</code>, which the paper rounds to 0.127.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="paged" data-nav="Paged optimizers">
+      <h3><span class="idx">05</span> Paged optimizers: survive the spikes</h3>
+      <p class="lede">Gradient checkpointing keeps activation memory low on average, but a mini-batch with a long sequence can spike it past the GPU limit. Paged optimizers let optimizer state spill to CPU memory instead of crashing the run.</p>
+
+      <ul class="notes">
+        <li><b>The mechanism.</b> Optimizer states are allocated in GPU unified memory, which does automatic page-to-page transfers between CPU and GPU. In the paper's words, the states are "automatically evicted to CPU RAM when the GPU runs out-of-memory" and "paged back into GPU memory when the memory is needed in the optimizer update step" — the same idea as an operating system paging between RAM and disk.</li>
+        <li><b>Why the optimizer state is the thing to page.</b> It is only touched once per step, in the update, whereas the weights and activations are needed throughout the forward and backward pass. Moving it out costs nothing until the update.</li>
+        <li><b>What was measured, and what was not.</b> The paper made no hard measurements of the paging cost, because paging happens mainly with rare long-sequence mini-batches. It reports that for 65B models on 48 GB GPUs at batch size 16, training ran at the same speed as with regular optimizers, and leaves characterising when slowdowns occur to future work. It also notes the 33B model does not quite fit in 24 GB without paging.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="layer" data-nav="The QLoRA layer">
+      <h3><span class="idx">06</span> One QLoRA layer: NF4 storage, BF16 compute</h3>
+      <p class="lede">QLoRA has one low-precision <i>storage</i> type (NF4) and one <i>computation</i> type (BFloat16). Every time a weight matrix is used — forward or backward — it is dequantized to BF16 just for that matmul.</p>
+
+      <div class="formula"><span class="lbl">forward pass of one linear layer with one adapter</span><span class="eq">Y^BF16  =  X^BF16 · doubleDequant( c₁^FP32, c₂^k-bit, W^NF4 )  +  X^BF16 · L₁^BF16 · L₂^BF16
+
+doubleDequant( c₁, c₂, W )  =  dequant( dequant( c₁, c₂ ), W )  =  W^BF16
+
+  c₂^k-bit   the per-block absmax constants of W, themselves quantized (8-bit floats, block 256)
+  c₁^FP32    the second-level constants that dequantize c₂
+  W^NF4      4-bit codes, block size 64</span>
+<span class="lbl">backward pass: which gradients exist</span><span class="eq">needed:      ∂E/∂L₁ , ∂E/∂L₂                     the adapter weights (BF16)
+needed:      ∂E/∂X                                to keep backpropagating through the layer
+             — uses W, so W is dequantized to BF16 again
+not needed:  ∂E/∂W                                W is frozen; no gradient, no optimizer state</span></div>
+
+      <ul class="notes">
+        <li><b>Gradients flow through the 4-bit weights, not into them.</b> The input gradient <code>∂E/∂X = (∂E/∂Y)·Wᵀ + …</code> requires <code>W</code>, so the backward pass dequantizes it as the forward pass did. Only the adapters accumulate gradients.</li>
+        <li><b>Quantization error is a fixed offset the adapters can compensate for.</b> The model being fine-tuned is the dequantized model <code>W̃ ≈ W</code>, and the adapters are trained against <i>that</i> model's loss — they learn on top of <code>W̃</code>, not of the 16-bit <code>W</code>. (This is our framing of why fine-tuning on a quantized base works; the paper's evidence is empirical, §08–§09.)</li>
+        <li><b>The adapters are a small share of memory but not of activations.</b> The paper's 7B example (LLaMA on FLAN v2, batch size 1, LoRA weights about 0.2% of the model): LoRA parameters take 26 MB, but the LoRA input gradients take 567 MB, falling to about 18 MB per sequence with gradient checkpointing — still more than all the LoRA weights. The 4-bit base model takes 5,048 MB. The conclusion drawn there: adding more adapters barely changes total memory, which is why §08's "adapt every layer" is affordable.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="memory" data-nav="Memory budget">
+      <h3><span class="idx">07</span> The memory budget, model by model</h3>
+      <p class="lede">Put the pieces together for the four sizes of the base model family the study used. All numbers in this figure are <b>our arithmetic</b> from stated assumptions, not the paper's measurements; the paper's reported footprints are listed underneath for comparison.</p>
+
+      <div class="viz" id="viz-mem">
+        <div class="vhead">
+          <span class="vtitle">Training memory: 16-bit full fine-tuning vs 16-bit LoRA vs QLoRA (estimated, activations excluded)</span>
+          <span class="vhint">zoom in to see the QLoRA bars against the 48 GB line; switch double quantization off to see the 3 GB it buys at 65B</span>
+        </div>
+        <div class="controls">
+          <label>LoRA rank r, all linear layers <select id="mem-r">
+            <option value="8">8</option><option value="16">16</option><option value="64" selected>64</option>
+          </select></label>
+          <label><input type="checkbox" id="mem-dq" checked /> double quantization</label>
+          <label>vertical axis <select id="mem-z">
+            <option value="full">full range</option>
+            <option value="zoom" selected>zoom to 0–160 GB</option>
+          </select></label>
+        </div>
+        <svg id="mem-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Grouped stacked bar chart of estimated training memory in gigabytes for four model sizes, 7, 13, 33 and 65 billion parameters, with three bars each: 16-bit full fine-tuning, 16-bit LoRA and QLoRA. Each bar is stacked from base weights, quantization constants, base-weight gradients, base optimizer state, and the adapters with their gradients and optimizer state. A dashed horizontal line marks a 48 gigabyte GPU. Full fine-tuning grows to about 780 gigabytes at 65B, dominated by optimizer state; 16-bit LoRA is about 140 gigabytes at 65B, almost all frozen 16-bit weights; QLoRA is about 44 gigabytes at 65B, below the 48 gigabyte line, mostly 4-bit weights plus the adapters. In the zoomed view bars that exceed the axis are cut with their total printed above. The readout lists every total, the per-parameter assumptions and the effect of double quantization."></svg>
+        <div class="readout" aria-live="polite" id="mem-readout"></div>
+      </div>
+
+      <div class="formula"><span class="lbl">assumptions behind the figure (our arithmetic, GB = 10⁹ bytes)</span><span class="eq">architecture (public dims of the model family): width d, MLP width f, layers L, vocab 32 000
+  linear params per block = 4d² + 3df        embeddings + output head = 2 · 32 000 · d
+  7B: d 4096, f 11008, L 32      13B: d 5120, f 13824, L 40
+  33B: d 6656, f 17920, L 60     65B: d 8192, f 22016, L 80
+
+16-bit full FT   2 B weight + 2 B gradient + 8 B Adam (two FP32 moments)  = 12 B / param
+16-bit LoRA      2 B / frozen param;  adapters 2 B + 2 B grad + 8 B Adam  = 12 B / adapter param
+QLoRA            block linears: 4 bits + constants (0.127 bits with DQ, 0.5 without)
+                 embeddings and output head kept in 16-bit (common implementation choice)
+                 adapters as for 16-bit LoRA
+adapter params per block = r · ( 4 · 2d  +  3 · (d + f) )          all 7 linear layers
+excluded: activations, input gradients, CUDA workspace, fragmentation</span></div>
+
+      <table class="grid2">
+        <tr><th>reported 4-bit footprint (paper, Guanaco models)</th><th>7B</th><th>13B</th><th>33B</th><th>65B</th></tr>
+        <tr><td>memory column of the chatbot results table</td><td class="num">5 GB</td><td class="num">10 GB</td><td class="num">21 GB</td><td class="num">41 GB</td></tr>
+        <tr><td>16-bit comparisons in the same table</td><td colspan="4">Vicuna 13B 26 GB · Open Assistant 33B 66 GB</td></tr>
+      </table>
+      <p>The reported 4-bit footprints are higher than our weights-only estimate of the 4-bit base (about 3.9, 7.2, 17.4 and 34.5 GB). The paper does not break those numbers down, so we do not attempt to reconcile them. (The paper's Elo table lists Guanaco 7B at 6 GB rather than 5 GB.) The headline the arithmetic does confirm: a 65B base in NF4 with 16-bit adapters on every linear layer fits under 48 GB with room left for activations, and switching double quantization off costs about 3 GB.</p>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="all-linear" data-nav="Adapt every linear layer">
+      <h3><span class="idx">08</span> The adapter ablation: every linear layer, and rank barely matters</h3>
+      <p class="lede"><b>The standard practice of applying LoRA only to the query and value projections does not replicate full fine-tuning for large base models. Applying it to all linear layers in the transformer block does</b> — and once that is done, the rank <code>r</code> has little effect.</p>
+
+      <ul class="notes">
+        <li><b>The experiment.</b> LLaMA 7B fine-tuned on Alpaca, scored by RougeL, with several random seeds per configuration. The number of adapted layers was the most critical LoRA hyperparameter: LoRA on all linear transformer-block layers was required to match 16-bit full fine-tuning.</li>
+        <li><b>Rank.</b> Searched over <code>r ∈ {8, 16, 32, 64, 128, 256}</code>; the paper reports <code>r</code> to be unrelated to final performance when LoRA is used on all layers. This is the same flatness the <a href="lora.html#rank">original LoRA rank ablation</a> found — but here it holds only once the adapters are spread across every layer.</li>
+        <li><b>The baselines were tuned too.</b> The study found the default full fine-tuning hyperparameters undertuned and searched learning rates from 1e-6 to 5e-5 and batch sizes from 8 to 128, so the comparison is against a strong 16-bit baseline. The LoRA <code>α</code> was held fixed while the learning rate was searched; LoRA dropout 0.05 helped the 7B and 13B models but not 33B and 65B.</li>
+      </ul>
+
+      <table class="grid2">
+        <tr><th>setting used for the chatbot models (paper's appendix)</th><th>value</th></tr>
+        <tr><td>LoRA rank r / alpha</td><td class="num">64 / 16</td></tr>
+        <tr><td>LoRA dropout</td><td class="num">0.1 up to 13B · 0.05 for 33B and 65B (appendix table; the ablation text reports 0.05 helping at 7B and 13B)</td></tr>
+        <tr><td>learning rate</td><td class="num">2e-4 for 7B, 13B · 1e-4 for 33B, 65B</td></tr>
+        <tr><td>Adam beta2 / max grad norm</td><td class="num">0.999 / 0.3</td></tr>
+        <tr><td>batch size · training steps</td><td class="num">16–64 · 1,875–10,000</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">The Super-NaturalInstructions runs with T5 used <code>r = 16</code> for the small, medium and large models and <code>r = 64</code> for XL and XXL, with <code>α = 64</code> and no dropout.</p>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="dtypes" data-nav="Does 4-bit match 16-bit?">
+      <h3><span class="idx">09</span> Does 4-bit match 16-bit? NF4 vs FP4 vs Int4</h3>
+      <p class="lede">Three tests, in increasing difficulty: language-modelling perplexity of the quantized base models, fine-tuning on GLUE and Super-NaturalInstructions against full 16-bit fine-tuning, and 5-shot MMLU after instruction tuning LLaMA from 7B to 65B.</p>
+
+      <h4>Perplexity of the quantized base</h4>
+      <table class="grid2">
+        <tr><th>4-bit data type (mean over models 125M–13B)</th><th>Pile Common Crawl perplexity ↓</th></tr>
+        <tr><td>Int4</td><td class="num">34.34</td></tr>
+        <tr><td>Float4 (E2M1)</td><td class="num">31.07</td></tr>
+        <tr><td>Float4 (E3M0)</td><td class="num">29.48</td></tr>
+        <tr class="hl"><td><b>NFloat4 + DQ</b></td><td class="num">27.41</td></tr>
+      </table>
+      <p>The same ordering appears in mean zero-shot accuracy over Winogrande, HellaSwag, PiQA, Arc-Easy and Arc-Challenge, which the paper shows as a figure (no table): NF4 significantly improves on regular 4-bit floats, and double quantization adds only minor gains while saving memory.</p>
+
+      <h4>Fine-tuning: GLUE and Super-NaturalInstructions</h4>
+      <table class="grid2">
+        <tr><th>method</th><th>GLUE acc, RoBERTa-large</th><th>T5-80M</th><th>T5-250M</th><th>T5-780M</th><th>T5-3B</th><th>T5-11B</th></tr>
+        <tr><td>BF16 full fine-tune</td><td class="num">88.6</td><td class="num">40.1</td><td class="num">42.1</td><td class="num">48.0</td><td class="num">54.3</td><td class="num">62.0</td></tr>
+        <tr><td>BF16 full, replication</td><td class="num">88.6</td><td class="num">40.0</td><td class="num">42.2</td><td class="num">47.3</td><td class="num">54.9</td><td class="num">–</td></tr>
+        <tr><td>LoRA BF16</td><td class="num">88.8</td><td class="num">40.5</td><td class="num">42.6</td><td class="num">47.1</td><td class="num">55.4</td><td class="num">60.7</td></tr>
+        <tr><td>QLoRA Int8</td><td class="num">88.8</td><td class="num">40.4</td><td class="num">42.9</td><td class="num">45.4</td><td class="num">56.5</td><td class="num">60.7</td></tr>
+        <tr><td>QLoRA FP4</td><td class="num">88.6</td><td class="num">40.3</td><td class="num">42.4</td><td class="num">47.5</td><td class="num">55.6</td><td class="num">60.9</td></tr>
+        <tr class="hl"><td><b>QLoRA NF4 + DQ</b></td><td class="num">–</td><td class="num">40.4</td><td class="num">42.7</td><td class="num">47.7</td><td class="num">55.3</td><td class="num">60.9</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">Super-NaturalInstructions columns are RougeL. Dashes are as in the paper: no GLUE entry for NF4 + DQ, no replication at 11B.</p>
+      <p>Here 16-bit, 8-bit and 4-bit adapter methods all replicate the 16-bit full fine-tuning baseline within noise; this benchmark does not separate FP4 from NF4. Note that at T5-11B every adapter method, 16-bit LoRA included, is about one point below the full fine-tuning row.</p>
+
+      <h4>Instruction tuning, 5-shot MMLU</h4>
+      <table class="grid2">
+        <tr><th>LLaMA adapter data type</th><th>7B Alpaca</th><th>7B FLAN v2</th><th>13B Alpaca</th><th>13B FLAN v2</th><th>33B Alpaca</th><th>33B FLAN v2</th><th>65B Alpaca</th><th>65B FLAN v2</th><th>mean</th></tr>
+        <tr><td>BFloat16</td><td class="num">38.4</td><td class="num">45.6</td><td class="num">47.2</td><td class="num">50.6</td><td class="num">57.7</td><td class="num">60.5</td><td class="num">61.8</td><td class="num">62.5</td><td class="num">53.0</td></tr>
+        <tr><td>Float4</td><td class="num">37.2</td><td class="num">44.0</td><td class="num">47.3</td><td class="num">50.0</td><td class="num">55.9</td><td class="num">58.5</td><td class="num">61.3</td><td class="num">63.3</td><td class="num">52.2</td></tr>
+        <tr class="hl"><td><b>NFloat4 + DQ</b></td><td class="num">39.0</td><td class="num">44.5</td><td class="num">47.5</td><td class="num">50.7</td><td class="num">57.3</td><td class="num">59.2</td><td class="num">61.8</td><td class="num">63.9</td><td class="num">53.1</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>NF4 + DQ matches 16-bit LoRA</b> on MMLU (mean 53.1 vs 53.0), while FP4 lags by about one point (52.2) — the paper's wording.</li>
+        <li><b>What "matches" covers.</b> The 16-bit comparison in this table is 16-bit <i>LoRA</i>, not 16-bit full fine-tuning; full fine-tuning parity is shown only at the smaller scales of the previous table. The paper says so itself (§12).</li>
+        <li><b>The conclusion the study draws:</b> 4-bit QLoRA with NF4 matches 16-bit full fine-tuning and 16-bit LoRA performance, and NF4 is superior to FP4.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="guanaco" data-nav="Guanaco & data quality">
+      <h3><span class="idx">10</span> The instruction-tuning study: Guanaco, and quality over size</h3>
+      <p class="lede">With fine-tuning of 65B models now cheap, the study instruction-tuned LLaMA at every size on eight datasets. The chatbot it produced, Guanaco, came from fine-tuning on a small, high-quality dataset — about 9k examples — and reached <b>99.3% of ChatGPT's score on the Vicuna benchmark</b> as judged by GPT-4, after about 24 hours of fine-tuning on a single professional GPU.</p>
+
+      <ul class="notes">
+        <li><b>Training data.</b> Guanaco is fine-tuned on a variant of OASST1, a crowd-sourced multi-turn conversation dataset, keeping only the top-ranked reply at each level of the conversation tree: 9,209 examples.</li>
+        <li><b>The Vicuna benchmark</b> is 80 prompts; GPT-4 scores both a model's answer and ChatGPT's out of ten, and the result is the model's score as a percentage of ChatGPT's. A second benchmark, <b>OA</b>, uses 953 unique user queries from the OASST1 validation set.</li>
+        <li><b>Cost.</b> The 65B result took about 24 hours of fine-tuning on a single professional GPU; the 33B Guanaco can be trained on 24 GB consumer GPUs in under 12 hours.</li>
+      </ul>
+
+      <table class="grid2">
+        <tr><th>model (Vicuna benchmark, GPT-4 judge)</th><th>bits</th><th>memory</th><th>% of ChatGPT</th><th>95% CI ±</th></tr>
+        <tr><td>GPT-4</td><td>–</td><td>–</td><td class="num">114.5%</td><td class="num">2.6%</td></tr>
+        <tr><td>Bard</td><td>–</td><td>–</td><td class="num">94.8%</td><td class="num">4.1%</td></tr>
+        <tr class="hl"><td><b>Guanaco 65B</b></td><td>4</td><td class="num">41 GB</td><td class="num">99.3%</td><td class="num">4.4%</td></tr>
+        <tr><td>Alpaca 65B</td><td>4</td><td class="num">41 GB</td><td class="num">70.7%</td><td class="num">4.3%</td></tr>
+        <tr><td>FLAN v2 65B</td><td>4</td><td class="num">41 GB</td><td class="num">48.4%</td><td class="num">4.6%</td></tr>
+        <tr class="hl"><td><b>Guanaco 33B</b></td><td>4</td><td class="num">21 GB</td><td class="num">97.8%</td><td class="num">4.4%</td></tr>
+        <tr><td>Open Assistant 33B</td><td>16</td><td class="num">66 GB</td><td class="num">94.9%</td><td class="num">4.5%</td></tr>
+        <tr><td>Vicuna 13B</td><td>16</td><td class="num">26 GB</td><td class="num">94.9%</td><td class="num">4.5%</td></tr>
+        <tr class="hl"><td><b>Guanaco 13B</b></td><td>4</td><td class="num">10 GB</td><td class="num">90.4%</td><td class="num">5.2%</td></tr>
+        <tr><td>Alpaca 13B</td><td>4</td><td class="num">10 GB</td><td class="num">69.4%</td><td class="num">4.2%</td></tr>
+        <tr><td>FLAN v2 13B</td><td>4</td><td class="num">10 GB</td><td class="num">47.0%</td><td class="num">3.6%</td></tr>
+        <tr class="hl"><td><b>Guanaco 7B</b></td><td>4</td><td class="num">5 GB</td><td class="num">87.0%</td><td class="num">5.4%</td></tr>
+        <tr><td>Alpaca 7B</td><td>4</td><td class="num">5 GB</td><td class="num">64.4%</td><td class="num">5.0%</td></tr>
+        <tr><td>FLAN v2 7B</td><td>4</td><td class="num">5 GB</td><td class="num">44.8%</td><td class="num">4.0%</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">A subset of the paper's table. At 13B it also lists HH-RLHF 62.5%, Unnatural Instructions 60.5%, Chip2 59.5%, Longform 53.6% and Self-Instruct 49.1%. Note the confidence intervals: Guanaco 65B at 99.3 ± 4.4 is statistically indistinguishable from ChatGPT (100) on this 80-prompt benchmark.</p>
+
+      <h4>Data quality beats dataset size</h4>
+      <p>OASST1's 9k examples beat FLAN v2 — a collection of over 15M examples, subsampled to 450k for this study — on chatbot performance at every size in the table above, and at 13B none of the other, larger sets (Unnatural Instructions 240,670; HH-RLHF 160,800; Self-Instruct 82,612; Alpaca 51,942 examples) comes close to it either. The paper's conclusion: for chatbot performance, dataset suitability and quality matter more than size. The general version of that argument — curation, quality signals, how much data is enough — is on <a href="../dataset-engineering.html#data-quantity">dataset engineering</a>.</p>
+
+      <h4>MMLU does not predict chatbot quality</h4>
+      <table class="grid2">
+        <tr><th>5-shot MMLU after fine-tuning LLaMA on</th><th>7B</th><th>13B</th><th>33B</th><th>65B</th></tr>
+        <tr><td>no tuning</td><td class="num">35.1</td><td class="num">46.9</td><td class="num">57.8</td><td class="num">63.4</td></tr>
+        <tr><td>Self-Instruct</td><td class="num">36.4</td><td class="num">33.3</td><td class="num">53.0</td><td class="num">56.7</td></tr>
+        <tr><td>Longform</td><td class="num">32.1</td><td class="num">43.2</td><td class="num">56.6</td><td class="num">59.7</td></tr>
+        <tr><td>Chip2</td><td class="num">34.5</td><td class="num">41.6</td><td class="num">53.6</td><td class="num">59.8</td></tr>
+        <tr><td>HH-RLHF</td><td class="num">34.9</td><td class="num">44.6</td><td class="num">55.8</td><td class="num">60.1</td></tr>
+        <tr><td>Unnatural Instructions</td><td class="num">41.9</td><td class="num">48.1</td><td class="num">57.3</td><td class="num">61.3</td></tr>
+        <tr class="hl"><td><b>Guanaco (OASST1)</b></td><td class="num">36.6</td><td class="num">46.4</td><td class="num">57.0</td><td class="num">62.2</td></tr>
+        <tr><td>Alpaca</td><td class="num">38.8</td><td class="num">47.8</td><td class="num">57.3</td><td class="num">62.5</td></tr>
+        <tr><td><b>FLAN v2</b></td><td class="num">44.5</td><td class="num">51.4</td><td class="num">59.2</td><td class="num">63.9</td></tr>
+      </table>
+      <p>Read the two tables together. FLAN v2 gives the best MMLU at every size and the worst chatbot score (48.4% at 65B); OASST1 gives middling MMLU and the best chatbot. The paper's statement is that strong MMLU performance does not imply strong chatbot performance, and vice versa — the two benchmarks measure different things, and which dataset is "best" depends on which one you care about.</p>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="judging" data-nav="Judging chatbots">
+      <h3><span class="idx">11</span> Judging chatbots: tournaments, GPT-4 vs humans, and the order bias</h3>
+      <p class="lede">Percent-of-ChatGPT scores depend on one reference model. The study also ran <b>Elo tournaments</b>: models compete in pairwise matches on the same prompt, judged either by GPT-4 or by human raters, and the ratings are compared.</p>
+
+      <div class="formula"><span class="lbl">the tournament (as the paper describes it)</span><span class="eq">every model starts at Elo 1000, update factor K = 32
+each match: two models answer one prompt, a judge picks the winner (or a tie)
+the result depends on match order, so the whole procedure is repeated
+   10 000 times with different random seeds and the ratings averaged</span></div>
+
+      <div class="viz" id="viz-elo">
+        <div class="vhead">
+          <span class="vtitle">Reported Elo ratings: human raters vs GPT-4 as the judge</span>
+          <span class="vhint">steep or crossing lines are where the two judges disagree; hover a model</span>
+        </div>
+        <div class="controls">
+          <label>right-hand judge <select id="elo-j">
+            <option value="g4v" selected>GPT-4 on the Vicuna prompts</option>
+            <option value="g4o">GPT-4 on the OA prompts</option>
+          </select></label>
+        </div>
+        <svg id="elo-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Slope chart of reported Elo ratings. The left axis gives each model's Elo from human raters on the Vicuna benchmark, the right axis its Elo from GPT-4 as the judge, on either the Vicuna prompts or the Open Assistant prompts. One line per model connects its two ratings: GPT-4, Guanaco 65B, 33B, 13B and 7B, Vicuna 13B, ChatGPT and Bard. GPT-4 is at the top on both sides but far higher when GPT-4 is the judge, 1348 against 1176. Guanaco 7B falls from third place with human raters to eighth with GPT-4 judging on Vicuna, while ChatGPT rises from seventh to fifth. Bard has no Open Assistant rating and is drawn only on the left in that view. The readout gives the hovered model's ranks under both judges and the rank-correlation figures."></svg>
+        <div class="readout" aria-live="polite" id="elo-readout"></div>
+      </div>
+
+      <table class="grid2">
+        <tr><th>agreement measure (as reported)</th><th>value</th><th>reading</th></tr>
+        <tr><td>system level, GPT-4 vs human: Kendall τ</td><td class="num">0.43</td><td>model rankings agree moderately</td></tr>
+        <tr><td>system level, GPT-4 vs human: Spearman r</td><td class="num">0.55</td><td></td></tr>
+        <tr><td>example level, GPT-4 vs human majority vote: Fleiss κ</td><td class="num">0.25</td><td>weak per-answer agreement</td></tr>
+        <tr><td>human annotators among themselves: Fleiss κ</td><td class="num">0.42</td><td>humans are only moderately consistent too</td></tr>
+      </table>
+
+      <ul class="notes">
+        <li><b>Order bias.</b> GPT-4 assigns higher scores to the system that appears first in its prompt. The paper's remedy is to score each pair in both orders and average — standard practice for pairwise judges since.</li>
+        <li><b>Self-preference.</b> GPT-4 rates its own outputs far higher than humans do (Elo 1348 vs 1176), which the paper puts at roughly a 20% higher win probability.</li>
+        <li><b>The verdict.</b> System-level rankings from GPT-4 are a cheap and reasonable alternative to human evaluation, but the paper is explicit about the uncertainty, and the failure cases are visible — Guanaco 7B is third for humans and last for GPT-4 on the same prompts. The general treatment of judge biases (position, verbosity, self-preference) and their mitigations is on <a href="../llm-as-a-judge.html#biases">LLM-as-a-judge</a>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="limits" data-nav="Limitations">
+      <h3><span class="idx">12</span> Limitations the original study states</h3>
+      <div class="cards">
+        <div class="box bad"><div class="n">parity</div><div class="t">Not shown at 33B and 65B full-FT scale</div><div class="g">Matching full 16-bit fine-tuning was established at the smaller scales (§09); at 33B and 65B the comparison is against 16-bit LoRA, because of the resource cost of full fine-tuning at that size.</div></div>
+        <div class="box warn"><div class="n">benchmarks</div><div class="t">Narrow evaluation</div><div class="g">Instruction-tuned models were evaluated on MMLU, the Vicuna benchmark and OA — not, for example, BigBench, RAFT or HELM — so generalisation is not assured. Results likely depend on how similar the fine-tuning data is to the benchmark.</div></div>
+        <div class="box warn"><div class="n">evaluation</div><div class="t">Judges are noisy</div><div class="g">Moderate human agreement, GPT-4's order bias and self-preference (§11). Responsible-AI evaluation was limited to one bias dataset (CrowS).</div></div>
+        <div class="box warn"><div class="n">scope</div><div class="t">One precision, one adapter family</div><div class="g">Other bit widths (e.g. 3-bit base models) and other parameter-efficient methods were not evaluated. Guanaco was not trained with reinforcement learning from human feedback.</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="practice" data-nav="In practice (beyond the study)">
+      <h3><span class="idx">13</span> In practice: what using a 4-bit base means afterwards</h3>
+      <p class="lede">Everything above is the original method and its reported evidence. This section is <b>common practice and general knowledge since the original study</b> — tool-dependent, and not part of the original study's claims. The paper reports no dequantization overhead measurements and does not discuss merging adapters into the quantized model.</p>
+
+      <table class="grid2">
+        <tr><th style="width:180px">issue</th><th>what happens</th><th>typical handling</th></tr>
+        <tr><td><b>training speed</b></td><td>every matmul dequantizes its weight first, in the forward <i>and</i> the backward pass, so a QLoRA step is generally slower than a 16-bit LoRA step on hardware that could hold the 16-bit model</td><td>use QLoRA when memory is the binding constraint; when the 16-bit base fits, plain LoRA trains faster</td></tr>
+        <tr><td><b>merging into a 4-bit base</b></td><td><code>W̃ + s·L₁L₂</code> is no longer on the NF4 grid; re-quantizing the merged weight rounds the adapter's small update away or distorts it, so merge-then-quantize is lossy</td><td>dequantize the base to 16-bit, merge (<a href="lora.html#merge">LoRA §05</a>), then quantize the merged model for serving with an inference method — or serve the adapter unmerged</td></tr>
+        <tr><td><b>which base to merge into</b></td><td>the adapter was trained against the dequantized <code>W̃</code>, not the original 16-bit <code>W</code>; merging into <code>W</code> gives a slightly different model from the one that was trained</td><td>usually a small effect; evaluate the merged model rather than assuming equivalence</td></tr>
+        <tr><td><b>serving format</b></td><td>NF4 is a training-oriented storage format; dedicated inference quantizers usually give faster kernels at similar size</td><td><a href="../../mlops/llm-serving.html#quantization">LLM serving: quantization</a> and <a href="../../mlops/model-acceleration.html#quant">model acceleration</a></td></tr>
+        <tr><td><b>what stays in 16-bit</b></td><td>implementations commonly quantize only the transformer-block linear layers and leave embeddings, the output head and norms in 16-bit</td><td>accounts for part of the gap between pure 4-bit arithmetic and measured footprints (§07)</td></tr>
+        <tr><td><b>defaults</b></td><td>NF4 storage, BF16 compute, double quantization on, adapters on all linear layers, a paged optimizer — i.e. the paper's recipe — became the usual starting configuration</td><td>combining several trained adapters is <a href="../model-merging.html#lora">model merging</a></td></tr>
+      </table>
+      <p>For where QLoRA sits among adapters, prompt tuning and LoRA variants, see the <a href="../parameter-efficient-fine-tuning.html#qlora">PEFT hub</a>; for the models it is applied to, <a href="../large-language-models.html#posttraining">large language models: post-training</a>.</p>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">14</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"QLoRA trains a 4-bit model."</span> <span class="fix">No — it trains 16-bit adapters on a frozen 4-bit base.</span> No gradient is ever taken with respect to the 4-bit weights, and no computation happens in 4 bits: weights are dequantized to BF16 for every matmul (§06).</div>
+      <div class="wrong"><span class="say">"NF4 is optimal, so it has the lowest quantization error."</span> <span class="fix">It is optimal in the quantile sense: equal expected use of every code for normal data.</span> That maximises the information per code, which is not the same objective as minimum mean-squared error, and the guarantee assumes normality, which most but not all neurons satisfy (§03).</div>
+      <div class="wrong"><span class="say">"Double quantization halves the memory again."</span> <span class="fix">It saves 0.373 bits per parameter</span> — the constants, not the weights: from 4.5 to about 4.127 bits per parameter at block size 64, about 3 GB on a 65B model (§04).</div>
+      <div class="wrong"><span class="say">"LoRA on the query and value projections is enough, as in the original LoRA."</span> <span class="fix">Not to match full fine-tuning on large models.</span> The study found all linear layers were required; with that done, rank matters little (§08).</div>
+      <div class="wrong"><span class="say">"Guanaco proves 9k examples are enough for anything."</span> <span class="fix">It shows that for a chatbot benchmark, a small high-quality conversational set beat much larger ones.</span> On MMLU the ordering reverses — FLAN v2 wins — so "best data" depends on the target (§10).</div>
+      <div class="wrong"><span class="say">"Guanaco 65B beats ChatGPT."</span> <span class="fix">99.3% ± 4.4% of ChatGPT on 80 prompts, judged by GPT-4.</span> That interval includes 100%, the judge is biased by order and towards itself, and humans and GPT-4 only moderately agree (§10–§11).</div>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">15</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Frozen means read-only</b>, and read-only weights can be stored at low precision: NF4 base, BF16 compute, BF16 adapters that get all the gradients.</li>
+        <li><b>Blockwise absmax</b> with block size 64 contains outliers; <b>NF4</b> places the 16 levels at normal quantiles with an exact zero; <b>double quantization</b> cuts the constants from 0.5 to 0.127 bits per parameter; <b>paged optimizers</b> absorb memory spikes.</li>
+        <li><b>65B in under 48 GB</b>, against more than 780 GB for 16-bit full fine-tuning — about 0.5 bytes per base parameter instead of 12.</li>
+        <li><b>Adapt every linear layer</b> to match 16-bit fine-tuning; after that, rank is a minor knob.</li>
+        <li><b>NF4 + DQ matches 16-bit</b>: full fine-tuning on GLUE and Super-NaturalInstructions at smaller scales, 16-bit LoRA on MMLU up to 65B (53.1 vs 53.0); FP4 lags by about a point.</li>
+        <li><b>Data quality over size</b> for chatbots (9k OASST1 beats 450k FLAN v2), and <b>MMLU does not predict chatbot quality</b>.</li>
+        <li><b>Model judges</b> give reasonable system-level rankings cheaply, but are order-biased and self-preferring — score both orders and keep humans in the loop.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Parameter-efficient fine-tuning" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="lora.html">← LoRA: Low-Rank Adaptation</a>
+      <a href="../parameter-efficient-fine-tuning.html" style="color:var(--muted)">PEFT · overview</a>
+      <a href="../model-merging.html">Model Merging →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="qlora.viz.js"></script>
+</body>
+</html>

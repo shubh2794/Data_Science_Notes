@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Data Warehousing, Lakes &amp; Lakehouses</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Data Warehousing, Lakes &amp; Lakehouses</h1>
+      <p>Analytical storage is built for a different question than application databases: not "fetch this one order" but "sum revenue by region over three years". That single shift — <b>few queries scanning many rows and few columns</b> — explains columnar storage, dimensional models, MPP engines, and partition pruning. Data lakes then relaxed the warehouse's rigidity by storing open files on cheap object storage, and lakehouses put warehouse guarantees (ACID, schema, time travel) back on top of those files.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Engineering</span>
+        <span class="pill">OLAP</span>
+        <span class="pill">Dimensional modelling</span>
+        <span class="pill">Columnar storage</span>
+        <span class="pill">Lakehouse</span>
+      </div>
+    </header>
+
+    <section class="topic" id="oltp-olap" data-nav="OLTP vs OLAP">
+      <h3><span class="idx">01</span> OLTP vs OLAP</h3>
+      <table class="cmp">
+        <tr><th></th><th>OLTP (operational)</th><th>OLAP (analytical)</th></tr>
+        <tr><td>Typical query</td><td>Point read/write by key: "update order 81723"</td><td>Scan + aggregate: "revenue by month and region since 2023"</td></tr>
+        <tr><td>Rows touched per query</td><td>Ones to hundreds</td><td>Millions to billions</td></tr>
+        <tr><td>Columns touched</td><td>Whole row</td><td>A handful out of hundreds</td></tr>
+        <tr><td>Concurrency</td><td>Thousands of short transactions/s</td><td>Tens of long queries</td></tr>
+        <tr><td>Schema</td><td>Normalised (3NF) to avoid update anomalies</td><td>Denormalised (star schema) to avoid joins at read time</td></tr>
+        <tr><td>Storage layout</td><td>Row-oriented + B-tree indexes</td><td>Column-oriented + compression + min/max statistics</td></tr>
+        <tr><td>Freshness</td><td>Current by definition</td><td>Minutes to a day behind, loaded by <a href="etl-pipelines.html">ETL/ELT</a> or CDC</td></tr>
+      </table>
+      <ul class="notes">
+        <li>Running analytics on the production OLTP database is how reports end up blocking checkouts. The warehouse exists to give analysis its own copy, its own layout, and its own compute.</li>
+        <li>See <a href="../databases/indexing.html">Indexing</a> for why B-trees serve point lookups but not full-column scans, and <a href="../databases/transactions-acid.html">Transactions (ACID)</a> for the OLTP side.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="dimensional" data-nav="Facts &amp; dimensions">
+      <h3><span class="idx">02</span> Dimensional modelling: facts, dimensions, and grain</h3>
+      <p class="lede">A dimensional model splits the world into <b>events you measure</b> (facts) and <b>context you slice by</b> (dimensions).</p>
+      <ul class="notes">
+        <li><b>Declare the grain first.</b> "One row per order line" or "one row per customer per day" — every other design decision follows, and mixing grains in one fact table is the root of most double-counting bugs.</li>
+        <li><b>Fact tables</b> are long and narrow: foreign keys to dimensions plus numeric <b>measures</b>. They grow with activity and are usually the biggest tables by far.</li>
+        <li><b>Dimension tables</b> are short and wide: descriptive attributes (product name, category, brand, colour) used in <code>WHERE</code> and <code>GROUP BY</code>. They change slowly — see <a href="etl-pipelines.html#scd">slowly changing dimensions</a>.</li>
+        <li><b>Surrogate keys</b> (warehouse-generated integers) decouple facts from source-system ids and let one natural key have several historical versions.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Measure type</th><th>Summable across…</th><th>Example</th></tr>
+        <tr><td><b>Additive</b></td><td>All dimensions</td><td>Revenue, quantity</td></tr>
+        <tr><td><b>Semi-additive</b></td><td>Some dimensions, not time</td><td>Account balance, inventory level — sum across accounts, but average or take last across days</td></tr>
+        <tr><td><b>Non-additive</b></td><td>None</td><td>Ratios, percentages, distinct counts — store numerator and denominator, compute at query time</td></tr>
+      </table>
+      <table class="cmp">
+        <tr><th>Fact table type</th><th>Grain</th></tr>
+        <tr><td><b>Transaction</b></td><td>One row per event (order line, click)</td></tr>
+        <tr><td><b>Periodic snapshot</b></td><td>One row per entity per period (account balance each day)</td></tr>
+        <tr><td><b>Accumulating snapshot</b></td><td>One row per process instance, updated as milestones occur (order placed → shipped → delivered)</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="star" data-nav="Star vs snowflake">
+      <h3><span class="idx">03</span> Star vs snowflake schemas</h3>
+      <div class="formula"><span class="lbl">star schema: one fact, denormalised dimensions</span><span class="eq">fact_sales(date_sk, product_sk, store_sk, customer_sk, qty, revenue)</span>
+<span class="eq">dim_product(product_sk, name, category, brand, …)</span>     <span class="eq">dim_store(store_sk, city, region, country, …)</span>
+<span class="lbl">snowflake: dimensions normalised into sub-dimensions</span><span class="eq">dim_product → dim_category → dim_department</span>      <span class="eq">dim_store → dim_city → dim_region</span></div>
+      <table class="cmp">
+        <tr><th></th><th>Star</th><th>Snowflake</th></tr>
+        <tr><td>Joins per query</td><td>One hop from fact to each dimension</td><td>Chains of joins through sub-dimensions</td></tr>
+        <tr><td>Dimension storage</td><td>Redundant (category name repeated per product)</td><td>Normalised, less redundancy</td></tr>
+        <tr><td>Usability</td><td>Simple for analysts and BI tools</td><td>More tables to understand</td></tr>
+        <tr><td>Typical verdict</td><td>Default choice — dimensions are tiny next to facts, so redundancy is cheap</td><td>When a sub-dimension is large, shared, or independently governed</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Conformed dimensions</b> (one shared <code>dim_date</code>, one <code>dim_customer</code>) let different fact tables be compared — "orders vs support tickets per customer segment" only works if both use the same segment definition.</li>
+        <li>Many columnar-era teams also build <b>one big table</b> (fact pre-joined with its dimensions). Columnar compression makes the repetition cheap; the cost is rebuilding when a dimension attribute changes.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="columnar" data-nav="Columnar storage">
+      <h3><span class="idx">04</span> Columnar storage: read only what you need</h3>
+      <p class="lede">A row store keeps each record's fields together; a column store keeps each column's values together. An analytical query that touches 3 of 40 columns reads ~7% of the bytes in a column store — before compression makes it smaller still.</p>
+      <div class="formula"><span class="lbl">bytes scanned for a query touching column set Q over N rows</span><span class="eq">row store:     B ≈ N · ∑<sub>c ∈ all columns</sub> w<sub>c</sub></span>
+<span class="eq">column store:  B ≈ N · ∑<sub>c ∈ Q</sub> w<sub>c</sub> / r<sub>c</sub></span>      <span class="eq">w<sub>c</sub> = width of column c,  r<sub>c</sub> = its compression ratio</span>
+<span class="lbl">with min/max pruning over row groups (zone maps)</span><span class="eq">B ≈ f · N · ∑<sub>c ∈ Q</sub> w<sub>c</sub> / r<sub>c</sub></span>      <span class="eq">f = share of row groups whose [min, max] overlaps the predicate</span></div>
+      <p>Pick the columns a query uses, set a date predicate, and compare layouts. Then toggle whether the table is <b>clustered by date</b> — pruning only works when each row group covers a narrow date range.</p>
+
+      <div class="viz" id="viz-col">
+        <div class="vhead">
+          <span class="vtitle">Row store vs column store, with zone-map pruning</span>
+          <span class="vhint">choose columns · narrow the date range · cluster the table</span>
+        </div>
+        <div class="controls">
+          <label>layout <select id="cs-layout"><option value="col">column store</option><option value="row">row store</option></select></label>
+          <label><input type="checkbox" class="cs-col" value="0" checked> date</label>
+          <label><input type="checkbox" class="cs-col" value="1"> customer</label>
+          <label><input type="checkbox" class="cs-col" value="2"> product</label>
+          <label><input type="checkbox" class="cs-col" value="3" checked> region</label>
+          <label><input type="checkbox" class="cs-col" value="4" checked> revenue</label>
+          <label><input type="checkbox" class="cs-col" value="5"> notes</label>
+        </div>
+        <div class="controls">
+          <label>WHERE month ≥ <input type="range" id="cs-from" min="1" max="12" step="1" value="10"> <b id="cs-fromv">10</b></label>
+          <label><input type="checkbox" id="cs-sort" checked> clustered by date</label>
+        </div>
+        <svg id="cs-svg" width="640" height="280" viewBox="0 0 640 280" role="img" aria-label="Interactive grid: blocks read by a query under row versus column storage, with row-group pruning by date"></svg>
+        <div class="readout" aria-live="polite" id="cs-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="compression" data-nav="Encodings &amp; compression">
+      <h3><span class="idx">05</span> Encodings and compression</h3>
+      <p class="lede">A column holds one type with a narrow range of values, so it compresses far better than interleaved rows — often 5–10× overall, and much more on sorted, low-cardinality columns.</p>
+      <table class="cmp">
+        <tr><th>Encoding</th><th>Idea</th><th>Wins on</th></tr>
+        <tr><td><b>Dictionary</b></td><td>Store distinct values once; replace each value with a small integer code</td><td>Low-cardinality strings (country, status)</td></tr>
+        <tr><td><b>Run-length (RLE)</b></td><td>Store (value, run length) instead of repeats</td><td>Sorted or clustered columns — <code>region</code> after sorting by region</td></tr>
+        <tr><td><b>Bit-packing</b></td><td>Use only ⌈log₂(max code + 1)⌉ bits per value</td><td>Dictionary codes, small integers</td></tr>
+        <tr><td><b>Delta / frame-of-reference</b></td><td>Store differences from the previous value or a base</td><td>Timestamps, monotonically increasing ids</td></tr>
+        <tr><td><b>General-purpose</b> (LZ4, Zstd, Snappy)</td><td>Byte-level compression applied on top</td><td>Anything left over; trades CPU for I/O</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">dictionary + bit-packing on a status column</span><span class="eq">10⁹ rows × 8-byte strings ≈ 8 GB</span>   <span class="eq">→</span>   <span class="eq">4 distinct values ⇒ 2 bits each ≈ 250 MB</span>   <span class="eq">(≈ 32×)</span></div>
+      <ul class="notes">
+        <li><b>Late materialisation and vectorised execution:</b> engines evaluate predicates directly on encoded data (compare dictionary codes, skip whole runs) and process batches of thousands of values per CPU instruction loop, stitching full rows together only for the final result.</li>
+        <li>Open file formats carry this design to the lake: <b>Parquet</b> and <b>ORC</b> split a file into row groups/stripes, store each column chunk separately with its own encoding, and keep min/max statistics in a footer so readers can skip whole chunks.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="mpp" data-nav="MPP execution">
+      <h3><span class="idx">06</span> MPP: massively parallel processing</h3>
+      <ul class="notes">
+        <li><b>Shared-nothing MPP</b>: rows are spread across many nodes, each with its own CPU, memory, and (originally) disk. A query plan runs as parallel fragments on every node; partial results are exchanged and combined — the same scatter/shuffle/gather as <a href="../databases/hadoop-mapreduce.html">MapReduce</a>, but pipelined and SQL-planned.</li>
+        <li><b>Distribution key.</b> Rows are hash-distributed on a column. A join on that column is <b>co-located</b> (no data movement); a join on anything else forces a redistribute or broadcast. Small dimensions are often replicated to every node.</li>
+        <li><b>Skew</b> in the distribution key (one giant customer) leaves one node doing most of the work — query time is the slowest node's time.</li>
+        <li><b>Separation of storage and compute</b> is the defining modern shift: data lives in durable object storage; stateless compute clusters cache hot data on local SSD and can be resized, paused, or multiplied independently. Many clusters can read the same data without copying it.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Join data movement</th><th>When</th><th>Cost</th></tr>
+        <tr><td><b>Co-located</b></td><td>Both tables distributed on the join key</td><td>None</td></tr>
+        <tr><td><b>Broadcast</b></td><td>One side small</td><td>Copy small side to all N nodes</td></tr>
+        <tr><td><b>Redistribute (shuffle)</b></td><td>Both large, different keys</td><td>Re-hash one or both sides across the network</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="partitioning" data-nav="Partitioning &amp; clustering">
+      <h3><span class="idx">07</span> Partitioning and clustering</h3>
+      <ul class="notes">
+        <li><b>Partitioning</b> physically separates data by a column's value (usually a date): <code>…/dt=2026-11-16/</code>. A query with <code>WHERE dt = …</code> never opens other partitions — <b>partition pruning</b>. It is also the natural unit of idempotent loads and retention deletes.</li>
+        <li><b>Clustering / sort keys</b> order data <i>within</i> partitions so that row groups have tight min/max ranges on frequently filtered columns, enabling the zone-map skipping in the viz above. Multi-column techniques (Z-order, Hilbert curves) interleave several columns' bits so that filters on any of them prune reasonably well.</li>
+        <li><b>Over-partitioning</b> is the common failure: partitioning by a high-cardinality column (user id, or by hour on a small table) creates millions of tiny files. Per-file overhead (listing, opening, footer reads, planning) then dominates. Aim for files in the hundreds of MB and partitions with at least a few such files.</li>
+        <li><b>Choose by query pattern:</b> partition on the coarse column almost every query filters on (date); cluster on the next most selective filters (customer, region); leave the rest to columnar scanning.</li>
+      </ul>
+      <div class="callout"><b>Diagnostic:</b> after a query, compare "bytes scanned" to table size. If a selective query scans most of the table, pruning failed — the predicate is on an unclustered column, wrapped in a function (<code>WHERE DATE(ts) = …</code> on a table partitioned by <code>ts</code> may not prune), or type-mismatched.</div>
+    </section>
+
+    <section class="topic" id="cloud" data-nav="Cloud warehouses">
+      <h3><span class="idx">08</span> Cloud warehouses</h3>
+      <ul class="notes">
+        <li><b>Managed, elastic, columnar MPP on object storage.</b> You load data and write SQL; the service handles storage layout, statistics, replication, and scaling.</li>
+        <li><b>Pricing models shape behaviour.</b> Pay-per-bytes-scanned rewards partitioning, clustering, and never running <code>SELECT *</code>; pay-per-compute-time rewards right-sizing clusters and suspending them when idle. Know which one you're on before writing a dashboard that refreshes every minute.</li>
+        <li><b>Workload isolation:</b> separate compute pools for ELT, BI dashboards, and ad-hoc data science, so a heavy backfill can't starve the CEO's dashboard. Auto-scaling adds clusters under concurrency spikes.</li>
+        <li><b>Result and materialised-view caching</b> serve repeated queries without rescanning; materialised views are incrementally maintained aggregates — fast, but they cost storage and refresh compute.</li>
+        <li>Semi-structured columns (JSON/variant types) let raw events land without upfront modelling while remaining queryable — blurring the line toward the lake.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="lakes" data-nav="Data lakes">
+      <h3><span class="idx">09</span> Data lakes: schema-on-read over open files</h3>
+      <p class="lede">A data lake stores data as files in cheap object storage, in open formats, in whatever shape it arrives. Structure is imposed by the reader at query time, not by the writer at load time.</p>
+      <table class="cmp">
+        <tr><th></th><th>Schema-on-write (warehouse)</th><th>Schema-on-read (lake)</th></tr>
+        <tr><td>When structure is enforced</td><td>At load; bad rows are rejected</td><td>At query; each reader interprets the files</td></tr>
+        <tr><td>Ingest speed / flexibility</td><td>Slower; must model first</td><td>Land anything immediately — logs, images, JSON, CSV</td></tr>
+        <tr><td>Query reliability</td><td>High; types guaranteed</td><td>Every consumer re-discovers quirks; parse errors at read time</td></tr>
+        <tr><td>Who it suits</td><td>BI, finance, governed reporting</td><td>Data science, ML training sets, exploratory and unstructured data</td></tr>
+      </table>
+      <table class="cmp">
+        <tr><th>Format</th><th>Layout</th><th>Typical use</th></tr>
+        <tr><td><b>Parquet</b></td><td>Columnar, row groups, per-column encoding, footer statistics, nested types</td><td>The default for analytical tables and ML feature data</td></tr>
+        <tr><td><b>ORC</b></td><td>Columnar, stripes, built-in indexes and bloom filters</td><td>Hive-lineage ecosystems</td></tr>
+        <tr><td><b>Avro</b></td><td>Row-oriented, schema embedded, good schema-evolution rules</td><td>Event streams, CDC landing, write-heavy ingestion</td></tr>
+        <tr><td><b>JSON / CSV</b></td><td>Text, row-oriented, no enforced types</td><td>Raw landing only — convert early</td></tr>
+      </table>
+      <h4>Why plain lakes became swamps</h4>
+      <ul class="notes">
+        <li><b>No atomic commits.</b> A job writing 500 files that dies at file 300 leaves readers seeing a partial table. Two concurrent writers can interleave files.</li>
+        <li><b>No updates or deletes.</b> Object storage files are immutable; changing one row means rewriting its files by hand. Privacy-driven deletion requests become multi-day projects.</li>
+        <li><b>Table = directory listing.</b> Discovering files by listing prefixes is slow at millions of objects, and the "schema" lives in an external catalog that can disagree with the files.</li>
+        <li><b>Small files</b> from streaming and frequent appends degrade every reader.</li>
+        <li><b>No governance by default:</b> nobody knows what a folder contains, who owns it, or whether it's current. See <a href="data-quality-governance.html">Data Quality &amp; Governance</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="lakehouse" data-nav="Lakehouses &amp; table formats">
+      <h3><span class="idx">10</span> Lakehouses: table formats bring ACID to object storage</h3>
+      <p class="lede">The fix was not a new storage system but a <b>metadata layer</b>: a table is defined by a log or tree of metadata files that lists exactly which data files belong to each version. Readers never list directories; writers commit by atomically publishing a new version.</p>
+      <table class="cmp">
+        <tr><th>Table format</th><th>Metadata structure</th><th>Commit mechanism</th><th>Distinctive features</th></tr>
+        <tr><td><b>Delta Lake</b></td><td>Ordered transaction log of JSON commit files (<code>_delta_log/000…N.json</code>), periodically compacted into Parquet checkpoints</td><td>Atomically create the next-numbered log entry; optimistic concurrency, conflict check on retry</td><td>Deletion vectors, change data feed, Z-order clustering</td></tr>
+        <tr><td><b>Apache Iceberg</b></td><td>Tree: table metadata file → snapshot → manifest list → manifests → data files (with per-file column stats)</td><td>Catalog atomically swaps the pointer to the current metadata file (compare-and-swap)</td><td>Hidden partitioning, partition evolution, engine-neutral spec, branching and tagging</td></tr>
+        <tr><td><b>Apache Hudi</b></td><td>Timeline of actions in a <code>.hoodie</code> directory</td><td>Timeline instants transition requested → inflight → completed</td><td>Record-level indexes for fast upserts, incremental queries, built-in table services</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>ACID on object storage.</b> Atomicity: a version is either published or not. Isolation: snapshot isolation (and serialisable for some operations) via optimistic concurrency — writers read version n, write new files, and try to commit n+1; if someone else committed first, they check for conflicting changes and retry.</li>
+        <li><b>Time travel.</b> Old versions stay addressable until their files are cleaned up: <code>SELECT … VERSION AS OF 41</code> or <code>TIMESTAMP AS OF '2026-11-01'</code>. Use it to reproduce a training set exactly, audit a change, or roll back a bad write.</li>
+        <li><b>Schema evolution</b> (add/rename/reorder columns via metadata, without rewriting files) and, in Iceberg, <b>partition evolution</b> — change from monthly to daily partitioning without rewriting history; queries plan across both layouts.</li>
+        <li><b>Row-level updates</b> come in two flavours, below. Either way, unreferenced files must be expired (<code>VACUUM</code>, expire-snapshots) to control storage cost — which also ends time travel to those versions.</li>
+        <li>Interoperability layers now let one physical table be read as more than one format, and open catalogs expose these tables to many engines (Spark, Flink, Trino, warehouses) at once.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Update strategy</th><th>Write cost</th><th>Read cost</th><th>Good for</th></tr>
+        <tr><td><b>Copy-on-write</b></td><td>Rewrite every file containing a changed row</td><td>Cheapest — plain files</td><td>Read-heavy tables, infrequent batch updates</td></tr>
+        <tr><td><b>Merge-on-read</b></td><td>Write small delete/update files (position deletes, deletion vectors, log files)</td><td>Readers merge them on the fly until compaction</td><td>Frequent upserts, CDC, streaming ingest</td></tr>
+      </table>
+
+      <div class="viz" id="viz-lh">
+        <div class="vhead">
+          <span class="vtitle">A table's version history: commits, deletes, compaction, time travel</span>
+          <span class="vhint">drag the version · switch update strategy · vacuum old files</span>
+        </div>
+        <div class="controls">
+          <label>read version <input type="range" id="lh-v" min="0" max="5" step="1" value="5"> <b id="lh-vv">5</b></label>
+          <label>updates <select id="lh-mode"><option value="cow">copy-on-write</option><option value="mor">merge-on-read</option></select></label>
+          <button type="button" class="btn ghost" id="lh-vac">vacuum (retain latest 2)</button>
+        </div>
+        <svg id="lh-svg" width="640" height="290" viewBox="0 0 640 290" role="img" aria-label="Interactive timeline: lakehouse table versions referencing data files, with time travel, copy-on-write versus merge-on-read, and vacuum"></svg>
+        <div class="readout" aria-live="polite" id="lh-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="compare" data-nav="Warehouse vs lake vs lakehouse">
+      <h3><span class="idx">11</span> Warehouse vs lake vs lakehouse</h3>
+      <table class="cmp">
+        <tr><th></th><th>Warehouse</th><th>Data lake</th><th>Lakehouse</th></tr>
+        <tr><td>Storage</td><td>Proprietary managed format (often on object storage underneath)</td><td>Open files on object storage</td><td>Open files + open table-format metadata on object storage</td></tr>
+        <tr><td>Schema</td><td>On write, strictly enforced</td><td>On read</td><td>On write, enforced by the table format; evolvable</td></tr>
+        <tr><td>Transactions</td><td>Full ACID</td><td>None</td><td>ACID per table (snapshot isolation, optimistic concurrency)</td></tr>
+        <tr><td>Updates / deletes</td><td>Native SQL DML</td><td>Rewrite files by hand</td><td>MERGE / UPDATE / DELETE via COW or MOR</td></tr>
+        <tr><td>Data types</td><td>Structured + semi-structured</td><td>Anything, incl. images, audio, raw logs</td><td>Structured tables; unstructured files alongside</td></tr>
+        <tr><td>Engines</td><td>The vendor's engine (plus connectors)</td><td>Any engine that reads the files</td><td>Many engines on the same tables</td></tr>
+        <tr><td>BI performance</td><td>Best out of the box</td><td>Poor without heavy tuning</td><td>Good with clustering, compaction, and caching; tuning is your job</td></tr>
+        <tr><td>ML / data science access</td><td>Export or connector</td><td>Direct file access</td><td>Direct file access plus versioned, reproducible snapshots</td></tr>
+        <tr><td>Time travel</td><td>Usually, limited retention</td><td>No</td><td>Yes, until files are expired</td></tr>
+        <tr><td>Main risk</td><td>Cost, lock-in, copies for ML</td><td>Swamp: no quality, consistency, or ownership</td><td>Operational upkeep: compaction, expiry, catalog management</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>The convergence is real.</b> Warehouses now read and write open table formats; lakehouse engines now offer warehouse-grade SQL. The deciding questions are mostly organisational: do you need many engines on one copy of the data, who operates the table maintenance, and how much is tied to BI vs ML.</li>
+        <li><b>Medallion layering</b> applies to all three: raw (bronze) → cleaned and conformed (silver) → business-level marts and feature tables (gold).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">12</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Analytics = few columns, many rows.</b> Columnar storage + compression + min/max pruning cut bytes scanned by orders of magnitude.</li>
+        <li><b>Model dimensionally:</b> declare the grain, keep facts narrow and additive, conform shared dimensions, prefer star over snowflake.</li>
+        <li><b>Partition coarse, cluster fine,</b> avoid tiny files; check bytes-scanned to confirm pruning.</li>
+        <li><b>MPP cost is data movement:</b> co-locate or broadcast joins, watch distribution skew; separate storage from compute.</li>
+        <li><b>Lakes</b> gave flexibility and open formats but lost transactions and governance; <b>lakehouse table formats</b> restore ACID, schema enforcement, upserts, and time travel via an atomically committed metadata layer.</li>
+        <li>Pipelines that feed these stores: <a href="etl-pipelines.html">ETL Pipelines</a>, <a href="stream-processing.html">Stream Processing</a>; compute that reads them: <a href="../programming/apache-spark.html">Apache Spark</a>, <a href="../programming/sql.html">SQL</a>; ML-facing layer: <a href="feature-stores.html">Feature Stores</a>; physical substrate: <a href="../databases/distributed-storage.html">Distributed Storage</a>.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="data-warehousing.viz.js"></script>
+</body>
+</html>

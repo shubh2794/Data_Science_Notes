@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Apache Spark</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Apache Spark</h1>
+      <p>A distributed engine for data that does not fit on one machine. You describe a computation over a partitioned table; Spark builds a <b>lazy plan</b>, optimises it, cuts it into <b>stages</b> at every shuffle, and runs one task per partition across a cluster — keeping intermediate data in memory where it can. Most performance problems reduce to three words: <b>shuffles, skew, and partitions</b>.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Programming &amp; Tools</span>
+        <span class="pill">Distributed compute</span>
+        <span class="pill">PySpark</span>
+        <span class="pill">Query optimisation</span>
+      </div>
+    </header>
+
+    <section class="topic" id="why" data-nav="Why Spark">
+      <h3><span class="idx">01</span> Why Spark exists</h3>
+      <ul class="notes">
+        <li><b>One machine stops working</b> somewhere between "doesn't fit in RAM" and "takes hours to scan". <a href="pandas.html">pandas</a> is single-threaded and in-memory; Spark is the same tabular mental model spread across many machines.</li>
+        <li>It replaced <a href="../databases/hadoop-mapreduce.html">MapReduce</a> by generalising its two-phase job into an arbitrary <b>DAG</b> and by keeping data in executor memory between steps instead of writing every intermediate result to replicated storage.</li>
+        <li><b>Architecture.</b> A <b>driver</b> process holds your program, builds the plan and schedules work; <b>executors</b> on worker machines run tasks and hold cached partitions. A cluster manager (standalone, YARN, or Kubernetes) hands out the executors.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Unit</th><th>What it is</th></tr>
+        <tr><td><b>Application</b></td><td>One driver + its executors (one <code>SparkSession</code>).</td></tr>
+        <tr><td><b>Job</b></td><td>Triggered by one <b>action</b> (<code>count</code>, <code>write</code>, <code>collect</code>).</td></tr>
+        <tr><td><b>Stage</b></td><td>A run of operations with no shuffle inside; ends at a shuffle boundary.</td></tr>
+        <tr><td><b>Task</b></td><td>One stage applied to one partition, on one executor core. The unit of parallelism and of retry.</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="abstractions" data-nav="RDD vs DataFrame">
+      <h3><span class="idx">02</span> RDDs, DataFrames, and Datasets</h3>
+      <table class="cmp">
+        <tr><th>API</th><th>Model</th><th>Optimised?</th><th>Use it for</th></tr>
+        <tr><td><b>RDD</b></td><td>Immutable, partitioned collection of arbitrary objects + its lineage</td><td>No — Spark cannot see inside your lambdas</td><td>Unstructured data, custom partitioning, legacy code</td></tr>
+        <tr><td><b>DataFrame</b></td><td>RDD of rows with a <b>schema</b>; relational operators</td><td>Yes — Catalyst plans it, Tungsten executes it</td><td>Almost everything, in Python, SQL, Scala, R</td></tr>
+        <tr><td><b>Dataset</b></td><td>Typed DataFrame (JVM languages only)</td><td>Mostly; typed lambdas are opaque again</td><td>Compile-time types in Scala/Java</td></tr>
+      </table>
+      <ul class="notes">
+        <li>An RDD is defined by five things: partitions, a compute function per partition, dependencies on parent RDDs, an optional partitioner, and preferred locations. The <b>dependencies are the lineage</b> — the recipe for rebuilding any lost partition.</li>
+        <li>A DataFrame and a SQL query compile to <i>the same plan</i>. <code>df.groupBy("k").sum("v")</code> and <code>SELECT k, SUM(v) … GROUP BY k</code> have identical performance — pick whichever reads better (see <a href="sql.html">SQL</a>).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="lazy" data-nav="Lazy evaluation &amp; the DAG">
+      <h3><span class="idx">03</span> Lazy evaluation and the DAG</h3>
+      <p class="lede">Transformations return a new (lazy) DataFrame immediately and do no work. Only an action makes Spark plan and execute everything upstream of it.</p>
+      <table class="cmp">
+        <tr><th>Transformations (lazy)</th><th>Actions (trigger a job)</th></tr>
+        <tr><td><code>select</code>, <code>filter</code>, <code>withColumn</code>, <code>join</code>, <code>groupBy().agg</code>, <code>orderBy</code>, <code>repartition</code>, <code>union</code></td><td><code>count</code>, <code>show</code>, <code>collect</code>, <code>take</code>, <code>write…save</code>, <code>toPandas</code>, <code>foreach</code></td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Why lazy?</b> Seeing the whole pipeline before running it lets the optimiser push filters below joins, read only the needed columns, and fuse many operations into one pass.</li>
+        <li><b>The trap:</b> because nothing is materialised, every action recomputes the whole lineage from source. Two actions on an uncached DataFrame = two full reads (§08).</li>
+        <li>Errors surface late. A typo in a column name fails at analysis (immediately, since the schema is known); a bad value or a division by zero only fails when an action finally runs the task. Since Spark 4.0, ANSI SQL mode is on by default, so overflows and invalid casts raise errors instead of silently returning null.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="stages" data-nav="Narrow vs wide">
+      <h3><span class="idx">04</span> Narrow vs wide transformations, stages and shuffles</h3>
+      <p class="lede">The single most useful mental model for Spark performance: which operations need data from <i>other</i> partitions?</p>
+      <table class="cmp">
+        <tr><th></th><th>Narrow</th><th>Wide</th></tr>
+        <tr><td>Dependency</td><td>Each output partition reads ≤ one parent partition (or a fixed few)</td><td>Each output partition reads from <b>many</b> parent partitions</td></tr>
+        <tr><td>Examples</td><td><code>filter</code>, <code>select</code>, <code>withColumn</code>, <code>map</code>, <code>union</code>, <code>coalesce</code>, broadcast join</td><td><code>groupBy</code>, <code>distinct</code>, sort-merge <code>join</code>, <code>orderBy</code>, <code>repartition</code>, window functions</td></tr>
+        <tr><td>Execution</td><td>Pipelined in memory inside one task</td><td>Requires a <b>shuffle</b>: write partitioned files, all-to-all network fetch</td></tr>
+        <tr><td>On failure</td><td>Recompute one parent partition</td><td>May need to recompute many upstream partitions (shuffle files mitigate this)</td></tr>
+      </table>
+      <p>Toggle operations in the pipeline below. Each wide operation cuts a new stage; flip the join to <b>broadcast</b> and watch a shuffle disappear. Then press <b>run action</b> — nothing executes until you do.</p>
+
+      <div class="viz" id="viz-dag">
+        <div class="vhead">
+          <span class="vtitle">From transformations to stages</span>
+          <span class="vhint">toggle ops · broadcast the join · trigger the action</span>
+        </div>
+        <div class="controls">
+          <label><input type="checkbox" id="dg-filter" checked> filter</label>
+          <label><input type="checkbox" id="dg-with" checked> withColumn</label>
+          <label><input type="checkbox" id="dg-join" checked> join dim</label>
+          <label><input type="checkbox" id="dg-bcast"> broadcast join</label>
+          <label><input type="checkbox" id="dg-group" checked> groupBy.agg</label>
+          <label><input type="checkbox" id="dg-order"> orderBy</label>
+          <button type="button" class="btn" id="dg-run">▶ run action</button>
+        </div>
+        <svg id="dg-svg" width="640" height="230" viewBox="0 0 640 230" role="img" aria-label="Interactive diagram: a Spark pipeline of transformations split into stages at each shuffle boundary"></svg>
+        <div class="readout" aria-live="polite" id="dg-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="partitions" data-nav="Partitions &amp; skew">
+      <h3><span class="idx">05</span> Partitions, parallelism, and skew</h3>
+      <ul class="notes">
+        <li><b>A stage runs one task per partition</b>, at most one task per executor core at a time. Too few partitions leave cores idle and make each task spill; too many add scheduling overhead and produce thousands of tiny output files. A common target is 100–200 MB of input per partition and 2–4× as many partitions as total cores.</li>
+        <li>Input partitions follow the files (roughly one per ~128 MB split). After a shuffle, the count is <code>spark.sql.shuffle.partitions</code> (200 by default) unless <b>Adaptive Query Execution</b> (on by default since 3.2) coalesces small post-shuffle partitions at runtime.</li>
+        <li><b>Skew</b> — one key holding a big share of rows — makes one task run far longer than the rest. The stage time is the max, not the mean.</li>
+      </ul>
+      <div class="formula"><span class="lbl">stage time is set by the largest partition</span><span class="eq">T<sub>stage</sub> ≥ c · maxᵢ rowsᵢ</span>      <span class="eq">balanced: T<sub>stage</sub> ≈ ⌈P / cores⌉ · c · (N / P)</span>      <span class="eq">skew ratio = maxᵢ rowsᵢ / meanᵢ rowsᵢ</span>
+<span class="lbl">c = cost per row · P = partitions · N = total rows</span>
+<span class="lbl">salting a hot key k into S sub-keys</span><span class="eq">k′ = (k, rand ∈ {0, …, S−1})</span>   <span class="eq">→ aggregate on k′, then aggregate the S partials on k</span></div>
+
+      <div class="viz" id="viz-skew">
+        <div class="vhead">
+          <span class="vtitle">One hot key vs salting</span>
+          <span class="vhint">raise the hot-key share · add salt buckets</span>
+        </div>
+        <div class="controls">
+          <label>hot-key share <input type="range" id="sk-hot" min="0" max="0.8" step="0.05" value="0.4"> <b id="sk-hotv">40%</b></label>
+          <label>salt buckets S <input type="range" id="sk-salt" min="1" max="8" step="1" value="1"> <b id="sk-saltv">1</b></label>
+        </div>
+        <svg id="sk-svg" width="640" height="220" viewBox="0 0 640 220" role="img" aria-label="Interactive bar chart: rows per shuffle partition with a hot key, and how salting spreads it"></svg>
+        <div class="readout" aria-live="polite" id="sk-read"></div>
+      </div>
+      <ul class="notes">
+        <li>AQE also handles the join case automatically: it detects skewed partitions in a sort-merge join from shuffle statistics and splits them into sub-tasks. Manual salting is still needed for skewed aggregations with custom logic and for older clusters.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="catalyst" data-nav="Catalyst &amp; Tungsten">
+      <h3><span class="idx">06</span> Catalyst and Tungsten: why DataFrames are fast</h3>
+      <div class="formula"><span class="lbl">the Catalyst pipeline</span><span class="eq">unresolved logical plan → (analysis: resolve names, types) → logical plan</span>
+<span class="eq">→ (rule-based + cost-based optimisation) → optimised logical plan</span>
+<span class="eq">→ (physical planning: pick join strategies) → physical plan → (codegen) → RDD of tasks</span></div>
+      <table class="cmp">
+        <tr><th>Optimisation</th><th>Effect</th></tr>
+        <tr><td><b>Predicate pushdown</b></td><td>Filters move below joins and into the file scan; Parquet row groups whose min/max statistics cannot match are skipped.</td></tr>
+        <tr><td><b>Column pruning</b></td><td>Only referenced columns are read from columnar files.</td></tr>
+        <tr><td><b>Constant folding, filter combining</b></td><td>Simplifies expressions once, at plan time.</td></tr>
+        <tr><td><b>Join reordering / strategy</b></td><td>With statistics, picks broadcast vs sort-merge and a join order.</td></tr>
+        <tr><td><b>Whole-stage code generation</b> (Tungsten)</td><td>Fuses a stage's operators into one generated function — no virtual call per row per operator.</td></tr>
+        <tr><td><b>Binary row format</b> (Tungsten)</td><td>Compact off-heap/unsafe rows: less GC, cache-friendly scans, fast hashing and sorting.</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Read the plan.</b> <code>df.explain("formatted")</code> shows the physical plan; every <code>Exchange</code> node is a shuffle, <code>BroadcastExchange</code> is a broadcast, and <code>PushedFilters</code> on the scan confirms pushdown worked.</li>
+        <li><b>Anything opaque defeats Catalyst:</b> a Python UDF is a black box — no pushdown through it, and rows must be serialised out to a Python worker and back.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="joins" data-nav="Join strategies">
+      <h3><span class="idx">07</span> Join strategies</h3>
+      <table class="cmp">
+        <tr><th>Strategy</th><th>When chosen</th><th>Shuffle?</th><th>Failure mode</th></tr>
+        <tr><td><b>Broadcast hash join</b></td><td>One side below <code>spark.sql.autoBroadcastJoinThreshold</code> (10 MB default) or hinted with <code>broadcast(df)</code></td><td>No — small side copied to every executor</td><td>Driver/executor OOM if the "small" side is not actually small</td></tr>
+        <tr><td><b>Sort-merge join</b></td><td>Default for two large tables on equi-join keys</td><td>Both sides shuffled and sorted by key</td><td>Skewed keys → one giant task</td></tr>
+        <tr><td><b>Shuffled hash join</b></td><td>One side much smaller per partition; enabled by config or AQE</td><td>Both shuffled; hash table per partition</td><td>Per-partition hash table can overflow memory</td></tr>
+        <tr><td><b>Broadcast nested loop / cartesian</b></td><td>Non-equi joins (<code>a.t BETWEEN b.start AND b.end</code>)</td><td>Varies</td><td>O(n·m) — usually the reason a job "hangs"</td></tr>
+      </table>
+      <div class="callout"><b>Rule of thumb:</b> joining a fact table to a dimension table should almost always be a broadcast join. If <code>explain()</code> shows a sort-merge join there, check the dimension's size estimate or add a hint.</div>
+    </section>
+
+    <section class="topic" id="caching" data-nav="Caching">
+      <h3><span class="idx">08</span> Caching, persistence, and checkpointing</h3>
+      <ul class="notes">
+        <li><code>df.cache()</code> marks a DataFrame for storage at level <code>MEMORY_AND_DISK</code>; it is itself lazy and is filled by the next action. Partitions that do not fit spill to local disk.</li>
+        <li><b>Cache when</b> a DataFrame is reused by several actions or in a loop (iterative ML, an exploratory session, a dimension joined many times). <b>Don't cache</b> something used once — it costs memory that execution needs for shuffles and joins.</li>
+        <li><code>unpersist()</code> explicitly when done. Executor memory is shared between storage and execution; cached blocks get evicted (LRU) when execution needs room.</li>
+        <li><b>Checkpointing</b> writes the data to reliable storage and <i>truncates the lineage</i>. Use it when a lineage grows very long (hundreds of iterative steps), where a single lost partition would otherwise trigger a huge recomputation and planning itself gets slow.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Mechanism</th><th>Survives executor loss?</th><th>Keeps lineage?</th></tr>
+        <tr><td><code>cache()</code> / <code>persist()</code></td><td>No — lost blocks are recomputed from lineage</td><td>Yes</td></tr>
+        <tr><td><code>checkpoint()</code></td><td>Yes — on durable storage</td><td>No — truncated</td></tr>
+        <tr><td><code>localCheckpoint()</code></td><td>No — executor-local</td><td>No (fast, but fragile)</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="pyspark" data-nav="PySpark idioms">
+      <h3><span class="idx">09</span> PySpark idioms</h3>
+      <div class="formula"><span class="eq">from pyspark.sql import SparkSession, functions as F</span>
+<span class="eq">spark = SparkSession.builder.appName("daily-revenue").getOrCreate()</span>
+
+<span class="eq">orders = spark.read.parquet("s3://lake/orders/")</span>           <span class="eq"># lazy; schema from file footers</span>
+<span class="eq">stores = spark.read.parquet("s3://lake/dim_store/")</span>
+
+<span class="eq">daily = (orders</span>
+<span class="eq">    .filter(F.col("order_date") &gt;= "2026-11-01")</span>             <span class="eq"># pushed into the scan</span>
+<span class="eq">    .join(F.broadcast(stores), "store_id")</span>                  <span class="eq"># no shuffle for the dim</span>
+<span class="eq">    .groupBy("order_date", "region")</span>                        <span class="eq"># wide → one shuffle</span>
+<span class="eq">    .agg(F.sum("amount").alias("revenue"),</span>
+<span class="eq">         F.countDistinct("customer_id").alias("buyers")))</span>
+
+<span class="eq">daily.explain("formatted")</span>                                  <span class="eq"># check: one Exchange, one BroadcastExchange</span>
+<span class="eq">daily.write.mode("overwrite").partitionBy("order_date").parquet("s3://lake/agg/daily/")</span></div>
+      <table class="cmp">
+        <tr><th>Do</th><th>Avoid</th><th>Why</th></tr>
+        <tr><td>Built-in functions in <code>pyspark.sql.functions</code></td><td>Row-at-a-time Python UDFs</td><td>Built-ins run in the JVM under codegen; UDFs serialise every row to Python</td></tr>
+        <tr><td>Vectorised pandas UDFs / <code>mapInPandas</code> when you must use Python</td><td>Plain <code>@udf</code> loops</td><td>Arrow batches amortise the JVM↔Python transfer</td></tr>
+        <tr><td><code>take(n)</code>, <code>limit(n).toPandas()</code>, write to storage</td><td><code>collect()</code> / <code>toPandas()</code> on big data</td><td>Pulls everything into the driver's memory</td></tr>
+        <tr><td>Chain column expressions; one <code>select</code> with many columns</td><td>Hundreds of chained <code>withColumn</code> calls</td><td>Each call grows the plan; analysis time explodes</td></tr>
+        <tr><td>Explicit schemas for CSV/JSON</td><td><code>inferSchema=True</code> in production</td><td>Inference costs an extra pass and drifts with the data</td></tr>
+        <tr><td><code>coalesce(n)</code> to reduce output files</td><td><code>repartition(n)</code> when only shrinking</td><td>coalesce is narrow (no shuffle); repartition is a full shuffle</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="streaming" data-nav="Structured Streaming">
+      <h3><span class="idx">10</span> Structured Streaming</h3>
+      <p class="lede">The same DataFrame API over an <b>unbounded table</b>: each micro-batch appends new rows, and Spark incrementally updates the result as if the query were re-run over all data so far.</p>
+      <ul class="notes">
+        <li><b>Execution:</b> micro-batches by default (triggered on a fixed interval or as fast as possible), giving latencies from roughly a hundred milliseconds to seconds. <code>availableNow</code> triggers process everything pending then stop — handy for cheap scheduled incremental jobs.</li>
+        <li><b>Fault tolerance:</b> source offsets and operator state are written to a <b>checkpoint location</b> each batch; with a replayable source (a durable log) and an idempotent or transactional sink, this yields end-to-end exactly-once results.</li>
+        <li><b>Event time:</b> <code>withWatermark("ts", "10 minutes")</code> bounds how long state for a window is kept waiting for late events. Without a watermark, aggregation state grows forever.</li>
+        <li><b>Output modes:</b> <code>append</code> (emit finalised rows only, needs a watermark for aggregations), <code>update</code> (emit changed rows), <code>complete</code> (re-emit the whole result; small aggregates only).</li>
+      </ul>
+      <p>Windows, watermarks, and the durable log are covered in depth in <a href="../data-engineering/stream-processing.html">Stream Processing</a>.</p>
+    </section>
+
+    <section class="topic" id="mllib" data-nav="MLlib">
+      <h3><span class="idx">11</span> MLlib</h3>
+      <ul class="notes">
+        <li><b>Pipeline API.</b> A <b>Transformer</b> maps DataFrame → DataFrame (<code>VectorAssembler</code>, a fitted model); an <b>Estimator</b> has <code>fit(df)</code> → Transformer (<code>StandardScaler</code>, <code>LogisticRegression</code>). A <code>Pipeline</code> chains them so the same fitted preprocessing is replayed at scoring time — the same leakage discipline as in <a href="../data-engineering/data-preprocessing.html">Data Preprocessing</a>.</li>
+        <li><b>What it's good at:</b> linear models, trees and gradient-boosted trees, ALS for recommendations, k-means, feature hashing and tokenising — algorithms that decompose into per-partition statistics plus a reduce.</li>
+        <li><b>What it isn't:</b> a deep-learning trainer. For neural nets, Spark usually does the feature engineering and writes Parquet or tensor shards; a separate framework trains (see <a href="../deep-learning/distributed-training.html">Distributed Training</a>). Distributed batch <i>inference</i> via pandas UDFs is a common, well-suited pattern.</li>
+        <li>A frequent sweet spot: Spark aggregates terabytes into a feature table of millions of rows, then a single machine trains on it. Scale only the part that needs it.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="vspandas" data-nav="Spark vs pandas">
+      <h3><span class="idx">12</span> Spark vs pandas, and takeaways</h3>
+      <table class="cmp">
+        <tr><th></th><th><a href="pandas.html">pandas</a></th><th>Spark</th></tr>
+        <tr><td>Data size</td><td>Fits in one machine's RAM (with headroom: often 5–10× the file size)</td><td>Bounded by cluster storage; streams partitions through memory</td></tr>
+        <tr><td>Evaluation</td><td>Eager — each line executes</td><td>Lazy — plan, optimise, run on action</td></tr>
+        <tr><td>Order &amp; index</td><td>Rows have an order and an index; positional access is cheap</td><td>No inherent row order or index; <code>orderBy</code> is a global shuffle</td></tr>
+        <tr><td>Mutation</td><td>In-place assignment common</td><td>Immutable; every op returns a new DataFrame</td></tr>
+        <tr><td>Overhead</td><td>Microseconds; ideal for &lt; a few GB</td><td>Seconds of job/task startup; wasteful on small data</td></tr>
+        <tr><td>Bridge</td><td colspan="2">pandas-on-Spark API (pandas syntax, Spark execution); Arrow-backed <code>toPandas()</code> / pandas UDFs for crossing over</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Lazy plan → optimiser → stages cut at shuffles → one task per partition.</b> Read <code>explain()</code>; count the Exchanges.</li>
+        <li><b>Shuffles are the cost centre</b>; broadcast small dimensions, filter and project early, prefer narrow ops.</li>
+        <li><b>Stage time = slowest task.</b> Watch for skew; rely on AQE, salt where it can't help.</li>
+        <li><b>Stay in the JVM</b>: built-in functions over Python UDFs; never <code>collect()</code> big data.</li>
+        <li><b>Cache only what is reused</b>, unpersist when done, checkpoint very long lineages.</li>
+        <li>Spark is the workhorse beneath <a href="../data-engineering/etl-pipelines.html">ETL pipelines</a>, <a href="../data-engineering/data-warehousing.html">lakehouse tables</a>, and <a href="../data-engineering/feature-stores.html">feature-store</a> materialisation.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="apache-spark.viz.js"></script>
+</body>
+</html>

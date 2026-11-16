@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Message Queues</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Message Queues — Decoupling Producers from Consumers</h1>
+      <p>A message queue lets one part of a system hand work or events to another <b>without waiting for it</b>. The producer writes a message and moves on; consumers process it when they can. That one indirection buys burst absorption, independent scaling and failure isolation — and costs you a new set of questions: <b>how many times</b> is a message delivered, <b>in what order</b>, and <b>what happens when consumers fall behind</b>. Queues are one of the core <a href="scalability.html">scalability</a> patterns.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Systems</span>
+        <span class="pill">Asynchronous Messaging</span>
+        <span class="pill">Delivery Semantics</span>
+        <span class="pill">Queueing Theory</span>
+      </div>
+    </header>
+
+    <section class="topic" id="why">
+      <h3><span class="idx">01</span> Why put a queue in the middle</h3>
+      <ul class="notes">
+        <li><b>Load levelling:</b> producers burst, consumers drain at a steady rate. The queue absorbs the difference so the database behind the consumers sees the average, not the peak.</li>
+        <li><b>Temporal decoupling:</b> the consumer can be down, deploying or slow; messages wait. A synchronous call chain fails if any link fails; a queue-connected chain degrades into <i>latency</i> instead.</li>
+        <li><b>Independent scaling:</b> add consumers to drain faster without touching producers — the queue depth is the autoscaling signal.</li>
+        <li><b>Fan-out:</b> one event ("order placed") feeds many independent consumers (billing, email, analytics, a <a href="../data-engineering/feature-stores.html">feature pipeline</a>) without the producer knowing they exist.</li>
+      </ul>
+      <div class="callout"><b>One line:</b> a queue converts a <b>failure or overload</b> problem into a <b>latency</b> problem — which is only a good deal if you watch the backlog and bound it.</div>
+    </section>
+
+    <section class="topic" id="models">
+      <h3><span class="idx">02</span> Point-to-point vs publish/subscribe</h3>
+      <table class="cmp">
+        <tr><th></th><th>Point-to-point (work queue)</th><th>Publish / subscribe</th></tr>
+        <tr><td><b>Who gets a message</b></td><td>Exactly one of the competing consumers</td><td>Every subscriber (each subscription gets its own copy or cursor)</td></tr>
+        <tr><td><b>Purpose</b></td><td>Distribute <i>tasks</i>: resize this image, score this batch</td><td>Broadcast <i>events</i>: this happened, react if you care</td></tr>
+        <tr><td><b>Scaling</b></td><td>More consumers = more parallelism on the same queue</td><td>More subscribers = more independent pipelines; each scales separately</td></tr>
+        <tr><td><b>After processing</b></td><td>Message is acknowledged and removed</td><td>Retained per subscription (broker) or by time/size (log)</td></tr>
+      </table>
+      <p>Log-based systems blur the line: a topic is pub/sub across <b>consumer groups</b>, and point-to-point <i>within</i> a group, because each partition is read by one member of the group.</p>
+    </section>
+
+    <section class="topic" id="systems">
+      <h3><span class="idx">03</span> Three architectures: log, broker, managed queue</h3>
+      <table class="cmp">
+        <tr><th></th><th>Distributed log (Kafka-style)</th><th>Smart broker (RabbitMQ-style)</th><th>Managed queue (SQS-style)</th></tr>
+        <tr><td><b>Storage model</b></td><td>Append-only, partitioned, replicated log on disk</td><td>Queues fed by <i>exchanges</i> (direct, topic, fanout, headers) via bindings</td><td>Hosted queue; messages hidden while in flight, deleted on ack</td></tr>
+        <tr><td><b>Consumption</b></td><td>Consumers pull and track an <b>offset</b>; messages stay after reading</td><td>Broker pushes to consumers with a prefetch limit; ack removes</td><td>Consumers poll; a <b>visibility timeout</b> hides a message until it is deleted or the timeout lapses</td></tr>
+        <tr><td><b>Ordering</b></td><td>Strict within a partition</td><td>Per queue, with a single consumer; lost with competing consumers and redeliveries</td><td>Standard: best effort · FIFO queues: per message group</td></tr>
+        <tr><td><b>Replay</b></td><td>Yes — rewind the offset, re-process history</td><td>Not for classic queues (stream queues add it)</td><td>No (beyond retention of unconsumed messages)</td></tr>
+        <tr><td><b>Sweet spot</b></td><td>High-throughput event streams, CDC, <a href="../data-engineering/stream-processing.html">stream processing</a>, many readers of the same data</td><td>Task routing with rich rules, per-message acks, priorities, RPC-style patterns</td><td>Simple decoupling with no servers to operate; elastic throughput</td></tr>
+      </table>
+      <ul class="notes">
+        <li>The deep difference: a <b>broker</b> tracks the state of each message (delivered? acked?), while a <b>log</b> tracks only each consumer's position. Logs make replay and many independent readers cheap; brokers make per-message routing, priorities and redelivery cheap.</li>
+        <li>Recent Kafka releases add <b>share groups</b> (queue semantics on a topic: consumers can outnumber partitions and ack records individually, at the cost of per-partition ordering), narrowing the gap between the two models.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="partitions">
+      <h3><span class="idx">04</span> Partitions, ordering and consumer groups</h3>
+      <ul class="notes">
+        <li>A topic is split into <b>partitions</b>; a message goes to <code>partition = hash(key) mod P</code>. All messages with the same key land in the same partition, and a partition is read in order — so ordering is guaranteed <b>per key</b>, never globally.</li>
+        <li>A <b>consumer group</b> divides partitions among its members: each partition is owned by exactly one consumer in the group. Therefore <b>parallelism ≤ number of partitions</b> — the 13th consumer on a 12-partition topic sits idle.</li>
+        <li><b>Rebalancing:</b> when a consumer joins, leaves or stops heart-beating, partitions are reassigned. During a rebalance consumption pauses, and uncommitted work is redone by the new owner. Cooperative/incremental rebalancing moves only the affected partitions.</li>
+        <li><b>Hot keys:</b> one very active key pins all its traffic to one partition and one consumer. Partition count cannot fix skew — only a better key (or key salting, giving up per-key ordering) can.</li>
+      </ul>
+      <div class="viz" id="viz-cg">
+        <div class="vhead">
+          <span class="vtitle">Partition assignment in a consumer group</span>
+          <span class="vhint">click a consumer to crash it and trigger a rebalance</span>
+        </div>
+        <div class="controls">
+          <label>partitions <input type="range" id="cg-p" min="1" max="12" step="1" value="6"><span id="cg-p-v" class="lbl"></span></label>
+          <label>consumers <input type="range" id="cg-c" min="1" max="10" step="1" value="4"><span id="cg-c-v" class="lbl"></span></label>
+          <label><input type="checkbox" id="cg-hot"> one hot key (40% of traffic)</label>
+          <button type="button" id="cg-reset">⟲ restore all</button>
+        </div>
+        <svg id="cg-svg" width="640" height="260" viewBox="0 0 640 260" role="img" aria-label="Interactive diagram: partitions of a topic assigned to consumers in a group, with per-consumer load"></svg>
+        <div class="readout" aria-live="polite" id="cg-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="semantics">
+      <h3><span class="idx">05</span> Delivery semantics</h3>
+      <table class="cmp">
+        <tr><th>Guarantee</th><th>How it arises</th><th>Failure symptom</th></tr>
+        <tr><td><b>At-most-once</b></td><td>Ack (commit offset) <i>before</i> processing; or fire-and-forget producer</td><td>Crash after ack → the message is <b>lost</b></td></tr>
+        <tr><td><b>At-least-once</b></td><td>Process, <i>then</i> ack; producer retries until acknowledged</td><td>Crash after processing, before ack → the message is <b>processed twice</b></td></tr>
+        <tr><td><b>Exactly-once (effectively-once)</b></td><td>At-least-once delivery + deduplication or atomic commit of output and offset</td><td>Holds only inside the boundary that participates in the protocol</td></tr>
+      </table>
+      <ul class="notes">
+        <li>No network protocol can guarantee a message is <i>delivered</i> exactly once (the sender cannot distinguish a lost message from a lost ack). What systems offer is <b>exactly-once processing</b>: duplicates still arrive but their <i>effects</i> are applied once.</li>
+        <li>Log systems implement it with <b>idempotent producers</b> (the broker drops retried duplicates using a producer ID and sequence numbers) and <b>transactions</b> that atomically write output records and the consumer's offsets. This covers read-from-log → write-to-log pipelines; the moment you call an external API or database, you are back to at-least-once plus your own idempotency.</li>
+        <li>FIFO managed queues deduplicate by a message-deduplication ID within a fixed window (minutes). Outside the window, duplicates are again your problem.</li>
+      </ul>
+      <div class="callout"><b>Rule of thumb:</b> design every consumer as <b>at-least-once + idempotent</b>. It is the only guarantee that survives crossing system boundaries.</div>
+    </section>
+
+    <section class="topic" id="idempotency">
+      <h3><span class="idx">06</span> Idempotency patterns</h3>
+      <ul class="notes">
+        <li><b>Naturally idempotent operations:</b> "set status = shipped", upserts keyed by ID, writing a file to a deterministic path. Applying twice equals applying once: <code>f(f(x)) = f(x)</code>.</li>
+        <li><b>Idempotency keys:</b> each message carries a unique ID; the consumer records processed IDs in the same <a href="transactions-acid.html">transaction</a> as its side effect, and skips IDs it has seen. The dedup table needs a retention policy longer than the maximum redelivery delay.</li>
+        <li><b>Transactional outbox:</b> the producer cannot atomically write its database <i>and</i> publish a message. Instead it writes the message into an <code>outbox</code> table in the same DB transaction; a relay (or change-data capture) publishes from the outbox. This removes the "DB committed but publish failed" gap.</li>
+        <li><b>Versioning / fencing:</b> include a monotonically increasing version; consumers ignore anything older than what they have applied. Handles both duplicates and out-of-order redeliveries.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="backpressure">
+      <h3><span class="idx">07</span> Backpressure and consumer lag</h3>
+      <ul class="notes">
+        <li><b>Consumer lag</b> — the number of messages (or seconds) between the newest produced message and the consumer's position — is <i>the</i> health metric of a queue. Rising lag means arrival rate exceeds service rate; nothing else will tell you sooner.</li>
+        <li><b>Unbounded queues hide overload</b> until memory or disk runs out, then fail catastrophically. Bound them, and decide explicitly what happens when full: <b>block</b> the producer (backpressure), <b>reject</b> with an error (load shedding), or <b>drop</b> low-priority messages.</li>
+        <li><b>Flow control:</b> pull-based consumers apply backpressure naturally (they fetch only what they can handle); push-based brokers need a <b>prefetch / credit</b> limit per consumer, or a fast broker will flood a slow consumer.</li>
+        <li><b>Autoscale on lag, not CPU:</b> a consumer blocked on a slow database shows low CPU and high lag. Remember the partition ceiling: you cannot scale a group past its partition count.</li>
+        <li>Because latency ≈ lag ÷ consume rate (<a href="scalability.html#little">Little's law</a>), a lag SLO can be stated in seconds — "events reach the feature store within 60 s".</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="failures">
+      <h3><span class="idx">08</span> Retries, poison messages and dead-letter queues</h3>
+      <ul class="notes">
+        <li><b>Transient failures</b> (timeouts, throttling) deserve retries with <b>exponential backoff and jitter</b>: <code>delay = random(0, min(cap, base · 2ᵃᵗᵗᵉᵐᵖᵗ))</code>. Without jitter, every failed consumer retries in lock-step and re-creates the overload.</li>
+        <li><b>Poison messages</b> (malformed payloads, a bug triggered by one input) fail every time. Retrying them forever blocks the partition behind them (head-of-line blocking) or burns capacity.</li>
+        <li><b>Dead-letter queue (DLQ):</b> after k failed attempts, move the message aside with its error and attempt count. The main flow continues; the DLQ is alarmed, inspected and replayed once the bug is fixed. A DLQ nobody watches is a silent data-loss mechanism.</li>
+        <li><b>Visibility timeouts</b> must exceed the worst-case processing time (or be extended while working); otherwise a slow-but-healthy consumer's message reappears and is processed twice in parallel.</li>
+        <li><b>Ordered streams and retries conflict:</b> to retry without blocking a partition you must move the message to a retry topic — which breaks per-key ordering. Decide which matters more per use case.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="math">
+      <h3><span class="idx">09</span> Queueing math — why 90% utilisation feels like an outage</h3>
+      <p class="lede">Model a consumer as an <b>M/M/1</b> queue: Poisson arrivals at rate λ, exponential service at rate μ, one server. Everything follows from the utilisation ρ (derivations in <a href="../math/probability/stochastic-processes/ergodic-mcmc-queues.html">Ergodic Averages, MCMC &amp; Queues</a>):</p>
+      <div class="formula"><span class="eq">ρ = λ / μ  (stable only if ρ &lt; 1)</span><br>
+<span class="eq">L = ρ / (1 − ρ)</span>      <span class="eq">W = 1 / (μ − λ)</span>      <span class="eq">W<sub>q</sub> = ρ / (μ − λ)</span>      <span class="eq">L = λ · W</span></div>
+      <ul class="notes">
+        <li>Waiting time is proportional to <code>ρ/(1 − ρ)</code>: 1× service time at ρ = 0.5, 9× at 0.9, 99× at 0.99. The curve is a hockey stick, and the knee is earlier than intuition suggests.</li>
+        <li><b>Variability matters as much as load.</b> For general arrivals and service (G/G/1), Kingman's approximation: <code>W<sub>q</sub> ≈ (ρ / (1 − ρ)) · ((cₐ² + cₛ²) / 2) · (1/μ)</code>, where c is the coefficient of variation. Bursty producers (cₐ &gt; 1) or heavy-tailed jobs (cₛ &gt; 1) multiply the wait.</li>
+        <li>With c consumers (M/M/c) the same knee appears at <code>ρ = λ/(cμ)</code> near 1, but pooling makes it sharper and later — one shared queue feeding c consumers beats c separate queues.</li>
+      </ul>
+      <div class="viz" id="viz-mm1">
+        <div class="vhead">
+          <span class="vtitle">M/M/1 consumer — the utilisation knee</span>
+          <span class="vhint">top: mean time in system vs ρ · bottom: a simulated backlog trace</span>
+        </div>
+        <div class="controls">
+          <label>arrival rate λ (msg/s) <input type="range" id="mm-l" min="5" max="120" step="1" value="80"><span id="mm-l-v" class="lbl"></span></label>
+          <label>service rate μ (msg/s) <input type="range" id="mm-m" min="20" max="150" step="1" value="100"><span id="mm-m-v" class="lbl"></span></label>
+          <button type="button" id="mm-rs">↻ new trace</button>
+        </div>
+        <svg id="mm-svg" width="640" height="320" viewBox="0 0 640 320" role="img" aria-label="Interactive chart: M/M/1 mean latency against utilisation, and a simulated queue length trace"></svg>
+        <div class="readout" aria-live="polite" id="mm-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="ml">
+      <h3><span class="idx">10</span> Queues in ML systems</h3>
+      <ul class="notes">
+        <li><b>Asynchronous inference:</b> long jobs (document parsing, video, large-batch embedding) go on a work queue; GPU workers pull at their own pace and the client polls or gets a callback. Queue depth drives GPU autoscaling — see <a href="../mlops/model-deployment.html">Model Deployment</a>.</li>
+        <li><b>Request batching:</b> an inference server's internal queue is what lets it form batches; the max-wait-before-batch setting is a direct latency↔throughput dial (<a href="../mlops/llm-serving.html">LLM Serving</a>).</li>
+        <li><b>Event logs as training data:</b> impressions, clicks and predictions logged to a topic feed both real-time features (<a href="../data-engineering/stream-processing.html">stream processing</a> → <a href="../data-engineering/feature-stores.html">feature stores</a>) and the offline lake for retraining — one log, two consumers, consistent data.</li>
+        <li><b>Prediction logging for monitoring:</b> publishing every prediction with its features lets <a href="../mlops/monitoring-and-drift.html">drift monitors</a> consume asynchronously without slowing serving.</li>
+        <li><b>Pipeline orchestration:</b> <a href="../data-engineering/etl-pipelines.html">ETL</a> stages connected by queues retry independently; idempotent stage outputs make re-runs safe.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">11</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Work queues</b> distribute tasks to one consumer; <b>pub/sub</b> broadcasts events to every subscriber; a log does both via consumer groups.</li>
+        <li><b>Ordering is per partition (per key)</b>, and group parallelism is capped by the partition count.</li>
+        <li><b>Assume at-least-once and make consumers idempotent</b>; "exactly-once" holds only inside a transactional boundary.</li>
+        <li><b>Watch lag, bound queues, and back off with jitter</b>; send poison messages to a DLQ that someone actually monitors.</li>
+        <li><b>Keep consumers below ~70–80% utilisation</b>: queueing delay grows like <code>ρ/(1 − ρ)</code>, and burstiness makes it worse.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="message-queues.viz.js"></script>
+</body>
+</html>

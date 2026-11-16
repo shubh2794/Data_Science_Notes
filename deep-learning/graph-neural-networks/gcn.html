@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · GCN: Semi-Supervised Classification with Graph Convolutional Networks</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../graph-neural-networks.html">Graph Neural Networks</a> · deep dive</p>
+      <h1>GCN: Semi-Supervised Classification with Graph Convolutional Networks</h1>
+      <p>The hub's <a href="../graph-neural-networks.html#gcn">GCN section</a> gives the layer and its one-line origin story. This page follows the paper the whole way: why conditioning on the adjacency beats regularizing with it, how a spectral filter becomes a Chebyshev polynomial and then a single sparse product, why the tied first-order operator is numerically unsafe and what the renormalization trick does to its spectrum, the two-layer model and its labelled-only loss, the karate-club picture, the four benchmarks, the propagation-model ablation that justifies every simplification, cost, depth, and the limits the paper states.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Deep Learning</span>
+        <span class="pill">Graph Neural Networks</span>
+        <span class="pill">spectral filters · Chebyshev · first-order cut · renormalization · labelled-only loss · WL · Cora / Citeseer / Pubmed / NELL · ablation · depth</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="problem" data-nav="The problem: few labels, one graph">
+      <h3><span class="idx">01</span> The problem: a few labelled nodes in one big graph</h3>
+      <p class="lede"><b>Graph-based semi-supervised node classification:</b> one graph, features on every node, labels on a tiny fraction — 20 per class on the citation networks, a single one per class on the knowledge graph. Predict the rest. The question the paper answers is <i>where the graph should enter the model</i>.</p>
+
+      <h4>The older answer: put the graph in the loss</h4>
+      <div class="formula"><span class="lbl">graph laplacian regularization (the approach the paper replaces)</span><span class="eq">L  =  L₀  +  λ · L_reg
+
+L₀      supervised loss on the labelled nodes
+L_reg   =  ∑ᵢⱼ Aᵢⱼ ‖ f(Xᵢ) − f(Xⱼ) ‖²   =   f(X)ᵀ Δ f(X)        Δ = D − A  (unnormalized Laplacian)
+
+f(·)    any differentiable model — an MLP, say — that never sees A</span></div>
+      <p>(Whether the sum runs over ordered or unordered pairs changes the identity by a factor of 2; the scale is absorbed into <code>λ</code>.) The penalty is small when every edge joins nodes with similar outputs, so the graph acts only as a smoothness prior on <code>f</code>. This family — label propagation, manifold regularization, embedding-based regularizers — is covered under <a href="../../machine-learning/semi-supervised-learning.html#graph-methods">graph-based methods</a> on the semi-supervised learning page.</p>
+
+      <ul class="notes">
+        <li><b>The built-in assumption:</b> connected nodes are likely to share a label. That is homophily, hard-coded. Edges may carry other information — similarity in some respects but not others — and the regularizer cannot express that.</li>
+        <li><b>The graph is not an input.</b> <code>f</code> maps <code>Xᵢ ↦ f(Xᵢ)</code> one node at a time; the graph only appears in a penalty term weighted by a hyperparameter <code>λ</code> that has to be tuned.</li>
+      </ul>
+
+      <h4>The paper's answer: put the graph in the network</h4>
+      <div class="formula"><span class="lbl">condition the model on the adjacency directly</span><span class="eq">Z  =  f(X, A)            trained with  L₀  only   (no explicit graph regularizer)</span></div>
+      <p>Now node <code>i</code>'s output depends on its neighbours' features, so the gradient of the supervised loss at a labelled node flows back through <code>A</code> into the representations of the unlabelled nodes around it. The graph does its work through the forward pass, not through a penalty — §06 makes this precise, and the figure in §07 shows what happens when you take <code>A</code> away.</p>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="spectral" data-nav="Spectral graph convolution">
+      <h3><span class="idx">02</span> Spectral graph convolution: exact, global, expensive</h3>
+      <p class="lede">The starting point is the classical definition of convolution on a graph: transform the signal into the eigenbasis of the graph Laplacian, multiply by a filter there, transform back. It is the graph analogue of the <a href="../../math/fourier-analysis/transform-convolution.html#convolution">convolution theorem</a>.</p>
+
+      <div class="formula"><span class="lbl">spectral convolution of a signal x ∈ ℝᴺ (one scalar per node)</span><span class="eq">L  =  I_N − D^−½ A D^−½  =  U Λ Uᵀ          normalized Laplacian, eigendecomposed
+
+g_θ ⋆ x  =  U g_θ Uᵀ x          g_θ = diag(θ),  θ ∈ ℝᴺ   — equivalently a function g_θ(Λ)
+
+Uᵀx      the graph Fourier transform of x        (eigenvectors = graph "frequencies")
+g_θ      one multiplier per frequency
+U(·)     back to the node domain</span></div>
+      <ul class="notes">
+        <li><b>Where "frequency" comes from.</b> <code>L</code> is symmetric positive semi-definite with eigenvalues in <code>[0, 2]</code>; small eigenvalues have eigenvectors that vary slowly across edges, large ones flip sign between neighbours. (General spectral graph theory; the eigendecomposition itself is on the <a href="../../math/linear-algebra-eigen-svd/eigenvalues.html#eigendecomposition">eigenvalues page</a>.)</li>
+        <li><b>Cost of applying it:</b> multiplication by the dense eigenvector matrix <code>U</code> is <code>O(N²)</code> per signal.</li>
+        <li><b>Cost of setting it up:</b> the eigendecomposition of <code>L</code> — prohibitively expensive for large graphs (cubic in <code>N</code> for a dense solver, general knowledge).</li>
+        <li><b>Not localized:</b> an arbitrary <code>θ</code> gives a filter that can couple any node with any other, and has <code>N</code> free parameters tied to one specific graph.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="chebyshev" data-nav="Chebyshev filters &amp; locality">
+      <h3><span class="idx">03</span> Chebyshev filters: a polynomial in <code>L</code> is a <code>K</code>-hop operator</h3>
+      <p class="lede">Make the filter a function of the eigenvalue, approximate that function by a degree-<code>K</code> Chebyshev polynomial, and the eigenvectors drop out entirely: a polynomial of <code>Λ</code> inside <code>U(·)Uᵀ</code> is the same polynomial of <code>L</code>.</p>
+
+      <div class="formula"><span class="lbl">truncated chebyshev expansion of the filter</span><span class="eq">g_θ′(Λ)  ≈  ∑ₖ₌₀..K  θ′ₖ Tₖ(Λ̃)            Λ̃ = (2 / λ_max) Λ − I_N     (eigenvalues rescaled into [−1, 1])
+
+Tₖ(x)  =  2x · Tₖ₋₁(x) − Tₖ₋₂(x)        T₀(x) = 1,   T₁(x) = x</span>
+<span class="lbl">the eigenvectors cancel</span><span class="eq">(U Λ Uᵀ)ᵏ  =  U Λᵏ Uᵀ        ⟹        g_θ′ ⋆ x  ≈  ∑ₖ₌₀..K  θ′ₖ Tₖ(L̃) x        L̃ = (2 / λ_max) L − I_N</span>
+<span class="lbl">computed by the same recurrence, on vectors</span><span class="eq">x̄₀ = x        x̄₁ = L̃ x        x̄ₖ = 2 L̃ x̄ₖ₋₁ − x̄ₖ₋₂        output = ∑ₖ θ′ₖ x̄ₖ
+
+K sparse matrix–vector products   →   O(K · |E|)  with no eigendecomposition</span></div>
+
+      <ul class="notes">
+        <li><b>Why the rescaling.</b> Chebyshev polynomials satisfy <code>Tₖ(cos t) = cos(kt)</code>, so they stay in <code>[−1, 1]</code> on <code>[−1, 1]</code> and grow fast outside it (general knowledge). Mapping <code>[0, λ_max]</code> onto <code>[−1, 1]</code> keeps every basis term bounded on the actual spectrum.</li>
+        <li><b>Why it is <code>K</code>-localized.</b> <code>(Lᵏ)ᵢⱼ</code> is a sum over walks of length <code>k</code> from <code>i</code> to <code>j</code>, so it is exactly zero when <code>j</code> is more than <code>k</code> hops from <code>i</code>. A degree-<code>K</code> polynomial therefore mixes each node only with its <code>K</code>-hop ball — the same "depth is radius" picture as the hub's <a href="../graph-neural-networks.html#message-passing">receptive-field figure</a>, but here inside a <i>single</i> layer.</li>
+        <li><b>Parameters:</b> <code>K + 1</code> per input–output channel pair, independent of <code>N</code> — the filter is no longer tied to one graph's eigenbasis.</li>
+      </ul>
+
+      <p>The figure applies one basis term <code>T_K(L̃)</code> to a delta on a node of the 34-node karate-club graph, using the three-term recurrence above. Hollow nodes are entries that are <i>exactly</i> zero. Move <code>K</code> and watch the support grow one hop per step and never beyond.</p>
+      <div class="viz" id="viz-cb">
+        <div class="vhead">
+          <span class="vtitle">One Chebyshev basis term on a real graph: support = the K-hop ball</span>
+          <span class="vhint">click any node to move the delta · switch λ_max to see what the first-order approximation assumes</span>
+        </div>
+        <div class="controls">
+          <label>K <input type="range" id="cb-k" min="0" max="6" step="1" value="2" /><span id="cb-kv" style="min-width:14px;display:inline-block">2</span></label>
+          <label>rescaling <select id="cb-s">
+            <option value="exact" selected>exact λ_max of this graph</option>
+            <option value="two">λ_max ≈ 2 (the first-order assumption)</option>
+          </select></label>
+        </div>
+        <svg id="cb-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Left: the 34-node karate-club graph. One node, outlined in red, carries a unit delta. Each node is filled according to its entry of the vector T sub K of L-tilde times the delta: teal for positive, amber for negative, brighter for larger magnitude on a logarithmic scale, and hollow with a dashed outline where the entry is exactly zero. Nodes within K hops of the delta node carry a white outline. As K increases from 0 to 6, the filled region grows by exactly one hop per step and every node beyond K hops stays hollow. Right: the Chebyshev polynomials T0 through TK plotted against the Laplacian eigenvalue lambda from 0 to 2, after rescaling by lambda max, with tick marks along the bottom at this graph's eigenvalues; the selected T K is drawn thick. With exact rescaling the region beyond the largest eigenvalue, about 1.71, is shaded as containing no eigenvalues; with lambda max taken as 2 the curves are evaluated on the whole interval. The readout gives the number of nonzero entries, the number of nodes within K hops, the largest entry beyond K hops (zero), the number of sparse products used, and the largest value of the basis polynomial over the graph's eigenvalues."></svg>
+        <div class="readout" aria-live="polite" id="cb-readout"></div>
+      </div>
+      <p>Two things to read off. The support is exact, not approximate: entries beyond <code>K</code> hops are computed as products with structural zeros of <code>L̃</code>, so they are 0 in floating point too. And on the right, with the exact <code>λ_max</code>, every basis polynomial is bounded by 1 on the graph's eigenvalues — the readout's last number — which is what the rescaling buys.</p>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="first-order" data-nav="The first-order cut &amp; tying">
+      <h3><span class="idx">04</span> The first-order cut: <code>K = 1</code>, <code>λ_max ≈ 2</code>, one parameter</h3>
+      <p class="lede">The paper's move is to keep the cheapest possible polynomial — linear in <code>L</code> — and get reach from <b>stacking layers</b> instead of from a high filter degree. Each layer then sees one hop; <code>K</code> layers with nonlinearities in between see <code>K</code> hops, with a richer function class than one fixed polynomial.</p>
+
+      <div class="formula"><span class="lbl">step 1 — truncate at k = 1</span><span class="eq">g_θ′ ⋆ x  ≈  θ′₀ x  +  θ′₁ L̃ x</span>
+<span class="lbl">step 2 — approximate the largest eigenvalue by 2 (training is expected to adapt to the scale)</span><span class="eq">L̃  =  (2/2) L − I_N  =  L − I_N  =  −D^−½ A D^−½
+
+g_θ′ ⋆ x  ≈  θ′₀ x  +  θ′₁ (L − I_N) x  =  θ′₀ x  −  θ′₁ D^−½ A D^−½ x          two free parameters</span>
+<span class="lbl">step 3 — tie them: one parameter per filter</span><span class="eq">θ  =  θ′₀  =  −θ′₁         ⟹         g_θ ⋆ x  ≈  θ ( I_N + D^−½ A D^−½ ) x</span></div>
+
+      <ul class="notes">
+        <li><b>What <code>λ_max ≈ 2</code> costs.</b> <code>2</code> is the upper bound of the normalized Laplacian's spectrum, reached only by bipartite graphs; the karate graph's true value is about 1.71 (switch the rescaling in §03's figure). Using the bound skips computing <code>λ_max</code> and is the step that turns <code>L̃</code> into a plain normalized adjacency; any mis-scaling is a constant the learned weights can absorb.</li>
+        <li><b>Why tie the two parameters.</b> The paper presents it as further constraining the number of parameters, to curb overfitting and reduce the operations per layer. The two-parameter version is not discarded on faith — it is the "1st-order model" row of the ablation in §10, and it loses.</li>
+        <li><b>Why one hop per layer at all.</b> The paper's stated intuition is that a layer limited to direct neighbours should be less prone to overfitting local neighbourhood structure on graphs whose degree distributions are very wide — social, citation and knowledge graphs. Depth is then the knob for radius (§12).</li>
+      </ul>
+      <div class="callout"><b>Read the result per node.</b> <code>( (I + D^−½AD^−½) x )ᵢ = xᵢ + ∑ⱼ∈N(i) xⱼ / √(dᵢ dⱼ)</code>: the node's own value with weight 1, plus a degree-normalized sum of its neighbours. That weight of 1 on the self term, independent of degree, is half of the problem the next section fixes.</div>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="renormalization" data-nav="The [0, 2] problem &amp; renormalization">
+      <h3><span class="idx">05</span> The <code>[0, 2]</code> problem and the renormalization trick</h3>
+      <p class="lede"><b>The tied operator <code>I_N + D^−½AD^−½</code> has eigenvalues in <code>[0, 2]</code>.</b> Applied once, fine. Applied layer after layer, as a deep model does, the top modes grow like <code>2ᵏ</code> while others shrink — numerical instability and exploding or vanishing gradients. The fix is to add the self-loop <i>before</i> normalizing.</p>
+
+      <div class="formula"><span class="lbl">why the spectrum is [0, 2]</span><span class="eq">I_N + D^−½ A D^−½  =  2 I_N − L         spec(L) ⊂ [0, 2]   ⟹   spec ⊂ [0, 2]
+
+λ = 0 of L (eigenvector D^½𝟙)    →   eigenvalue exactly 2      on every connected graph
+λ = 2 of L (bipartite graphs only)  →   eigenvalue exactly 0</span>
+<span class="lbl">the renormalization trick</span><span class="eq">I_N + D^−½ A D^−½      →      D̃^−½ Ã D̃^−½            Ã = A + I_N,     D̃ᵢᵢ = ∑ⱼ Ãᵢⱼ
+
+spec( D̃^−½ Ã D̃^−½ )  ⊂  (−1, 1]          top eigenvalue exactly 1 (eigenvector D̃^½𝟙)</span>
+<span class="lbl">per node, the two operators side by side</span><span class="eq">before:   hᵢ  +  ∑ⱼ∈N(i)  hⱼ / √(dᵢ dⱼ)                       self weight 1, whatever the degree
+after:    hᵢ / (dᵢ + 1)  +  ∑ⱼ∈N(i)  hⱼ / √((dᵢ + 1)(dⱼ + 1))    self-loop is just one more, equally normalized, edge</span></div>
+      <p>The spectral bounds and eigenvectors in the first and second block are standard spectral graph theory (the renormalized operator is the normalized adjacency of <code>Ã</code>, whose self-loops rule out the eigenvalue <code>−1</code>); the paper states the instability and the fix. Below, both operators are built for a small graph and their eigenvalues computed; the bars show what <code>k</code> applications do to each eigenmode, <code>|μᵢ|ᵏ</code>.</p>
+
+      <div class="viz" id="viz-sp">
+        <div class="vhead">
+          <span class="vtitle">Eigenvalues of the two propagation operators, and their gains after k applications</span>
+          <span class="vhint">try the star and the path (bipartite) as well as the karate graph · drag k to 30</span>
+        </div>
+        <div class="controls">
+          <label>graph <select id="sp-g">
+            <option value="karate" selected>karate club (34 nodes)</option>
+            <option value="path">path, 10 nodes</option>
+            <option value="star">star, 1 hub + 8 leaves</option>
+            <option value="cycle7">cycle, 7 nodes</option>
+            <option value="k6">complete graph, 6 nodes</option>
+          </select></label>
+          <label>applications k <input type="range" id="sp-k" min="1" max="30" step="1" value="6" /><span id="sp-kv" style="min-width:20px;display:inline-block">6</span></label>
+        </div>
+        <svg id="sp-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="Top: two horizontal number lines from minus 1 to 2, one for the eigenvalues of I plus D to the minus one half A D to the minus one half, in amber, over a shaded band from 0 to 2, and one for the eigenvalues of the renormalized operator D-tilde to the minus one half A-tilde D-tilde to the minus one half, in teal, over a shaded band from minus 1 to 1. Repeated eigenvalues are stacked. Dashed vertical guides mark minus 1 and plus 1. For every graph the amber spectrum reaches exactly 2 and the teal spectrum reaches exactly 1; for bipartite graphs, the path and the star, the amber spectrum also touches 0. Bottom: two bar charts on a logarithmic vertical axis from 10 to the minus 12 up to 10 to the 10, one per operator, with one bar per eigenmode giving the absolute eigenvalue raised to the power k, drawn up from or down from a dashed line at 1. As k grows, the amber bars for eigenvalues above 1 shoot up toward 2 to the k while those below 1 sink, a spread of many orders of magnitude; the teal bars never exceed 1, the top one stays exactly at 1 and the rest decay. The readout gives, for each operator, its spectral range, the largest and smallest gain, and how many modes remain within a factor of one thousand of the largest."></svg>
+        <div class="readout" aria-live="polite" id="sp-readout"></div>
+      </div>
+      <ul class="notes">
+        <li><b>Unrenormalized: a gain spread that explodes.</b> At <code>k = 30</code> the top mode of the amber operator has been multiplied by <code>2³⁰ ≈ 10⁹</code>. A stack of layers with this operator in each would need its weights to cancel that scale exactly — the instability the paper describes. On the star and the path the bottom of the spectrum is an exact 0, so some signal is annihilated in one step.</li>
+        <li><b>Renormalized: bounded, with one fixed point.</b> Nothing exceeds 1, so the linear part cannot blow up. But read the last number in the readout: as <code>k</code> grows, the count of modes within <code>10⁻³</code> of the top falls towards 1 — repeated application drives every signal towards the single top eigenvector (the amber operator does the same, relative to its exploding top mode). That is exactly what the hub calls <a href="../graph-neural-networks.html#failure-modes">over-smoothing</a>; the renormalization trick cures explosion, not smoothing (§12).</li>
+        <li><b>Caveat on the figure:</b> it is the linear propagation alone. In a real layer each application is followed by <code>W⁽ˡ⁾</code> and a nonlinearity, which can rescale or rotate the signal — but the operator's spectrum is what every layer starts from.</li>
+      </ul>
+
+      <h4>Multi-channel form: the layer the paper actually uses</h4>
+      <div class="formula"><span class="lbl">generalized to C input channels and F filters</span><span class="eq">Z  =  D̃^−½ Ã D̃^−½ X Θ            X ∈ ℝ^(N×C),   Θ ∈ ℝ^(C×F),   Z ∈ ℝ^(N×F)
+
+cost  O(|E| F C)       — Ã X is a sparse–dense product</span>
+<span class="lbl">stacked, with a nonlinearity</span><span class="eq">H⁽ˡ⁺¹⁾  =  σ( D̃^−½ Ã D̃^−½ H⁽ˡ⁾ W⁽ˡ⁾ )            H⁽⁰⁾ = X</span></div>
+      <p>That is the layer in the hub's <a href="../graph-neural-networks.html#gcn">§03</a>, now with its derivation complete: a first-order, parameter-tied Chebyshev filter with <code>λ_max ≈ 2</code>, renormalized so it can be stacked.</p>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="model" data-nav="The two-layer model &amp; its loss">
+      <h3><span class="idx">06</span> The two-layer model and the labelled-only loss</h3>
+      <p class="lede">The model used for every benchmark is two of these layers and a softmax. The adjacency is normalized once, up front; the loss looks only at labelled rows; and yet every node's prediction is trained, because every labelled row depends on its neighbours.</p>
+
+      <div class="formula"><span class="lbl">forward pass</span><span class="eq">Â  =  D̃^−½ Ã D̃^−½                        precomputed once (a preprocessing step)
+
+Z  =  softmax(  Â · ReLU( Â X W⁽⁰⁾ ) · W⁽¹⁾  )        softmax applied row-wise
+
+W⁽⁰⁾ ∈ ℝ^(C×H)    input-to-hidden          W⁽¹⁾ ∈ ℝ^(H×F)    hidden-to-output</span>
+<span class="lbl">tensor shapes on cora (c = 1433 features, h = 16 hidden, f = 7 classes) — our arithmetic</span><span class="eq">X        2708 × 1433    ─ · W⁽⁰⁾ (1433 × 16) ─→  2708 × 16  ─ Â · ─→  2708 × 16  ─ ReLU ─→ H
+H        2708 × 16      ─ · W⁽¹⁾ (16 × 7)    ─→  2708 × 7   ─ Â · ─→  2708 × 7   ─ softmax ─→ Z
+
+weights:  1433·16 + 16·7  =  22 928 + 112  =  23 040</span>
+<span class="lbl">loss — cross-entropy over labelled nodes only</span><span class="eq">L  =  − ∑_(l ∈ Y_L)  ∑_(f = 1..F)  Y_lf · ln Z_lf          Y_L = indices of the labelled nodes</span></div>
+
+      <h4>Why a labelled-only loss trains unlabelled nodes</h4>
+      <ul class="notes">
+        <li>Row <code>l</code> of <code>Z</code> depends on the features of every node within <b>two hops</b> of <code>l</code> (two applications of <code>Â</code>). So <code>∂L/∂W⁽⁰⁾</code> is assembled from the features of those neighbourhoods, and the shared weights learn a transform that works for them.</li>
+        <li>Every unlabelled node within two hops of a labelled one contributes to the gradient; every unlabelled node anywhere then receives a prediction from the same shared weights and its own neighbourhood. That is the "gradients spread from labelled to unlabelled nodes" mechanism of §01 — in contrast to the regularizer, which acts only through a penalty.</li>
+        <li><b>The setting is transductive.</b> Test nodes, their features and their edges are all present during training; only their labels are hidden. The forward pass always runs over the whole graph (the "mask" pattern of the hub's <a href="../graph-neural-networks.html#tasks">tasks section</a>).</li>
+      </ul>
+
+      <h4>How it is trained</h4>
+      <ul class="notes">
+        <li><b>Full-batch gradient descent</b>: the whole dataset, every iteration — one gradient step per epoch. With <code>A</code> stored sparse, memory is <code>O(|E|)</code> (see <a href="../../dsa/data-structures/graphs/graph-storage.html#csr">CSR storage</a>); the forward pass costs <code>O(|E| C H F)</code> as the paper states it, implemented as sparse–dense matrix multiplication.</li>
+        <li><b>Regularization:</b> dropout, plus L2 weight decay on the first layer only (§08 has the values). Mini-batch training is explicitly left as future work — the hub's <a href="../graph-neural-networks.html#training">training section</a> covers how later work did it.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="karate" data-nav="WL view &amp; the karate club">
+      <h3><span class="idx">07</span> The Weisfeiler–Lehman view and the karate club</h3>
+      <p class="lede">The paper also reads the layer spatially: it is a <b>differentiable, parameterized version of the 1-WL colour-refinement step</b>, with the hash replaced by a learned linear map and a nonlinearity, and with normalization constants on the edges. That reading predicts something striking — even an <i>untrained</i> GCN should already separate communities.</p>
+
+      <div class="formula"><span class="lbl">from a hash to a layer</span><span class="eq">1-WL step:      hᵢ  ←  hash( ∑ⱼ∈Nᵢ  hⱼ )
+
+GCN layer:      hᵢ⁽ˡ⁺¹⁾  =  σ( ∑ⱼ∈Nᵢ  (1 / cᵢⱼ) · hⱼ⁽ˡ⁾ W⁽ˡ⁾ )          cᵢⱼ = √(dᵢ dⱼ)</span></div>
+      <p>The 1-WL test, and what its ceiling means for expressiveness — including why a <i>normalized</i> sum like this one sits below the ceiling that a plain sum reaches — is the subject of the hub's <a href="../graph-neural-networks.html#gin-mpnn">expressiveness section</a>.</p>
+
+      <h4>What the appendix shows</h4>
+      <ul class="notes">
+        <li><b>Untrained:</b> a 3-layer GCN with <code>tanh</code>, random Glorot-initialized weights, <b>no features</b> (<code>X = I_N</code>, a one-hot id per node), hidden width 4 and a 2-D output. The 2-D embeddings already resemble the community structure — four classes obtained by modularity-based clustering. Propagation alone, with random weights, is doing WL-like refinement.</li>
+        <li><b>Semi-supervised:</b> the same model trained with <b>one labelled node per class</b>, Adam with learning rate 0.01, 300 iterations; the embeddings separate into the classes.</li>
+        <li><b>A note on size.</b> The paper gives the graph as 34 nodes and 154 edges. The standard, publicly circulated edge list has 78 undirected edges (156 directed entries). 154 is exactly twice 77, and versions of this dataset with 77 edges also circulate, so the most likely reading is that the paper counts each undirected edge in both directions on a 77-edge version — our interpretation, not something the paper states. The figure uses the 78-edge list.</li>
+      </ul>
+
+      <p>Below: the appendix experiment, run in the page. The three <code>tanh</code> GCN layers are 34 → 4 → 4 → 2; to turn the 2-D output into class scores this figure adds a linear softmax read-out (our construction), and trains with the labelled-only cross-entropy of §06, Adam, learning rate 0.01, for 300 iterations, no dropout or weight decay. The four classes are computed here with Louvain modularity clustering, so they may differ slightly from the paper's; the labelled node in each class is its highest-degree member. Switch the propagation to <code>Â = I</code> to run the same network with the graph removed.</p>
+      <div class="viz" id="viz-kc">
+        <div class="vhead">
+          <span class="vtitle">A featureless GCN on the karate club, one label per class</span>
+          <span class="vhint">look at iteration 0 first — the untrained embedding — then train · then try Â = I</span>
+        </div>
+        <div class="controls">
+          <label>classes <select id="kc-l">
+            <option value="comm" selected>4 modularity communities</option>
+            <option value="club">2 factions after the split</option>
+          </select></label>
+          <label>propagation <select id="kc-p">
+            <option value="gcn" selected>Â = D̃^−½ÃD̃^−½ (GCN)</option>
+            <option value="none">Â = I (no graph)</option>
+          </select></label>
+          <button id="kc-play" type="button">train</button>
+          <button id="kc-step" type="button">+25 iterations</button>
+          <button id="kc-reset" type="button">new random init</button>
+        </div>
+        <svg id="kc-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Left: the 34-node karate-club graph. Each node has an inner fill showing the class the network currently predicts and an outer ring showing its true class, using four colours; the one labelled node per class has a white halo. Right: a scatter plot of the 34 nodes at their two-dimensional output from the third GCN layer, coloured by true class, with labelled nodes enlarged and outlined; the axes rescale to fit. At iteration 0, with random weights and no features, the scatter already shows nodes of the same community lying near one another. During training with the graph, the four colour groups pull apart in the scatter and most inner fills come to match their outer rings, spreading outward from the labelled nodes. With the propagation set to the identity, the labelled nodes are fitted but the other nodes' predictions stay essentially arbitrary and the scatter shows no community structure. The readout gives the iteration, the loss on labelled nodes, the accuracy on all other nodes against chance, the partition's modularity, the labelled node ids, and the propagation in use."></svg>
+        <div class="readout" aria-live="polite" id="kc-readout"></div>
+      </div>
+      <ul class="notes">
+        <li><b>With the graph</b>, accuracy on the unlabelled nodes typically ends around 83–93% on the four communities and ≈ 97% (31 of 32) on the two factions across random initializations (our runs of this figure's code over ten seeds; an occasional seed lands far lower — try "new random init").</li>
+        <li><b>Without it</b> (<code>Â = I</code>, <code>X = I</code>) the model is an MLP on one-hot ids: row <code>i</code> of <code>W⁽⁰⁾</code> is touched only by node <code>i</code>, so unlabelled rows never get a gradient and their predictions stay at whatever the random initialization gave — around chance. Every bit of generalization in the left panel came through <code>Â</code>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="setup" data-nav="Datasets &amp; setup">
+      <h3><span class="idx">08</span> Datasets and experimental setup</h3>
+      <p class="lede">Three citation networks — documents as nodes, citations as undirected edges, bag-of-words features — and one bipartite knowledge graph, all at extremely low label rates.</p>
+
+      <table class="grid2">
+        <tr><th>dataset</th><th>type</th><th>nodes</th><th>edges</th><th>classes</th><th>features</th><th>label rate</th></tr>
+        <tr><td><b>Citeseer</b></td><td>citation network</td><td class="num">3,327</td><td class="num">4,732</td><td class="num">6</td><td class="num">3,703</td><td class="num">0.036</td></tr>
+        <tr><td><b>Cora</b></td><td>citation network</td><td class="num">2,708</td><td class="num">5,429</td><td class="num">7</td><td class="num">1,433</td><td class="num">0.052</td></tr>
+        <tr><td><b>Pubmed</b></td><td>citation network</td><td class="num">19,717</td><td class="num">44,338</td><td class="num">3</td><td class="num">500</td><td class="num">0.003</td></tr>
+        <tr><td><b>NELL</b></td><td>knowledge graph</td><td class="num">65,755</td><td class="num">266,144</td><td class="num">210</td><td class="num">5,414</td><td class="num">0.001</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Citation networks: 20 labels per class.</b> The label rates follow: 20 · 6 / 3,327 = 0.036, 20 · 7 / 2,708 = 0.052, 20 · 3 / 19,717 = 0.003 (our check).</li>
+        <li><b>NELL: one labelled example per class.</b> The graph has 55,864 relation nodes and 9,891 entity nodes (55,864 + 9,891 = 65,755). Each directed relation edge between entities is turned into an undirected bipartite structure by adding a relation node; relation nodes get one-hot features, giving <code>5,414 + 55,864 = 61,278</code>-dimensional sparse features (our arithmetic for the sum). For how such graphs are built from triples, see <a href="../../nlp/knowledge-graphs.html#triples">knowledge graphs</a>. (One loose end we cannot resolve from the table: 210 classes × 1 label over 65,755 nodes would be ≈ 0.0032, not the listed 0.001 — the listed rate presumably uses a different denominator.)</li>
+        <li><b>Splits:</b> 1,000 test nodes; 500 validation nodes, used <b>only</b> for hyperparameter selection, never for training. The setup follows the Planetoid work's splits, and the baseline numbers are taken from the Planetoid paper.</li>
+      </ul>
+
+      <table class="grid2">
+        <tr><th>hyperparameter</th><th>citation networks</th><th>NELL</th></tr>
+        <tr><td><b>architecture</b></td><td>2-layer GCN, 16 hidden units</td><td>2-layer GCN, 64 hidden units</td></tr>
+        <tr><td><b>dropout</b></td><td class="num">0.5</td><td class="num">0.1</td></tr>
+        <tr><td><b>L2 regularization (first layer)</b></td><td class="num">5 · 10⁻⁴</td><td class="num">1 · 10⁻⁵</td></tr>
+        <tr><td><b>optimizer</b></td><td colspan="2">Adam, learning rate 0.01, at most 200 epochs, early stopping on the validation loss with a window of 10 epochs</td></tr>
+        <tr><td><b>initialization · inputs</b></td><td colspan="2">Glorot initialization; row-normalized input features</td></tr>
+        <tr><td><b>tuning</b></td><td colspan="2">hyperparameters tuned on Cora only and reused unchanged for Citeseer and Pubmed</td></tr>
+      </table>
+      <p>That last row matters for reading §09: two of the three citation results are effectively <b>untuned</b> transfers of Cora's settings.</p>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="results" data-nav="Results">
+      <h3><span class="idx">09</span> Results: accuracy and wall-clock time</h3>
+      <p class="lede">GCN beats every baseline on all four datasets, and it is fast: seconds on the citation graphs. The 10-random-splits row is the honest companion to the headline numbers.</p>
+
+      <table class="grid2">
+        <tr><th>method</th><th>Citeseer</th><th>Cora</th><th>Pubmed</th><th>NELL</th></tr>
+        <tr><td>ManiReg (Laplacian-regularized)</td><td class="num">60.1</td><td class="num">59.5</td><td class="num">70.7</td><td class="num">21.8</td></tr>
+        <tr><td>SemiEmb (embedding regularizer)</td><td class="num">59.6</td><td class="num">59.0</td><td class="num">71.1</td><td class="num">26.7</td></tr>
+        <tr><td>LP (label propagation)</td><td class="num">45.3</td><td class="num">68.0</td><td class="num">63.0</td><td class="num">26.5</td></tr>
+        <tr><td>DeepWalk (random-walk embeddings)</td><td class="num">43.2</td><td class="num">67.2</td><td class="num">65.3</td><td class="num">58.1</td></tr>
+        <tr><td>ICA (iterative classification)</td><td class="num">69.1</td><td class="num">75.1</td><td class="num">73.9</td><td class="num">23.1</td></tr>
+        <tr><td>Planetoid*</td><td class="num">64.7 (26 s)</td><td class="num">75.7 (13 s)</td><td class="num">77.2 (25 s)</td><td class="num">61.9 (185 s)</td></tr>
+        <tr class="hl"><td><b>GCN</b></td><td class="num">70.3 (7 s)</td><td class="num">81.5 (4 s)</td><td class="num">79.0 (38 s)</td><td class="num">66.0 (48 s)</td></tr>
+        <tr><td>GCN, 10 random splits</td><td class="num">67.9 ± 0.5</td><td class="num">80.1 ± 0.5</td><td class="num">78.9 ± 0.7</td><td class="num">58.4 ± 1.7</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">Accuracy in %. Times are wall-clock to convergence. GCN figures are the mean of 100 runs with random weight initialization on the standard split. The one-line glosses of the baselines are ours.</p>
+
+      <ul class="notes">
+        <li><b>Margins over the strongest prior model</b> (Planetoid), our arithmetic: +5.6 on Citeseer, +5.8 on Cora, +1.8 on Pubmed, +4.1 on NELL. Over ManiReg — the Laplacian-regularization recipe of §01 — the margins are 8 to 44 points.</li>
+        <li><b>Speed is not uniform.</b> GCN is 3–4× faster than Planetoid on Citeseer, Cora and NELL, but <i>slower</i> on Pubmed (38 s vs 25 s). Full-batch training pays per epoch for the whole graph.</li>
+        <li><b>Random splits cost accuracy.</b> On 10 random splits of the same sizes, accuracy drops by 2.4 (Citeseer), 1.4 (Cora), 0.1 (Pubmed) and 7.6 points (NELL), with a larger spread on NELL. With one label per class out of 210, which node happens to be labelled matters a lot. The standard-split numbers are the comparable ones; the random-split ones are closer to what to expect on a fresh split.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ablation" data-nav="Propagation-model ablation">
+      <h3><span class="idx">10</span> The ablation: every simplification, tested</h3>
+      <p class="lede">The derivation of §03–§05 made four choices — truncate to first order, set <code>λ_max ≈ 2</code>, tie the parameters, renormalize. The paper checks them by swapping only the propagation model inside the same two-layer network and training each variant 100 times.</p>
+
+      <table class="grid2">
+        <tr><th>propagation model</th><th>formula</th><th>Citeseer</th><th>Cora</th><th>Pubmed</th></tr>
+        <tr><td>Chebyshev filter, K = 3</td><td><code>∑ₖ₌₀..₃ Tₖ(L̃) X Θₖ</code></td><td class="num">69.8</td><td class="num">79.5</td><td class="num">74.4</td></tr>
+        <tr><td>Chebyshev filter, K = 2</td><td><code>∑ₖ₌₀..₂ Tₖ(L̃) X Θₖ</code></td><td class="num">69.6</td><td class="num">81.2</td><td class="num">73.8</td></tr>
+        <tr><td>1st-order model</td><td><code>XΘ₀ + D^−½AD^−½XΘ₁</code></td><td class="num">68.3</td><td class="num">80.0</td><td class="num">77.5</td></tr>
+        <tr><td>single parameter</td><td><code>(I_N + D^−½AD^−½)XΘ</code></td><td class="num">69.3</td><td class="num">79.2</td><td class="num">77.4</td></tr>
+        <tr class="hl"><td><b>renormalization trick</b></td><td><code>D̃^−½ÃD̃^−½XΘ</code></td><td class="num">70.3</td><td class="num">81.5</td><td class="num">79.0</td></tr>
+        <tr><td>1st-order term only</td><td><code>D^−½AD^−½XΘ</code></td><td class="num">68.7</td><td class="num">80.5</td><td class="num">77.8</td></tr>
+        <tr><td>multi-layer perceptron</td><td><code>XΘ</code></td><td class="num">46.5</td><td class="num">55.1</td><td class="num">71.4</td></tr>
+      </table>
+
+      <div class="viz" id="viz-ab">
+        <div class="vhead">
+          <span class="vtitle">Reported test accuracy by propagation model</span>
+          <span class="vhint">switch dataset · un-zoom to see how far the no-graph MLP sits below everything</span>
+        </div>
+        <div class="controls">
+          <label>dataset <select id="ab-d">
+            <option value="0">Citeseer</option>
+            <option value="1" selected>Cora</option>
+            <option value="2">Pubmed</option>
+            <option value="mean">mean of the three</option>
+          </select></label>
+          <label><input type="checkbox" id="ab-z" checked /> zoom axis to the graph-based models</label>
+        </div>
+        <svg id="ab-svg" width="760" height="340" viewBox="0 0 760 340" role="img" aria-label="Horizontal bar chart of reported test accuracy for seven propagation models inside the same two-layer network, each labelled with its formula: Chebyshev filters with K equal to 3 and 2 in violet, three first-order variants in amber, the renormalization trick in teal, and the multi-layer perceptron with no graph in red. On every dataset the teal renormalization bar is the longest. On Citeseer and Cora the red MLP bar is more than 20 points shorter than the rest; on Pubmed the gap is smaller, about 8 points, and the Chebyshev filters sit below the first-order variants. With the zoom option on, the axis starts a few points below the worst graph-based model and the MLP bar is drawn faded and marked as off the axis. The readout gives the renormalization result and its margins over the single-parameter variant, the two-parameter first-order model, the best Chebyshev filter and the MLP; hovering a bar reports its gaps."></svg>
+        <div class="readout" aria-live="polite" id="ab-readout"></div>
+      </div>
+
+      <h4>What the table says</h4>
+      <ul class="notes">
+        <li><b>The graph is most of the gain.</b> Every propagation model beats the MLP by a wide margin on Citeseer and Cora (≈ 22–26 points). On Pubmed the MLP is much closer (71.4 vs 79.0): with only 500 features and 3 classes, the features alone carry more of the signal.</li>
+        <li><b>Higher-order filters do not pay.</b> Chebyshev <code>K = 2, 3</code> is never best, and on Pubmed — the lowest label rate, 0.003 — it sits 3–5 points below every first-order variant. More parameters per layer with 60 labels looks like overfitting (our reading; the table does not isolate the cause). This is the empirical case for the first-order cut.</li>
+        <li><b>Tying alone is a wash.</b> Single parameter vs two parameters: +1.0, −0.8, −0.1. Tying saves parameters without a clear accuracy cost or benefit.</li>
+        <li><b>Renormalization is the step that wins.</b> Against the single-parameter operator it replaces: +1.0 on Citeseer, +2.3 on Cora, +1.6 on Pubmed. And note that "1st-order term only" (no self-connection at all) beats the unrenormalized <code>I + D^−½AD^−½</code> on Cora and Pubmed — adding the identity <i>without</i> renormalizing does not help; adding it as a self-loop inside the normalization does.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="cost" data-nav="Cost &amp; scaling">
+      <h3><span class="idx">11</span> Cost and scaling: linear in edges, but full-batch</h3>
+      <p class="lede">The whole point of the spectral-to-spatial collapse is that each layer is one sparse product: cost and memory are linear in the number of edges. The paper confirms it on random graphs and states the catch — the whole graph must fit in memory.</p>
+
+      <div class="formula"><span class="lbl">where the multiply–accumulates go on cora — our arithmetic</span><span class="eq">nnz(Â)  =  2·|E| + N  =  2·5 429 + 2 708  =  13 566     (if each of the 5 429 edges is listed once)
+
+layer 1   X W⁽⁰⁾  dense:   N·C·H  =  2 708 · 1 433 · 16   ≈  62.1 M
+          Â (X W⁽⁰⁾):      nnz · H =  13 566 · 16          ≈  0.22 M
+layer 2   H W⁽¹⁾:          N·H·F  =  2 708 · 16 · 7        ≈  0.30 M
+          Â (H W⁽¹⁾):      nnz · F =  13 566 · 7           ≈  0.09 M</span>
+<span class="lbl">the nell input layer — our arithmetic</span><span class="eq">W⁽⁰⁾ ∈ ℝ^(61 278 × 64)   →   3 921 792 weights,  on extremely sparse one-hot / bag-of-words inputs</span></div>
+      <ul class="notes">
+        <li><b>Propagation is cheap; the feature transform dominates</b> when features are wide and treated as dense. Real implementations keep <code>X</code> sparse, so the first product costs <code>nnz(X)·H</code> instead. Either way the graph part is a rounding error on Cora — the paper's "linear in edges" is about how cost grows, not about where it goes on small graphs.</li>
+        <li><b>Associativity matters.</b> Computing <code>Â(XW⁽⁰⁾)</code> propagates 16 columns; <code>(ÂX)W⁽⁰⁾</code> would propagate all 1,433. Same result, very different cost.</li>
+        <li><b>Measured scaling.</b> On random graphs with <code>N</code> nodes and <code>2N</code> random edges and identity features, the paper times one epoch (forward pass, cross-entropy, backward pass) on a GPU and on a 16-core CPU: run time grows linearly in the number of edges. The exact timings are only in a figure, so none are quoted here.</li>
+        <li><b>Memory is the ceiling.</b> Full-batch training holds every node's activations for every layer; memory grows linearly with the dataset. Storage formats that make <code>O(|E|)</code> real are on the <a href="../../dsa/data-structures/graphs/graph-storage.html#representation-costs">graph storage</a> page.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="depth" data-nav="Depth &amp; residuals">
+      <h3><span class="idx">12</span> Depth: best at two or three layers, hard beyond seven</h3>
+      <p class="lede">An appendix asks how deep a GCN should be. With all labels available, 5-fold cross-validation on Cora, Citeseer and Pubmed, 1 to 10 layers, 400 epochs, 16 units per layer: <b>the best models have 2–3 layers</b>, and past about 7 layers training without residual connections becomes difficult.</p>
+
+      <div class="formula"><span class="lbl">plain vs residual layer, as tested</span><span class="eq">plain:      H⁽ˡ⁺¹⁾  =  σ( Â H⁽ˡ⁾ W⁽ˡ⁾ )
+
+residual:   H⁽ˡ⁺¹⁾  =  σ( Â H⁽ˡ⁾ W⁽ˡ⁾ )  +  H⁽ˡ⁾           (equal widths, so the identity can be added)</span></div>
+      <ul class="notes">
+        <li><b>Why depth hurts here:</b> each extra layer widens every node's effective context by one more hop and adds parameters, so deep models are both harder to optimize and easier to overfit on so few labels — and the fix tested is the one from CNNs. The mechanics of why <code>x + F(x)</code> keeps gradients alive are on the <a href="../residual-skip-connections.html#why">residual connections</a> page.</li>
+        <li><b>Residuals rescue trainability, not accuracy.</b> The residual variant trains stably at depth, but the deep models do not beat the shallow ones; exact accuracies appear only in the paper's figure.</li>
+        <li><b>The name came later.</b> The paper does not call it over-smoothing; later work did, tracing the collapse to repeated application of <code>Â</code> converging to its top eigenvector — visible as the shrinking "modes within 10⁻³" count in §05's figure. Remedies (initial residuals, jumping knowledge, DropEdge) are on the hub's <a href="../graph-neural-networks.html#failure-modes">failure-modes section</a>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="limits" data-nav="Limitations &amp; what came next">
+      <h3><span class="idx">13</span> Limitations the paper states — and what addressed them</h3>
+      <div class="cards">
+        <div class="box bad"><div class="n">memory</div><div class="t">Full-batch only</div><div class="g">Memory grows linearly with dataset size. Mini-batch SGD is the way out, but a mini-batch must account for each node's <code>K</code>-hop neighbourhood (for a <code>K</code>-layer model), which can approach the whole graph on dense graphs. Later: <a href="../graph-neural-networks.html#graphsage">GraphSAGE</a> neighbour sampling and the subgraph samplers in <a href="../graph-neural-networks.html#training">training in practice</a>.</div></div>
+        <div class="box warn"><div class="n">edges</div><div class="t">No directed edges, no edge features</div><div class="g">The framework handles neither natively. NELL works around it by turning each relation into a node of an undirected bipartite graph (§08). Later: relation-specific transforms (the R-GCN pattern noted on the hub) and edge-conditioned messages (<a href="../graph-neural-networks.html#gin-mpnn">MPNN</a>).</div></div>
+        <div class="box warn"><div class="n">locality &amp; weighting</div><div class="t">Self and neighbours weighted alike</div><div class="g">The model assumes locality (<code>K</code> layers = <code>K</code> hops) and equal importance for the self-connection and the edges to neighbours. Suggested fix: <code>Ã = A + λ I_N</code> with <code>λ</code> learnable. Later: <a href="../graph-neural-networks.html#gat">GAT</a> learns a weight per edge from features; GIN's <code>(1 + ε)</code> self term does it for sum aggregation.</div></div>
+        <div class="box good"><div class="n">fixed by structure</div><div class="t">Weights come from degrees only</div><div class="g">Not listed as a limitation in the paper, but a direct consequence of §05: the coefficient on edge <code>(i, j)</code> is <code>1/√(d̃ᵢ d̃ⱼ)</code>, whatever the features say. That, and the homophily it presumes, is what the hub's <a href="../graph-neural-networks.html#failure-modes">heterophily</a> discussion is about.</div></div>
+      </div>
+      <div class="formula"><span class="lbl">the suggested learnable self-loop (<span class="keep">λ</span> trained with the rest)</span><span class="eq">Ã  =  A + λ I_N            λ = 1 recovers the renormalization trick;  λ → ∞ ignores the neighbours;  λ = 0 ignores the node</span></div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misreadings" data-nav="Common misreadings">
+      <h3><span class="idx">14</span> Common misreadings</h3>
+      <div class="wrong"><span class="say">"GCN is a spectral method, so it needs the Laplacian's eigenvectors."</span> <span class="fix">No — it never computes them.</span> The spectral view is the derivation; the result is a polynomial in <code>L</code>, applied by sparse products. The first-order cut removes even the <code>λ_max</code> computation (§03–§04).</div>
+      <div class="wrong"><span class="say">"The renormalization trick just means adding self-loops."</span> <span class="fix">It means adding self-loops <i>and</i> recomputing the degrees with them.</span> <code>I + D^−½AD^−½</code> already contains the identity and is the worse operator in the ablation; the gain comes from normalizing the self-loop like every other edge, which also moves the spectrum from <code>[0, 2]</code> to <code>(−1, 1]</code> (§05, §10).</div>
+      <div class="wrong"><span class="say">"The loss is computed over all nodes, with the graph as a smoothness penalty."</span> <span class="fix">That is the method GCN replaced.</span> The loss is cross-entropy on labelled nodes only, with no graph regularizer; the graph acts through the forward pass (§01, §06).</div>
+      <div class="wrong"><span class="say">"81.5% on Cora is what GCN gets."</span> <span class="fix">On one fixed, standard split.</span> On 10 random splits it is 80.1 ± 0.5, and on NELL the gap is 7.6 points (§09). Quote the setting with the number.</div>
+      <div class="wrong"><span class="say">"The results show GCN generalizes to unseen nodes."</span> <span class="fix">The experiments are transductive.</span> Test nodes, their features and edges are in the graph during training; only labels are hidden (§06). The shared weights <i>can</i> be applied to a new graph, but that was not what was evaluated.</div>
+      <div class="wrong"><span class="say">"A deeper GCN sees more of the graph, so it should be better."</span> <span class="fix">Best at 2–3 layers.</span> Beyond about 7, training without residuals becomes difficult, and with them depth still does not win (§12).</div>
+      <div class="wrong"><span class="say">"Bounded eigenvalues mean the renormalized model can be stacked arbitrarily deep."</span> <span class="fix">Bounded means no explosion, not no collapse.</span> Repeated <code>Â</code> converges to its top eigenvector — see the shrinking mode count in §05's figure.</div>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">15</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Condition on the graph, don't regularize with it:</b> <code>Z = f(X, A)</code> trained on labelled nodes only lets supervision reach unlabelled nodes through the forward pass.</li>
+        <li><b>Spectral → polynomial → sparse:</b> a Chebyshev filter of degree <code>K</code> in <code>L̃</code> is <code>K</code>-hop localized and costs <code>O(K·|E|)</code>, with no eigendecomposition.</li>
+        <li><b>First order, <code>λ_max ≈ 2</code>, one tied parameter</b> gives <code>θ(I + D^−½AD^−½)x</code>; reach comes from stacking layers instead of filter degree.</li>
+        <li><b>That operator's spectrum is <code>[0, 2]</code></b> and stacks unstably; the renormalization trick <code>D̃^−½ÃD̃^−½</code>, <code>Ã = A + I</code>, bounds it to <code>(−1, 1]</code> and is the variant that wins the ablation (+1.0 / +2.3 / +1.6 over the unrenormalized one).</li>
+        <li><b>The model:</b> <code>softmax(Â ReLU(ÂXW⁽⁰⁾) W⁽¹⁾)</code>, 16 hidden units, dropout 0.5, L2 on the first layer, Adam 0.01, full-batch — 70.3 / 81.5 / 79.0 / 66.0 on Citeseer / Cora / Pubmed / NELL, ahead of every baseline.</li>
+        <li><b>It is a learned 1-WL step;</b> even untrained, it embeds the karate club by community.</li>
+        <li><b>Limits:</b> full-batch memory, no directed or typed edges, fixed degree-based weights with self and neighbours treated alike, and depth beyond 2–3 layers does not help.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Graph neural networks" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../graph-neural-networks.html">← Graph Neural Networks</a>
+      <a href="../graph-neural-networks.html" style="color:var(--muted)">GNNs · overview</a>
+      <a href="../state-space-models.html">State Space Models →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="gcn.viz.js"></script>
+</body>
+</html>

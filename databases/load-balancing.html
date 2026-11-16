@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Load Balancing</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Load Balancing — Spreading Requests Across Servers</h1>
+      <p>A load balancer sits between clients and a pool of interchangeable backends and decides, request by request, <b>who does the work</b>. Done well it multiplies throughput, hides failures, and keeps tail latency flat; done naively it piles work onto the one slow server. This page covers the layers (L4 vs L7), the algorithms (round robin to <b>power of two choices</b>), <b>consistent hashing</b>, health checks, stickiness, and global traffic steering. It is one of the core patterns of <a href="scalability.html">scalability</a>.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Systems</span>
+        <span class="pill">Networking</span>
+        <span class="pill">Consistent Hashing</span>
+        <span class="pill">Reliability</span>
+      </div>
+    </header>
+
+    <section class="topic" id="why">
+      <h3><span class="idx">01</span> What a load balancer is for</h3>
+      <ul class="notes">
+        <li><b>Throughput:</b> turn N servers into one logical service with roughly N× capacity — the horizontal half of <a href="scalability.html">scaling</a>.</li>
+        <li><b>Availability:</b> stop sending traffic to dead or sick backends, so a single failure costs capacity, not correctness.</li>
+        <li><b>Decoupling:</b> clients see one stable address while backends are added, drained, deployed and autoscaled behind it — the mechanism under rolling, blue/green and canary <a href="../mlops/model-deployment.html">deployments</a>.</li>
+        <li><b>Edge duties</b> that naturally live in the same hop: TLS termination, request routing, rate limiting, retries, connection pooling, observability.</li>
+      </ul>
+      <div class="callout"><b>One line:</b> the goal is not equal <i>request counts</i> but equal <i>queueing</i> — every backend should be about as busy as every other, relative to its capacity.</div>
+    </section>
+
+    <section class="topic" id="layers">
+      <h3><span class="idx">02</span> Layer 4 vs Layer 7</h3>
+      <table class="cmp">
+        <tr><th></th><th>L4 (transport)</th><th>L7 (application)</th></tr>
+        <tr><td><b>Sees</b></td><td>IP addresses, ports, TCP/UDP connections</td><td>Full requests: HTTP method, path, headers, cookies, gRPC method</td></tr>
+        <tr><td><b>Balances</b></td><td>Connections (a long-lived connection sticks to one backend)</td><td>Individual requests, even multiplexed over one HTTP/2 connection</td></tr>
+        <tr><td><b>Can do</b></td><td>Very high packet rates, low added latency, protocol-agnostic, can forward without terminating</td><td>Path/host routing, header-based canaries, TLS termination, retries, compression, auth, caching</td></tr>
+        <tr><td><b>Costs</b></td><td>No content awareness; poor balance with few long connections</td><td>Must parse and usually terminate TLS — more CPU, more latency, more config</td></tr>
+        <tr><td><b>Typical place</b></td><td>Network edge, in front of L7 proxies, non-HTTP protocols</td><td>API gateways, ingress controllers, service-mesh sidecars</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>The HTTP/2 / gRPC trap:</b> clients hold one long connection and multiplex everything over it. An L4 balancer pins that whole stream to one backend, so new replicas receive nothing. Use L7 (per-request) balancing or client-side balancing for gRPC.</li>
+        <li>Large deployments stack them: L4 at the edge (or anycast) spreads connections across a fleet of L7 proxies, which then route requests to services.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="static">
+      <h3><span class="idx">03</span> Static algorithms — no feedback from the backends</h3>
+      <table class="cmp">
+        <tr><th>Algorithm</th><th>Rule</th><th>Good when · fails when</th></tr>
+        <tr><td><b>Round robin</b></td><td>Cycle through backends in order</td><td>Identical servers, uniform requests · heterogeneous hardware, variable request cost</td></tr>
+        <tr><td><b>Weighted round robin</b></td><td>Backend i gets a share <code>wᵢ / ∑ wⱼ</code></td><td>Known capacity differences · capacity changes at runtime (GC, noisy neighbour)</td></tr>
+        <tr><td><b>Random</b></td><td>Pick uniformly at random</td><td>Many independent balancers, no shared state · small pools (variance)</td></tr>
+        <tr><td><b>Hash-based</b></td><td>backend = hash(client IP or key) mod N</td><td>Affinity / cache locality · any change in N remaps almost every key (see §06)</td></tr>
+      </table>
+      <p>Static rules are cheap and stateless, which matters when the balancer itself is distributed. But they are blind: they keep sending to a server that has slowed down.</p>
+    </section>
+
+    <section class="topic" id="dynamic">
+      <h3><span class="idx">04</span> Dynamic algorithms and the power of two choices</h3>
+      <ul class="notes">
+        <li><b>Least connections:</b> send to the backend with the fewest outstanding requests. Self-correcting — a slow server accumulates in-flight work and stops being chosen. Needs a global view, which a fleet of independent balancers does not have.</li>
+        <li><b>Least response time / peak-EWMA:</b> score backends by a decaying average of latency × outstanding requests; reacts to slowdowns that connection counts miss.</li>
+        <li><b>Herd behaviour:</b> if many balancers all read the same stale "least loaded" signal, they all pick the same backend at once and overload it. Full information, applied synchronously, can be worse than randomness.</li>
+        <li><b>Power of two choices (P2C):</b> sample <b>two</b> backends at random and send to the less loaded. It needs almost no state, avoids herding (the random sample decorrelates balancers), and its effect on the worst-case load is exponential:</li>
+      </ul>
+      <div class="formula"><span class="lbl"><span class="keep">n</span> balls into <span class="keep">n</span> bins — maximum load with high probability</span><br>
+<span class="eq">one random choice:  ≈ ln n / ln ln n</span>      <span class="eq">best of d ≥ 2 choices:  ≈ ln ln n / ln d + O(1)</span></div>
+      <p>Going from one choice to two collapses the maximum load from roughly <i>log</i> to <i>log log</i>; going from two to more helps only by a constant factor. That asymmetry is why P2C is the default in many modern proxies and service meshes. The balls-into-bins analysis connects to the greedy-approximation view of <a href="../dsa/algorithms/greedy/approximation-heuristics.html">online load balancing</a>.</p>
+    </section>
+
+    <section class="topic" id="sim">
+      <h3><span class="idx">05</span> Simulation — eight servers, one of them fast, two of them slow</h3>
+      <p class="lede">Requests arrive as a Poisson stream; servers process them with random service times. Two servers run at half speed, one at double speed. Pick a policy, push the load, and watch the queues and the p99 latency.</p>
+      <div class="viz" id="viz-lb">
+        <div class="vhead">
+          <span class="vtitle">Load-balancing policies under load</span>
+          <span class="vhint">bars = queue per server · right panel = p99 latency of every policy on the same trace</span>
+        </div>
+        <div class="controls">
+          <label>policy
+            <select id="lb-pol">
+              <option value="rr">round robin</option>
+              <option value="wrr">weighted round robin</option>
+              <option value="rand">random</option>
+              <option value="lc">least connections</option>
+              <option value="p2c" selected>power of two choices</option>
+            </select>
+          </label>
+          <label>utilisation ρ <input type="range" id="lb-rho" min="0.3" max="0.95" step="0.01" value="0.8"><span id="lb-rho-v" class="lbl"></span></label>
+          <button type="button" id="lb-play">⏸ pause</button>
+          <button type="button" id="lb-reset">⟲ reset</button>
+        </div>
+        <svg id="lb-svg" width="640" height="270" viewBox="0 0 640 270" role="img" aria-label="Interactive simulation: queue length per server under a chosen load-balancing policy, with p99 latency compared across policies"></svg>
+        <div class="readout" aria-live="polite" id="lb-read"></div>
+      </div>
+      <ul class="notes">
+        <li>Above ρ ≈ 0.5, <b>round robin</b> and <b>random</b> overload the half-speed servers: they receive 1/8 of the traffic but only have 1/16 of the capacity, so their queues grow without bound.</li>
+        <li><b>Weighted round robin</b> fixes the known imbalance; <b>least connections</b> and <b>P2C</b> fix it without being told the weights — they read the queues.</li>
+        <li>Notice that P2C here can trail weighted round robin: comparing raw queue lengths, an idle slow server looks as attractive as an idle fast one, so short queues still leak work to the slow machines. Production P2C balancers compare a <b>latency-weighted</b> load (e.g. peak-EWMA × outstanding requests) for exactly this reason.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="consistent">
+      <h3><span class="idx">06</span> Consistent hashing — affinity that survives resizing</h3>
+      <p class="lede">When the same key should go to the same backend (a cache shard, a <a href="sharding-replication.html">partition</a>, a replica holding a warm KV cache), <code>hash(key) mod N</code> is a disaster on resize: going from N to N+1 moves about <b>N/(N+1)</b> of all keys.</p>
+      <div class="formula"><span class="eq">mod-N: keys moved on N → N+1 ≈ K · N/(N+1)</span>      <span class="eq">consistent hashing: keys moved ≈ K / (N+1)</span></div>
+      <ul class="notes">
+        <li><b>The ring:</b> hash both nodes and keys onto a circle; a key belongs to the first node clockwise. Adding a node steals keys only from its successor; removing one hands its keys to the next.</li>
+        <li><b>Virtual nodes:</b> with one point per node, arcs are very uneven. Give each node v points; load imbalance shrinks roughly like <code>1/√v</code>, and weights become "more vnodes for bigger machines".</li>
+        <li><b>Relatives:</b> <i>rendezvous (highest-random-weight) hashing</i> scores every node per key and picks the max — no ring, O(N) per lookup; <i>Maglev</i> hashing builds a lookup table for O(1) lookups with minimal disruption; <i>consistent hashing with bounded loads</i> caps any node at (1+ε)× the average and spills the overflow clockwise, fixing hot keys.</li>
+      </ul>
+      <div class="viz" id="viz-ring">
+        <div class="vhead">
+          <span class="vtitle">Consistent-hash ring</span>
+          <span class="vhint">change the node count — orange keys are the ones that moved</span>
+        </div>
+        <div class="controls">
+          <label>nodes <input type="range" id="rg-n" min="2" max="10" step="1" value="5"><span id="rg-n-v" class="lbl"></span></label>
+          <label>virtual nodes each <input type="range" id="rg-v" min="1" max="40" step="1" value="8"><span id="rg-v-v" class="lbl"></span></label>
+        </div>
+        <svg id="rg-svg" width="640" height="320" viewBox="0 0 640 320" role="img" aria-label="Interactive diagram: keys and virtual nodes on a consistent-hash ring, highlighting keys that move when nodes are added or removed"></svg>
+        <div class="readout" aria-live="polite" id="rg-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="health">
+      <h3><span class="idx">07</span> Health checks, outlier detection and retries</h3>
+      <ul class="notes">
+        <li><b>Active health checks:</b> the balancer probes each backend (TCP connect, HTTP <code>/healthz</code>) every few seconds; after k consecutive failures it is ejected, after j successes re-admitted. The hysteresis stops flapping.</li>
+        <li><b>Liveness vs readiness:</b> "the process is up" is not "it can serve". A model server that is still loading weights must fail readiness, or it will receive traffic and time out. Deep checks that hit the database can take the whole fleet out when the database blips — keep readiness local.</li>
+        <li><b>Passive checks / outlier detection:</b> watch real traffic and eject backends whose error rate or latency is an outlier, with a cap on the ejected fraction so a global problem does not empty the pool.</li>
+        <li><b>Retries amplify load:</b> three layers each retrying three times turn one failure into 27 requests. Use <b>retry budgets</b> (e.g. retries ≤ 10% of requests), exponential backoff with jitter, and only retry idempotent requests.</li>
+        <li><b>Connection draining:</b> on deploy or scale-in, stop new requests to a backend but let in-flight ones finish before shutdown.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="sticky">
+      <h3><span class="idx">08</span> Sticky sessions — when affinity helps and when it hurts</h3>
+      <table class="cmp">
+        <tr><th>Mechanism</th><th>How</th><th>Trade-off</th></tr>
+        <tr><td>Source-IP hash</td><td>Same client IP → same backend</td><td>Breaks behind NAT (many users, one IP) and on mobile IP changes</td></tr>
+        <tr><td>Cookie affinity</td><td>L7 balancer sets a cookie naming the backend</td><td>Precise, but uneven load when a few sessions are heavy</td></tr>
+        <tr><td>Key / header hash</td><td>Consistent hash of user ID, tenant ID or prompt prefix</td><td>Good cache locality; hot keys need bounded-load spill-over</td></tr>
+      </table>
+      <ul class="notes">
+        <li>Stickiness is usually a sign of <b>state on the server</b>. Prefer moving session state out (shared <a href="caching.html">cache</a>, tokens) and keeping affinity only as a <i>performance hint</i> — the system must still be correct when a sticky backend dies.</li>
+        <li>The legitimate use is <b>cache locality</b>: routing the same key to the same node so its local cache stays warm.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="global">
+      <h3><span class="idx">09</span> Global load balancing — DNS, GeoDNS and anycast</h3>
+      <ul class="notes">
+        <li><b>DNS load balancing:</b> the name resolves to several addresses, or to the nearest/healthiest region (GeoDNS, latency-based routing). Simple and global, but <b>slow to react</b>: resolvers and clients cache answers for the TTL, and some ignore it. Expect failover in minutes, not seconds.</li>
+        <li><b>Anycast:</b> many sites announce the same IP; internet routing delivers each packet to the topologically nearest one. Fast failover (routes withdraw), natural DDoS absorption; typical for CDNs and DNS itself. Long-lived TCP flows can break if routes shift.</li>
+        <li><b>The hierarchy:</b> DNS/anycast picks a region → an L4 tier spreads connections → L7 proxies route requests → a service mesh or client library picks a replica with P2C. Each layer balances at a different granularity and timescale.</li>
+        <li><b>Data gravity:</b> global routing is easy for stateless serving and hard for writes — sending a user to another region only helps if their data is there too (<a href="sharding-replication.html">replication</a> and <a href="cap-theorem.html">CAP</a> trade-offs).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="ml">
+      <h3><span class="idx">10</span> Load balancing for ML inference</h3>
+      <ul class="notes">
+        <li><b>Request cost varies wildly.</b> An LLM request with a 20-token prompt and one with a 30 000-token prompt are not the same unit of work. Count outstanding <i>tokens</i> or estimated compute, not requests — least-loaded by request count misleads.</li>
+        <li><b>Batching backends</b> are most efficient when full; balancing must trade even spreading against letting each GPU accumulate a batch.</li>
+        <li><b>Cache-aware routing:</b> replicas that already hold a prompt's prefix in their KV cache answer far faster. Routers hash on the prefix (consistent hashing with bounded loads) to reuse it — see <a href="../mlops/llm-serving.html">LLM Serving</a>.</li>
+        <li><b>Model and version routing:</b> L7 header rules send a percentage of traffic to a canary model and mirror traffic to a shadow model; the statistics of comparing them are in <a href="../mlops/ab-testing.html">A/B Testing</a>.</li>
+        <li><b>Readiness matters more:</b> a replica is not ready until weights are loaded and warm-up inference has run, or the first requests will see multi-second latencies.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">11</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>L4 balances connections; L7 balances requests</b> — use L7 (or client-side) for HTTP/2 and gRPC.</li>
+        <li><b>Static rules are blind</b> to slow servers; <b>least connections</b> and <b>power of two choices</b> read the queues, and P2C does it without herding.</li>
+        <li><b>Consistent hashing</b> moves only ~K/N keys on resize; add virtual nodes for balance and bounded loads for hot keys.</li>
+        <li><b>Health checks need hysteresis</b>, readiness must be local, and retries need budgets.</li>
+        <li><b>Global steering</b> (DNS, anycast) is coarse and slow; the fine-grained balancing happens near the backends.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="load-balancing.viz.js"></script>
+</body>
+</html>

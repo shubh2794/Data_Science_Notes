@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Distributed Storage</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Distributed Storage — HDFS, Object Stores and Erasure Coding</h1>
+      <p>When data outgrows one machine's disks — or must survive that machine dying — it is split into pieces, spread across many nodes, and stored <b>redundantly</b>. This page covers the three storage interfaces (block, file, object), the classic <b>HDFS</b> design, modern <b>object stores</b>, the maths of <b>replication vs erasure coding</b>, columnar formats like <b>Parquet</b>, and how ML training jobs actually read terabytes from all of it.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Systems</span>
+        <span class="pill">HDFS</span>
+        <span class="pill">Object Storage</span>
+        <span class="pill">Durability</span>
+      </div>
+    </header>
+
+    <section class="topic" id="why">
+      <h3><span class="idx">01</span> What distributing storage buys — and costs</h3>
+      <ul class="notes">
+        <li><b>Capacity:</b> petabytes across thousands of commodity disks, growing by adding nodes rather than replacing machines.</li>
+        <li><b>Aggregate throughput:</b> a file striped across 100 disks can be read at 100 disks' bandwidth — the property that makes parallel compute (<a href="hadoop-mapreduce.html">MapReduce</a>, <a href="../programming/apache-spark.html">Spark</a>, distributed training) possible.</li>
+        <li><b>Durability and availability:</b> at scale, disk and node failures are daily events, not exceptions. Redundancy plus automatic repair turns them into routine background work.</li>
+        <li><b>The cost:</b> redundant bytes (storage overhead), repair traffic, metadata that must itself be highly available, and consistency semantics that are weaker or slower than a local filesystem.</li>
+      </ul>
+      <div class="callout"><b>One line:</b> distributed storage is the art of choosing an <b>overhead</b> (how many extra bytes) and a <b>repair speed</b> that together make the probability of losing data negligible.</div>
+    </section>
+
+    <section class="topic" id="types">
+      <h3><span class="idx">02</span> Block vs file vs object storage</h3>
+      <table class="cmp">
+        <tr><th></th><th>Block</th><th>File</th><th>Object</th></tr>
+        <tr><td><b>Interface</b></td><td>Fixed-size blocks at offsets — a raw virtual disk</td><td>Hierarchical paths, POSIX-like open/read/seek/rename</td><td>HTTP API: PUT / GET / DELETE / LIST whole objects by key, plus byte-range GETs</td></tr>
+        <tr><td><b>Metadata</b></td><td>None — the filesystem on top owns it</td><td>Directories, permissions, timestamps</td><td>Flat key namespace + arbitrary per-object metadata</td></tr>
+        <tr><td><b>Mutability</b></td><td>Overwrite any block in place</td><td>Append / overwrite, atomic rename</td><td>Objects are immutable; "update" = rewrite the whole object</td></tr>
+        <tr><td><b>Latency · scale</b></td><td>Sub-ms · one volume attached to one host (typically)</td><td>ms · shared across many clients, metadata server limits</td><td>Tens of ms per request · effectively unlimited capacity and aggregate throughput</td></tr>
+        <tr><td><b>Use for</b></td><td>Databases, VM disks, anything needing low-latency random writes</td><td>Shared home directories, legacy tools, HPC scratch</td><td>Data lakes, backups, media, model artefacts, training datasets</td></tr>
+      </table>
+      <p>Analytics and ML have converged on <b>object storage</b> as the system of record: cheap, elastic, and decoupled from compute, so clusters can be created and destroyed while data stays put.</p>
+    </section>
+
+    <section class="topic" id="hdfs">
+      <h3><span class="idx">03</span> HDFS architecture</h3>
+      <ul class="notes">
+        <li><b>NameNode</b> (metadata): holds the entire namespace — directory tree, file → block list, block → DataNode locations — <b>in RAM</b>, persisted as a checkpoint image plus an edit log. Clients ask it <i>where</i> blocks live, then talk to DataNodes directly; file data never flows through the NameNode.</li>
+        <li><b>DataNodes</b> (data): store blocks as local files, send <b>heartbeats</b> every few seconds and periodic <b>block reports</b>. A DataNode that stops heart-beating is declared dead and its blocks are re-replicated elsewhere.</li>
+        <li><b>Blocks are large</b> — 128 MB by default — so a 1 GB file is just 8 blocks. Large blocks keep metadata small and make reads sequential and streaming-friendly; they are wrong for small random reads.</li>
+        <li><b>Write pipeline:</b> the client streams a block to the first DataNode, which forwards to the second, which forwards to the third; acks flow back. HDFS is <b>write-once, append-only</b> — no in-place edits.</li>
+        <li><b>High availability:</b> an active and a standby NameNode share the edit log through a quorum of journal nodes; failover is coordinated so only one NameNode is ever active. <b>Federation</b> splits the namespace across several NameNodes.</li>
+        <li><b>The small-files problem:</b> every file, directory and block is an in-RAM object on the NameNode (a commonly quoted rule of thumb is ~150 bytes each). 100 million 10 KB files cost far more NameNode memory than 10 000 files of 100 MB — and each tiny file becomes its own map task. Compact small files.</li>
+        <li><b>Data locality:</b> because the NameNode knows block locations, schedulers run compute <i>on the node holding the block</i> — the original "move compute to data" idea behind <a href="hadoop-mapreduce.html">MapReduce</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="racks">
+      <h3><span class="idx">04</span> Rack-aware replication</h3>
+      <p class="lede">With the default replication factor 3, HDFS places replicas to survive a whole rack failing (a top-of-rack switch or power feed) while keeping write traffic mostly within racks:</p>
+      <ul class="notes">
+        <li><b>Replica 1:</b> on the writer's node if the writer is a DataNode, otherwise a random node.</li>
+        <li><b>Replica 2:</b> on a node in a <b>different rack</b>.</li>
+        <li><b>Replica 3:</b> on a <b>different node in the same rack as replica 2</b>.</li>
+      </ul>
+      <p>One cross-rack transfer per block instead of two, yet any single rack can disappear and every block still has a live copy. Try it — place a file, then fail nodes and racks:</p>
+      <div class="viz" id="viz-hdfs">
+        <div class="vhead">
+          <span class="vtitle">HDFS block placement across three racks</span>
+          <span class="vhint">click a node to fail it · buttons fail whole racks</span>
+        </div>
+        <div class="controls">
+          <label>file size (MB) <input type="range" id="hd-size" min="100" max="1600" step="50" value="900"><span id="hd-size-v" class="lbl"></span></label>
+          <label>block size
+            <select id="hd-bs"><option value="64">64 MB</option><option value="128" selected>128 MB</option><option value="256">256 MB</option></select>
+          </label>
+          <label>writer
+            <select id="hd-wr"><option value="dn">on DataNode r1-n1</option><option value="ext">external client</option></select>
+          </label>
+          <button type="button" id="hd-r2">fail rack 2</button>
+          <button type="button" id="hd-heal">⟲ heal all</button>
+        </div>
+        <svg id="hd-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Interactive diagram: HDFS blocks of a file replicated three times across racks, with node and rack failure"></svg>
+        <div class="readout" aria-live="polite" id="hd-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="object">
+      <h3><span class="idx">05</span> Object stores</h3>
+      <ul class="notes">
+        <li><b>Flat namespace:</b> <code>s3://bucket/datasets/2026/part-00017.parquet</code> is one key; the slashes are a naming convention. "Directories" are prefixes, and <code>LIST</code> by prefix is a paginated scan.</li>
+        <li><b>No rename:</b> "renaming a directory" means copying and deleting every object under the prefix — non-atomic and slow. Job commit protocols that relied on HDFS's atomic rename had to be redesigned; <a href="../data-engineering/data-warehousing.html">table formats</a> (Iceberg, Delta Lake, Hudi) solve it by committing a new metadata/manifest file instead of moving data.</li>
+        <li><b>Consistency:</b> the major object stores now provide <b>strong read-after-write consistency</b> for PUTs, overwrites, deletes and LIST. Older eventual-consistency behaviour (a new object missing from a listing) is why many older tools carry workarounds. Concurrent writers to the same key: last writer wins, unless you use <b>conditional writes</b> (if-none-match / if-match on an ETag) where supported.</li>
+        <li><b>Large objects:</b> uploaded in parts (multipart upload, parallel, resumable) and read with <b>byte-range GETs</b> — which is what lets Parquet readers fetch just a footer or a single column.</li>
+        <li><b>Request rates scale per prefix</b> (on the order of thousands of requests per second per prefix in a widely used service) and the store partitions hot prefixes automatically over time. Spread high-rate workloads over many prefixes; expect throttling (HTTP 503 "slow down") during sudden ramps.</li>
+        <li><b>Durability</b> is typically designed for "eleven nines" annually via erasure coding across failure domains (availability zones). Availability — being able to read <i>right now</i> — is a separate, lower number.</li>
+        <li><b>Cost model:</b> per GB-month, <i>plus</i> per request, <i>plus</i> egress. Millions of tiny GETs can cost more than the storage; lifecycle rules move cold data to cheaper, slower tiers.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="ec">
+      <h3><span class="idx">06</span> Replication vs erasure coding</h3>
+      <p class="lede"><b>Replication</b> stores r full copies. <b>Erasure coding</b> (Reed–Solomon RS(k, m)) splits data into k fragments and computes m parity fragments; <b>any k of the k + m</b> reconstruct the data.</p>
+      <div class="formula"><span class="eq">overhead: replication = r×</span>      <span class="eq">RS(k, m) = (k + m) / k ×</span><br>
+<span class="eq">tolerates: r − 1 lost copies</span>      <span class="eq">m lost fragments</span><br>
+<span class="eq">P(loss)<sub>rep</sub> ≈ pʳ</span>      <span class="eq">P(loss)<sub>EC</sub> = ∑<sub>j=m+1..k+m</sub> C(k+m, j) · pʲ · (1 − p)<sup>k+m−j</sup></span>      <span class="lbl">(<span class="keep">p</span> = chance a node fails before repair completes; independence assumed)</span></div>
+      <table class="cmp">
+        <tr><th>Scheme</th><th>Overhead</th><th>Survives</th><th>Repair cost for one lost piece</th></tr>
+        <tr><td>3× replication</td><td>200% extra</td><td>2 lost copies</td><td>Copy 1 block</td></tr>
+        <tr><td>RS(6, 3)</td><td>50% extra</td><td>any 3 lost fragments</td><td>Read 6 fragments, decode, write 1</td></tr>
+        <tr><td>RS(10, 4)</td><td>40% extra</td><td>any 4 lost fragments</td><td>Read 10 fragments</td></tr>
+      </table>
+      <ul class="notes">
+        <li>When per-node failure probability within a repair window is small, EC gives <b>more durability for less space</b> (RS(6, 3) loses data only if 4 of 9 fragments fail, ≈ 126·p⁴, vs p³ for 3× replication — EC wins whenever p &lt; ~0.8%). But repair reads k× as much data, degraded reads (a fragment is missing) need decoding, and small files waste space. Hence the common split: <b>replicate hot data</b>, <b>erasure-code warm and cold data</b>. HDFS supports both (EC policies such as RS-6-3 per directory).</li>
+        <li><b>Correlated failures break the formula.</b> The binomial model assumes independent failures; a rack, power domain or bad firmware batch takes out many at once. That is why fragments must be spread across <b>failure domains</b> — at least k + m racks or zones for the guarantees to mean anything.</li>
+        <li><b>Repair time is a durability knob:</b> p is the probability of further failures <i>during</i> the repair window, so faster repair (more parallel rebuild bandwidth) shrinks p and adds nines.</li>
+      </ul>
+      <div class="viz" id="viz-ec">
+        <div class="vhead">
+          <span class="vtitle">Durability vs overhead — replication against Reed–Solomon</span>
+          <span class="vhint">click fragments to fail them; sliders change the scheme</span>
+        </div>
+        <div class="controls">
+          <label>data fragments k <input type="range" id="ec-k" min="2" max="12" step="1" value="6"><span id="ec-k-v" class="lbl"></span></label>
+          <label>parity m <input type="range" id="ec-m" min="1" max="6" step="1" value="3"><span id="ec-m-v" class="lbl"></span></label>
+          <label>replicas r <input type="range" id="ec-r" min="1" max="5" step="1" value="3"><span id="ec-r-v" class="lbl"></span></label>
+          <label>node-loss prob p <input type="range" id="ec-p" min="-4" max="-1" step="0.1" value="-2.5"><span id="ec-p-v" class="lbl"></span></label>
+        </div>
+        <svg id="ec-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Interactive chart: storage overhead and durability in nines for replication versus erasure coding, with clickable fragments"></svg>
+        <div class="readout" aria-live="polite" id="ec-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="parquet">
+      <h3><span class="idx">07</span> Columnar files on object storage: Parquet</h3>
+      <p class="lede">Object stores are slow per request but fast in bulk; analytical queries read a few columns of many rows. Columnar formats exploit both.</p>
+      <ul class="notes">
+        <li><b>Layout:</b> a file is split into <b>row groups</b> (often ~128 MB–1 GB of rows); inside each, every column is stored contiguously as a <b>column chunk</b> made of <b>pages</b>. A <b>footer</b> at the end holds the schema and, per row group and column, statistics (min, max, null count).</li>
+        <li><b>Projection pushdown:</b> <code>SELECT user_id, label</code> reads just those column chunks via byte-range GETs — often 5–20% of the bytes.</li>
+        <li><b>Predicate pushdown:</b> <code>WHERE event_date = '2026-11-01'</code> skips every row group whose min/max excludes it. Sorting or clustering data on common filter columns makes the statistics selective. Directory-style <b>partitioning</b> (<code>…/event_date=2026-11-01/</code>) skips whole files.</li>
+        <li><b>Encoding and compression:</b> values of one type sit together, so dictionary encoding, run-length encoding and general compression (Snappy, Zstandard) work well — 3–10× smaller than row-oriented text formats is common.</li>
+        <li><b>File sizing:</b> aim for files of roughly 100 MB–1 GB. Thousands of tiny files multiply request overhead and listing time (the object-store version of the small-files problem); one giant file limits parallelism.</li>
+        <li>Table formats layer on top: a metadata log of which Parquet files make up the table, giving atomic commits, snapshots/time travel and schema evolution — the basis of lakehouse <a href="../data-engineering/data-warehousing.html">warehousing</a>. Query engines and <a href="../programming/apache-spark.html">Spark</a> read the same files.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Format</th><th>Orientation</th><th>Typical role</th></tr>
+        <tr><td>CSV / JSON lines</td><td>Row, text</td><td>Interchange, raw landing zone; no types, no stats, slow to parse</td></tr>
+        <tr><td>Avro</td><td>Row, binary, schema'd</td><td>Streaming / message payloads, write-heavy ingestion</td></tr>
+        <tr><td>Parquet / ORC</td><td>Columnar, binary</td><td>Analytics, feature tables, tabular training data</td></tr>
+        <tr><td>Sharded record files (TFRecord, tar shards)</td><td>Row, sequential</td><td>Streaming unstructured samples (images, audio, text) into training</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="ml">
+      <h3><span class="idx">08</span> How ML training reads from distributed storage</h3>
+      <div class="formula"><span class="eq">required read bandwidth = GPUs × samples/s per GPU × bytes per sample</span><br>
+<span class="eq">e.g. 64 GPUs × 2 000 img/s × 110 KB ≈ 14 GB/s</span>      <span class="lbl">(sustained, for every epoch)</span></div>
+      <ul class="notes">
+        <li><b>Shard the dataset into large sequential files</b> (hundreds of MB each, thousands of shards) instead of millions of individual images. Per-object latency (tens of ms) is fatal for random small reads and fine for streaming big ones.</li>
+        <li><b>Parallel, prefetched reads:</b> each data-loader worker streams different shards with several concurrent range GETs; decoding and augmentation overlap with GPU compute. A starving GPU (utilisation dips while the loader catches up) is the symptom of an I/O-bound pipeline.</li>
+        <li><b>Shuffling without random access:</b> shuffle the <i>shard order</i> each epoch, then mix samples in an in-memory <b>shuffle buffer</b>. Larger buffers approach a true shuffle; a tiny buffer over sorted shards leaks ordering into training.</li>
+        <li><b>Distributed training splits shards across ranks</b> (each rank reads a disjoint subset per epoch), so the total shard count should be a healthy multiple of workers × loader processes — see <a href="../deep-learning/distributed-training.html">Distributed Training</a>.</li>
+        <li><b>Cache locally:</b> multi-epoch jobs read everything repeatedly; staging the dataset to local NVMe (or a node-local cache) after the first epoch turns a network-bound job into a disk-bound one.</li>
+        <li><b>Tabular data:</b> read Parquet with column projection and row-group filters; for features, the offline store of a <a href="../data-engineering/feature-stores.html">feature store</a> is usually exactly such a table. Pin the dataset <b>snapshot / version</b> used for each run so experiments are reproducible (<a href="../mlops/experiment-tracking.html">Experiment Tracking</a>).</li>
+        <li><b>Checkpoints and model artefacts</b> go to object storage too; multi-GB writes use multipart upload, and serving replicas pulling the same weights at once benefit from a caching layer (<a href="caching.html">Caching</a>).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="ops">
+      <h3><span class="idx">09</span> Operational failure modes</h3>
+      <table class="cmp">
+        <tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr>
+        <tr><td>NameNode out of memory; slow job start</td><td>Too many small files</td><td>Compact into large files; use archive formats or a table format</td></tr>
+        <tr><td>HTTP 503 / throttling from the object store</td><td>Request ramp on one prefix</td><td>Spread keys over prefixes, back off with jitter, fewer larger objects</td></tr>
+        <tr><td>Jobs "missing" files or reading partial output</td><td>Non-atomic directory commits on object storage</td><td>Commit via table-format metadata, write-then-publish manifests</td></tr>
+        <tr><td>Durability lower than calculated</td><td>Correlated failures (same rack, zone, firmware)</td><td>Place replicas/fragments across failure domains; stagger hardware batches</td></tr>
+        <tr><td>Cluster-wide slowdown after a node loss</td><td>Re-replication or EC repair saturating the network</td><td>Throttle repair bandwidth, prioritise blocks with the fewest live copies</td></tr>
+        <tr><td>Storage bill dominated by requests or egress</td><td>Tiny objects, cross-region reads</td><td>Batch objects, co-locate compute with data, lifecycle tiers</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">10</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Block for databases, file for shared POSIX, object for lakes and ML data</b> — object storage is now the default system of record.</li>
+        <li><b>HDFS</b> = in-RAM NameNode metadata + DataNodes with large replicated blocks, rack-aware placement and data locality; its Achilles' heel is small files.</li>
+        <li><b>Object stores</b> have a flat namespace, immutable objects, strong read-after-write consistency, no atomic rename, and request-based pricing.</li>
+        <li><b>Erasure coding</b> beats replication on space and durability but costs repair bandwidth and decode latency; both depend on independent failure domains.</li>
+        <li><b>Parquet</b> + partitioning + sensible file sizes make object storage fast for analytics; <b>large sequential shards</b>, prefetching and shuffle buffers make it fast for training.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="distributed-storage.viz.js"></script>
+</body>
+</html>

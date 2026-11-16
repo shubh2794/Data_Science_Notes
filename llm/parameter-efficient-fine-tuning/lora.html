@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · LoRA: Low-Rank Adaptation</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../parameter-efficient-fine-tuning.html">Parameter-Efficient Fine-Tuning</a> · deep dive</p>
+      <h1>LoRA: Low-Rank Adaptation</h1>
+      <p>Freeze the pretrained weight <code>W₀</code> and learn only a low-rank update <code>ΔW = BA</code> beside it. This page goes past the parameter count: why the update should be low-rank at all, what the zero-initialised <code>B</code> and the <code>α/r</code> scale actually do, what gradient descent on a factorised update converges to, which attention matrices to adapt, why rank 1 is often enough, what the learned <code>ΔW</code> amplifies inside <code>W₀</code>, and where the method stops working.</p>
+      <div style="margin-top:10px">
+        <span class="pill">LLMs &amp; Generative AI</span>
+        <span class="pill">Fine-tuning</span>
+        <span class="pill">intrinsic rank · B = 0 init · α/r · merging · Wq/Wv · rank ablation · subspace similarity · limits</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="motivation" data-nav="Why another method">
+      <h3><span class="idx">01</span> Why another adaptation method: the three costs it was built to avoid</h3>
+      <p class="lede"><b>Full fine-tuning stores a whole model per task; adapter layers add sequential depth and therefore latency; prefix tuning is hard to optimise and eats context.</b> LoRA is designed to avoid all three at once — small per-task storage, <i>no</i> added inference latency, and no change to the input sequence.</p>
+
+      <ul class="notes">
+        <li><b>Storage and deployment.</b> Fully fine-tuning a 175B-parameter model produces another 175B-parameter model per task. Holding many independent instances of that in memory, or swapping them in, is prohibitive. (The general trade-offs of updating everything are on the <a href="../../deep-learning/fine-tuning-transfer-learning.html">fine-tuning &amp; transfer learning</a> page.)</li>
+        <li><b>Adapters cost latency, worst exactly where serving lives.</b> Adapter layers are extra modules executed <i>in series</i> with the existing ones. Large models already saturate hardware through parallelism, so the extra depth cannot be hidden — and it hurts most at small batch sizes, which is the online-inference regime.</li>
+        <li><b>Prefix tuning is hard to optimise and costs sequence length.</b> Its quality changes non-monotonically with the number of trainable parameters, and every position reserved for the learned prefix is a position the task input cannot use. In the reported large-model experiments, quality <i>dropped</i> beyond about 256 special tokens for prefix-embedding tuning and beyond about 32 for prefix-layer tuning.</li>
+      </ul>
+
+      <table class="grid2">
+        <tr><th>single forward pass, GPT-2 medium</th><th>fine-tune / merged LoRA</th><th>adapter variant L</th><th>adapter variant H</th></tr>
+        <tr><td>batch 32, sequence 512</td><td class="num">1449.4 ms</td><td class="num">1482.0 ms (+2.2%)</td><td class="num">1492.2 ms (+3.0%)</td></tr>
+        <tr><td>batch 16, sequence 256</td><td class="num">338.0 ms</td><td class="num">354.8 ms (+5.0%)</td><td class="num">366.3 ms (+8.4%)</td></tr>
+        <tr class="hl"><td><b>batch 1, sequence 128</b></td><td class="num">19.8 ms</td><td class="num">23.9 ms (+20.7%)</td><td class="num">25.8 ms (+30.3%)</td></tr>
+      </table>
+      <p>Mean of 100 trials on one workstation GPU. Read it bottom-up: the smaller the batch, the larger the relative penalty, because there is less parallel work to hide the extra sequential layers behind. A merged LoRA model <i>is</i> a plain dense model of the original shape, so it sits in the first column by construction (§05).</p>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="hypothesis" data-nav="The low-intrinsic-rank bet">
+      <h3><span class="idx">02</span> The bet: the <i>update</i> has low intrinsic rank</h3>
+      <p class="lede">Earlier work on intrinsic dimension showed that over-parameterised pretrained models can still be fine-tuned effectively after a random projection of the trainable parameters into a surprisingly small subspace. LoRA makes the analogous bet about the <b>weight update</b>: the change a task needs, <code>ΔW</code>, has low "intrinsic rank", even though <code>W₀</code> itself is full-rank.</p>
+
+      <div class="formula"><span class="lbl">two different claims, often blurred</span><span class="eq">intrinsic DIMENSION (prior work):  the fine-tuning trajectory can be confined to
+                                     a random d_int-dimensional subspace of ALL params
+                                     with d_int ≪ total, and still work.
+
+intrinsic RANK (the LoRA bet):     each adapted matrix's update  ΔW ∈ ℝ^(d×k)
+                                     is well approximated by rank r ≪ min(d, k).</span></div>
+
+      <p>The second is a structural assumption <i>per matrix</i>, and it is cheaper to exploit: a rank-<code>r</code> matrix factors as a product of a <code>d×r</code> and an <code>r×k</code> matrix, so it costs <code>r(d + k)</code> numbers instead of <code>dk</code>. Whether the bet is true is an empirical question; §08 and §09 are the evidence, and §11 records where it is expected to fail.</p>
+      <div class="callout"><b>The intuition.</b> Pretraining has already built the features. Adapting to a task mostly means re-weighting a few directions the model already represents — a low-dimensional steer, not a rebuild. <a href="../../math/linear-algebra-eigen-svd/svd.html">The SVD page</a> is the background for "rank" and "directions" used throughout.</div>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="method" data-nav="The parameterisation">
+      <h3><span class="idx">03</span> The parameterisation, the initialisation and the scale</h3>
+      <p class="lede">Every detail of the forward pass below is there for a reason: the zero <code>B</code> makes training start exactly at the pretrained model, and the <code>α/r</code> factor decouples the step size from the rank.</p>
+
+      <div class="formula"><span class="lbl">forward pass of one adapted linear layer</span><span class="eq">h  =  W₀x + ΔWx  =  W₀x + (α / r) · B A x
+
+W₀ ∈ ℝ^(d×k)   frozen, full-rank, receives no gradient
+B  ∈ ℝ^(d×r)   trainable, initialised to 0
+A  ∈ ℝ^(r×k)   trainable, initialised random Gaussian
+r  ≪ min(d, k)</span>
+<span class="lbl">trainable numbers per adapted matrix</span><span class="eq">r · (d + k)      instead of      d · k
+
+d = k = 12288 (a 175B-scale model width), r = 4:
+    98 304  vs  150 994 944     →  0.065% of the matrix</span></div>
+
+      <h4>Why B = 0 and A random — and not both zero</h4>
+      <div class="formula"><span class="lbl">gradients, with g = ∂L/∂h and scale s = alpha / r</span><span class="eq">∂L/∂B  =  s · g (A x)ᵀ          ∂L/∂A  =  s · Bᵀ g xᵀ
+
+at step 0:  B = 0   ⇒   ΔW = BA = 0          the model IS the pretrained model
+            ∂L/∂A = 0                        A does not move on the first step
+            ∂L/∂B ≠ 0  (A is random)          B starts learning immediately
+
+if both were 0:  both gradients vanish forever — the adapter never trains.</span></div>
+      <p>So the symmetry is broken by <code>A</code> and the "no-op at start" property is supplied by <code>B</code>. After the first step <code>B ≠ 0</code> and both factors train. The choice could be flipped (random <code>B</code>, zero <code>A</code>) with the same effect; what matters is that exactly one factor is zero.</p>
+
+      <h4>What <code>α/r</code> is for</h4>
+      <ul class="notes">
+        <li>In the reported experiments <code>α</code> was set to the first <code>r</code> tried and then <b>not tuned</b>. With Adam, scaling the update by a constant is roughly equivalent to scaling the learning rate (given a suitably scaled initialisation), so tuning <code>α</code> and tuning the learning rate are nearly the same knob.</li>
+        <li>Dividing by <code>r</code> is the useful part: it keeps the size of the update from growing with the rank, which reduces the need to retune hyperparameters when <code>r</code> changes. (A later refinement argues the right divisor is <code>√r</code>; see §12.)</li>
+      </ul>
+
+      <h4>A generalisation of full fine-tuning, not an approximation of the model</h4>
+      <p>Adapt every weight matrix with <code>r</code> equal to its full rank and LoRA can express any update full fine-tuning can — it roughly recovers full fine-tuning's expressiveness. As the trainable budget grows, LoRA converges to training the original model. The alternatives do not have this property: adapter-based methods converge to training an extra MLP, and prefix-based methods to a model that cannot take long inputs.</p>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="learner" data-nav="What gradient descent finds">
+      <h3><span class="idx">04</span> Fitting a low-rank update: what gradient descent on <code>BA</code> finds</h3>
+      <p class="lede"><b>No rank-<code>r</code> matrix can be closer to a target <code>ΔW*</code> than its truncated SVD, and the error is exactly the discarded singular values (Eckart–Young).</b> LoRA never computes an SVD — it runs gradient descent on <code>B</code> and <code>A</code> — but from <code>B = 0</code> it typically lands on that floor, learning the target's directions largest-first.</p>
+
+      <div class="formula"><span class="lbl">the floor any rank-r adapter is bounded by</span><span class="eq">ΔW*  =  ∑ᵢ σᵢ uᵢ vᵢᵀ                  (SVD of the update the task "wants")
+
+min over rank(BA) ≤ r of ‖BA − ΔW*‖_F   =   √( ∑_(i&gt;r) σᵢ² )
+
+relative floor(r)  =  √( ∑_(i&gt;r) σᵢ² ) / ‖ΔW*‖_F</span></div>
+
+      <p>The toy below is a 32×32 "task update" built with a chosen intrinsic rank (a few large singular values) plus a small noise tail. A LoRA adapter of rank <code>r</code> is trained on <code>½‖BA − ΔW*‖²_F</code> by plain gradient descent from LoRA's own initialisation (<code>B = 0</code>, <code>A</code> Gaussian), with <code>α = r</code> so the scale is 1. The bars show, for each of the target's singular directions, how much of it the adapter has learned so far: <code>uᵢᵀ(BA)vᵢ</code> against <code>σᵢ</code>. The full statement and proof of Eckart–Young is on the <a href="../../math/linear-algebra-eigen-svd/svd.html">SVD page</a>.</p>
+
+      <div class="viz" id="viz-lr">
+        <div class="vhead">
+          <span class="vtitle">A rank-r adapter learning a target update, against the Eckart–Young floor</span>
+          <span class="vhint">set r below the intrinsic rank and the loss stalls on the floor; set it at or above and the floor drops to the noise</span>
+        </div>
+        <div class="controls">
+          <label>intrinsic rank of the target <input type="range" id="lr-k" min="1" max="12" step="1" value="4" /><span id="lr-kv" style="min-width:20px;display:inline-block">4</span></label>
+          <label>noise tail <input type="range" id="lr-n" min="0" max="0.12" step="0.01" value="0.03" /><span id="lr-nv" style="min-width:32px;display:inline-block">0.03</span></label>
+          <label>LoRA rank r <input type="range" id="lr-r" min="1" max="16" step="1" value="2" /><span id="lr-rv" style="min-width:20px;display:inline-block">2</span></label>
+          <button id="lr-play" type="button">train</button>
+          <button id="lr-reset" type="button">re-initialise A</button>
+          <button id="lr-new" type="button">new target</button>
+        </div>
+        <svg id="lr-svg" width="760" height="440" viewBox="0 0 760 440" role="img" aria-label="Top left: three 32 by 32 heat maps, the target update, the adapter's current product B times A, and their residual, on a shared diverging colour scale. Before training the middle map is blank, because B starts at zero, and the residual equals the target. Top right: the relative Frobenius error of the adapter plotted against training step on a logarithmic vertical axis, with a dashed horizontal line at the Eckart–Young floor for the selected rank, the smallest error any rank-r matrix can achieve. During training the error curve descends in steps, one plateau per singular direction learned, and settles on the dashed floor. Bottom: one bar slot per singular direction of the target, ordered from largest to smallest; an outline shows the target singular value and a filled bar shows how much of that direction the adapter has learned, with a vertical rule after the r-th direction. The filled bars rise largest-first and stop at the rule: directions beyond the adapter's rank are never learned. Raising the rank above the target's intrinsic rank lets the adapter also absorb noise directions, slowly. The readout gives the step, the current error, the floor, the gap between them, and the trainable parameter counts for the toy matrix and for a 12288-wide matrix."></svg>
+        <div class="readout" aria-live="polite" id="lr-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Largest-first is a property of the dynamics, not of LoRA's definition.</b> From a small or zero start, factorised gradient descent grows each direction at a rate proportional to its singular value, so the plateaus in the loss curve appear in order. That is one reason a too-large <code>r</code> mostly wastes capacity on small, noisy directions rather than harming the large ones — the same picture the subspace analysis of §09 finds in real adapters.</li>
+        <li><b>The toy knows the target; real fine-tuning does not.</b> In a real model there is no <code>ΔW*</code> to fit — the loss is the task loss through the whole network. The toy isolates one question: given an update of some intrinsic rank, how much a rank-<code>r</code> factorisation can capture, and what training does to approach that.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="merge" data-nav="Merge, switch, mixed batches">
+      <h3><span class="idx">05</span> Merge for zero latency, switch tasks cheaply — and the mixed-batch catch</h3>
+      <p class="lede">Because the update is additive and linear, it can be folded into the weight once: <code>W = W₀ + BA</code>. The deployed model is then an ordinary dense model of the original shape, with exactly the original inference cost.</p>
+
+      <div class="formula"><span class="lbl">merge, switch, unmerge</span><span class="eq">deploy task 1:      W  ←  W₀ + B₁A₁                    once; no extra latency afterwards
+switch to task 2:    W  ←  W − B₁A₁ + B₂A₂              two rank-r products per matrix
+                                                         — cheap, and little extra memory
+
+kept UNMERGED, per request i with adapter t(i):
+                     hᵢ  =  W₀xᵢ + B_t(i) A_t(i) xᵢ     extra MACs per token: r(d + k)
+                                                         vs the base's d·k</span></div>
+
+      <p>The catch is in the last line. A merged weight is <i>one</i> task. A batch that mixes requests for different tasks cannot share a single merged forward pass — you either serialise by task (re-merging between groups) or keep the adapters <b>unmerged</b> and pick the adapter per sample, paying a small extra cost for every token. The latter is how multi-adapter serving systems run many fine-tunes on one copy of the base; batching and scheduling for that setting are on the <a href="../../mlops/llm-serving.html#batching">LLM serving</a> page.</p>
+
+      <div class="viz" id="viz-mg">
+        <div class="vhead">
+          <span class="vtitle">One batch, several tasks: merged weights vs unmerged adapters</span>
+          <span class="vhint">with one task, merging is free; add a second task to the batch and count what each strategy costs</span>
+        </div>
+        <div class="controls">
+          <label>strategy <select id="mg-m">
+            <option value="merged" selected>merge one adapter into W</option>
+            <option value="unmerged">keep adapters unmerged, route per request</option>
+          </select></label>
+          <label>distinct tasks in the batch <input type="range" id="mg-t" min="1" max="4" step="1" value="2" /><span id="mg-tv" style="min-width:14px;display:inline-block">2</span></label>
+          <label>rank r <select id="mg-r">
+            <option value="8">8</option><option value="16" selected>16</option><option value="64">64</option>
+          </select></label>
+          <label>width d = k <select id="mg-d">
+            <option value="4096" selected>4096</option><option value="8192">8192</option><option value="12288">12288</option>
+          </select></label>
+        </div>
+        <svg id="mg-svg" width="760" height="320" viewBox="0 0 760 320" role="img" aria-label="Diagram of one batch of eight requests, each coloured by the task adapter it needs, flowing into a weight block. In the merged strategy the weight block is the frozen base plus one adapter folded in; only the requests for that task pass through in this forward pass, the others are greyed out and queued for later passes, each preceded by a re-merge, so the number of passes equals the number of distinct tasks. In the unmerged strategy the base weight is shared by all eight requests and each request additionally passes through its own small pair of low-rank factors drawn beside the base, so the whole batch completes in one pass at a small extra cost per token. The readout gives the number of forward passes, the re-merge cost in multiply-accumulates, and the extra per-token cost of unmerged adapters as a percentage of the base matrix multiply."></svg>
+        <div class="readout" aria-live="polite" id="mg-readout"></div>
+      </div>
+
+      <div class="callout"><b>Combining several adapters into one</b> is a different operation from switching between them: it is weight-space merging, and the rule there is to merge the products <code>BᵢAᵢ</code>, never the factors separately. <a href="../model-merging.html#lora">Model merging</a> owns that, including why averaging <code>A</code>s and <code>B</code>s produces meaningless cross terms.</div>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="savings" data-nav="What it saves at 175B">
+      <h3><span class="idx">06</span> What it saves at 175B scale</h3>
+      <p class="lede">The savings come from not storing optimiser state or gradients for frozen weights, and from storing only the factors per task. Inference compute is not among them (§13).</p>
+
+      <div class="cards">
+        <div class="box good"><div class="n">training memory</div><div class="t">1.2 TB → 350 GB</div><div class="g">VRAM during training of the 175B model. Up to about 3× less GPU memory, because the frozen parameters need no optimiser state.</div></div>
+        <div class="box good"><div class="n">checkpoint per task</div><div class="t">~350 GB → ~35 MB</div><div class="g">With <code>r = 4</code> on <code>Wq</code> and <code>Wv</code> only: about 10 000× smaller. Trainable parameters drop by up to 10 000×.</div></div>
+        <div class="box good"><div class="n">training throughput</div><div class="t">~25% faster</div><div class="g">Relative to full fine-tuning, since gradients are not computed for the vast majority of parameters.</div></div>
+      </div>
+
+      <div class="formula"><span class="lbl">the arithmetic behind the checkpoint size (96 layers, d_model = 12288)</span><span class="eq">per adapted matrix:   r(d + k) = 4 · (12288 + 12288) =     98 304
+× 2 matrices (Wq, Wv) × 96 layers                    =  18 874 368   ≈ 18.9M params
+× 2 bytes (16-bit)                                   ≈  37.7 MB      ≈ 36 MiB  → "~35 MB"
+
+the same budget at r = 1  →  4.72M params    at r = 8  →  37.7M params</span></div>
+      <p>The last line is worth noticing: <code>4.7M</code> and <code>37.7M</code> are exactly the two LoRA budgets in the headline 175B results of §10. The study's hyperparameter appendix lists the configurations behind them: 4.7M is <code>Wq, Wv</code> at <code>r = 1</code> or, at the same count, <code>Wv</code> alone at <code>r = 2</code>; 37.7M is <code>Wq, Wv</code> at <code>r = 8</code> or all four attention matrices at <code>r = 4</code>. The 18M budget used for the comparison in §07 is the <code>r = 4</code> figure.</p>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="which" data-nav="Which matrices to adapt">
+      <h3><span class="idx">07</span> Which weight matrices to adapt, at a fixed budget</h3>
+      <p class="lede">The original study adapted only the attention projections — <a href="../../deep-learning/attention/query-key-value.html"><code>Wq</code>, <code>Wk</code>, <code>Wv</code> and <code>Wo</code></a>, each treated as a single <code>d_model × d_model</code> matrix — and froze the MLP blocks. Holding the trainable budget at about 18M parameters on the 175B model, it asked where those parameters should go.</p>
+
+      <table class="grid2">
+        <tr><th>adapted matrices</th><th>rank r</th><th>WikiSQL acc</th><th>MultiNLI acc</th></tr>
+        <tr><td><code>Wq</code></td><td class="num">8</td><td class="num">70.4</td><td class="num">91.0</td></tr>
+        <tr><td><code>Wk</code></td><td class="num">8</td><td class="num">70.0</td><td class="num">90.8</td></tr>
+        <tr><td><code>Wv</code></td><td class="num">8</td><td class="num">73.0</td><td class="num">91.0</td></tr>
+        <tr><td><code>Wo</code></td><td class="num">8</td><td class="num">73.2</td><td class="num">91.3</td></tr>
+        <tr><td><code>Wq, Wk</code></td><td class="num">4</td><td class="num">71.4</td><td class="num">91.3</td></tr>
+        <tr class="hl"><td><b><code>Wq, Wv</code></b></td><td class="num">4</td><td class="num">73.7</td><td class="num">91.3</td></tr>
+        <tr class="hl"><td><b><code>Wq, Wk, Wv, Wo</code></b></td><td class="num">2</td><td class="num">73.7</td><td class="num">91.7</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Breadth beats depth.</b> Spreading the same budget over more matrices at lower rank beats putting it all into one matrix at higher rank — consistent with the update having low rank per matrix: extra rank in one place buys little.</li>
+        <li><b><code>Wq</code> alone or <code>Wk</code> alone is clearly worse</b> (about 3 points on WikiSQL). Adapting the value or output path matters more than adapting only how attention scores are computed.</li>
+        <li><b><code>Wq + Wv</code> is the strong default</b> the rest of the study uses; all four at <code>r = 2</code> is as good or slightly better.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="rank" data-nav="How small can r be">
+      <h3><span class="idx">08</span> How small can <code>r</code> be? Flat from 1 to 64</h3>
+      <p class="lede"><b>With <code>Wq</code> and <code>Wv</code> both adapted, rank 1 is already competitive</b>, and going to rank 64 — 64× the parameters — buys essentially nothing. <code>Wq</code> alone benefits from a little more rank, which hints that its update is less low-rank (§09).</p>
+
+      <div class="viz" id="viz-ra">
+        <div class="vhead">
+          <span class="vtitle">Reported accuracy against LoRA rank on the 175B model — and the fixed-budget comparison</span>
+          <span class="vhint">note how zoomed the vertical axis has to be before any rank dependence becomes visible</span>
+        </div>
+        <div class="controls">
+          <label>view <select id="ra-v">
+            <option value="rank" selected>accuracy vs rank r</option>
+            <option value="budget">which matrices, fixed 18M budget</option>
+          </select></label>
+          <label>dataset <select id="ra-d">
+            <option value="wikisql" selected>WikiSQL</option>
+            <option value="mnli">MultiNLI</option>
+          </select></label>
+          <label><input type="checkbox" id="ra-ft" checked /> show full fine-tuning</label>
+        </div>
+        <svg id="ra-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Rank view: reported validation accuracy plotted against LoRA rank, at ranks 1, 2, 4, 8 and 64 on an evenly spaced categorical axis, with one line each for adapting the query matrix alone, the query and value matrices, and all four attention matrices. On both datasets the query-plus-value and all-four lines are nearly flat across the whole range, within about half a point, while the query-only line sits lower and rises over the first few ranks. An optional dashed horizontal line marks full fine-tuning of all 175 billion parameters; on MultiNLI every LoRA configuration sits above it, and on WikiSQL the multi-matrix lines sit at about the same level. The vertical axis is zoomed and does not start at zero, which the chart states. Budget view: horizontal bars of accuracy for seven ways of spending the same eighteen-million-parameter budget, from one matrix at rank 8 to all four at rank 2, with the query-only and key-only bars visibly shortest. The readout gives the spread across ranks for each line, or the best and worst allocation, and the parameter count of the hovered configuration."></svg>
+        <div class="readout" aria-live="polite" id="ra-readout"></div>
+      </div>
+
+      <div class="callout"><b>Reading this correctly.</b> "Rank 1 suffices" is a statement about these tasks on a very large pretrained model, with two or more matrices adapted per layer. It is evidence for the low-intrinsic-rank bet, not a universal setting — §11 notes tasks far from the pretraining distribution, and §12 how practice moved to larger ranks once all linear layers were adapted.</div>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="subspace" data-nav="Inside the learned ΔW">
+      <h3><span class="idx">09</span> Inside the learned <code>ΔW</code>: shared directions, noise, and amplification</h3>
+      <p class="lede">Two questions the accuracy tables cannot answer: <b>do adapters of different rank learn the same thing?</b> and <b>how does <code>ΔW</code> relate to the <code>W₀</code> it is added to?</b></p>
+
+      <h4>Rank 8 and rank 64 agree on the top direction</h4>
+      <div class="formula"><span class="lbl">normalised subspace similarity between two learned A matrices</span><span class="eq">φ(A₁, A₂, i, j)  =  ‖ U₁⁽ⁱ⁾ᵀ U₂⁽ʲ⁾ ‖²_F  /  min(i, j)       ∈ [0, 1]
+
+U⁽ⁱ⁾ = the top-i right-singular vectors of A        1 = one subspace contains the other
+                                                    0 = orthogonal</span></div>
+      <ul class="notes">
+        <li>Comparing <code>A</code> learned at <code>r = 8</code> with <code>A</code> learned at <code>r = 64</code>: the <b>top singular directions overlap significantly</b>; for both <code>ΔWq</code> and <code>ΔWv</code> the two runs share a one-dimensional subspace with similarity above 0.5. That is the direct explanation for §08's flat curve — rank 1 already holds the direction that matters.</li>
+        <li>The remaining directions of the rank-64 adapter overlap little with the rank-8 one: they look like <b>noise accumulated during training</b> rather than additional structure.</li>
+        <li>Across random seeds, <code>ΔWq</code> appears to have a <b>higher intrinsic rank than <code>ΔWv</code></b> — more shared directions between runs — matching the observation that <code>Wq</code> alone benefits from more rank.</li>
+      </ul>
+
+      <h4><code>ΔW</code> amplifies what <code>W₀</code> under-weights</h4>
+      <p>Take the SVD of <code>ΔW</code>, keep its top-<code>r</code> left and right singular vectors <code>U</code> and <code>V</code>, and project the pretrained <code>W</code> onto that subspace: <code>‖UᵀWVᵀ‖_F</code>. If <code>ΔW</code> just repeated <code>W</code>'s dominant directions, this would be large; if it were unrelated, it would be as small as for a random subspace.</p>
+      <div class="formula"><span class="lbl">layer 48 of the 175B model, Wq, r = 4</span><span class="eq">subspace U, V taken from        ‖UᵀWqVᵀ‖_F
+  ΔWq (the learned update)            0.32
+  Wq itself (its own top-4)          21.67
+  a random matrix                     0.02
+
+‖Wq‖_F = 61.95        ‖ΔWq‖_F = 6.91
+
+amplification factor  =  ‖ΔWq‖_F / ‖UᵀWqVᵀ‖_F  ≈  21.5
+     (the reported figure; the two-decimal norms above give 6.91 / 0.32 ≈ 21.6)</span></div>
+      <ul class="notes">
+        <li><b>Correlated, but not with the top.</b> 0.32 is far above random (0.02), so <code>ΔW</code> lives in directions related to <code>W</code>; but it is far below 21.67, so those are <i>not</i> <code>W</code>'s dominant directions.</li>
+        <li><b>It amplifies features already present but weak.</b> Along its own directions <code>W</code> has norm about 0.32; the update adds about 6.91 there — roughly a 21× boost of directions the pretrained weights under-emphasise. The reading is that adaptation turns up task-relevant features the general model learned but did not prioritise.</li>
+        <li>At <code>r = 64</code> the amplification factor is much smaller, consistent with the extra directions being mostly noise rather than additional amplified features.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="results" data-nav="Results across scales">
+      <h3><span class="idx">10</span> Results from 125M to 175B parameters</h3>
+      <p class="lede">Across encoders and decoders, LoRA matches or beats full fine-tuning with two to four orders of magnitude fewer trainable parameters.</p>
+
+      <table class="grid2">
+        <tr><th>model · benchmark</th><th>method</th><th>trainable params</th><th>score</th></tr>
+        <tr><td rowspan="2">RoBERTa base · GLUE avg</td><td>full fine-tune</td><td class="num">125M</td><td class="num">86.4</td></tr>
+        <tr class="hl"><td>LoRA</td><td class="num">0.3M</td><td class="num">87.2</td></tr>
+        <tr><td rowspan="2">RoBERTa large · GLUE avg</td><td>full fine-tune</td><td class="num">355M</td><td class="num">88.9</td></tr>
+        <tr class="hl"><td>LoRA</td><td class="num">0.8M</td><td class="num">89.0</td></tr>
+        <tr><td rowspan="2">DeBERTa XXL · GLUE avg</td><td>full fine-tune</td><td class="num">1500M</td><td class="num">91.1</td></tr>
+        <tr class="hl"><td>LoRA</td><td class="num">4.7M</td><td class="num">91.3</td></tr>
+        <tr><td rowspan="3">GPT-2 medium · E2E NLG BLEU</td><td>full fine-tune</td><td class="num">354.92M</td><td class="num">68.2</td></tr>
+        <tr><td>prefix-layer tuning</td><td class="num">0.35M</td><td class="num">69.7</td></tr>
+        <tr class="hl"><td>LoRA</td><td class="num">0.35M</td><td class="num">70.4</td></tr>
+        <tr><td rowspan="2">GPT-2 large · E2E NLG BLEU</td><td>full fine-tune</td><td class="num">774.03M</td><td class="num">68.5</td></tr>
+        <tr class="hl"><td>LoRA</td><td class="num">0.77M</td><td class="num">70.4</td></tr>
+      </table>
+
+      <table class="grid2">
+        <tr><th>175B model</th><th>trainable params</th><th>WikiSQL acc</th><th>MNLI-m acc</th><th>SAMSum R1 / R2 / RL</th></tr>
+        <tr><td>full fine-tune</td><td class="num">175 255.8M</td><td class="num">73.8</td><td class="num">89.5</td><td class="num">52.0 / 28.0 / 44.5</td></tr>
+        <tr><td>BitFit (biases only)</td><td class="num">14.2M</td><td class="num">71.3</td><td class="num">91.0</td><td class="num">51.3 / 27.4 / 43.5</td></tr>
+        <tr><td>prefix-layer tuning</td><td class="num">20.2M</td><td class="num">70.1</td><td class="num">89.5</td><td class="num">50.8 / 27.3 / 43.5</td></tr>
+        <tr><td>adapter variant H</td><td class="num">40.1M</td><td class="num">73.2</td><td class="num">91.5</td><td class="num">53.2 / 29.0 / 45.1</td></tr>
+        <tr class="hl"><td><b>LoRA</b></td><td class="num">4.7M</td><td class="num">73.4</td><td class="num">91.7</td><td class="num">53.8 / 29.8 / 45.9</td></tr>
+        <tr class="hl"><td><b>LoRA</b></td><td class="num">37.7M</td><td class="num">74.0</td><td class="num">91.6</td><td class="num">53.4 / 29.2 / 45.1</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">The other PEFT families in the table are summarised on the <a href="../parameter-efficient-fine-tuning.html#variants">PEFT hub</a>.</p>
+      <p>Two things to take from the 175B table. The 4.7M-parameter adapter — <b>about 37 000× fewer</b> trainable parameters than full fine-tuning — is within 0.4 points on WikiSQL and ahead on the other two tasks. And the larger LoRA budget is not uniformly better: 37.7M beats 4.7M on WikiSQL but is slightly worse on SAMSum, the same flatness §08 shows. (Note that the baselines did not all scale well with budget: prefix methods in particular degraded as their token count grew, §01.)</p>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="limits" data-nav="Limitations">
+      <h3><span class="idx">11</span> Limitations the original study states</h3>
+      <div class="cards">
+        <div class="box bad"><div class="n">serving</div><div class="t">Merged means single-task</div><div class="g">Once <code>BA</code> is folded into <code>W</code>, inputs for different tasks cannot share one forward pass. Keeping adapters unmerged and choosing per sample works where latency is less critical (§05).</div></div>
+        <div class="box warn"><div class="n">design</div><div class="t">No principled choice of matrices</div><div class="g">Which matrices to adapt was settled by heuristics and ablation (§07). Adapting the MLP, LayerNorm or biases was left unexplored.</div></div>
+        <div class="box warn"><div class="n">rank</div><div class="t">Small r is not universal</div><div class="g">A task far from pretraining — for example, a downstream language very different from the pretraining data — may need a much larger rank.</div></div>
+        <div class="box good"><div class="n">composition</div><div class="t">Orthogonal to other methods</div><div class="g">LoRA can be combined with other approaches, such as prefix tuning; it changes weights, not the input sequence.</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="practice" data-nav="In practice (beyond the study)">
+      <h3><span class="idx">12</span> In practice: what changed after the original study</h3>
+      <p class="lede">Everything above is the original method and its reported evidence. This section is <b>common practice since the original study</b> — fast-moving, tool-dependent, and not part of the original study's claims.</p>
+
+      <table class="grid2">
+        <tr><th style="width:180px">knob</th><th>typical practice</th><th>why</th></tr>
+        <tr><td><b>rank r</b></td><td><code>r</code> in 4–64, with 8–16 a common starting point; larger for big distribution shifts (new language, code, long structured outputs)</td><td>§08's flatness holds best for "steer" tasks; knowledge-heavy or out-of-distribution tasks use more rank</td></tr>
+        <tr><td><b>alpha</b></td><td><code>α</code> often set to <code>r</code> or <code>2r</code>, i.e. a scale of 1 or 2, then left alone</td><td>§03: with Adam, <code>α</code> mostly duplicates the learning rate</td></tr>
+        <tr><td><b>target modules</b></td><td>all linear layers (attention <i>and</i> MLP projections) rather than only <code>Wq, Wv</code></td><td>later quantised-LoRA work found adapting every linear layer was needed to match full 16-bit fine-tuning; the MLP holds most of a block's parameters</td></tr>
+        <tr><td><b>learning rate</b></td><td>typically an order of magnitude higher than for full fine-tuning</td><td>far fewer parameters, and <code>B</code> starts at zero</td></tr>
+        <tr><td><b>quantised base</b></td><td>QLoRA: freeze the base in 4-bit and train 16-bit adapters on top — see the <a href="qlora.html">QLoRA deep dive</a> (and the <a href="../parameter-efficient-fine-tuning.html#qlora">PEFT hub's QLoRA section</a>)</td><td>the frozen weights only need to be read, so their precision can drop</td></tr>
+        <tr><td><b>serving</b></td><td>merge for a single dedicated task; keep unmerged with batched per-request adapter kernels for many tenants (<a href="../../mlops/llm-serving.html">LLM serving</a>)</td><td>§05's trade-off</td></tr>
+        <tr><td><b>combining adapters</b></td><td>merge <code>ΔWᵢ = BᵢAᵢ</code> as task vectors, or concatenate factors into a rank-<code>(r₁ + r₂)</code> adapter (<a href="../model-merging.html#lora">model merging</a>)</td><td>products add; factors do not</td></tr>
+      </table>
+
+      <h4>Well-known successors, one line each</h4>
+      <ul class="notes">
+        <li><b>rsLoRA</b> — scales the update by <code>α/√r</code> instead of <code>α/r</code>, so that large ranks keep learning instead of having their updates shrink; this makes higher <code>r</code> actually useful.</li>
+        <li><b>DoRA</b> — decomposes each weight into a magnitude vector and a direction, trains the magnitude directly and applies a LoRA update to the direction.</li>
+        <li><b>LoRA+</b> — uses a larger learning rate for <code>B</code> than for <code>A</code>, motivated by the asymmetry of the two factors' roles.</li>
+      </ul>
+      <p>For how LoRA fits among adapters, prefix and prompt tuning, (IA)³ and BitFit, see the <a href="../parameter-efficient-fine-tuning.html">PEFT hub</a>; for where it sits among adaptation strategies generally, <a href="../../deep-learning/fine-tuning-transfer-learning.html#peft">fine-tuning &amp; transfer learning</a>; and for the models it is usually applied to, <a href="../large-language-models.html">large language models</a> and the <a href="../../deep-learning/transformers.html">transformer</a> block.</p>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">13</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"LoRA approximates the weight matrix with a low-rank one."</span> <span class="fix">No — <code>W₀</code> stays full-rank and untouched.</span> Only the <i>update</i> <code>ΔW</code> is constrained to rank <code>r</code>. The adapted weight <code>W₀ + BA</code> is full-rank. Compressing <code>W</code> itself with a truncated SVD is a different technique (low-rank compression) with very different quality costs.</div>
+      <div class="wrong"><span class="say">"LoRA makes inference cheaper."</span> <span class="fix">No — merged, it costs exactly the same as the base model; unmerged, slightly more.</span> What LoRA reduces is training memory (no optimiser state for frozen weights), training time, and per-task storage (§06).</div>
+      <div class="wrong"><span class="say">"Higher rank is always better, it is just more expensive."</span> <span class="fix">Not in the reported results.</span> Accuracy is flat from <code>r = 1</code> to <code>r = 64</code> when two or more matrices are adapted (§08), and the extra directions of a high-rank adapter look like noise (§09). Where more rank does help — distant domains, many adapted modules — it is a property of the task, not of the method.</div>
+      <div class="wrong"><span class="say">"You can average two LoRA adapters by averaging their A and B matrices."</span> <span class="fix">No — merge <code>BᵢAᵢ</code>, not the factors.</span> Averaging factors creates cross terms <code>B₁A₂ + B₂A₁</code> that never trained together (<a href="../model-merging.html#lora">model merging §07</a>).</div>
+      <div class="wrong"><span class="say">"Initialising both A and B to zero would be safer."</span> <span class="fix">It would never train.</span> With both zero, both gradients are zero (§03). Exactly one factor must be zero for the no-op start, and the other must be random to break the symmetry.</div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">14</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Freeze <code>W₀</code>, learn <code>ΔW = (α/r)·BA</code></b> with <code>r ≪ min(d, k)</code>: <code>r(d + k)</code> trainable numbers per matrix instead of <code>dk</code>.</li>
+        <li><b><code>B = 0</code>, <code>A</code> random</b>: training starts exactly at the pretrained model, and the symmetry is still broken.</li>
+        <li><b><code>α/r</code></b> decouples the update size from the rank; with Adam, <code>α</code> is nearly a learning-rate knob.</li>
+        <li><b>Merge <code>W₀ + BA</code></b> for zero added latency; switch tasks by subtracting one product and adding another; keep adapters unmerged to batch mixed tasks.</li>
+        <li><b>Spread the budget across matrices</b> at low rank; <code>Wq + Wv</code> at <code>r = 1–4</code> is already competitive on a 175B model.</li>
+        <li><b>The learned <code>ΔW</code></b> concentrates in a very few directions that runs of different rank agree on, and it amplifies features <code>W₀</code> has but under-weights — by about 21× at <code>r = 4</code> in the measured layer.</li>
+        <li><b>Limits:</b> merged adapters are single-task, matrix choice is heuristic, and distant tasks may need large rank.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Parameter-efficient fine-tuning" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../parameter-efficient-fine-tuning.html">← Parameter-Efficient Fine-Tuning</a>
+      <a href="../parameter-efficient-fine-tuning.html" style="color:var(--muted)">PEFT · overview</a>
+      <a href="../model-merging.html">Model Merging →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="lora.viz.js"></script>
+</body>
+</html>

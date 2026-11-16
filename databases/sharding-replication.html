@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Sharding &amp; Replication</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Sharding &amp; Replication</h1>
+      <p>Two independent techniques for spreading a database across machines. <b>Sharding</b> (partitioning) splits the data so each node holds only part of it, which scales storage and write throughput. <b>Replication</b> copies each part onto several nodes, which gives availability, read scaling and lower latency. Real systems combine them: every shard is replicated. This page covers how to split keys, how to keep the split balanced as the cluster changes, and how replicas stay in sync, fall behind and take over.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Systems</span>
+        <span class="pill">Partitioning</span>
+        <span class="pill">Replication</span>
+        <span class="pill">Consistent Hashing</span>
+      </div>
+    </header>
+
+    <section class="topic" id="why">
+      <h3><span class="idx">01</span> Two axes of scale</h3>
+      <table class="cmp">
+        <tr><th></th><th>Sharding (partitioning)</th><th>Replication</th></tr>
+        <tr><td>What it splits or copies</td><td>Splits the keyspace: each key lives on one shard</td><td>Copies each shard onto R nodes</td></tr>
+        <tr><td>Scales</td><td>Storage, write throughput, working-set memory</td><td>Read throughput, availability, geographic latency</td></tr>
+        <tr><td>Main hazards</td><td>Hotspots, cross-shard queries and transactions, rebalancing</td><td>Replication lag, failover, write conflicts</td></tr>
+        <tr><td>Doesn't help with</td><td>Availability (one shard down means its data is gone)</td><td>Write throughput (every replica applies every write)</td></tr>
+      </table>
+      <div class="callout"><b>One line:</b> shard for <b>size and writes</b>, replicate for <b>survival and reads</b>, and expect to need both before long.</div>
+    </section>
+
+    <section class="topic" id="range">
+      <h3><span class="idx">02</span> Range partitioning</h3>
+      <p class="lede">Each shard owns a contiguous key range, for example <code>[a, f)</code>, <code>[f, m)</code> and so on. A router or metadata service maps ranges to nodes.</p>
+      <ul class="notes">
+        <li><b>Strength:</b> range scans (<code>ts BETWEEN …</code>, "all keys with prefix user42:") hit one or a few shards, and data stays sorted.</li>
+        <li><b>Weakness: monotonic keys.</b> With timestamps or auto-increment ids as the key, <i>all</i> new writes go to the last range. One shard is busy and the rest sit idle. Fix it by prefixing the key with something well spread (<code>(sensor_id, ts)</code>) or by hashing.</li>
+        <li><b>Dynamic splitting:</b> a range that grows past a size threshold splits in two, and one half can move to another node. The number of ranges follows the data volume. A new, empty table starts as a single range, so pre-split it before a bulk load.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="hash">
+      <h3><span class="idx">03</span> Hash partitioning and the mod-N trap</h3>
+      <p class="lede">Hash the key and assign <code>shard = h(k) mod N</code>. Keys spread evenly whatever their distribution, but ranges are lost, because neighbouring keys land on random shards.</p>
+      <div class="formula"><span class="lbl">Fraction of keys that move when N → N + 1</span><span class="eq">mod-N:  P(h mod N ≠ h mod (N+1)) = N / (N + 1)</span>        <span class="eq">ideal (consistent):  1 / (N + 1)</span></div>
+      <ul class="notes">
+        <li>Going from 10 to 11 nodes with mod-N moves about <b>91%</b> of the data, which is a full reshuffle at the moment you're short of capacity. Only about 9% actually has to move to fill the new node.</li>
+        <li>Fixes, in rising order of sophistication: a <b>fixed number of partitions</b> much larger than the node count (move whole partitions, never re-hash), <b>consistent hashing</b>, <b>rendezvous (highest-random-weight) hashing</b>, and <b>jump consistent hash</b> for numbered buckets (see <a href="../dsa/data-structures/hash-tables/modern-hashing-bloom.html">hashing beyond the table</a>).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="consistent">
+      <h3><span class="idx">04</span> Consistent hashing with virtual nodes</h3>
+      <p class="lede">Map both keys and nodes onto a ring of hash values. A key belongs to the first node clockwise from it. Adding a node takes over only the arc just before it, so about 1/(N+1) of keys move. With one point per node the arcs are very uneven. Giving each node V <b>virtual nodes</b> (tokens) averages that out.</p>
+      <div class="formula"><span class="lbl">Load spread with V tokens per node (random placement)</span><span class="eq">share of a node ≈ sum of V arc lengths, each ≈ Exp(mean 1/(N·V))</span>        <span class="eq">coefficient of variation of load ≈ 1 / √V</span></div>
+      <div class="viz" id="viz-ring">
+        <div class="vhead">
+          <span class="vtitle">Consistent-hash ring</span>
+          <span class="vhint">more virtual nodes → flatter load · adding a node moves ~1/(N+1) of keys</span>
+        </div>
+        <div class="controls">
+          <label>nodes N <input type="range" id="ring-n" min="2" max="10" step="1" value="4"></label>
+          <label>virtual nodes V <input type="range" id="ring-v" min="1" max="64" step="1" value="1"></label>
+          <label><input type="checkbox" id="ring-add"> preview adding node N+1</label>
+        </div>
+        <svg id="ring-svg" width="640" height="280" viewBox="0 0 640 280" role="img" aria-label="Interactive diagram: hash ring arcs owned by each node and the resulting load per node"></svg>
+        <div class="readout" aria-live="polite" id="ring-read"></div>
+      </div>
+      <ul class="notes">
+        <li><b>Heterogeneous hardware:</b> give bigger machines more tokens.</li>
+        <li><b>Trade-off of many tokens:</b> more metadata, and more peers involved in every rebuild and repair. Some systems have lowered their default token counts for this reason and use placement algorithms in place of purely random tokens.</li>
+        <li><b>Replicas on the ring:</b> store a key on the next R <i>distinct physical</i> nodes clockwise, skipping tokens owned by nodes already chosen, and ideally spread across racks or zones.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="rebalance">
+      <h3><span class="idx">05</span> Rebalancing</h3>
+      <table class="cmp">
+        <tr><th>Strategy</th><th>How</th><th>Trade-off</th></tr>
+        <tr><td><b>Fixed partitions</b></td><td>Create, say, 1000 partitions for 10 nodes. New nodes take whole partitions from existing ones.</td><td>Simple and no re-hashing. Partition size grows with the data, and the count is hard to change later.</td></tr>
+        <tr><td><b>Dynamic splitting</b></td><td>Split ranges or partitions that pass a size or load threshold, merge small ones</td><td>Adapts to the data. Needs a metadata service and careful split logic.</td></tr>
+        <tr><td><b>Proportional to nodes</b></td><td>A fixed number of partitions per node (tokens on a ring)</td><td>Partition size stays roughly constant as the cluster grows</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Throttle data movement.</b> Rebalancing competes with live traffic for disk and network. Moving data at full speed during a capacity crisis can make the crisis worse.</li>
+        <li><b>Keep a human in the loop</b> for big moves. Automatic rebalancing combined with automatic failure detection can cascade: an overloaded node looks dead, its data moves, and its neighbours become overloaded in turn.</li>
+        <li><b>Request routing:</b> clients talk to any node that forwards requests, or to a routing tier, or they cache the partition map themselves. The map normally lives in a consensus store.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="hotspots">
+      <h3><span class="idx">06</span> Hotspots and secondary indexes</h3>
+      <ul class="notes">
+        <li><b>Hash spreading doesn't fix a hot key.</b> A celebrity's timeline, a viral product or a global counter is <i>one</i> key on <i>one</i> shard. Measure the per-key rate, not just the per-shard rate.</li>
+        <li><b>Key salting:</b> write to <code>key#0 … key#(S−1)</code> at random, which spreads the writes S ways. Reads then have to gather all S sub-keys and merge them. Apply this only to keys detected as hot.</li>
+        <li><b>Caching</b> absorbs read-hot keys in front of the shard (see <a href="caching.html">Caching</a>). Request coalescing stops many simultaneous misses for the same key from all reaching the database.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Secondary index</th><th>Write</th><th>Read by indexed field</th></tr>
+        <tr><td><b>Local</b> (each shard indexes its own rows)</td><td>Cheap and in the same transaction</td><td>Scatter-gather to every shard, so tail latency is the slowest shard</td></tr>
+        <tr><td><b>Global</b> (the index is itself partitioned by the indexed value)</td><td>Touches another shard, usually updated asynchronously</td><td>One index shard, but the result may be stale</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="leader">
+      <h3><span class="idx">07</span> Leader-follower replication</h3>
+      <p class="lede">One leader accepts writes and streams its log (physical WAL or a logical row-change stream) to followers. Followers apply the log in order and can serve reads.</p>
+      <table class="cmp">
+        <tr><th>Mode</th><th>Commit waits for</th><th>Durability on leader loss</th><th>Latency and availability</th></tr>
+        <tr><td><b>Synchronous</b></td><td>All (or named) followers</td><td>No acknowledged write lost</td><td>Slowest replica sets the latency, and any replica being down blocks writes</td></tr>
+        <tr><td><b>Semi-synchronous</b></td><td>At least one follower</td><td>Survives one node loss</td><td>The usual compromise</td></tr>
+        <tr><td><b>Asynchronous</b></td><td>Nothing (leader only)</td><td>Recent writes lost (RPO &gt; 0)</td><td>Fast; followers lag by an unbounded amount</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Adding a follower:</b> take a consistent snapshot tagged with its log position, copy it over, then stream the log from that position onward. No write downtime is needed.</li>
+        <li><b>Consensus replication</b> (Raft or Paxos per shard) is leader-follower where commit waits for a majority and leader election is built into the protocol. Many modern distributed databases use it.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="lag">
+      <h3><span class="idx">08</span> Replication lag and the anomalies it causes</h3>
+      <p class="lede">With asynchronous followers, a read routed to a follower returns the state as of <i>lag</i> seconds ago. Usually that's milliseconds. Under load, during a long-running query or after a network blip it can be minutes. Move the sliders to see who reads stale data.</p>
+      <div class="viz" id="viz-lag">
+        <div class="vhead">
+          <span class="vtitle">Replication lag: read-after-write against three followers</span>
+          <span class="vhint">a follower is stale for you if its lag exceeds your read delay</span>
+        </div>
+        <div class="controls">
+          <label>base lag (ms) <input type="range" id="lag-l" min="0" max="2000" step="10" value="400"></label>
+          <label>read delay after write (ms) <input type="range" id="lag-d" min="0" max="3000" step="10" value="500"></label>
+          <label>read routing <select id="lag-route"><option value="any">any follower</option><option value="ryw">read-your-writes token</option><option value="sticky">sticky follower (monotonic)</option></select></label>
+        </div>
+        <svg id="lag-svg" width="640" height="240" viewBox="0 0 640 240" role="img" aria-label="Interactive chart: applied log position of a leader and three lagging followers over time with a client's write and read"></svg>
+        <div class="readout" aria-live="polite" id="lag-read"></div>
+      </div>
+      <table class="cmp">
+        <tr><th>Anomaly</th><th>What the user sees</th><th>Mitigation</th></tr>
+        <tr><td><b>Read-your-writes</b> violation</td><td>Posts a comment, refreshes, and the comment is gone</td><td>Read own data from the leader for a while after writing, or send the write's log position and have the follower wait until it has applied it</td></tr>
+        <tr><td><b>Monotonic reads</b> violation</td><td>The comment appears, then disappears on the next refresh (a different, laggier follower)</td><td>Pin each user to one replica, for example by hashing the user id</td></tr>
+        <tr><td><b>Consistent prefix</b> violation</td><td>Sees an answer before its question (partitions replicate independently)</td><td>Write causally related data to the same partition, or track causal dependencies</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="failover">
+      <h3><span class="idx">09</span> Failover</h3>
+      <ol class="notes">
+        <li><b>Detect:</b> missed heartbeats for longer than a timeout. Too short gives false failovers under load spikes or GC pauses. Too long means minutes of write downtime.</li>
+        <li><b>Elect:</b> choose the most up-to-date follower, by consensus or by an external coordinator.</li>
+        <li><b>Reconfigure:</b> point clients and the other followers at the new leader, and demote the old one if it returns.</li>
+      </ol>
+      <ul class="notes">
+        <li><b>Lost writes:</b> with asynchronous replication, writes the old leader acknowledged but never shipped are gone. If they are later discarded while other systems (caches, search, ids already handed out) have seen them, you get inconsistencies that are very hard to debug.</li>
+        <li><b>Split brain:</b> the old leader didn't actually die, it was only partitioned, and it keeps accepting writes. Guard against it with <b>epochs / fencing tokens</b> that storage checks, leader leases that expire before a new leader is allowed to start, or forcibly cutting the old node off.</li>
+        <li><b>Practise it.</b> A failover path that never runs will fail when it's needed. Run scheduled failover drills and measure the real RTO (time to recover) and RPO (data lost).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="multi">
+      <h3><span class="idx">10</span> Multi-leader and leaderless replication</h3>
+      <p class="lede">Letting more than one node accept writes gives local write latency in every region and keeps writes working through partitions. The price is <b>write conflicts</b>.</p>
+      <table class="cmp">
+        <tr><th>Conflict handling</th><th>How</th><th>Risk</th></tr>
+        <tr><td><b>Last-write-wins</b></td><td>Keep the value with the highest timestamp</td><td>Silently drops concurrent writes, and clock skew decides which one</td></tr>
+        <tr><td><b>Version vectors + siblings</b></td><td>Detect true concurrency and return every concurrent version for the application to merge</td><td>Merge logic is pushed onto the application</td></tr>
+        <tr><td><b>CRDTs</b></td><td>Data types whose merge is commutative, associative and idempotent</td><td>Only for data that fits a CRDT; metadata overhead</td></tr>
+        <tr><td><b>Avoid conflicts</b></td><td>Route all writes for a given record to its "home" leader</td><td>Re-homing on failure reintroduces conflicts</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Leaderless (Dynamo-style):</b> the client or a coordinator sends each write to all N replicas and waits for W acknowledgements. Reads ask R replicas. With <code>R + W &gt; N</code> the two sets overlap (details and caveats on <a href="cap-theorem.html">CAP Theorem</a>).</li>
+        <li><b>Catching up stale replicas:</b> <i>read repair</i> writes the newest version back to replicas that returned old ones. <i>Anti-entropy</i> compares Merkle trees of key ranges in the background and syncs the ranges that differ. <i>Hinted handoff</i> has a stand-in node hold writes for a down replica and replay them when it returns.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">11</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Range</b> partitioning keeps scans cheap but creates hotspots on monotonic keys. <b>Hash</b> partitioning spreads load but loses ranges. Never use bare <code>mod N</code>, because changing N moves N/(N+1) of the data.</li>
+        <li><b>Consistent hashing with virtual nodes</b> moves about 1/(N+1) of keys per added node, and load imbalance shrinks like 1/√V.</li>
+        <li><b>Hot keys</b> need salting or caching. Local secondary indexes mean scatter-gather reads, and global ones mean asynchronous staleness.</li>
+        <li><b>Leader-follower</b> replication trades durability against latency (sync, semi-sync or async). Lag causes read-your-writes and monotonic-read anomalies, and failover risks lost writes and split brain unless you use fencing.</li>
+        <li><b>Multi-leader and leaderless</b> replication give write availability and pay for it with conflict resolution: prefer CRDTs or conflict avoidance over last-write-wins.</li>
+        <li>Related pages: <a href="cap-theorem.html">CAP Theorem</a>, <a href="transactions-acid.html">Transactions (ACID)</a>, <a href="nosql.html">NoSQL</a>, <a href="scalability.html">Scalability</a>, <a href="load-balancing.html">Load Balancing</a>.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="sharding-replication.viz.js"></script>
+</body>
+</html>

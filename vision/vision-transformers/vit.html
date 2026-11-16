@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · ViT: Scale Beats Inductive Bias</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover,.controls button.on{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../vision-transformers.html">Vision Transformers</a> · the source paper</p>
+      <h1>ViT: Scale Beats Inductive Bias</h1>
+      <p>The paper that applied a standard Transformer encoder, almost unchanged, to a sequence of 16×16 image patches. The hub page covers how patch tokens, the class token and the encoder work. This page reads the paper <i>as a paper</i>. It covers the exact equations, what the paper says about inductive bias, the three model sizes and their training recipe, the results table and its compute column, the data-size experiments that show where ViT starts to win, the scaling study, what the trained model's embeddings and attention look like, and the appendix ablations.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Computer vision</span>
+        <span class="pill">Vision Transformers</span>
+        <span class="pill">Eq. 1–4 · inductive bias · hybrids · 2-D interpolation · B/L/H · JFT-300M · Table 2 · VTAB · data subsets · scaling · attention distance · ablations</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="claim" data-nav="The claim">
+      <h3><span class="idx">01</span> The claim, and what it was arguing against</h3>
+      <p class="lede"><b>In 2020, attention in vision was mostly used together with convolutions, or to replace some parts of a convolutional network while keeping its overall structure.</b> The paper's claim is that this reliance on CNNs is not necessary. A pure Transformer applied directly to a sequence of image patches does very well on image classification. When it is pre-trained on enough data and then transferred to mid-sized or small benchmarks, it matches or beats the best convolutional networks while using substantially less pre-training compute.</p>
+      <ul class="notes">
+        <li><b>The design rule.</b> Follow the original Transformer as closely as possible, so that scalable NLP Transformer architectures and their efficient implementations can be used almost out of the box. The only image-specific steps are cutting the image into patches and, at fine-tuning time, resizing the position embeddings (§03–§04).</li>
+        <li><b>The catch, stated up front.</b> Trained on mid-sized datasets such as ImageNet without strong regularisation, these models land a few points <i>below</i> ResNets of comparable size. The paper attributes this to missing inductive biases (translation equivariance and locality) and argues that large-scale training "trumps inductive bias" (§10).</li>
+        <li><b>The background.</b> Convolutional priors are on <a href="../../deep-learning/convolutional-networks.html">CNNs</a>. The encoder itself is on <a href="../../deep-learning/transformers.html">Transformers</a>, and the paper it copies is on <a href="../../deep-learning/transformers/original-transformer.html">The Original Transformer (2017)</a>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="formulation" data-nav="Equations 1–4">
+      <h3><span class="idx">02</span> The exact formulation (Eq. 1–4)</h3>
+      <p class="lede">The whole model fits in four lines. The hub explains patch counting and the class token, so this section gives only the equations as the paper prints them, plus the two details people usually miss: what the head looks like and how it is swapped.</p>
+
+      <div class="formula"><span class="lbl">as published (Section 3.1)</span><span class="eq">z₀  =  [ x_class ;  x_p¹ E ;  x_p² E ;  … ;  x_pᴺ E ]  +  E_pos        E ∈ ℝ^((P²·C) × D),   E_pos ∈ ℝ^((N+1) × D)      (1)
+
+z′_ℓ  =  MSA( LN(z_ℓ₋₁) )  +  z_ℓ₋₁                                    ℓ = 1 … L                     (2)
+z_ℓ   =  MLP( LN(z′_ℓ) )  +  z′_ℓ                                      ℓ = 1 … L                     (3)
+
+y  =  LN( z_L⁰ )                                                                                     (4)</span>
+<span class="lbl">symbols</span><span class="eq">image x ∈ ℝ^(H × W × C)  →  N = H·W / P²  flattened patches  x_pⁱ ∈ ℝ^(P²·C)
+D        constant latent width of every layer
+z_L⁰     the state of the class-token slot (position 0) after the last layer
+MLP      two layers with a GELU non-linearity;   LN  =  LayerNorm, applied before every block</span></div>
+
+      <ul class="notes">
+        <li><b>Pre-norm, not post-norm.</b> Equations 2–3 put <code>LN</code> <i>inside</i> the residual branch. That is the reverse of the 2017 paper's <code>LayerNorm(x + f(x))</code>. The difference is explained on <a href="../../deep-learning/transformers/residual-norms-ffn.html">Residual Stream, Norms &amp; FFN</a>.</li>
+        <li><b>Learnable 1-D position embeddings.</b> <code>E_pos</code> is a plain table with one learned vector per sequence slot, in raster order. The paper does not use sinusoids or a 2-D scheme by default. §14 shows why this choice barely matters.</li>
+        <li><b>The head changes between stages.</b> During pre-training the classification head on <code>y</code> is an MLP with one hidden layer, which uses a tanh non-linearity according to the appendix. During fine-tuning that head is removed and replaced by a single <b>zero-initialised</b> <code>D × K</code> linear layer, where <code>K</code> is the number of downstream classes.</li>
+        <li><b>Patch embedding.</b> Because <code>E</code> is shared across patches with stride equal to patch size, it is a convolution with kernel <code>P</code> and stride <code>P</code>. The hub covers this in its patchify section (<a href="../vision-transformers.html">Vision Transformers</a>).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="bias" data-nav="Inductive bias &amp; hybrids">
+      <h3><span class="idx">03</span> Inductive bias, and the hybrid architecture</h3>
+      <p class="lede">The paper is precise about how little image structure the model gets for free. It is not "no bias". The bias is confined to two moments, and everything else must be learned.</p>
+
+      <div class="cards">
+        <div class="box warn"><div class="n">in a CNN</div><div class="t">Built into every layer</div><div class="g">Locality, two-dimensional neighbourhood structure and translation equivariance hold in each layer, throughout the whole model.</div></div>
+        <div class="box good"><div class="n">in ViT</div><div class="t">Only the MLP is local</div><div class="g">The per-token MLP layers are local and translation-equivariant. Self-attention is global. Nothing in the attention layers knows which patches are neighbours.</div></div>
+        <div class="box"><div class="n">where 2-D structure enters</div><div class="t">Twice, and sparingly</div><div class="g">(1) When the image is cut into patches. (2) At fine-tuning, when position embeddings are resized for a new resolution (§04). At initialisation the position embeddings carry <i>no</i> 2-D information. All spatial relations are learned from scratch.</div></div>
+      </div>
+
+      <h4>The hybrid: CNN features as the token sequence</h4>
+      <ul class="notes">
+        <li><b>The idea.</b> Instead of raw pixels, form the input sequence from a CNN feature map. The projection <code>E</code> of Eq. 1 is applied to patches of that map. In the special case of 1×1 patches, the sequence is just the feature map with its spatial dimensions flattened, projected to width <code>D</code>.</li>
+        <li><b>What the paper built.</b> A ResNet50 stem ("R50+ViT"), fed into ViT with a patch size of one "pixel". The sequence length is varied in one of two ways. (i) Take the output of stage 4 of a regular ResNet50. (ii) Remove stage 4, put the same number of layers into stage 3, and take the output of this extended stage 3. Option (ii) gives a <b>4× longer sequence</b> and a more expensive ViT.</li>
+        <li><b>The ResNet modifications.</b> In both the baselines and the hybrid stems, Batch Normalisation is replaced with Group Normalisation, and the convolutions are standardised. This is the large-transfer ResNet recipe that the paper also uses as its main baseline.</li>
+        <li><b>How hybrids compare.</b> They are slightly better than pure ViT at small compute budgets, and the gap vanishes for larger models (§11). Their early-layer attention is also less local (§12), because the ResNet has already done the local work.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="resolution" data-nav="Higher-resolution fine-tuning">
+      <h3><span class="idx">04</span> Fine-tuning at higher resolution: 2-D interpolation of position embeddings</h3>
+      <p class="lede"><b>Pre-training is done at 224×224. Fine-tuning is usually done higher, at 384 by default and 512 or 518 for the headline ImageNet numbers.</b> The paper notes that a higher fine-tuning resolution is often beneficial. The patch size stays fixed, so a larger image gives a <i>longer</i> sequence. The Transformer can process any length, but the pre-trained <code>E_pos</code> has one row per old slot, so it no longer fits.</p>
+
+      <div class="formula"><span class="lbl">the grids involved (our arithmetic from the paper's resolutions)</span><span class="eq">pre-train   224 px, P = 16   →  14 × 14  =  196 patches   (+1 class token)
+fine-tune   384 px, P = 16   →  24 × 24  =  576 patches        default for transfer (Table 4)
+            512 px, P = 16   →  32 × 32  =  1024 patches       ViT-L/16 on ImageNet, Table 2
+            518 px, P = 14   →  37 × 37  =  1369 patches       ViT-H/14 on ImageNet, Table 2  (pre-trained grid 16 × 16)</span>
+<span class="lbl">the fix the paper uses</span><span class="eq">reshape the N patch rows of E_pos into a  g × g × D  grid      (the class-token row is set aside)
+2-D interpolate to  g′ × g′ × D  "according to their location in the original image"
+flatten back to  g′² rows  and re-attach the class-token row</span></div>
+      <p>The paper says only "2D interpolation". It does not name the kernel. The figure below uses bilinear interpolation with patch centres aligned, which is one common choice. Keeping the class-token row unchanged is how public implementations handle it. That is general knowledge, not a statement in the paper.</p>
+
+      <div class="viz" id="viz-pos">
+        <div class="vhead">
+          <span class="vtitle">Resizing a 14 × 14 position-embedding grid for fine-tuning</span>
+          <span class="vhint">drag the resolution and pick a target patch · left: the pre-trained grid, coloured by similarity to the chosen interpolated embedding, with its four source neighbours outlined · right: the new grid · embeddings are a synthetic stand-in with smooth row/column structure, not the paper's learned weights</span>
+        </div>
+        <div class="controls">
+          <label>fine-tune resolution <input type="range" id="pos-res" min="224" max="640" step="32" value="384" /><span id="pos-resv" style="min-width:110px;display:inline-block">384</span></label>
+          <label>target row <input type="range" id="pos-r" min="0" max="39" step="1" value="5" /><span id="pos-rv" style="min-width:22px;display:inline-block">5</span></label>
+          <label>target column <input type="range" id="pos-c" min="0" max="39" step="1" value="17" /><span id="pos-cv" style="min-width:22px;display:inline-block">17</span></label>
+        </div>
+        <svg id="pos-svg" width="640" height="320" viewBox="0 0 640 320" role="img" aria-label="Two grids: the pre-trained 14 by 14 position-embedding grid and the interpolated grid at the fine-tuning resolution, coloured by cosine similarity to a chosen target patch, with the four bilinear source neighbours and their weights highlighted"></svg>
+        <div class="readout" aria-live="polite" id="pos-read"></div>
+      </div>
+      <p>This interpolation is the point where the model is given 2-D structure by hand. The other point is patch cutting. Without it, the model would have to learn new position vectors for 380 slots it never saw (our arithmetic: 576 − 196). With it, each new slot starts from a weighted mix of its spatial neighbours.</p>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="variants" data-nav="Base, Large, Huge">
+      <h3><span class="idx">05</span> The model variants (Table 1)</h3>
+      <table class="grid2">
+        <tr><th>model</th><th>layers</th><th>hidden size D</th><th>MLP size</th><th>heads</th><th>params</th></tr>
+        <tr><td><b>ViT-Base</b></td><td class="num">12</td><td class="num">768</td><td class="num">3072</td><td class="num">12</td><td class="num">86M</td></tr>
+        <tr><td><b>ViT-Large</b></td><td class="num">24</td><td class="num">1024</td><td class="num">4096</td><td class="num">16</td><td class="num">307M</td></tr>
+        <tr class="hl"><td><b>ViT-Huge</b></td><td class="num">32</td><td class="num">1280</td><td class="num">5120</td><td class="num">16</td><td class="num">632M</td></tr>
+      </table>
+      <p>Base and Large reuse the configurations of the BERT encoder (<a href="../../models/bert.html">BERT</a>). Huge is new. The MLP is 4·D wide in every size. Per-head width is <code>D / heads</code>: 64 for Base and Large, and 80 for Huge (our arithmetic). Names add the patch size: <b>ViT-L/16</b> is Large with 16×16 patches. Sequence length scales as <code>1 / P²</code>, so smaller patches cost more compute.</p>
+
+      <div class="formula"><span class="lbl">where the parameters are (our arithmetic; 224 px input, biases and LN included, heads excluded)</span><span class="eq">one layer             4·D²  (Q, K, V, O)   +   2·D·4D  (MLP)   ≈  12·D²
+ViT-B/16              12 · 12 · 768²  ≈ 84.9M    + patch embedding 16²·3·768 ≈ 0.59M   + E_pos 197·768 ≈ 0.15M
+                      total ≈ 85.8M                                         reported  86M
+ViT-L/16              24 · 12 · 1024² ≈ 302M     + 0.79M + 0.20M            total ≈ 303M   reported 307M
+ViT-H/14              32 · 12 · 1280² ≈ 629M     + 0.75M + 0.33M            total ≈ 631M   reported 632M</span></div>
+      <p>The paper does not itemise its counts. The Base and Huge totals match to within rounding. The roughly 4M gap for Large is not explained by the encoder alone, and this page does not try to reconcile it. Almost everything is in the encoder layers. The patch embedding and position table together are under 1% of the parameters.</p>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="datasets" data-nav="Datasets &amp; metrics">
+      <h3><span class="idx">06</span> Datasets, de-duplication and the two metrics</h3>
+      <table class="grid2">
+        <tr><th>pre-training set</th><th>classes</th><th>images</th><th>note</th></tr>
+        <tr><td><b>ImageNet</b> (ILSVRC-2012)</td><td class="num">1k</td><td class="num">1.3M</td><td>the usual benchmark, used here as the <i>small</i> pre-training set</td></tr>
+        <tr><td><b>ImageNet-21k</b></td><td class="num">21k</td><td class="num">14M</td><td>the public superset</td></tr>
+        <tr class="hl"><td><b>JFT-300M</b></td><td class="num">18k</td><td class="num">303M</td><td>high-resolution images, not public</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>De-duplication.</b> Each pre-training set is de-duplicated against the <i>test</i> sets of the downstream tasks, following the large-transfer ResNet work it compares against. Without this, a model pre-trained on hundreds of millions of web images could have seen the evaluation images.</li>
+        <li><b>Transfer benchmarks.</b> ImageNet, scored on both the original validation labels and the cleaned-up <b>ReaL</b> labels. Also CIFAR-10 and CIFAR-100, Oxford-IIIT Pets and Oxford Flowers-102. These use the same pre-processing as the ResNet baseline.</li>
+        <li><b>VTAB.</b> 19 tasks with <b>1 000 training examples each</b>, in three groups. <i>Natural</i> covers ordinary photos. <i>Specialized</i> covers medical and satellite imagery. <i>Structured</i> covers tasks that need geometric understanding, such as localisation and counting (§09).</li>
+      </ul>
+
+      <h4>Fine-tuning accuracy vs linear few-shot accuracy</h4>
+      <p>Most results are <b>fine-tuning accuracy</b>, measured after fine-tuning the whole model on each downstream set. Where fine-tuning every checkpoint would be too costly, the paper uses <b>few-shot linear accuracy</b>. The representations are frozen, and a regularised least-squares regression maps the representations of a small training subset to <code>{−1, 1}^K</code> target vectors.</p>
+      <div class="formula"><span class="lbl">the few-shot probe (the closed form is the standard ridge solution, general knowledge)</span><span class="eq">X ∈ ℝ^(n × D)   frozen y-features of n labelled images        Y ∈ {−1, 1}^(n × K)   one-hot targets scaled to ±1
+
+W*  =  argmin_W  ‖ X W − Y ‖²  +  λ ‖ W ‖²   =   ( XᵀX + λ I )⁻¹ Xᵀ Y          predict  argmax_k ( x W* )_k</span></div>
+      <p>The closed form takes seconds to compute, which is what makes the data-subset sweep (§10) and the ablations (§14) affordable. "5-shot ImageNet" means five labelled images per class go into <code>X</code>.</p>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="training" data-nav="The training setup">
+      <h3><span class="idx">07</span> The training setup</h3>
+      <h4>Pre-training (Section 4.1 and Table 3)</h4>
+      <div class="formula"><span class="lbl">common to every pre-training run</span><span class="eq">optimiser     Adam,   β₁ = 0.9,   β₂ = 0.999          (used for the ResNets too)
+batch         4096                 resolution  224
+weight decay  0.1 on JFT-300M      ("high", found useful for transfer of all models)
+schedule      linear warmup over 10k steps, then linear decay  (cosine on ImageNet-only runs)
+ImageNet      additionally clips gradients at global norm 1</span></div>
+
+      <table class="grid2">
+        <tr><th>model</th><th>data</th><th>epochs</th><th>base LR</th><th>weight decay</th><th>dropout</th></tr>
+        <tr><td>ViT-B/{16, 32}</td><td>JFT-300M</td><td class="num">7</td><td class="num">8·10⁻⁴</td><td class="num">0.1</td><td class="num">0.0</td></tr>
+        <tr><td>ViT-L/32</td><td>JFT-300M</td><td class="num">7</td><td class="num">6·10⁻⁴</td><td class="num">0.1</td><td class="num">0.0</td></tr>
+        <tr><td>ViT-L/16</td><td>JFT-300M</td><td class="num">7 / 14</td><td class="num">4·10⁻⁴</td><td class="num">0.1</td><td class="num">0.0</td></tr>
+        <tr class="hl"><td>ViT-H/14</td><td>JFT-300M</td><td class="num">14</td><td class="num">3·10⁻⁴</td><td class="num">0.1</td><td class="num">0.0</td></tr>
+        <tr><td>ViT-B/{16, 32}</td><td>ImageNet-21k</td><td class="num">90</td><td class="num">10⁻³</td><td class="num">0.03</td><td class="num">0.1</td></tr>
+        <tr><td>ViT-L/{16, 32}</td><td>ImageNet-21k</td><td class="num">30 / 90</td><td class="num">10⁻³</td><td class="num">0.03</td><td class="num">0.1</td></tr>
+        <tr><td>ViT-*</td><td>ImageNet</td><td class="num">300</td><td class="num">3·10⁻³</td><td class="num">0.3</td><td class="num">0.1</td></tr>
+      </table>
+      <p>The pattern is that the less data there is, the more epochs and the more regularisation are used. On JFT-300M there is no dropout and seven epochs are enough. On ImageNet there are 300 epochs, weight decay 0.3 and dropout 0.1. The ResNet and hybrid rows of the same table, omitted here, use the same batch, warmup and weight decay on JFT-300M with base LRs between 2·10⁻⁴ and 10⁻³.</p>
+
+      <h4>Why Adam, even for the ResNets (Appendix D.1, Table 7)</h4>
+      <p>The paper departs from the usual SGD-for-ResNets practice and checks that this is fair. ResNets pre-trained on JFT with Adam transfer slightly better on average than with SGD: ResNet50 averages 89.33 with Adam against 88.79 with SGD, and ResNet152x2 averages 94.01 against 93.72 over five transfer sets. SGD wins on individual cells, for example ResNet50 on ImageNet, 78.24 against 77.54.</p>
+
+      <h4>Fine-tuning (Appendix B.1.1 and Table 4)</h4>
+      <div class="formula"><span class="lbl">common to every fine-tuning run</span><span class="eq">optimiser     SGD with momentum 0.9        batch 512        no weight decay
+schedule      cosine decay                 gradient clipping at global norm 1
+resolution    384 unless stated            (512 for ViT-L/16 and 518 for ViT-H/14 in the Table 2 ImageNet column)
+Table 2 only  Polyak averaging with factor 0.9999 on ImageNet</span></div>
+      <table class="grid2">
+        <tr><th>dataset</th><th>steps</th><th>base LR swept over</th></tr>
+        <tr><td>ImageNet</td><td class="num">20 000</td><td class="num">{0.003, 0.01, 0.03, 0.06}</td></tr>
+        <tr><td>CIFAR-10, CIFAR-100</td><td class="num">10 000</td><td class="num">{0.001, 0.003, 0.01, 0.03}</td></tr>
+        <tr><td>Oxford-IIIT Pets, Flowers-102</td><td class="num">500</td><td class="num">{0.001, 0.003, 0.01, 0.03}</td></tr>
+        <tr><td>VTAB, each of 19 tasks</td><td class="num">2 500</td><td class="num">0.01 (fixed)</td></tr>
+      </table>
+      <p>The general pattern of a pre-train-then-fine-tune recipe, including why the head is swapped and why fine-tuning learning rates are small, is on <a href="../../deep-learning/fine-tuning-transfer-learning.html">Fine-Tuning &amp; Transfer Learning</a>.</p>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="results" data-nav="Table 2: main results">
+      <h3><span class="idx">08</span> The main results, and what they cost (Table 2)</h3>
+      <p class="lede"><b>The comparison is with the two strongest published systems.</b> One is a large-transfer ResNet152x4, pre-trained supervised on JFT-300M, which was the best result on most of these transfer sets. The other is a large EfficientNet-L2 trained semi-supervised by self-training on ImageNet plus unlabelled JFT-300M images, which was the best result on ImageNet. Values are the mean ± standard deviation over three fine-tuning runs.</p>
+
+      <table class="grid2">
+        <tr><th>dataset</th><th>ViT-H/14 (JFT)</th><th>ViT-L/16 (JFT)</th><th>ViT-L/16 (I21k)</th><th>ResNet152x4 (JFT, supervised)</th><th>EfficientNet-L2 (semi-supervised)</th></tr>
+        <tr><td><b>ImageNet</b></td><td class="num"><b>88.55</b> ± 0.04</td><td class="num">87.76 ± 0.03</td><td class="num">85.30 ± 0.02</td><td class="num">87.54 ± 0.02</td><td class="num">88.4 / 88.5*</td></tr>
+        <tr><td><b>ImageNet ReaL</b></td><td class="num"><b>90.72</b> ± 0.05</td><td class="num">90.54 ± 0.03</td><td class="num">88.62 ± 0.05</td><td class="num">90.54</td><td class="num">90.55</td></tr>
+        <tr><td><b>CIFAR-10</b></td><td class="num"><b>99.50</b> ± 0.06</td><td class="num">99.42 ± 0.03</td><td class="num">99.15 ± 0.03</td><td class="num">99.37 ± 0.06</td><td class="num">—</td></tr>
+        <tr><td><b>CIFAR-100</b></td><td class="num"><b>94.55</b> ± 0.04</td><td class="num">93.90 ± 0.05</td><td class="num">93.25 ± 0.05</td><td class="num">93.51 ± 0.08</td><td class="num">—</td></tr>
+        <tr><td><b>Oxford-IIIT Pets</b></td><td class="num"><b>97.56</b> ± 0.03</td><td class="num">97.32 ± 0.11</td><td class="num">94.67 ± 0.15</td><td class="num">96.62 ± 0.23</td><td class="num">—</td></tr>
+        <tr><td><b>Oxford Flowers-102</b></td><td class="num">99.68 ± 0.02</td><td class="num"><b>99.74</b> ± 0.00</td><td class="num">99.61 ± 0.02</td><td class="num">99.63 ± 0.03</td><td class="num">—</td></tr>
+        <tr><td><b>VTAB (19 tasks)</b></td><td class="num"><b>77.63</b> ± 0.23</td><td class="num">76.28 ± 0.46</td><td class="num">72.72 ± 0.21</td><td class="num">76.29 ± 1.70</td><td class="num">—</td></tr>
+        <tr class="hl"><td><b>TPUv3-core-days</b></td><td class="num">2.5k</td><td class="num">0.68k</td><td class="num">0.23k</td><td class="num">9.9k</td><td class="num">12.3k</td></tr>
+      </table>
+      <p>* The 88.5 is a slightly improved later figure for the same EfficientNet-L2 model that the paper footnotes. "—" means not reported. Baselines are described by architecture and training regime rather than by name.</p>
+
+      <div class="formula"><span class="lbl">reading the compute column (our arithmetic)</span><span class="eq">ViT-H/14  vs  ResNet152x4        9.9k / 2.5k   ≈ 4.0 × less pre-training compute,  +1.0 on ImageNet
+ViT-H/14  vs  EfficientNet-L2    12.3k / 2.5k  ≈ 4.9 × less,                       +0.15 on ImageNet (vs 88.4)
+ViT-L/16  vs  ResNet152x4        9.9k / 0.68k  ≈ 15 × less,                        ahead or tied everywhere
+ViT-L/16 (I21k)                  8 cores × 30 days = 240 core-days  ≈  the 0.23k in the table</span></div>
+      <ul class="notes">
+        <li><b>The public-data result.</b> The paper says the ImageNet-21k ViT-L/16 "could be trained using a standard cloud TPUv3 with 8 cores in approximately 30 days". It reaches 85.30 on ImageNet and 99.15 on CIFAR-10 without any non-public data.</li>
+        <li><b>"Outperforms on all tasks", read carefully.</b> The paper says ViT-L/16 on JFT beats the ResNet152x4 baseline on all tasks at much lower cost. The table supports that on five rows. ReaL is a tie at 90.54, and VTAB is 76.28 ± 0.46 against 76.29 ± 1.70, which is indistinguishable given the spreads. The clear wins over the baselines belong to ViT-H/14.</li>
+        <li><b>What a core-day measures.</b> It is accelerator time, not a FLOP count of the model. The paper itself cautions that pre-training efficiency also depends on the training schedule, optimiser and weight decay, not only on the architecture. §11 is the controlled version of this comparison.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="vtab" data-nav="VTAB breakdown">
+      <h3><span class="idx">09</span> The VTAB breakdown</h3>
+      <p class="lede">The paper's Figure 2 compares group means against the ResNet152x4 baseline and two ImageNet-based methods. One is a ResNet co-trained on ImageNet and video. The other combines supervised and self-supervised learning on ImageNet. The group values appear only as bars. ViT-H/14 is ahead on <i>Natural</i> and <i>Structured</i> and about level with the baseline on <i>Specialized</i>. The appendix (Table 9) gives per-task numbers for the three ViT models only.</p>
+
+      <table class="grid2">
+        <tr><th>group (tasks)</th><th>ViT-H/14 (JFT)</th><th>ViT-L/16 (JFT)</th><th>ViT-L/16 (I21k)</th></tr>
+        <tr><td><b>Natural</b> (7): Caltech101, CIFAR-100, DTD, Flowers102, Pets, Sun397, SVHN</td><td class="num">86.7</td><td class="num">85.6</td><td class="num">83.3</td></tr>
+        <tr><td><b>Specialized</b> (4): Camelyon, EuroSAT, Resisc45, Retinopathy</td><td class="num">87.0</td><td class="num">86.7</td><td class="num">84.7</td></tr>
+        <tr><td><b>Structured</b> (8): Clevr-Count, Clevr-Dist, DMLab, dSpr-Loc, dSpr-Ori, KITTI-Dist, sNORB-Azim, sNORB-Elev</td><td class="num">65.0</td><td class="num">63.0</td><td class="num">57.5</td></tr>
+        <tr class="hl"><td><b>Mean of 19</b> (reported)</td><td class="num">77.6</td><td class="num">76.3</td><td class="num">72.7</td></tr>
+      </table>
+      <p>The group means are our arithmetic, unweighted means of the Table 9 per-task values, using VTAB's standard grouping. Recomputing the 19-task means from the same rows gives 77.63, 76.29 and 72.71, which matches the reported means.</p>
+      <ul class="notes">
+        <li><b>Where the extra JFT data helps most.</b> Moving from ImageNet-21k to JFT pre-training (ViT-L/16) adds about 2 points on Natural and Specialized but about <b>5.5 on Structured</b> (our arithmetic). The largest single gains are Clevr-Count (70.3 → 86.4) and DMLab (41.9 → 49.7).</li>
+        <li><b>Where it does not.</b> dSpr-Ori goes <i>down</i>, from 64.9 to 60.5, and the JFT ViT-L/16 beats the larger ViT-H/14 on sNORB-Azim (36.2 against 33.2). These are 1 000-example tasks, so single-task differences are noisy.</li>
+        <li><b>The hardest tasks stay hard.</b> sNORB-Azim (33.2) and DMLab (53.1) are the lowest scores even for ViT-H/14.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="data" data-nav="How much data?">
+      <h3><span class="idx">10</span> How much pre-training data does it need?</h3>
+      <p class="lede"><b>Two experiments, one conclusion.</b> The first varies the dataset (ImageNet → ImageNet-21k → JFT-300M) and fine-tunes. The second varies the amount of data within JFT and uses only a linear probe. In both, convolutional inductive bias is worth a lot at small data and is overtaken as data grows.</p>
+
+      <h4>Experiment 1: three datasets, fine-tuned to ImageNet (Figure 3 and Table 5)</h4>
+      <p>To give the small datasets a fair chance, the paper tunes three regularisers there: weight decay, dropout and label smoothing. The values in Table 5 are ImageNet top-1 after fine-tuning at 384, without the Polyak averaging and 512-pixel resolution of Table 2.</p>
+
+      <div class="viz" id="viz-data">
+        <div class="vhead">
+          <span class="vtitle">Table 5, as reported: ImageNet top-1 by pre-training dataset</span>
+          <span class="vhint">pick a model to highlight · hover or focus a point · ViT-H/14 was not trained on ImageNet alone · the ResNet band of the paper's Figure 3 is not plotted because it is only given graphically</span>
+        </div>
+        <div class="controls" id="data-btns"></div>
+        <svg id="data-svg" width="640" height="290" viewBox="0 0 640 290" role="img" aria-label="Line chart of ImageNet top-1 accuracy for five Vision Transformer models when pre-trained on ImageNet, ImageNet-21k and JFT-300M; larger models are worse than smaller ones on ImageNet and better on JFT-300M"></svg>
+        <div class="readout" aria-live="polite" id="data-read"></div>
+      </div>
+      <ul class="notes">
+        <li><b>On ImageNet alone, bigger is worse.</b> ViT-L/16 scores 76.53 against 77.91 for ViT-B/16, even with heavy regularisation.</li>
+        <li><b>On ImageNet-21k they draw level.</b> ViT-L/16 reaches 85.15 and ViT-H/14 85.13.</li>
+        <li><b>Only on JFT-300M does size pay.</b> ViT-H/14 reaches 88.04, ViT-L/16 87.12 and ViT-B/16 84.15. The paper's figure also shows a shaded band for large-transfer ResNets of several sizes. Those ResNets beat ViT when pre-trained on ImageNet, and ViT overtakes them on the larger sets.</li>
+        <li><b>Patch 32 needs even more data.</b> ViT-B/32 drops slightly from 21k to JFT (81.28 → 80.73), while ViT-L/32 gains 3.4 points (our arithmetic).</li>
+      </ul>
+
+      <h4>Experiment 2: random JFT subsets of 9M, 30M, 90M and 300M (Figure 4)</h4>
+      <ul class="notes">
+        <li><b>Designed to remove regularisation as a confound.</b> No extra regularisation is used, the hyperparameters are the same at every size, and the paper uses early stopping, reporting the best validation accuracy reached during training. The paper evaluates with <b>linear few-shot</b> accuracy on ImageNet (§06), so the subsets measure the representation, not the fine-tuning recipe.</li>
+        <li><b>The crossover.</b> ViT-B/32 is slightly faster than ResNet50. It is much worse on the 9M subset and better from 90M images upward. The same holds for ResNet152x2 against ViT-L/16. The paper gives this result only as a plot, so this page does not quote values from it.</li>
+        <li><b>The paper's reading.</b> Convolutional inductive bias is useful for small datasets. For larger ones, learning the relevant patterns directly from data is sufficient, and even beneficial. Its caption summarises it as ResNets doing better on small pre-training sets but plateauing sooner.</li>
+      </ul>
+      <p>Later work showed that the small-data gap is partly a training-recipe problem. With strong augmentation, regularisation and distillation, a ViT trains competitively on ImageNet alone. That work is beyond this paper and is summarised on the hub's DeiT section (<a href="../vision-transformers.html">Vision Transformers</a>) and on <a href="../../deep-learning/knowledge-distillation.html">Knowledge Distillation</a>.</p>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="scaling" data-nav="Scaling study">
+      <h3><span class="idx">11</span> The scaling study: accuracy against pre-training compute (Figure 5, Table 6)</h3>
+      <p class="lede">This is the controlled version of Table 2's compute column. Every model is pre-trained on JFT-300M with the same recipe, so differences are architectural. The sweep has 7 ResNets, 6 ViTs and 5 R50 hybrids, at 7 or 14 epochs, and cost is counted in exaFLOPs, a count of arithmetic rather than hardware time.</p>
+
+      <div class="viz" id="viz-scale">
+        <div class="vhead">
+          <span class="vtitle">Table 6, as reported: transfer accuracy vs pre-training exaFLOPs</span>
+          <span class="vhint">pick a transfer set · x is logarithmic · hover or focus a point for the model · "average-5" is our arithmetic</span>
+        </div>
+        <div class="controls" id="scale-btns"></div>
+        <svg id="scale-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Scatter plot of transfer accuracy against pre-training compute on a log scale for Vision Transformers, ResNets and hybrids pre-trained on JFT-300M"></svg>
+        <div class="readout" aria-live="polite" id="scale-read"></div>
+      </div>
+
+      <div class="cards">
+        <div class="box good"><div class="n">observation 1</div><div class="t">ViT dominates on performance per compute</div><div class="g">The paper's estimate is that ViT uses roughly 2–4× less compute for the same performance, averaged over 5 datasets. Checked against Table 6 (our arithmetic): the 563-exaFLOP ResNet152x2 averages 94.01, and the 224-exaFLOP ViT-B/16 averages 94.08 (2.5×). The 3306-exaFLOP ResNet200x3 averages 95.09, and the 783-exaFLOP ViT-L/16 averages 95.12 (4.2×).</div></div>
+        <div class="box warn"><div class="n">observation 2</div><div class="t">Hybrids help only when small</div><div class="g">At small budgets the R50 hybrids slightly beat pure ViT. R50+ViT-B/32 averages 94.27 at 106 exaFLOPs against 92.50 for ViT-B/32 at 55 (our arithmetic). The difference vanishes for larger models: R50+ViT-L/16 at 14 epochs and ViT-L/16 at 14 epochs both reach 87.12 on ImageNet.</div></div>
+        <div class="box"><div class="n">observation 3</div><div class="t">No saturation in range</div><div class="g">ViT does not appear to saturate within the range tried. ViT-H/14 at 4262 exaFLOPs is the best model in every column except Pets, where the 14-epoch R50+ViT-L/16 hybrid is higher (97.36 against 97.11). The paper takes this as motivation for further scaling.</div></div>
+      </div>
+      <p>The 2–4× is an average, and individual columns vary (our arithmetic). On ImageNet alone, the best ResNet (ResNet200x3, 87.22 at 3306 exaFLOPs) is beaten only by ViT-H/14 at 4262, although ViT-L/16 at 14 epochs comes within 0.1 points at 1567. On Flowers, by contrast, even the 55-exaFLOP ViT-B/32 is ahead.</p>
+      <p>The ImageNet values in Table 6 are fine-tuned at 384 without Polyak averaging, so the ViT-H/14 value (88.08) differs from Table 2 (88.55). The exaFLOP column is from the revised version of the paper, which corrected that computation.</p>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="inspect" data-nav="Inspecting the model">
+      <h3><span class="idx">12</span> Inspecting the trained model</h3>
+      <p class="lede">These are three probes of what ViT learns in place of the priors it lacks, plus one way to read its attention. They are qualitative figures, illustrated on chosen models and images.</p>
+      <div class="cards">
+        <div class="box"><div class="n">patch embedding E (ViT-L/32)</div><div class="t">Filters look like a CNN's first layer</div><div class="g">The top principal components of the learned embedding filters look like plausible basis functions for a low-dimensional representation of the fine structure within each patch. Our reading of the figure is that they resemble the oriented edges and colour blobs of early CNN filters.</div></div>
+        <div class="box"><div class="n">position embeddings (ViT-L/32)</div><div class="t">2-D topology is learned</div><div class="g">Cosine similarity between position embeddings shows that closer patches have more similar embeddings. Row and column structure appears, so patches in the same row or column are similar. For larger grids a sinusoidal pattern sometimes shows. This is why hand-built 2-D schemes add nothing (§14).</div></div>
+        <div class="box"><div class="n">mean attention distance</div><div class="t">Local and global heads from layer 1</div><div class="g">This is the average image-space distance across which a head integrates information, weighted by attention, over 128 example images. It is analogous to receptive-field size in a CNN. In lower layers it varies widely across heads: some already attend over most of the image, others stay near the query. Distance grows with depth, and in the second half of the network most heads attend widely.</div></div>
+      </div>
+
+      <div class="formula"><span class="lbl">mean attention distance of one head (the paper's definition, written out)</span><span class="eq">d̄(head)  =  mean over images and query positions q  of   ∑ₖ  A[q, k] · ‖ pos(q) − pos(k) ‖       (in pixels)</span>
+<span class="lbl">attention rollout (Appendix D.8)</span><span class="eq">Āℓ  =  attention matrix of layer ℓ, averaged over all heads   (ViT-L/16)
+R   =  Ā_L · Ā_(L−1) · … · Ā₁              row of the class token in R  →  a map over input patches</span></div>
+      <ul class="notes">
+        <li><b>Local heads in the hybrid.</b> The highly local attention seen in early ViT layers is less pronounced in hybrids, because a ResNet stem already did the local mixing. The paper suggests these local heads may serve a similar function to early convolutional layers.</li>
+        <li><b>Attention rollout.</b> Multiplying the head-averaged attention matrices of all layers accounts for attention mixing across tokens through the whole network. The paper's Figure 6 uses it to show, on representative images, that the class token attends to regions that are semantically relevant for classification. The rollout method as originally proposed also mixes in the identity to account for residual connections. The paper's appendix does not spell this out (general knowledge).</li>
+        <li><b>Caution.</b> Attention maps are a weak guide to what a model relies on. The caveats are on <a href="../../deep-learning/attention/cost-limits.html">Attention Cost &amp; Limits</a> (beyond this paper).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="selfsup" data-nav="Masked-patch prediction">
+      <h3><span class="idx">13</span> A preliminary self-supervised result: masked patch prediction</h3>
+      <p class="lede">The paper's last experiment borrows masked-token prediction from BERT. With this pre-training, ViT-B/16 reaches <b>79.9%</b> on ImageNet. That is <b>2 points better</b> than training from scratch, but still <b>4 points behind</b> supervised pre-training. The paper calls it preliminary and leaves contrastive pre-training to future work.</p>
+      <div class="formula"><span class="lbl">the recipe (Appendix B.1.2)</span><span class="eq">corrupt 50 % of patch embeddings:    80 %  →  a learnable [mask] embedding
+                                     10 %  →  a random other patch embedding
+                                     10 %  →  left unchanged
+target   the 3-bit mean colour of each corrupted patch   (3 bits × 3 channels → 512 colours, a 512-way classification)
+train    1M steps (≈ 14 epochs) on JFT, batch 4096, Adam, base LR 2·10⁻⁴, warmup 10k steps, cosine decay</span></div>
+      <ul class="notes">
+        <li><b>Alternatives the paper tried.</b> It also tried predicting a 4×4 downsized patch, or regressing the full patch with an L2 loss. The mean-colour target gave the best few-shot performance. A 15% corruption rate, as in BERT, did slightly worse than 50%.</li>
+        <li><b>What came after (beyond this paper).</b> Masked autoencoders later made this idea work at scale. They mask about 75% of patches, run the encoder on the visible ones only, and reconstruct pixels. The hub summarises this in its section on follow-ups (<a href="../vision-transformers.html">Vision Transformers</a>). The language-side origin of the idea is on <a href="../../models/bert.html">BERT</a>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ablations" data-nav="Appendix ablations">
+      <h3><span class="idx">14</span> The appendix ablations</h3>
+
+      <h4>Class token vs global average pooling (Appendix D.3)</h4>
+      <p>The paper keeps the extra class token so the model stays as close as possible to the original Transformer. The alternative is to average-pool the patch outputs and feed the result to a linear classifier. At first this pooling approach "performed very poorly". The paper then found the difference is <b>fully explained by the learning rate</b>: each head needs its own, and when both are tuned they work about equally well. The comparison is shown only as a plot (Figure 9), so no accuracies are quoted here.</p>
+
+      <h4>Positional embeddings (Appendix D.4, Table 8)</h4>
+      <p>ViT-B/16 is evaluated with 5-shot linear accuracy on ImageNet. The four encodings tested are as follows. None means a "bag of patches". 1-D is the default, learned and in raster order. 2-D uses separate learned X and Y tables of width D/2 each, concatenated. Relative uses learned embeddings of the relative distance between patches, added as a bias to the attention logits. The embeddings are added at the input ("stem"), at every layer, or at every layer with one shared table.</p>
+      <table class="grid2">
+        <tr><th>position embedding</th><th>at the input (default)</th><th>every layer</th><th>every layer, shared</th></tr>
+        <tr><td>none</td><td class="num">0.61382</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+        <tr class="hl"><td><b>1-D learned</b> (default)</td><td class="num">0.64206</td><td class="num">0.63964</td><td class="num">0.64292</td></tr>
+        <tr><td>2-D learned</td><td class="num">0.64001</td><td class="num">0.64046</td><td class="num">0.64022</td></tr>
+        <tr><td>relative</td><td class="num">0.64032</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Having positions matters.</b> Removing them costs about 2.8 points of 5-shot accuracy (our arithmetic: 0.64206 − 0.61382).</li>
+        <li><b>How they are encoded barely matters.</b> All seven settings that include positions fall within 0.33 points of each other (our arithmetic). The paper's explanation is that the encoder works on patches, not pixels. Learning spatial relations on a 14×14 grid is much easier than on a 224×224 one, so any scheme captures them. §12 shows the 1-D table learns 2-D topology anyway.</li>
+      </ul>
+
+      <h4>Two smaller appendix results</h4>
+      <ul class="notes">
+        <li><b>Real-world cost (Appendix D.5).</b> Measured inference speed on TPUv3 is comparable to similar ResNets. The theoretical quadratic cost in sequence length, which is quartic in image side, only barely starts to show for the largest models at the largest resolutions. Large ViTs also fit larger per-core batches than ResNets, so they are more memory-efficient.</li>
+        <li><b>Axial attention (Appendix D.6).</b> Variants that attend along rows and then columns beat their ViT-B counterparts in accuracy at higher compute cost. A naive implementation was too slow on TPUs to use at scale. Window and axis restrictions of this kind are covered on <a href="../../deep-learning/attention/cost-limits.html">Attention Cost &amp; Limits</a>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">15</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"ViT has no image prior at all."</span> <span class="fix">It has two, used sparingly.</span> The patch cut and the 2-D interpolation of position embeddings at fine-tuning. The per-token MLP is also local and translation-equivariant (§03).</div>
+      <div class="wrong"><span class="say">"ViT beats CNNs."</span> <span class="fix">Only with enough pre-training data.</span> On ImageNet alone, large-transfer ResNets win, and ViT-L/16 is worse than ViT-B/16 (76.53 against 77.91). On the 9M JFT subset ViT-B/32 is much worse than ResNet50 (§10).</div>
+      <div class="wrong"><span class="say">"1-D position embeddings throw away the 2-D layout."</span> <span class="fix">The model learns it.</span> The learned table shows distance and row/column structure, and 2-D or relative schemes score within about 0.2 points of it (§12, §14).</div>
+      <div class="wrong"><span class="say">"ViT-L/16 beat the ResNet baseline on every benchmark."</span> <span class="fix">It tied on two.</span> ReaL 90.54 against 90.54, and VTAB 76.28 against 76.29 with overlapping spreads. ViT-H/14 is the model that wins across the board.</div>
+      <div class="wrong"><span class="say">"The compute savings are the TPU-days column."</span> <span class="fix">That column mixes recipes.</span> The controlled comparison is the scaling study's exaFLOPs, where the gap is 2–4× (§11).</div>
+      <div class="wrong"><span class="say">"The paper introduced masked image pre-training as used today."</span> <span class="fix">It tried a small version.</span> It predicted 3-bit mean colours of 50% corrupted patches and stayed 4 points behind supervised pre-training. Masked autoencoders came later (§13).</div>
+    </section>
+
+    <!-- ═══ 16 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">16</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Four equations:</b> embed patches plus a class token plus learned 1-D positions, then L pre-norm blocks of MSA and GELU MLP, and read out <code>y = LN(z_L⁰)</code>. The head is a tanh MLP for pre-training and a zero-initialised linear layer for fine-tuning.</li>
+        <li><b>Sizes:</b> Base 12 / 768 / 3072 / 12 heads / 86M, Large 24 / 1024 / 4096 / 16 / 307M, Huge 32 / 1280 / 5120 / 16 / 632M.</li>
+        <li><b>Recipe:</b> pre-train at 224 with Adam (0.9, 0.999), batch 4096, weight decay 0.1 and 10k-step warmup. Fine-tune with SGD momentum 0.9, batch 512 and no weight decay, at 384 or higher, with 2-D-interpolated position embeddings.</li>
+        <li><b>Results:</b> ViT-H/14 on JFT-300M reaches 88.55 on ImageNet, 94.55 on CIFAR-100 and 77.63 on VTAB, at about 4× less TPU time than the large-transfer ResNet152x4.</li>
+        <li><b>Data:</b> CNN priors win at 1.3M or 9M images. ViT overtakes from roughly 90M images up and keeps improving with size.</li>
+        <li><b>Compute:</b> 2–4× less pre-training compute than ResNets for equal transfer accuracy. Hybrids help only at small budgets. There is no saturation in the range tried.</li>
+        <li><b>Learned priors:</b> the position table learns 2-D topology, some heads are local from layer 1, and attention distance grows with depth.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Vision Transformers series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../vision-transformers.html">← Vision Transformers</a>
+      <a href="../vision-transformers.html" style="color:var(--muted)">Vision Transformers · overview</a>
+      <a href="../image-classification.html">Image Classification →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="vit.viz.js"></script>
+</body>
+</html>

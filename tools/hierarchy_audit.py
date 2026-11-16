@@ -31,6 +31,7 @@ DOMAIN_FOLDERS = {
     "mlops": "MLOps & Deployment",
     "speech": "Speech & Audio",
     "vision": "Computer Vision",
+    "data-viz": "Data Viz & Communication",
 }
 
 # ---------------------------------------------------------------- parse data.js

@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · XGBoost: Scalable Tree Boosting</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 td.yes{color:var(--good);text-align:center}
+  table.grid2 td.no{color:var(--bad);text-align:center}
+  table.grid2 td.part{color:var(--accent-2);text-align:center}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../decision-trees.html">Decision Trees &amp; Ensembles</a> · deep dive</p>
+      <h1>XGBoost: Scalable Tree Boosting</h1>
+      <p>The hub page describes gradient boosting as fitting each new tree to the residuals of the current model. XGBoost keeps that additive model but changes two things. Each tree is fitted to a <b>second-order</b> expansion of a <b>regularised</b> objective, which gives closed-form leaf weights and a split gain that works for any twice-differentiable loss. And the engineering around split finding (weighted quantile candidates, learned directions for missing values, pre-sorted column blocks, cache-aware access, compressed and sharded out-of-core storage) lets the same algorithm run on billions of rows. This page derives the objective, works one split by hand, and then covers each piece of the system and the results reported for it.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Machine Learning</span>
+        <span class="pill">Ensembles · Boosting</span>
+        <span class="pill">Ω = γT + ½λ‖w‖² · gᵢ, hᵢ · w* = −G/(H+λ) · split gain · weighted quantile sketch · default directions · column blocks · out-of-core</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="problem" data-nav="What it attacks">
+      <h3><span class="idx">01</span> The problem: accuracy <i>and</i> scale at once</h3>
+      <p class="lede"><b>By 2015 gradient-boosted trees were already among the most accurate tabular learners. The common implementations were either exact but single-machine and slow, or fast but limited to approximate splits.</b> The 2016 study set out to build a single system that keeps exact-greedy quality where data fits in memory, degrades gracefully to approximate splits where it does not, and also runs out-of-core and distributed.</p>
+
+      <ul class="notes">
+        <li><b>Accuracy.</b> A regularised objective (§02) and a second-order fitting step (§03) give principled leaf values and a split criterion for any twice-differentiable loss, covering regression, classification and ranking.</li>
+        <li><b>Real data is sparse and dirty.</b> Missing values, frequent zeros and one-hot columns are the norm. Rather than requiring imputation, the system learns where missing values should go (§09).</li>
+        <li><b>Scale.</b> Split finding is the hot loop of tree learning. The study's main systems contribution is to sort each column once, keep the result in blocks, read gradient statistics cache-efficiently, and stream compressed blocks from several disks (§10).</li>
+      </ul>
+
+      <div class="callout"><b>Adoption at the time.</b> The study reports that of 29 challenge-winning solutions published on a machine-learning-competition blog during 2015, <b>17 used XGBoost</b> (8 of them used it alone; most of the others combined it with neural nets in ensembles), compared with 11 that used deep neural nets. In KDDCup 2015 every one of the top-10 teams used it.</div>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="objective" data-nav="Regularised objective">
+      <h3><span class="idx">02</span> The model and the regularised objective</h3>
+      <p class="lede">The ensemble is a sum of <code>K</code> regression trees. What is new compared with classic gradient boosting is a <b>complexity penalty on each tree</b>, charged both on its number of leaves and on the size of its leaf weights.</p>
+
+      <div class="formula"><span class="lbl">tree ensemble</span><span class="eq">ŷᵢ  =  φ(xᵢ)  =  Σₖ fₖ(xᵢ),        fₖ ∈ F
+
+F  =  { f(x) = w_q(x) }      q : ℝᵐ → {1, …, T}   the tree STRUCTURE (which leaf x falls in)
+                             w ∈ ℝᵀ                the LEAF WEIGHTS (one score per leaf)</span>
+<span class="lbl">regularised objective</span><span class="eq">L(φ)  =  Σᵢ l(ŷᵢ, yᵢ)  +  Σₖ Ω(fₖ)
+
+Ω(f)  =  γ·T  +  ½·λ·‖w‖²       T = number of leaves,  ‖w‖² = Σⱼ wⱼ²</span></div>
+
+      <ul class="notes">
+        <li><b><code>l</code></b> is any differentiable convex loss: squared error, logistic, a ranking loss. Nothing below depends on which one, as long as its first and second derivatives exist.</li>
+        <li><b><code>γ</code> prices a leaf.</b> Adding a leaf must buy at least <code>γ</code> of loss reduction (§05).</li>
+        <li><b><code>λ</code> is an L2 penalty on leaf scores.</b> It is the same idea as ridge regression on the <a href="../regularization.html#weight-decay">regularisation</a> page, applied to the outputs of the leaves instead of to coefficients. It smooths the final learned weights.</li>
+        <li><b>Set Ω = 0 and you recover traditional gradient tree boosting.</b> So the regularisation is an addition to the model, not a different model.</li>
+      </ul>
+      <p>Each <code>f</code> is a CART-style regression tree with a real-valued score in every leaf, even for classification, where the scores are summed in log-odds space. The structural vocabulary (nodes, leaves, thresholds) is the one on the <a href="../decision-trees.html#building">hub</a>.</p>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="second-order" data-nav="Second-order step">
+      <h3><span class="idx">03</span> Additive training with a second-order step: the Newton view</h3>
+      <p class="lede">The objective cannot be optimised over all trees at once, so it is optimised greedily, one tree per round. The study expands the loss <b>to second order</b> around the current prediction. That turns "fit tree <code>t</code>" into minimising a sum of per-example quadratics.</p>
+
+      <div class="formula"><span class="lbl">round <span class="keep">t</span>: add the tree that most improves the objective</span><span class="eq">L⁽ᵗ⁾  =  Σᵢ l( yᵢ, ŷᵢ⁽ᵗ⁻¹⁾ + fₜ(xᵢ) )  +  Ω(fₜ)</span>
+<span class="lbl">second-order Taylor expansion around <span class="keep">ŷ⁽ᵗ⁻¹⁾</span> (constant terms dropped)</span><span class="eq">L̃⁽ᵗ⁾  =  Σᵢ [ gᵢ·fₜ(xᵢ)  +  ½·hᵢ·fₜ²(xᵢ) ]  +  Ω(fₜ)
+
+gᵢ  =  ∂l(yᵢ, ŷ⁽ᵗ⁻¹⁾) / ∂ŷ⁽ᵗ⁻¹⁾          first derivative  (gradient)
+hᵢ  =  ∂²l(yᵢ, ŷ⁽ᵗ⁻¹⁾) / ∂(ŷ⁽ᵗ⁻¹⁾)²       second derivative (hessian)</span></div>
+
+      <p>Two consequences. First, a single implementation handles every loss: the tree learner only ever sees the pairs <code>(gᵢ, hᵢ)</code>, and a new loss needs just these two derivatives. Second, the step is a <b>Newton step</b>, not a gradient step. In one dimension, minimising <code>g·w + ½·h·w²</code> gives <code>w = −g/h</code>, which is gradient divided by curvature. The first-order and second-order methods are compared on the <a href="../../math/optimization.html#beyond">optimisation page</a>.</p>
+
+      <h4>How this differs from the hub's residual fitting</h4>
+      <div class="formula"><span class="lbl">first-order gradient boosting (hub §boosting)</span><span class="eq">fit fₜ by least squares to the pseudo-residuals  rᵢ = −gᵢ
+leaf value  =  mean of rᵢ in the leaf                     (curvature ignored)</span>
+<span class="lbl">second-order, regularised (this page)</span><span class="eq">choose the structure q and the weights w that minimise  Σᵢ[gᵢf + ½hᵢf²] + γT + ½λ‖w‖²
+leaf value  =  −Σgᵢ / (Σhᵢ + λ)                            (curvature + shrinkage)</span></div>
+      <p>The curvature <code>hᵢ</code> appears in the leaf values and also in the split criterion (§04). So the tree's <i>shape</i> is chosen for the Newton objective, not for a least-squares fit to gradients.</p>
+
+      <h4>Two losses worked out</h4>
+      <div class="formula"><span class="lbl">squared loss  <span class="keep">l = ½(y − ŷ)²</span>   (derivation on this page)</span><span class="eq">gᵢ = ŷᵢ − yᵢ  =  −rᵢ          hᵢ = 1
+
+wⱼ*  =  Σ_{i∈Iⱼ} rᵢ / (nⱼ + λ)  =  [ nⱼ / (nⱼ + λ) ] · r̄ⱼ
+
+→ the mean residual of the leaf, shrunk toward 0 by the factor nⱼ/(nⱼ + λ).
+  With λ = 0 this is exactly the hub's residual-fitting leaf; small leaves are shrunk most.</span>
+<span class="lbl">logistic loss on log-odds <span class="keep">ŷ, p = σ(ŷ)</span>   (standard result)</span><span class="eq">l  =  −[ y·ln p + (1 − y)·ln(1 − p) ]
+
+gᵢ  =  pᵢ − yᵢ               hᵢ  =  pᵢ(1 − pᵢ)  ∈ (0, ¼]
+
+wⱼ*  =  Σ (yᵢ − pᵢ) / ( Σ pᵢ(1 − pᵢ) + λ )      — a damped Newton step in log-odds</span></div>
+      <p>The logistic case shows why <code>hᵢ</code> matters. A point the model already classifies confidently (<code>p</code> near 0 or 1) has <code>hᵢ ≈ 0</code> and contributes almost nothing to <code>H</code>. Uncertain points with <code>p ≈ ½</code> dominate it. The gradient <code>p − y</code> is the same one that drives <a href="../logistic-regression.html">logistic regression</a>. This uneven weighting is what the quantile sketch of §08 is built around.</p>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="gain" data-nav="Leaf weights &amp; split gain">
+      <h3><span class="idx">04</span> Optimal leaf weights, the structure score, and the split gain</h3>
+      <p class="lede">Group the sum by leaf. For a fixed structure the objective separates into <code>T</code> independent one-variable quadratics, each with a closed-form minimum. Substituting the minima back in gives a <b>score for the structure itself</b>, and the difference in scores before and after a split is the gain.</p>
+
+      <div class="formula"><span class="lbl">group by leaf: <span class="keep">Iⱼ = { i : q(xᵢ) = j },  Gⱼ = Σ_{i∈Iⱼ} gᵢ,  Hⱼ = Σ_{i∈Iⱼ} hᵢ</span></span><span class="eq">L̃⁽ᵗ⁾  =  Σⱼ [ Gⱼ·wⱼ  +  ½·(Hⱼ + λ)·wⱼ² ]  +  γT</span>
+<span class="lbl">set <span class="keep">∂/∂wⱼ = 0</span></span><span class="eq">Gⱼ + (Hⱼ + λ)·wⱼ = 0      ⇒      wⱼ*  =  − Gⱼ / (Hⱼ + λ)</span>
+<span class="lbl">structure score: plug w* back in (lower is better)</span><span class="eq">L̃⁽ᵗ⁾(q)  =  − ½ · Σⱼ  Gⱼ² / (Hⱼ + λ)   +   γT</span>
+<span class="lbl">gain of splitting one leaf into L and R  (G = G_L + G_R,  H = H_L + H_R)</span><span class="eq">L_split  =  ½ · [ G_L²/(H_L + λ)  +  G_R²/(H_R + λ)  −  G²/(H + λ) ]  −  γ</span></div>
+
+      <p>The structure score plays the role that <a href="../decision-trees.html#splitting">Gini or variance</a> plays for a single tree, but it is derived from the loss being optimised, so it works for any <code>l</code>. With squared loss and <code>λ = γ = 0</code> it reduces to the familiar criterion. Then <code>Gⱼ²/Hⱼ = nⱼ·r̄ⱼ²</code>, and the bracket equals the drop in residual sum of squares, i.e. <code>n×</code> the hub's variance reduction. (This reduction is our own derivation, not one stated in the study.) The <code>−γ</code> is subtracted once because a split adds exactly one leaf.</p>
+
+      <h4>A split worked by hand</h4>
+      <p>Six points, squared loss <code>½(y − ŷ)²</code>, first round from <code>ŷ⁽⁰⁾ = 0</code>, <code>λ = 1</code>, <code>γ = 1</code>. (All arithmetic below is our own.)</p>
+      <table class="grid2">
+        <tr><th>x</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th></tr>
+        <tr><td>y</td><td class="num">−2</td><td class="num">−1</td><td class="num">−1.5</td><td class="num">3</td><td class="num">2</td><td class="num">4</td></tr>
+        <tr><td>gᵢ = ŷ − y</td><td class="num">2</td><td class="num">1</td><td class="num">1.5</td><td class="num">−3</td><td class="num">−2</td><td class="num">−4</td></tr>
+        <tr><td>hᵢ</td><td class="num">1</td><td class="num">1</td><td class="num">1</td><td class="num">1</td><td class="num">1</td><td class="num">1</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">root: G = −4.5, H = 6</span><span class="eq">G²/(H + λ)  =  20.25 / 7  =  2.893        w*_root = 4.5/7 = 0.643       (mean y = 0.75, shrunk by 6/7)</span>
+<span class="lbl">candidate split <span class="keep">x &lt; 3.5</span>: left {1,2,3}, right {4,5,6}</span><span class="eq">G_L = 4.5,  H_L = 3     →   G_L²/(H_L + λ) = 20.25 / 4 =  5.063      w_L* = −4.5/4 = −1.125
+G_R = −9,   H_R = 3     →   G_R²/(H_R + λ) = 81 / 4    = 20.250      w_R* =  9/4   =  2.250
+
+L_split  =  ½ · (5.063 + 20.250 − 2.893)  −  1   =  11.210 − 1   =  10.210   &gt; 0  → split</span></div>
+      <table class="grid2">
+        <tr><th>threshold</th><th>G_L, H_L</th><th>G_R, H_R</th><th>bracket ½[…]</th><th>gain (γ = 1)</th><th>w_L*, w_R*</th></tr>
+        <tr><td>x &lt; 1.5</td><td class="num">2, 1</td><td class="num">−6.5, 5</td><td class="num">3.074</td><td class="num">2.074</td><td class="num">−1.000, 1.083</td></tr>
+        <tr><td>x &lt; 2.5</td><td class="num">3, 2</td><td class="num">−7.5, 4</td><td class="num">5.679</td><td class="num">4.679</td><td class="num">−1.000, 1.500</td></tr>
+        <tr class="hl"><td><b>x &lt; 3.5</b></td><td class="num">4.5, 3</td><td class="num">−9, 3</td><td class="num">11.210</td><td class="num">10.210</td><td class="num">−1.125, 2.250</td></tr>
+        <tr><td>x &lt; 4.5</td><td class="num">1.5, 4</td><td class="num">−6, 2</td><td class="num">4.779</td><td class="num">3.779</td><td class="num">−0.300, 2.000</td></tr>
+        <tr><td>x &lt; 5.5</td><td class="num">−0.5, 5</td><td class="num">−4, 1</td><td class="num">2.574</td><td class="num">1.574</td><td class="num">0.083, 2.000</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Shrinkage you can see.</b> The left leaf's mean target is −1.5 and its weight is −1.125 = (3/4)·(−1.5). The right leaf's mean is 3 and its weight is 2.25 = (3/4)·3. With <code>λ = 1</code> a 3-point leaf keeps <code>3/(3+1)</code> of its mean.</li>
+        <li><b>Structure-score check.</b> Root alone: <code>−½·2.893 + 1·γ = −0.446</code>. After the split: <code>−½·(5.063 + 20.25) + 2·γ = −10.656</code>. The difference is 10.210, the gain.</li>
+        <li><b>The edges are weakest.</b> <code>x &lt; 5.5</code> isolates a single point, and its bracket is small because <code>H_R + λ = 2</code> puts that lone leaf under heavy shrinkage. Raise <code>γ</code> above 3.074 and the first threshold no longer qualifies; above 11.21, nothing does.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="explorer" data-nav="γ prunes, λ shrinks (interactive)">
+      <h3><span class="idx">05</span> <code>γ</code> prunes, <code>λ</code> shrinks: the split-gain explorer</h3>
+      <p class="lede"><b>The two penalties are often confused, but they act on different things.</b> <code>γ</code> is a fixed toll per leaf, subtracted from every gain, so a split happens only if its bracket exceeds <code>γ</code>. This is pruning built into the criterion. <code>λ</code> sits inside every denominator. It shrinks each leaf weight toward zero, and it lowers the bracket most for splits that create leaves with small <code>H</code>.</p>
+
+      <p>The figure fits one depth-1 tree (a stump) per round to 26 points in one dimension. Each round it recomputes <code>gᵢ</code> and <code>hᵢ</code> from the current prediction, evaluates the bracket of §04 at every threshold, and applies the best split, scaled by <code>η</code> (§06). Under squared loss every <code>hᵢ = 1</code>. Switch to logistic loss and every <code>hᵢ</code> starts at ¼, because the model begins at <code>p = ½</code>. Set <code>γ = 0</code> and <code>η = 1</code>, then boost about ten rounds. The hessian bars become uneven: in this toy they fall to under 0.1 for the points the model now predicts most confidently, so those points count for less in every <code>H</code>. With the default <code>γ = 1</code>, the logistic run stops splitting after a few rounds, because no remaining gain clears the toll.</p>
+
+      <div class="viz" id="viz-sg">
+        <div class="vhead">
+          <span class="vtitle">Split gain from gᵢ and hᵢ, threshold by threshold</span>
+          <span class="vhint">raise γ above the curve's peak and the round becomes a single leaf; raise λ and both leaf weights shrink and small edge splits lose most of their gain</span>
+        </div>
+        <div class="controls">
+          <label>loss <select id="sg-loss">
+            <option value="sq" selected>squared  ½(y − ŷ)²</option>
+            <option value="lg">logistic (labels 0/1)</option>
+          </select></label>
+          <label>λ <input type="range" id="sg-lam" min="0" max="20" step="0.5" value="1" /><span id="sg-lamv" style="min-width:30px;display:inline-block">1.0</span></label>
+          <label>γ <input type="range" id="sg-gam" min="0" max="30" step="0.5" value="1" /><span id="sg-gamv" style="min-width:30px;display:inline-block">1.0</span></label>
+          <label>η <input type="range" id="sg-eta" min="0.05" max="1" step="0.05" value="0.3" /><span id="sg-etav" style="min-width:34px;display:inline-block">0.30</span></label>
+          <button id="sg-boost" type="button">boost one round</button>
+          <button id="sg-best" type="button">snap to best split</button>
+          <button id="sg-reset" type="button">reset to ŷ = 0</button>
+        </div>
+        <svg id="sg-svg" width="760" height="476" viewBox="0 0 760 476" role="img" aria-label="Three stacked panels sharing one horizontal axis, the feature x from 0 to 10. Top: 26 data points, with the current prediction drawn as a teal step function and, dashed in amber, the prediction after adding the selected split's leaf weights scaled by the learning rate. Under squared loss the points are real-valued targets in three plateaus, low, high, then middle. Under logistic loss they are 0 or 1 labels and the curve is the predicted probability. A dashed vertical line marks the selected threshold, and points are coloured violet left of it and blue right of it. Middle: each point's gradient g as a stem above or below a zero line, and its hessian h as a short bar. Under squared loss every h bar has the same height. Under logistic loss the bars shrink for points the model already predicts confidently. Bottom: the split-gain bracket at every possible threshold, as dots joined by a line, with a dashed red horizontal line at gamma. Dots above the gamma line are green and are allowed splits. A small teal triangle marks the best threshold. Raising gamma above the highest dot means no split is taken. Raising lambda flattens the curve, most at thresholds near the edges that isolate few points. The readout gives the selected threshold's G and H sums, both optimal leaf weights, the gain after subtracting gamma, whether this round splits, the round number and the training loss."></svg>
+        <div class="readout" aria-live="polite" id="sg-readout"></div>
+      </div>
+
+      <div class="cards">
+        <div class="box good"><div class="n">γ — per-leaf toll</div><div class="t">Decides <i>whether</i> to split</div><div class="g">Subtracted once per split, independent of the data. A negative gain means no split. Leaf values are unaffected: <code>γ</code> appears nowhere in <code>w*</code>. Same idea as the complexity term in <a href="../decision-trees.html#pruning">cost-complexity pruning</a>, but charged while the tree is being grown.</div></div>
+        <div class="box good"><div class="n">λ — L2 on leaf weights</div><div class="t">Decides <i>how much</i> each leaf says</div><div class="g">Shrinks <code>w* = −G/(H+λ)</code> toward 0, most for leaves with small <code>H</code>. It also lowers the gain, so it discourages splits that isolate a few points. It never makes a gain negative by itself; only <code>γ</code> does that.</div></div>
+        <div class="box warn"><div class="n">implementation note (general knowledge)</div><div class="t">Grow, then prune back</div><div class="g">The library grows each tree to <code>max_depth</code> and then removes, bottom-up, splits whose gain falls below <code>γ</code>. So a weak split can survive when a strong split below it depends on it. A separate floor on <code>H</code> per leaf (<code>min_child_weight</code>) also refuses leaves whose hessian sum is too small.</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="shrinkage" data-nav="Shrinkage &amp; column sampling">
+      <h3><span class="idx">06</span> Two more guards against overfitting: shrinkage and column subsampling</h3>
+      <p class="lede">Besides Ω, the study uses two further techniques. <b>Shrinkage</b> scales each new tree by <code>η</code> after it is fitted. <b>Column (feature) subsampling</b>, borrowed from random forests, lets each tree see only a random subset of features.</p>
+
+      <div class="formula"><span class="lbl">shrinkage: <span class="keep">η</span> applied to the newly added tree</span><span class="eq">ŷ⁽ᵗ⁾  =  ŷ⁽ᵗ⁻¹⁾  +  η · fₜ(x)          the study's experiments use η = 0.1</span></div>
+      <ul class="notes">
+        <li><b>Why it helps.</b> Shrinkage reduces the influence of each individual tree and leaves room for future trees to improve the model. It is the same <code>η</code> as on the <a href="../decision-trees.html#boosting">hub</a>, and a smaller <code>η</code> needs more rounds. Setting the number of rounds by early stopping on a validation set is the usual companion (see <a href="../hyperparameter-tuning.html">hyperparameter tuning</a>).</li>
+        <li><b><code>η</code> and <code>λ</code> are not interchangeable.</b> <code>η</code> scales the whole tree uniformly after its structure is chosen. <code>λ</code> changes which structure is chosen, and it shrinks small leaves more than large ones.</li>
+        <li><b>Column subsampling.</b> According to user feedback reported in the study, it prevents overfitting <i>even more</i> than row subsampling does. Because each tree touches fewer columns, it also speeds up the column-parallel split search of §10. In the experiments it hurt slightly on Higgs (the study suggests there are few important features there). On the ranking task it was slightly better, which the study attributes to reduced overfitting (§11). The hub explains <a href="../decision-trees.html#bagging">why de-correlating trees helps</a> for random forests.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="split-finding" data-nav="Exact vs approximate splits">
+      <h3><span class="idx">07</span> Finding the split: exact greedy vs the approximate algorithm</h3>
+      <p class="lede">The gain formula says how to score a split. Finding the best one requires trying every threshold of every feature. With pre-sorted data that is a single linear scan per feature. The approximate algorithm cuts it down to a few candidates per feature.</p>
+
+      <div class="formula"><span class="lbl">exact greedy, for one node</span><span class="eq">for each feature k:
+    sort the node's instances by xₖ
+    G_L ← 0,  H_L ← 0
+    for each instance j in sorted order:
+        G_L += gⱼ,   H_L += hⱼ
+        G_R = G − G_L,   H_R = H − H_L
+        score = max(score,  G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ))
+output the split with the maximum score</span>
+<span class="lbl">approximate</span><span class="eq">for each feature k:   propose candidates Sₖ = {sₖ₁, …, sₖₗ} by percentiles of xₖ
+                      bucket each instance's (gᵢ, hᵢ) into the interval it falls in
+then:                 find the best split among the l bucket boundaries only</span></div>
+
+      <ul class="notes">
+        <li><b>Exact greedy</b> enumerates every distinct value. It is what scikit-learn, R's gbm and single-machine XGBoost supported. It breaks down when the data does not fit in memory, and in a distributed setting.</li>
+        <li><b>Global proposal</b> picks candidates once per tree and reuses them at every depth. Proposal is cheaper, but it needs <i>more</i> candidates, because after a few splits each node only covers a small part of a feature's range.</li>
+        <li><b>Local proposal</b> re-proposes after each split, using only the instances in that node. It needs fewer candidates and suits deeper trees.</li>
+      </ul>
+
+      <table class="grid2">
+        <tr><th>Higgs-10M, test AUC vs boosting rounds (the study's Fig. 3)</th><th>candidates per feature (≈ 1/ε)</th><th>result</th></tr>
+        <tr><td>exact greedy</td><td>all distinct values</td><td>reference</td></tr>
+        <tr class="hl"><td><b>local proposal, ε = 0.3</b></td><td class="num">≈ 3</td><td>about as good as exact greedy</td></tr>
+        <tr class="hl"><td><b>global proposal, ε = 0.05</b></td><td class="num">≈ 20</td><td>about as good as exact greedy</td></tr>
+        <tr><td>global proposal, ε = 0.3</td><td class="num">≈ 3</td><td>clearly worse</td></tr>
+      </table>
+      <p>Read the table as: candidate quality matters more than candidate count. A handful of candidates re-proposed at each node match exact search, while the same handful fixed for the whole tree does not. The library's later histogram method (<code>tree_method="hist"</code>, general knowledge) is a descendant of the global variant with many bins.</p>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="quantile-sketch" data-nav="Weighted quantile sketch">
+      <h3><span class="idx">08</span> Which percentiles? The weighted quantile sketch</h3>
+      <p class="lede"><b>Ordinary percentiles give every row equal weight. The second-order objective does not.</b> Rewriting it shows that every row is a squared-error example weighted by its hessian <code>hᵢ</code>. So candidates should be spaced evenly in <i>accumulated hessian</i>, not in row count.</p>
+
+      <div class="formula"><span class="lbl">the objective is a weighted least-squares problem (completing the square)</span><span class="eq">Σᵢ [ gᵢ·f(xᵢ) + ½hᵢ·f²(xᵢ) ]  =  Σᵢ ½·hᵢ·( f(xᵢ) + gᵢ/hᵢ )²  −  Σᵢ gᵢ²/(2hᵢ)
+
+                                    weight hᵢ,  target −gᵢ/hᵢ,   last term constant in f</span>
+<span class="lbl">rank function over <span class="keep">Dₖ = {(x₁ₖ, h₁), (x₂ₖ, h₂), …}</span></span><span class="eq">rₖ(z)  =  ( 1 / Σ_{(x,h)∈Dₖ} h ) · Σ_{(x,h)∈Dₖ, x&lt;z} h          the share of total hessian below z</span>
+<span class="lbl">candidate condition (<span class="keep">ε</span> = approximation factor)</span><span class="eq">| rₖ(sₖ,ⱼ) − rₖ(sₖ,ⱼ₊₁) |  &lt;  ε,      sₖ₁ = min xᵢₖ,   sₖₗ = max xᵢₖ        →  roughly 1/ε candidates</span></div>
+      <p style="font-size:12.5px;color:var(--muted)">On the sign: the study prints the weighted-squares form as <code>(fₜ(xᵢ) − gᵢ/hᵢ)²</code>. Expanding the square gives the <code>+</code> form above, i.e. target <code>−gᵢ/hᵢ</code>, the Newton step. Either way the weights are <code>hᵢ</code>, and the weights are what the sketch needs.</p>
+
+      <p>Computing exact quantiles requires sorting all of the data, which is not possible when the data is streamed or spread across machines. Earlier quantile sketches (summaries that can be merged and pruned while keeping error bounds) handled only <i>unweighted</i> data. The study introduces a new mergeable, prunable sketch for weighted data with a provable guarantee, with details in its appendix. Why sample quantiles are statistically well behaved in the first place is covered on <a href="../../math/probability/limit-theorems/quantiles-extremes.html">Sample Quantiles &amp; Extreme Values</a>.</p>
+
+      <div class="viz" id="viz-qs">
+        <div class="vhead">
+          <span class="vtitle">Candidate splits by row count vs by hessian, under logistic loss</span>
+          <span class="vhint">raise the model's confidence k: far-away rows lose their hessian, and the h-weighted candidates crowd into the region where the next split is actually found</span>
+        </div>
+        <div class="controls">
+          <label>model confidence k <input type="range" id="qs-k" min="0.5" max="8" step="0.5" value="4" /><span id="qs-kv" style="min-width:30px;display:inline-block">4.0</span></label>
+          <label>ε <input type="range" id="qs-eps" min="0.04" max="0.34" step="0.02" value="0.12" /><span id="qs-epsv" style="min-width:140px;display:inline-block">0.12</span></label>
+        </div>
+        <svg id="qs-svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-label="Top: histograms over a single feature x for 800 rows drawn from a standard normal. Grey filled bars give each bin's share of rows. Teal outlined bars give each bin's share of the total hessian under logistic loss for a current model whose probability, drawn as a dashed sigmoid, rises around x equals 1.5. At high confidence the teal mass is concentrated around 1.5, in the right tail, where few rows live. Below it, two rows of tick marks: amber ticks are candidate split points chosen by equal row counts, which cluster around zero where the data is dense, and teal ticks are candidates chosen by equal hessian mass, which cluster around 1.5. A ring on each row marks that candidate set's best split, and a red dotted vertical line marks the best split found by exact greedy search over all thresholds. Bottom: the two cumulative rank functions, unweighted in amber and hessian-weighted in teal, with faint horizontal lines at multiples of epsilon. Candidates sit where each curve crosses those lines. The readout compares the best gain achievable from each candidate set with the exact best gain, and counts how many candidates fall in the region where the model is uncertain."></svg>
+        <div class="readout" aria-live="polite" id="qs-readout"></div>
+      </div>
+      <ul class="notes">
+        <li><b>What the toy shows.</b> The labels are soft: each <code>yᵢ</code> is the true probability from a decision boundary at <code>x = 1.9</code>. The current model puts the boundary at 1.5, so the useful next split lies in the right tail. Count quantiles spend most of their budget near <code>x = 0</code>, where the model is already confidently right and <code>gᵢ ≈ 0</code>. Hessian-weighted quantiles spend it where gradient signal is left. At the default settings (<code>k = 4</code>, <code>ε = 0.12</code>), the best h-weighted candidate recovers about 98% of the exact-greedy gain, against about 45% for count quantiles (figures from the toy, not from the study). Lower <code>k</code> and the hessians become more uniform, so the two candidate sets move closer together. At large <code>ε</code> with low <code>k</code>, both sets are too sparse to reach the tail.</li>
+        <li><b>Why soft labels.</b> With random 0/1 labels, a single rare positive deep in the confident region has <code>|gᵢ| ≈ 1</code> but <code>hᵢ ≈ 0</code>. The exact search can then chase that one point, which is noise. Down-weighting such points is part of what the weighting does.</li>
+        <li><b>Squared loss is the unweighted special case.</b> When every <code>hᵢ = 1</code>, the weighted sketch is an ordinary quantile sketch.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="sparsity" data-nav="Missing values: default directions">
+      <h3><span class="idx">09</span> Sparsity-aware split finding: learn where missing values go</h3>
+      <p class="lede"><b>Each tree node stores a default direction.</b> A row whose feature is missing (or, in sparse storage, absent) follows that branch. The direction is learned from the data at training time, by trying both and keeping the better one.</p>
+
+      <div class="formula"><span class="lbl">sparsity-aware split finding, one node, one feature <span class="keep">k</span></span><span class="eq">I   = all instances in the node          G = Σ_{i∈I} gᵢ,   H = Σ_{i∈I} hᵢ
+Iₖ  = instances whose xₖ is PRESENT       (enumerate only these)
+
+pass 1 — missing go RIGHT:  scan Iₖ ascending,   accumulate G_L, H_L over present rows only;
+                            G_R = G − G_L  (the missing block lands on the right)
+pass 2 — missing go LEFT:   scan Iₖ descending,  accumulate G_R, H_R over present rows only;
+                            G_L = G − G_R  (the missing block lands on the left)
+
+keep the better (threshold, direction) pair;  cost is linear in |Iₖ|, the non-missing entries</span></div>
+
+      <ul class="notes">
+        <li><b>Where sparsity comes from:</b> genuinely missing values, frequent zero entries, and artefacts of feature engineering such as one-hot encoding. Absent entries are never visited. They enter only through the totals <code>G</code> and <code>H</code>.</li>
+        <li><b>It pays off a lot.</b> On Allstate-10K, a one-hot-heavy dataset, the sparsity-aware algorithm ran <b>more than 50× faster</b> than the naive version that visits every entry.</li>
+        <li><b>It is a learned imputation, per node.</b> Unlike mean or median filling (see <a href="../../data-engineering/data-preprocessing.html#missing">missing values in preprocessing</a>), the direction is chosen to reduce the loss, and it can differ for every node and every feature. When missingness is itself informative, the tree can use that information.</li>
+      </ul>
+
+      <div class="viz" id="viz-md">
+        <div class="vhead">
+          <span class="vtitle">Missing → left, missing → right, or impute the mean first?</span>
+          <span class="vhint">with informative missingness, one default direction wins clearly; mean imputation drops those rows into the middle of the range, where they may land on the wrong side</span>
+        </div>
+        <div class="controls">
+          <label>fraction missing <input type="range" id="md-f" min="0" max="0.5" step="0.05" value="0.25" /><span id="md-fv" style="min-width:36px;display:inline-block">25%</span></label>
+          <label>missingness <select id="md-p">
+            <option value="informative" selected>informative (missing rows have high y)</option>
+            <option value="random">random (unrelated to y)</option>
+          </select></label>
+          <label>λ <input type="range" id="md-lam" min="0" max="10" step="0.5" value="1" /><span id="md-lamv" style="min-width:30px;display:inline-block">1.0</span></label>
+          <button id="md-new" type="button">new sample</button>
+        </div>
+        <svg id="md-svg" width="760" height="448" viewBox="0 0 760 448" role="img" aria-label="Top: 30 rows with a real-valued target y. Rows whose feature x is observed are plotted against x from 0 to 10 and follow a low plateau below x equals 5 and a high plateau above. Rows whose x is missing are collected in a separate box on the left, coloured by the branch the selected split would send them to. An amber dotted vertical line marks where mean imputation would place every missing row, near the middle of the range. A dashed line marks the selected threshold. Bottom: split gain against threshold for three strategies. Violet: missing rows sent left. Blue: missing rows sent right. Amber dotted: every missing row replaced by the observed mean, then split normally. With informative missingness, where the missing rows have high targets, the blue missing-right curve is highest near x equals 5, and mean imputation is lower. With random missingness the three curves are close. The readout gives both gains at the selected threshold, the learned default direction, and the best gain each strategy achieves."></svg>
+        <div class="readout" aria-live="polite" id="md-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="system" data-nav="System design">
+      <h3><span class="idx">10</span> System design: column blocks, cache-aware access, out-of-core</h3>
+      <p class="lede">Most of the study's speed-up comes from data layout rather than from the algorithm. Sorting is the expensive part of split finding, so the system sorts each column <b>once</b>, stores it, and reuses that order for every node of every tree.</p>
+
+      <h4>Column blocks</h4>
+      <p>Data is stored in in-memory <b>blocks</b> in compressed sparse column (CSC) format. Each column is sorted by feature value and keeps, for each entry, a pointer back to its row's gradient statistics. The layout is computed once before training. A linear scan of a block's column then finds the best split for all leaves at the current depth at once, and different columns can be scanned in parallel. Blocks can also be spread across machines or kept on disk, and column subsampling simply means picking a subset of columns from a block.</p>
+
+      <div class="formula"><span class="lbl">time complexity  (<span class="keep">K</span> trees, <span class="keep">d</span> max depth, <span class="keep">‖x‖₀</span> non-missing entries, <span class="keep">n</span> rows, <span class="keep">q</span> candidates, <span class="keep">B</span> rows per block)</span><span class="eq">exact greedy        original:   O( K · d · ‖x‖₀ · log n )        sort at every level
+                    with blocks: O( K · d · ‖x‖₀  +  ‖x‖₀ · log n )   sort once, then linear scans
+
+approximate         original:   O( K · d · ‖x‖₀ · log q )        binary search into q candidates
+                    with blocks: O( K · d · ‖x‖₀  +  ‖x‖₀ · log B )   q is typically 32–100</span></div>
+      <p>The <code>log</code> factor moves out of the per-tree term into a one-time cost. Over hundreds of trees, that is the difference between paying for a sort at every level of every tree and paying for one sort in total.</p>
+
+      <div class="cards">
+        <div class="box good"><div class="n">cache-aware access</div><div class="t">Prefetch the gradients</div><div class="g">The sorted column order is not the row order, so reading <code>(gᵢ, hᵢ)</code> by row pointer jumps around memory and misses the CPU cache. For exact greedy, each thread gathers the statistics into a small contiguous buffer and then accumulates. This made exact greedy about <b>2× faster</b> on large (10M-row) data. For the approximate algorithm the fix is the block size: <b>2¹⁶ examples per block</b> balanced cache behaviour against parallelism.</div></div>
+        <div class="box good"><div class="n">out-of-core: compression</div><div class="t">Trade CPU for disk bandwidth</div><div class="g">Blocks are compressed by column and decompressed on the fly by an independent thread. Row indices are stored as 16-bit offsets from the start of the block. Compression ratios of about <b>26% to 29%</b> were reported.</div></div>
+        <div class="box good"><div class="n">out-of-core: sharding</div><div class="t">Read several disks at once</div><div class="g">The data is split across multiple disks, with one prefetch thread per disk filling an in-memory buffer. The training thread alternately reads from each buffer, so disk throughput adds up.</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="experiments" data-nav="Experiments">
+      <h3><span class="idx">11</span> Experiments: speed at equal accuracy, then scale</h3>
+      <p class="lede">Four datasets, chosen to stress different parts of the system. Unless stated otherwise: maximum depth 8, <code>η = 0.1</code>, no column subsampling.</p>
+
+      <table class="grid2">
+        <tr><th>dataset</th><th>n</th><th>features</th><th>task</th><th>what it stresses</th></tr>
+        <tr><td><b>Allstate</b></td><td class="num">10M</td><td class="num">4227</td><td>insurance claim classification</td><td>sparsity (one-hot)</td></tr>
+        <tr><td><b>Higgs Boson</b></td><td class="num">10M</td><td class="num">28</td><td>event classification</td><td>dense, many rows</td></tr>
+        <tr><td><b>Yahoo LTRC</b></td><td class="num">473K</td><td class="num">700</td><td>learning to rank</td><td>ranking loss</td></tr>
+        <tr><td><b>Criteo</b></td><td class="num">1.7B</td><td class="num">67</td><td>click-through-rate prediction</td><td>out-of-core, distributed</td></tr>
+      </table>
+
+      <h4>Single machine, exact greedy (Higgs-1M, 500 trees)</h4>
+      <table class="grid2">
+        <tr><th>method</th><th>time per tree (s)</th><th>test AUC</th></tr>
+        <tr class="hl"><td><b>XGBoost</b></td><td class="num">0.6841</td><td class="num">0.8304</td></tr>
+        <tr><td>XGBoost, colsample = 0.5</td><td class="num">0.6401</td><td class="num">0.8245</td></tr>
+        <tr><td>scikit-learn</td><td class="num">28.51</td><td class="num">0.8302</td></tr>
+        <tr><td>R gbm</td><td class="num">1.032</td><td class="num">0.6224</td></tr>
+      </table>
+      <p>XGBoost matches scikit-learn's accuracy and is more than 10× faster. (28.51 / 0.6841 ≈ 42, by our arithmetic. The study states the conservative "more than 10×".) R's gbm is quick but far less accurate. The study explains that it uses a greedy approach that expands only one branch of a tree, which makes it faster but can lower accuracy. Column subsampling was slightly <i>worse</i> here, plausibly because this dataset has few important features.</p>
+
+      <h4>Learning to rank (Yahoo LTRC, 500 trees)</h4>
+      <table class="grid2">
+        <tr><th>method</th><th>time per tree (s)</th><th>NDCG@10</th></tr>
+        <tr><td>XGBoost</td><td class="num">0.826</td><td class="num">0.7892</td></tr>
+        <tr class="hl"><td><b>XGBoost, colsample = 0.5</b></td><td class="num">0.506</td><td class="num">0.7913</td></tr>
+        <tr><td>pGBRT</td><td class="num">2.576</td><td class="num">0.7915</td></tr>
+      </table>
+      <p>In this comparison XGBoost ran exact greedy, while pGBRT supports only an approximate algorithm, and XGBoost was still about 3× faster per tree (2.576 / 0.826, by our arithmetic). Here column subsampling both cut the time and slightly raised NDCG, which the study attributes to reduced overfitting. AUC, the metric of the Higgs table, is covered on <a href="../model-evaluation.html">model evaluation</a>. NDCG@10 is a ranking metric: discounted gain over the top 10 results, normalised by the ideal ordering.</p>
+
+      <div class="cards">
+        <div class="box good"><div class="n">out-of-core · one AWS c3.8xlarge</div><div class="t">All 1.7B Criteo rows on one machine</div><div class="g">The basic out-of-core algorithm handles about 200M examples. Block compression gives about a 3× speed-up, and sharding into two disks a further 2×. Performance drops once the operating system's file cache runs out (around 400M examples). The final combination processes all 1.7 billion examples on a single machine.</div></div>
+        <div class="box good"><div class="n">distributed · 32 EC2 m3.2xlarge</div><div class="t">&gt; 10× Spark MLlib per iteration</div><div class="g">Per-iteration cost was more than 10× lower than Spark MLlib and 2.2× lower than H2O's optimised version. H2O was also slower at loading data. Scaling was close to linear in the number of machines, and the full 1.7B rows could be handled with only four machines.</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="comparison" data-nav="Feature comparison">
+      <h3><span class="idx">12</span> What each system supported (the study's Table 1)</h3>
+      <table class="grid2">
+        <tr><th>system</th><th>exact greedy</th><th>approx. global</th><th>approx. local</th><th>out-of-core</th><th>sparsity-aware</th><th>parallel</th></tr>
+        <tr class="hl"><td><b>XGBoost</b></td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td></tr>
+        <tr><td>pGBRT</td><td class="no">no</td><td class="no">no</td><td class="yes">yes</td><td class="no">no</td><td class="no">no</td><td class="yes">yes</td></tr>
+        <tr><td>Spark MLlib</td><td class="no">no</td><td class="yes">yes</td><td class="no">no</td><td class="no">no</td><td class="part">partially</td><td class="yes">yes</td></tr>
+        <tr><td>H2O</td><td class="no">no</td><td class="yes">yes</td><td class="no">no</td><td class="no">no</td><td class="part">partially</td><td class="yes">yes</td></tr>
+        <tr><td>scikit-learn</td><td class="yes">yes</td><td class="no">no</td><td class="no">no</td><td class="no">no</td><td class="no">no</td><td class="no">no</td></tr>
+        <tr><td>R GBM</td><td class="yes">yes</td><td class="no">no</td><td class="no">no</td><td class="no">no</td><td class="part">partially</td><td class="no">no</td></tr>
+      </table>
+      <p>The table reflects the state of these tools in 2016, not today. The point it makes is that no other system covered the whole row. Each competitor had picked one regime: exact and single-machine, or approximate and distributed.</p>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="after" data-nav="What came after (later work)">
+      <h3><span class="idx">13</span> What came after, and how the symbols map to the library</h3>
+      <p class="lede">Everything above is the original study. This section is <b>later work and general knowledge about the software</b>. None of it is a claim of the 2016 study.</p>
+
+      <div class="cards">
+        <div class="box warn"><div class="n">later work</div><div class="t">Histogram, leaf-wise, ordered boosting</div><div class="g">LightGBM made pre-binned histogram split finding (a global-proposal approximate method) the default, growing trees leaf-wise (best leaf first) instead of level-wise, and added gradient-based row sampling. CatBoost added ordered boosting and native categorical encodings to reduce target leakage. XGBoost itself later gained a histogram method (<code>tree_method="hist"</code>), GPU training and categorical support. All of them keep the second-order gain of §04. The <a href="../decision-trees.html#boosting">hub's implementations table</a> compares them in one line each.</div></div>
+      </div>
+
+      <table class="grid2">
+        <tr><th style="width:190px">on this page</th><th>library parameter (general knowledge)</th><th>note</th></tr>
+        <tr><td><b>η</b> (§06)</td><td><code>eta</code> / <code>learning_rate</code></td><td>trade against the number of rounds; use early stopping</td></tr>
+        <tr><td><b>γ</b> (§05)</td><td><code>gamma</code> / <code>min_split_loss</code></td><td>in units of the loss, so its scale depends on the loss and on the data size</td></tr>
+        <tr><td><b>λ</b> (§05)</td><td><code>lambda</code> / <code>reg_lambda</code></td><td>the L2 term of Ω</td></tr>
+        <tr><td>L1 on leaf weights</td><td><code>alpha</code> / <code>reg_alpha</code></td><td>a library addition, <i>not</i> in the study's Ω; it soft-thresholds <code>G</code> in <code>w*</code></td></tr>
+        <tr><td>minimum <b>H</b> per leaf</td><td><code>min_child_weight</code></td><td>a floor on Σhᵢ, not on the row count (§08: rows are weighted by hᵢ)</td></tr>
+        <tr><td>column subsampling (§06)</td><td><code>colsample_bytree</code>, <code>_bylevel</code>, <code>_bynode</code></td><td>per tree, per depth level, or per split</td></tr>
+        <tr><td>split finding (§07)</td><td><code>tree_method</code>: <code>exact</code>, <code>approx</code>, <code>hist</code></td><td>candidate density is set by a bin count (<code>max_bin</code>) in current versions</td></tr>
+      </table>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">14</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"XGBoost is a different algorithm from gradient boosting."</span> <span class="fix">It is regularised, second-order gradient tree boosting.</span> The model is still an additive ensemble of regression trees trained one round at a time. Setting Ω = 0 recovers the traditional objective (§02). What is new is the Newton-style fitting step, the penalty, and above all the system (§07–§10).</div>
+      <div class="wrong"><span class="say">"λ and γ do the same thing — both are regularisation."</span> <span class="fix">They act on different quantities.</span> <code>γ</code> is a per-leaf toll that decides <i>whether</i> to split and never changes a leaf's value. <code>λ</code> shrinks leaf values, and it lowers gains in a data-dependent way, most for low-<code>H</code> leaves (§05). Only <code>γ</code> can make a gain negative.</div>
+      <div class="wrong"><span class="say">"Missing values must be imputed before training."</span> <span class="fix">Not for this learner.</span> Each node learns a default direction for missing entries by trying both sides (§09). Imputing first can throw away the information in the missingness itself, and on sparse one-hot data it is also far slower.</div>
+      <div class="wrong"><span class="say">"Approximate split finding is always worse than exact."</span> <span class="fix">Not with good candidates.</span> Local proposals at ε = 0.3 and global proposals at ε = 0.05 both came close to exact-greedy AUC on Higgs-10M (§07). Weighting candidates by hessian puts them where the objective is sensitive (§08).</div>
+      <div class="wrong"><span class="say">"min_child_weight is the minimum number of samples in a leaf."</span> <span class="fix">It is a minimum hessian sum.</span> It equals the row count only under squared loss, where every <code>hᵢ = 1</code>. Under logistic loss, a leaf of 1000 confidently classified rows can have a tiny <code>H</code> and be refused.</div>
+      <div class="wrong"><span class="say">"Its speed comes from cutting corners on the model."</span> <span class="fix">At equal settings it matched the exact-greedy reference.</span> On Higgs-1M, XGBoost's exact greedy reached essentially the same AUC as scikit-learn (0.8304 vs 0.8302) and was more than 10× faster per tree (§11). The speed comes from data layout, the cache and the disks.</div>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">15</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Objective:</b> <code>Σ l(ŷᵢ, yᵢ) + Σₖ (γT + ½λ‖w‖²)</code>; with the penalty set to zero it is plain gradient tree boosting.</li>
+        <li><b>Second-order step:</b> each round sees only <code>(gᵢ, hᵢ)</code>, so one tree learner serves every twice-differentiable loss. The leaf weight <code>w* = −G/(H+λ)</code> is a damped Newton step.</li>
+        <li><b>Split gain:</b> <code>½[G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ)] − γ</code>. A non-positive gain means no split, so <code>γ</code> is built-in pruning and <code>λ</code> is leaf shrinkage.</li>
+        <li><b>Shrinkage</b> (<code>η</code>, 0.1 in the experiments) and <b>column subsampling</b> are the other two guards against overfitting.</li>
+        <li><b>Approximate splits</b> use about 1/ε candidates per feature, re-proposed per node (local) or once per tree (global, which needs more). Candidates are <b>hessian-weighted quantiles</b>, because the objective is least squares weighted by <code>hᵢ</code>.</li>
+        <li><b>Missing values:</b> a learned default direction per node, at a cost linear in the non-missing entries; over 50× faster on one-hot-heavy data.</li>
+        <li><b>System:</b> pre-sorted CSC column blocks take the <code>log n</code> out of the per-tree cost. Gradient prefetching (about 2×), block compression (about 3×) and disk sharding (about 2× more) took one machine to 1.7B rows.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Decision trees &amp; ensembles" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../decision-trees.html">← Decision Trees &amp; Ensembles</a>
+      <a href="../decision-trees.html#boosting" style="color:var(--muted)">Boosting · overview</a>
+      <a href="../regularization.html">Regularization →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="xgboost.viz.js"></script>
+</body>
+</html>

@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Word2Vec: CBOW, Skip-gram and the Cost of a Word Vector</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  table.grid2 td.miss{color:var(--bad)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../embeddings.html">Embeddings</a> · deep dive</p>
+      <h1>Word2Vec: CBOW, Skip-gram and the Cost of a Word Vector</h1>
+      <p>The <a href="../embeddings.html#word2vec">embeddings hub</a> gives the one-paragraph version: predict context, get vectors, <code>king − man + woman ≈ queen</code>. This page follows the original paper's actual argument, which is about <b>cost</b>: count the parameters a model touches per training word, notice that the non-linear hidden layer and the vocabulary-sized output dominate, delete the first and shrink the second to a Huffman-tree walk, and spend the savings on far more data. Then it reads the paper's analogy test set and result tables closely — including where the method's headline examples go wrong.</p>
+      <div style="margin-top:10px">
+        <span class="pill">NLP</span>
+        <span class="pill">Embeddings</span>
+        <span class="pill">O = E·T·Q · hierarchical softmax · Huffman tree · CBOW · skip-gram · analogy test set · scaling · limits</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="motivation" data-nav="Why: billions of words">
+      <h3><span class="idx">01</span> The goal: vectors from billions of words, not hundreds of millions</h3>
+      <p class="lede"><b>The paper's stated goal is to learn high-quality word vectors from data sets with billions of words and vocabularies of millions.</b> At the time, no proposed neural architecture had, as far as the paper knew, been trained successfully on more than a few hundred million words, and typical vectors had only 50–100 dimensions.</p>
+
+      <ul class="notes">
+        <li><b>Words as atomic indices hit a ceiling.</b> Treating words as vocabulary indices — the <a href="../language-models.html#ngram">N-gram</a> view — is simple and robust, and N-gram models can be trained on essentially all available text (trillions of words). But in domains with little in-domain data (transcribed speech: often just millions of words; many machine-translation corpora: a few billion words or less) more of the same model does not help.</li>
+        <li><b>Distributed representations work, but are expensive.</b> <a href="../language-models.html#neural">Neural language models</a> already beat N-grams and learn word vectors as a by-product. The problem the paper attacks is that they are too slow to train on the data sizes where vectors would get really good.</li>
+        <li><b>The quality target is not just "similar words are close".</b> The paper wants words to have <i>multiple degrees of similarity</i> — the regularity that a simple vector offset like <code>vector("King") − vector("Man") + vector("Woman")</code> lands nearest to <code>Queen</code>. It designs both its architectures and its test set around preserving such <b>linear regularities</b>.</li>
+        <li><b>Why not LSA or LDA?</b> Neural distributed representations had been shown to preserve linear regularities significantly better than latent semantic analysis, and LDA becomes very expensive on large data. (Those methods are covered on the <a href="../topic-modeling.html">topic modeling</a> page.)</li>
+      </ul>
+      <div class="callout"><b>The bet in one line.</b> A simpler model "might not be able to represent the data as precisely as neural networks", but if it is cheap enough to train on far more data, the vectors come out better. Everything below is an accounting of what was removed to make it cheap, and evidence that the trade paid off.</div>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="cost-model" data-nav="The cost model O = E·T·Q">
+      <h3><span class="idx">02</span> The cost model: parameters touched per training word</h3>
+      <p class="lede">To compare architectures fairly, the paper defines computational complexity as <b>the number of parameters that must be accessed to fully train the model</b>, and then tries to maximise accuracy while minimising it.</p>
+
+      <div class="formula"><span class="lbl">training complexity, for every model in the paper</span><span class="eq">O  =  E × T × Q
+
+E   number of training epochs          common choice: 3 – 50
+T   number of words in the training set           up to one billion
+Q   cost per training example — defined separately for each architecture</span></div>
+
+      <p>All models are trained with stochastic gradient descent and backpropagation. <code>E</code> and <code>T</code> are properties of the training run; <code>Q</code> is the property of the architecture, so the rest of the argument is about making <code>Q</code> small. The symbols used for every <code>Q</code> below:</p>
+      <table class="grid2">
+        <tr><th style="width:70px">symbol</th><th>meaning</th></tr>
+        <tr><td><code>V</code></td><td>vocabulary size (words are 1-of-V coded at the input)</td></tr>
+        <tr><td><code>D</code></td><td>word-vector dimensionality (the projection size per word)</td></tr>
+        <tr><td><code>N</code></td><td>number of context words fed in (NNLM history length; CBOW window)</td></tr>
+        <tr><td><code>H</code></td><td>hidden-layer size</td></tr>
+        <tr><td><code>C</code></td><td>skip-gram's maximum context distance</td></tr>
+      </table>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="baselines" data-nav="NNLM & RNNLM costs">
+      <h3><span class="idx">03</span> Where the baselines spend it: NNLM and RNNLM</h3>
+      <p class="lede"><b>A feedforward NNLM pays for a dense projection-to-hidden layer and a vocabulary-sized output; a recurrent one pays for its recurrent matrix and the same output.</b> Fix the output and the hidden layer is what remains.</p>
+
+      <h4>Feedforward neural net language model</h4>
+      <p>Input, projection, hidden and output layers. The <code>N</code> previous words are 1-of-V coded and projected through a shared matrix to a projection layer of size <code>N×D</code> — cheap, because only <code>N</code> inputs are active. The cost is after that: the projection is dense, so every projection unit connects to every hidden unit, and the hidden layer feeds a softmax over all <code>V</code> words.</p>
+      <div class="formula"><span class="lbl">feedforward nnlm, per training example</span><span class="eq">Q  =  N × D   +   N × D × H   +   H × V
+       projection   projection→hidden   hidden→output
+
+typical sizes given in the paper:  N = 10,  N×D ≈ 500 – 2000,  H ≈ 500 – 1000</span></div>
+      <ul class="notes">
+        <li>With a full softmax the dominating term is <code>H × V</code>. Hierarchical softmax (§04), or models that are not normalised during training, cut the output cost to about <code>H × log₂(V)</code> — and then <b>most of the complexity is the <code>N × D × H</code> term</b>.</li>
+        <li><i>Worked example (not from the paper):</i> <code>N = 10, D = 50, H = 500, V = 10⁶</code> gives <code>500 + 250 000 + 500 000 000</code> with a full softmax, and <code>500 + 250 000 + ≈ 9 966</code> once the output is a binary-tree walk. Removing the output bottleneck leaves the hidden layer as about 96% of the cost.</li>
+      </ul>
+
+      <h4>Recurrent neural net language model</h4>
+      <p>No projection layer — input, hidden, output — plus a recurrent matrix connecting the hidden layer to itself with a time delay, which gives a short-term memory and removes the need to fix a context length <code>N</code>. The word representations have the same dimensionality as the hidden layer (<code>D = H</code>). Background on recurrent networks is on the <a href="../../deep-learning/rnns-lstms.html">RNNs &amp; LSTMs</a> page.</p>
+      <div class="formula"><span class="lbl">recurrent lm, per training example</span><span class="eq">Q  =  H × H  +  H × V        →   H × H  +  H × log₂(V)   with hierarchical softmax
+
+most of the remaining cost:  H × H</span></div>
+      <div class="callout"><b>The diagnosis.</b> In both models, once the output is handled, "most of the complexity is caused by the non-linear hidden layer". That layer is what makes neural networks attractive; the paper's move is to delete it and see what the vectors lose.</div>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="hierarchical-softmax" data-nav="Huffman hierarchical softmax">
+      <h3><span class="idx">04</span> The output layer: hierarchical softmax over a Huffman tree</h3>
+      <p class="lede"><b>Arrange the vocabulary as the leaves of a binary tree and a word's probability becomes a product of binary decisions along its root-to-leaf path</b> — about <code>log₂(V)</code> of them for a balanced tree. The paper uses a <b>Huffman</b> tree, which gives frequent words short paths and brings the average down to about <code>log₂(unigram perplexity)</code>.</p>
+
+      <div class="formula"><span class="lbl">output units evaluated per prediction</span><span class="eq">full softmax                   V
+balanced binary tree          ≈ log₂(V)
+Huffman binary tree           ≈ log₂( unigram_perplexity(V) )
+
+reported example:  V = 1 million words  →  about two times faster evaluation (Huffman vs balanced)</span></div>
+
+      <p>Why Huffman? Word frequency had already been found to work well for building output classes in neural LMs, and a Huffman code assigns short binary codes to frequent words. Because text is dominated by a few very frequent words, the <i>average</i> path length per training token drops. The connection to perplexity is a standard information-theory fact rather than something the paper derives: a Huffman code's expected length <code>L̄</code> satisfies <code>H ≤ L̄ &lt; H + 1</code> bits, where <code>H</code> is the entropy of the unigram distribution, and <code>log₂(perplexity) = H</code>. The construction and that bound are proven on the <a href="../../dsa/algorithms/greedy/huffman-coding.html#huffman-entropy">Huffman coding page</a>.</p>
+
+      <div class="formula"><span class="lbl">beyond this paper — the hierarchical softmax probability</span><span class="eq">P(w | h)  =  ∏ⱼ₌₁…L(w)−1   σ( ⟦ next node on w's path is the left child ⟧ · v′ₙ₍w,ⱼ₎ · h )
+
+h            the input-side vector (the projected context, or the input word's vector)
+n(w, j)      the j-th inner node on the path from the root to leaf w;  L(w) = path length in nodes
+v′ₙ          a learned vector for each INNER node (there are V − 1 of them, no per-word output vector)
+⟦x⟧          +1 if x is true, −1 otherwise;   σ(z) = 1 / (1 + e⁻ᶻ)
+
+the two children's probabilities at every node sum to 1, so ∑_w P(w | h) = 1 with no normalising sum over V</span></div>
+      <p style="font-size:12.5px;color:var(--muted)">This paper states only the cost (<code>log₂</code> output units) and the Huffman choice; the explicit product form above comes from the earlier hierarchical-softmax work it cites and is written out in its follow-up paper.</p>
+
+      <div class="viz" id="viz-hs">
+        <div class="vhead">
+          <span class="vtitle">Huffman hierarchical softmax: path length tracks frequency</span>
+          <span class="vhint">pick a frequent word, then a rare one, and count the binary decisions each needs</span>
+        </div>
+        <div class="controls">
+          <label>vocabulary size V <input type="range" id="hs-v" min="6" max="20" step="1" value="14" /><span id="hs-vv" style="min-width:20px;display:inline-block">14</span></label>
+          <label>Zipf exponent s <input type="range" id="hs-s" min="0" max="2" step="0.1" value="1" /><span id="hs-sv" style="min-width:26px;display:inline-block">1.0</span></label>
+          <label>word <select id="hs-w"></select></label>
+        </div>
+        <svg id="hs-svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="A Huffman tree built over a toy vocabulary whose word frequencies follow a Zipf law. The root is at the top; each leaf is a word, labelled with its probability, and sits at a depth equal to its Huffman code length, so frequent words such as 'the' and 'of' are near the top and rare words such as 'kwanza' and 'tallahassee' are deep. Inner nodes are small circles; each one stands for a learned vector and a binary sigmoid decision. The path from the root to the selected word is highlighted, with each edge labelled 0 for the upper branch or 1 for the lower branch, spelling the word's code. A dashed vertical line marks the depth a balanced tree would need. Clicking a leaf selects that word. Raising the Zipf exponent makes the frequencies more skewed and the tree more lopsided; an exponent of zero makes all words equally likely and the tree nearly balanced. The readout gives the selected word's code, its path length, the balanced-tree depth, the frequency-weighted average Huffman path length, the unigram entropy in bits, and log base 2 of the vocabulary size."></svg>
+        <div class="readout" aria-live="polite" id="hs-readout"></div>
+      </div>
+      <ul class="notes">
+        <li><b>What to notice.</b> With <code>s = 0</code> (uniform frequencies) the Huffman tree is essentially balanced and the average path is <code>≈ log₂ V</code>: there is nothing to exploit. As <code>s</code> grows the average path falls below <code>log₂ V</code> and stays within one bit of the entropy — the toy version of the paper's "about log₂(unigram perplexity)".</li>
+        <li><b>The rare words pay.</b> A rare word's path can be <i>longer</i> than <code>log₂ V</code>. That is fine for the cost, which is averaged over training tokens, and those tokens are mostly frequent words.</li>
+        <li><b>Why it matters more here than for an NNLM.</b> For an NNLM the 2× output speedup is "not crucial", because <code>N × D × H</code> dominates. The new architectures have no hidden layer, so the output walk <i>is</i> the cost — they "depend heavily on the efficiency of the softmax normalization".</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="cbow" data-nav="CBOW">
+      <h3><span class="idx">05</span> Continuous bag-of-words (CBOW): predict the middle word from its neighbours</h3>
+      <p class="lede">Take the feedforward NNLM, <b>remove the non-linear hidden layer, and share the projection layer itself</b> (not just the projection matrix) across all context positions — so every context word is projected to the same place, i.e. their vectors are averaged. The averaged vector feeds a log-linear classifier for the current word.</p>
+
+      <div class="formula"><span class="lbl">cbow, per training example</span><span class="eq">Q  =  N × D  +  D × log₂(V)
+
+N × D          look up and average the N context vectors
+D × log₂(V)    one hierarchical-softmax walk for the middle word
+
+best reported setting:  4 history words + 4 future words  →  N = 8</span></div>
+      <ul class="notes">
+        <li><b>"Bag of words"</b> because word order in the context does not affect the projection; <b>"continuous"</b> because, unlike a standard bag of words, the context is a dense distributed representation.</li>
+        <li><b>It uses the future too.</b> A language model may only look back; CBOW is not trying to be one, so it uses words on both sides. The best performance on the paper's test set came from four words on each side.</li>
+        <li>The input-to-projection weight matrix is shared across all word positions, as in the NNLM. The learned word vectors are the rows of that matrix.</li>
+      </ul>
+      <div class="formula"><span class="lbl">worked example, not from the paper</span><span class="eq">N = 8,  D = 300,  V = 10⁶   (log₂ V ≈ 19.93, balanced tree)
+
+Q_CBOW  =  8·300  +  300·19.93  ≈  2 400 + 5 979  ≈  8 379  parameters per training word
+
+the same D with a feedforward NNLM's  N × D × H  (N = 8, H = 500):  1 200 000  — before the output layer</span></div>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="skip-gram" data-nav="Continuous skip-gram">
+      <h3><span class="idx">06</span> Continuous skip-gram: predict the neighbours from the word</h3>
+      <p class="lede">Invert CBOW. Use the current word as input to a log-linear classifier with a continuous projection layer, and <b>predict words within some range before and after it</b>. A larger range gives better vectors but costs more, and distant words are usually less related, so the paper <b>samples distant words less often</b>.</p>
+
+      <div class="formula"><span class="lbl">skip-gram, per training example</span><span class="eq">Q  =  C × (D  +  D × log₂(V))
+
+C    the maximum distance of context words   (the paper uses C = 10)
+
+for each training word:
+    draw R uniformly from {1, …, C}
+    use the R words before and the R words after as correct labels
+    →  R × 2 classifications, each with the current word as input</span></div>
+
+      <p>The sampling of <code>R</code> is how "less weight to distant words" is implemented — there is no explicit weight in the loss. The paper states the procedure; the consequences below are straightforward arithmetic on it.</p>
+      <div class="formula"><span class="lbl">worked arithmetic on the sampling rule, not from the paper</span><span class="eq">a context word at distance d (1 ≤ d ≤ C) is used  ⇔  R ≥ d
+P(used)  =  (C − d + 1) / C
+
+C = 10:   d = 1 → 1.0    d = 2 → 0.9    d = 5 → 0.6    d = 10 → 0.1
+
+expected classifications per training word  =  2 · E[R]  =  2 · (C + 1)/2  =  C + 1  =  11</span></div>
+      <ul class="notes">
+        <li>So the <code>C</code> in the paper's <code>Q</code> is a proportionality, not an exact count: on average a training word costs <code>C + 1</code> predictions (11 at <code>C = 10</code>), each <code>D + D × log₂(V)</code>.</li>
+        <li><b>Skip-gram does <code>C</code>-ish times the work of CBOW per word</b> at the same <code>D</code>: CBOW averages the context into one prediction; skip-gram makes one prediction per context word. This is why the reported single-machine skip-gram runs take roughly three times as long as CBOW (§11).</li>
+        <li>The hub's <a href="../embeddings.html#word2vec">skip-gram window figure</a> shows which (centre → context) pairs one fixed window produces; the random <code>R</code> above shrinks that window per word.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="cost-compare" data-nav="Cost side by side">
+      <h3><span class="idx">07</span> The four architectures side by side</h3>
+      <p class="lede">Put the four <code>Q</code>s next to each other and the design is visible in the terms that are <i>missing</i>: no <code>N × D × H</code>, no <code>H × H</code>, and no <code>× V</code> anywhere.</p>
+
+      <table class="grid2">
+        <tr><th>architecture</th><th>Q per training example</th><th>dominant term (balanced or Huffman tree)</th></tr>
+        <tr><td><b>feedforward NNLM</b></td><td><code>N×D + N×D×H + H×V</code></td><td><code>N×D×H</code> — dense projection-to-hidden</td></tr>
+        <tr><td><b>recurrent LM</b></td><td><code>H×H + H×V</code></td><td><code>H×H</code> — the recurrent matrix</td></tr>
+        <tr class="hl"><td><b>CBOW</b></td><td><code>N×D + D×log₂(V)</code></td><td><code>D×log₂(V)</code> — one tree walk</td></tr>
+        <tr class="hl"><td><b>skip-gram</b></td><td><code>C×(D + D×log₂(V))</code></td><td><code>C×D×log₂(V)</code> — one walk per context word</td></tr>
+      </table>
+
+      <div class="viz" id="viz-q">
+        <div class="vhead">
+          <span class="vtitle">Per-example cost Q, term by term, on a log scale</span>
+          <span class="vhint">switch the output layer to a full softmax to see why V had to go; then grow H and watch only the baselines move</span>
+        </div>
+        <div class="controls">
+          <label>vocabulary V = 10^<input type="range" id="q-v" min="4" max="7" step="0.1" value="6" /><span id="q-vv" style="min-width:76px;display:inline-block">1 000 000</span></label>
+          <label>vector size D <input type="range" id="q-d" min="50" max="1000" step="10" value="300" /><span id="q-dv" style="min-width:32px;display:inline-block">300</span></label>
+          <label>hidden H <input type="range" id="q-h" min="100" max="1000" step="10" value="500" /><span id="q-hv" style="min-width:32px;display:inline-block">500</span></label>
+          <label>context N <input type="range" id="q-n" min="2" max="10" step="1" value="8" /><span id="q-nv" style="min-width:18px;display:inline-block">8</span></label>
+          <label>skip-gram C <input type="range" id="q-c" min="1" max="20" step="1" value="10" /><span id="q-cv" style="min-width:18px;display:inline-block">10</span></label>
+          <label>output layer <select id="q-o">
+            <option value="full">full softmax (× V)</option>
+            <option value="tree" selected>balanced binary tree (× log₂ V)</option>
+            <option value="huff">Huffman tree, Zipf model (× entropy)</option>
+          </select></label>
+        </div>
+        <svg id="q-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Horizontal bars on a logarithmic axis of parameters accessed per training example, grouped into four rows: feedforward neural language model, recurrent language model, continuous bag-of-words, and skip-gram. Each row has one thin bar per term of its cost formula, labelled with the term, and a thicker bar for the total. With the output layer set to a full softmax, the hidden-times-vocabulary terms of the two baselines are the longest bars by far, and the two new models' output terms are also vocabulary-sized. With a binary tree or Huffman tree, the output terms collapse by four to five orders of magnitude, the feedforward model's projection-to-hidden term and the recurrent model's hidden-to-hidden term become dominant, and continuous bag-of-words is the cheapest model, with skip-gram about C times more expensive. The readout gives each total, the ratios between models, and the total training cost E times T times Q for one epoch over one billion words."></svg>
+        <div class="readout" aria-live="polite" id="q-readout"></div>
+      </div>
+      <ul class="notes">
+        <li><b>The Huffman option uses an idealised Zipf(1) unigram law</b> to estimate the average path (entropy in bits). That is a modelling assumption of this figure, not a number from the paper; for <code>V = 10⁶</code> it gives about 13.4 bits against <code>log₂ V ≈ 19.9</code> — a 1.5× saving. The paper reports about 2× for its real one-million-word vocabulary; real word frequencies are more skewed at the head than a pure Zipf(1) law, and a Zipf exponent near 1.1 already gives 1.8×.</li>
+        <li><b>Data and dimension trade one-for-one.</b> In CBOW's <code>Q</code> both terms are linear in <code>D</code>, and <code>O</code> is linear in <code>T</code>, so — as the paper notes from its Eq. 4 — doubling the training data costs about the same as doubling the vector size. §09 shows that you have to grow both.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="test-set" data-nav="The analogy test set">
+      <h3><span class="idx">08</span> Measuring "multiple degrees of similarity": the semantic–syntactic test set</h3>
+      <p class="lede">Nearest-neighbour tables ("France is close to Italy") are easy to show and hard to score. The paper builds a <b>test set of analogy questions</b> instead: two word pairs with the same relationship, where the model must produce the fourth word.</p>
+
+      <table class="grid2">
+        <tr><th>relationship type</th><th>word pair 1</th><th>word pair 2</th></tr>
+        <tr><td colspan="3" style="color:var(--accent);font-size:11.5px;letter-spacing:.04em;text-transform:uppercase">five semantic types</td></tr>
+        <tr><td>common capital city</td><td>Athens · Greece</td><td>Oslo · Norway</td></tr>
+        <tr><td>all capital cities</td><td>Astana · Kazakhstan</td><td>Harare · Zimbabwe</td></tr>
+        <tr><td>currency</td><td>Angola · kwanza</td><td>Iran · rial</td></tr>
+        <tr><td>city-in-state</td><td>Chicago · Illinois</td><td>Stockton · California</td></tr>
+        <tr><td>man–woman</td><td>brother · sister</td><td>grandson · granddaughter</td></tr>
+        <tr><td colspan="3" style="color:var(--accent);font-size:11.5px;letter-spacing:.04em;text-transform:uppercase">nine syntactic types</td></tr>
+        <tr><td>adjective to adverb</td><td>apparent · apparently</td><td>rapid · rapidly</td></tr>
+        <tr><td>opposite</td><td>possibly · impossibly</td><td>ethical · unethical</td></tr>
+        <tr><td>comparative</td><td>great · greater</td><td>tough · tougher</td></tr>
+        <tr><td>superlative</td><td>easy · easiest</td><td>lucky · luckiest</td></tr>
+        <tr><td>present participle</td><td>think · thinking</td><td>read · reading</td></tr>
+        <tr><td>nationality adjective</td><td>Switzerland · Swiss</td><td>Cambodia · Cambodian</td></tr>
+        <tr><td>past tense</td><td>walking · walked</td><td>swimming · swam</td></tr>
+        <tr><td>plural nouns</td><td>mouse · mice</td><td>dollar · dollars</td></tr>
+        <tr><td>plural verbs</td><td>work · works</td><td>speak · speaks</td></tr>
+      </table>
+
+      <div class="cards">
+        <div class="box good"><div class="n">size</div><div class="t">8 869 semantic + 10 675 syntactic</div><div class="g">19 544 questions in total (our sum). Built in two steps: a manual list of word pairs per category, then questions formed by connecting two pairs — e.g. 68 large American cities with their states gave about 2.5K questions by random pairing.</div></div>
+        <div class="box warn"><div class="n">scoring</div><div class="t">Exact match only</div><div class="g">A question is correct only if the nearest word is <i>exactly</i> the expected one; synonyms count as mistakes. The paper notes this makes 100% likely impossible, since the models have no input information about word morphology.</div></div>
+        <div class="box warn"><div class="n">coverage</div><div class="t">Single tokens only</div><div class="g">Multi-word entities (such as New York) are excluded. Reported as overall accuracy and separately for the semantic and syntactic parts.</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="offset" data-nav="Answering by vector offset">
+      <h3><span class="idx">09</span> Answering a question with one subtraction and one addition</h3>
+      <p class="lede">"What word is similar to <i>small</i> in the same sense that <i>biggest</i> is similar to <i>big</i>?" Compute the offset, add it, and take the nearest word by cosine — <b>discarding the question's own words from the search</b>.</p>
+
+      <div class="formula"><span class="lbl">the vector offset method</span><span class="eq">X  =  vector("biggest")  −  vector("big")  +  vector("small")
+
+answer  =  argmax over words w ∉ {biggest, big, small}  of   cos(X, vector(w))
+
+cos(a, b)  =  (a · b) / (‖a‖ ‖b‖)          correct  ⇔  answer = "smallest" exactly</span></div>
+
+      <p>The toy below is a hand-built 2-D space, not trained vectors: each relation is given a consistent offset, and every word is then jittered by noise. In two dimensions cosine is just angle, so the answer is whichever word lies closest to the ray from the origin through <code>X</code> — length is ignored. Similarity metrics in general are on the <a href="../embeddings.html#similarity">hub's similarity section</a>.</p>
+
+      <div class="viz" id="viz-an">
+        <div class="vhead">
+          <span class="vtitle">A toy analogy space: offset, ray, nearest by cosine</span>
+          <span class="vhint">add noise until questions start failing; then average the offset over the other pairs and watch toy-set accuracy rise</span>
+        </div>
+        <div class="controls">
+          <label>question <select id="an-q"></select></label>
+          <label>noise <input type="range" id="an-n" min="0" max="1" step="0.05" value="0.3" /><span id="an-nv" style="min-width:30px;display:inline-block">0.30</span></label>
+          <label><input type="checkbox" id="an-x" checked /> exclude the question words</label>
+          <label><input type="checkbox" id="an-avg" /> average the offset over the relation's other pairs</label>
+          <button id="an-seed" type="button">new noise</button>
+        </div>
+        <svg id="an-svg" width="760" height="440" viewBox="0 0 760 440" role="img" aria-label="A two-dimensional scatter of about forty words arranged in four angular clusters around the origin: gender pairs, country and capital pairs, adjectives and their comparatives, and verbs and their present participles. Within each cluster the second word of every pair is displaced from the first by roughly the same offset vector. For the selected question, an arrow shows the offset from the first word to the second, a dashed arrow applies the same offset to the third word, and a marker shows the resulting point X. A faint ray runs from the origin through X, because cosine similarity ranks words only by angle. The nearest remaining word by cosine is highlighted, in green when it is the expected answer and in red otherwise. Raising the noise jitters every word and makes more questions fail; averaging the offset over the other pairs of the same relation cancels much of that noise. Unticking the exclusion box lets a question word itself win, which with noise usually happens. The readout gives the top three candidates with their cosine similarities and whether the question is answered correctly, plus the accuracy over all questions in the toy set."></svg>
+        <div class="readout" aria-live="polite" id="an-readout"></div>
+      </div>
+      <ul class="notes">
+        <li><b>Excluding the inputs is not cosmetic.</b> <code>X</code> is built from the third word plus a small offset, so that word is usually very close to <code>X</code>. Without the exclusion, it often wins; the paper's procedure explicitly discards the question words.</li>
+        <li><b>Averaging the offset is in the paper.</b> Forming the relationship vector from ten example pairs instead of one, by averaging, improved the best models' accuracy by about 10 percentage points absolute on the test set (§14). The toy shows the mechanism: per-pair noise in the offset cancels, while the noise on the third word and on the answer does not, so averaging helps but cannot restore 100%. (In the toy, at noise 0.2–0.4, averaging raised toy-set accuracy in 17–19 of 20 random noise draws, by about 7–10 points on average — a property of this hand-built toy, not a reproduction of the paper's figure.)</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="dimension-data" data-nav="Dimension vs data">
+      <h3><span class="idx">10</span> Dimension versus data: grow both or gain neither</h3>
+      <p class="lede">With CBOW on growing subsets of a news corpus (about 6B tokens; vocabulary restricted to the 30k most frequent words for this sweep, and only questions within that vocabulary used), accuracy saturates along either axis alone. <b>Dimensionality and training data have to be increased together.</b></p>
+
+      <table class="grid2">
+        <tr><th>dimensionality ↓ / training words →</th><th>24M</th><th>49M</th><th>98M</th><th>196M</th><th>391M</th><th>783M</th></tr>
+        <tr><td><b>50</b></td><td class="num">13.4</td><td class="num">15.7</td><td class="num">18.6</td><td class="num">19.1</td><td class="num">22.5</td><td class="num">23.2</td></tr>
+        <tr><td><b>100</b></td><td class="num">19.4</td><td class="num">23.1</td><td class="num">27.8</td><td class="num">28.7</td><td class="num">33.4</td><td class="num">32.2</td></tr>
+        <tr><td><b>300</b></td><td class="num">23.2</td><td class="num">29.2</td><td class="num">35.3</td><td class="num">38.6</td><td class="num">43.7</td><td class="num">45.9</td></tr>
+        <tr class="hl"><td><b>600</b></td><td class="num">24.0</td><td class="num">30.1</td><td class="num">36.5</td><td class="num">40.8</td><td class="num">46.6</td><td class="num">50.4</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">Accuracy (%) on the 30k-vocabulary subset of the test set, CBOW. Three epochs of SGD with backpropagation; learning rate starting at 0.025 and decreased linearly to approach zero at the end of the last epoch.</p>
+      <ul class="notes">
+        <li><b>Read the first column down:</b> at 24M words, going from 50 to 600 dimensions only moves 13.4 → 24.0. <b>Read the first row across:</b> at 50 dimensions, 32× more data only moves 13.4 → 23.2. The corner (600 dims, 783M words) reaches 50.4.</li>
+        <li><b>Not perfectly monotone.</b> At 100 dimensions, 783M words (32.2) scores below 391M (33.4) — a small reminder that single runs are noisy.</li>
+        <li>The paper's point aimed at contemporary practice: it was popular to train on large data but with too few dimensions (50–100), which this table says wastes the data.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="architectures" data-nav="Architecture comparison">
+      <h3><span class="idx">11</span> Same data, different architectures — and against published vectors</h3>
+      <p class="lede"><b>Skip-gram is far ahead on semantic questions; CBOW is best on syntactic ones;</b> both beat the hidden-layer models at a fraction of the cost.</p>
+
+      <h4>Controlled comparison: 640-dimensional vectors, identical data</h4>
+      <p>Training data: several LDC corpora, 320M words, 82K vocabulary — chosen so a previously trained recurrent LM (about 8 weeks on a single CPU) could be compared. The feedforward NNLM was trained with the same 640 hidden units on the distributed framework (§12), with a history of 8 words, so it has more parameters than the RNNLM (its projection layer is 640×8). This and all later comparisons use the <i>full</i> test set, not the 30k subset.</p>
+      <table class="grid2">
+        <tr><th>architecture</th><th>semantic acc. (%)</th><th>syntactic acc. (%)</th><th>earlier syntactic test set (%)</th></tr>
+        <tr><td>recurrent LM</td><td class="num">9</td><td class="num">36</td><td class="num">35</td></tr>
+        <tr><td>feedforward NNLM</td><td class="num">23</td><td class="num">53</td><td class="num">47</td></tr>
+        <tr class="hl"><td><b>CBOW</b></td><td class="num">24</td><td class="num"><b>64</b></td><td class="num"><b>61</b></td></tr>
+        <tr class="hl"><td><b>skip-gram</b></td><td class="num"><b>55</b></td><td class="num">59</td><td class="num">56</td></tr>
+      </table>
+      <ul class="notes">
+        <li>The RNN vectors do well mostly on syntax; the paper reads the NNLM's lead over them as unsurprising, because RNN word vectors are wired directly into a non-linear hidden layer.</li>
+        <li>CBOW beats the NNLM on syntax and ties it on semantics; skip-gram is slightly behind CBOW on syntax (still above the NNLM) and <b>more than twice</b> anyone else on semantics.</li>
+        <li>The last column is a separate, earlier syntactic-relationship test set, included for continuity with prior work.</li>
+      </ul>
+
+      <h4>Single-CPU models against publicly available vectors</h4>
+      <table class="grid2">
+        <tr><th>model</th><th>dim</th><th>training words</th><th>semantic</th><th>syntactic</th><th>total</th></tr>
+        <tr><td>published NNLM vectors (A)</td><td class="num">50</td><td class="num">660M</td><td class="num">9.3</td><td class="num">12.3</td><td class="num">11.0</td></tr>
+        <tr><td>published NNLM vectors (B)</td><td class="num">50</td><td class="num">37M</td><td class="num">1.4</td><td class="num">2.6</td><td class="num">2.1</td></tr>
+        <tr><td>published NNLM vectors (B)</td><td class="num">200</td><td class="num">37M</td><td class="num">1.4</td><td class="num">2.2</td><td class="num">1.8</td></tr>
+        <tr><td>published NNLM vectors (C)</td><td class="num">50</td><td class="num">37M</td><td class="num">1.8</td><td class="num">9.1</td><td class="num">5.8</td></tr>
+        <tr><td>published NNLM vectors (C)</td><td class="num">100</td><td class="num">37M</td><td class="num">3.3</td><td class="num">13.2</td><td class="num">8.8</td></tr>
+        <tr><td>published recurrent LM vectors</td><td class="num">80</td><td class="num">320M</td><td class="num">4.9</td><td class="num">18.4</td><td class="num">12.7</td></tr>
+        <tr><td>published recurrent LM vectors</td><td class="num">640</td><td class="num">320M</td><td class="num">8.6</td><td class="num">36.5</td><td class="num">24.6</td></tr>
+        <tr><td>published NNLM vectors (D)</td><td class="num">50</td><td class="num">990M</td><td class="num">13.3</td><td class="num">11.6</td><td class="num">12.3</td></tr>
+        <tr><td>the paper's NNLM</td><td class="num">20</td><td class="num">6B</td><td class="num">12.9</td><td class="num">26.4</td><td class="num">20.3</td></tr>
+        <tr><td>the paper's NNLM</td><td class="num">50</td><td class="num">6B</td><td class="num">27.9</td><td class="num">55.8</td><td class="num">43.2</td></tr>
+        <tr><td>the paper's NNLM</td><td class="num">100</td><td class="num">6B</td><td class="num">34.2</td><td class="num">64.5</td><td class="num">50.8</td></tr>
+        <tr class="hl"><td><b>CBOW</b></td><td class="num">300</td><td class="num">783M</td><td class="num">15.5</td><td class="num">53.1</td><td class="num">36.1</td></tr>
+        <tr class="hl"><td><b>skip-gram</b></td><td class="num">300</td><td class="num">783M</td><td class="num">50.0</td><td class="num">55.9</td><td class="num">53.3</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">Full vocabularies; accuracy in %. Letters group rows that come from the same published source. The CBOW model was trained on a subset of the news data in about a day; skip-gram in about three days.</p>
+      <ul class="notes">
+        <li><b>Every previously published set scores at most 24.6% total.</b> Single-machine skip-gram on 783M words reaches 53.3%.</li>
+        <li>The paper's own NNLM on 6B words is strong (50.8% at 100 dims) — evidence that data size, not only the architecture, drove the gap. But that NNLM needed the distributed framework, and §12 shows its cost.</li>
+      </ul>
+
+      <h4>One epoch on more data beats three epochs on less</h4>
+      <table class="grid2">
+        <tr><th>model</th><th>dim</th><th>training words</th><th>semantic</th><th>syntactic</th><th>total</th><th>training time (days)</th></tr>
+        <tr><td>3 epoch CBOW</td><td class="num">300</td><td class="num">783M</td><td class="num">15.5</td><td class="num">53.1</td><td class="num">36.1</td><td class="num">1</td></tr>
+        <tr><td>3 epoch skip-gram</td><td class="num">300</td><td class="num">783M</td><td class="num">50.0</td><td class="num">55.9</td><td class="num">53.3</td><td class="num">3</td></tr>
+        <tr><td>1 epoch CBOW</td><td class="num">300</td><td class="num">783M</td><td class="num">13.8</td><td class="num">49.9</td><td class="num">33.6</td><td class="num">0.3</td></tr>
+        <tr class="hl"><td>1 epoch CBOW</td><td class="num">300</td><td class="num">1.6B</td><td class="num">16.1</td><td class="num">52.6</td><td class="num">36.1</td><td class="num">0.6</td></tr>
+        <tr><td>1 epoch CBOW</td><td class="num">600</td><td class="num">783M</td><td class="num">15.4</td><td class="num">53.3</td><td class="num">36.2</td><td class="num">0.7</td></tr>
+        <tr><td>1 epoch skip-gram</td><td class="num">300</td><td class="num">783M</td><td class="num">45.6</td><td class="num">52.2</td><td class="num">49.2</td><td class="num">1</td></tr>
+        <tr class="hl"><td>1 epoch skip-gram</td><td class="num">300</td><td class="num">1.6B</td><td class="num">52.2</td><td class="num">55.1</td><td class="num">53.8</td><td class="num">2</td></tr>
+        <tr><td>1 epoch skip-gram</td><td class="num">600</td><td class="num">783M</td><td class="num">56.7</td><td class="num">54.5</td><td class="num">55.5</td><td class="num">2.5</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Twice the data for one epoch ≥ the same data three times:</b> CBOW 36.1 in 0.6 days vs 36.1 in 1 day; skip-gram 53.8 in 2 days vs 53.3 in 3 days. From here on the paper trains for one epoch, again decaying the learning rate linearly to near zero.</li>
+        <li><b>For skip-gram, dimension paid off more than data in this row set:</b> 600 dims on 783M (55.5) beats 300 dims on 1.6B (53.8), driven by the semantic part (56.7 vs 52.2).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="large-scale" data-nav="Large-scale distributed training">
+      <h3><span class="idx">12</span> Large-scale distributed training on 6B words</h3>
+      <p class="lede">On a distributed parameter-server framework — many replicas of the model, each synchronising gradients through a central server holding all parameters, trained with <b>mini-batch asynchronous gradient descent and Adagrad</b> — the paper trains 1000-dimensional CBOW and skip-gram models on the full 6B-word corpus.</p>
+
+      <table class="grid2">
+        <tr><th>model</th><th>dim</th><th>training words</th><th>semantic</th><th>syntactic</th><th>total</th><th>days × CPU cores</th><th>CPU-days (our product)</th></tr>
+        <tr><td>NNLM</td><td class="num">100</td><td class="num">6B</td><td class="num">34.2</td><td class="num">64.5</td><td class="num">50.8</td><td class="num">14 × 180</td><td class="num">2 520</td></tr>
+        <tr class="hl"><td><b>CBOW</b></td><td class="num">1000</td><td class="num">6B</td><td class="num">57.3</td><td class="num">68.9</td><td class="num">63.7</td><td class="num">2 × 140</td><td class="num">280</td></tr>
+        <tr class="hl"><td><b>skip-gram</b></td><td class="num">1000</td><td class="num">6B</td><td class="num">66.1</td><td class="num">65.1</td><td class="num">65.6</td><td class="num">2.5 × 125</td><td class="num">312.5</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Ten times the dimensionality for about one ninth of the compute.</b> CBOW at 1000 dims used 280 CPU-days against the 100-dim NNLM's 2 520, and gained 12.9 points total. A 1000-dimensional NNLM "would take too long to complete".</li>
+        <li><b>Skip-gram leads overall (65.6%)</b> on the strength of semantics (66.1%); CBOW still wins syntax (68.9%).</li>
+        <li><b>Read the core counts loosely.</b> The paper calls them estimates — the data-centre machines were shared with production work and usage fluctuated. It also notes that the framework's overhead makes CBOW and skip-gram CPU usage much closer than on a single machine, where skip-gram is about 3× slower (§11). 50 to 100 model replicas were used. Distributed-training mechanics are on the <a href="../../deep-learning/distributed-training.html">distributed training</a> page.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="sentence-completion" data-nav="Sentence completion">
+      <h3><span class="idx">13</span> A second task: the sentence-completion challenge</h3>
+      <p class="lede">1040 sentences, each missing one word, with five plausible candidates; pick the most coherent. <b>Skip-gram alone is mediocre here — but it is complementary to recurrent LMs, and the combination set a new best result.</b></p>
+
+      <div class="formula"><span class="lbl">how skip-gram scores a sentence</span><span class="eq">train a 640-dimensional skip-gram model on the task's 50M-word training text
+
+for each candidate filling:
+    put the candidate (the unknown word) at the input
+    predict all surrounding words of the sentence
+    sentence score  =  sum of those individual predictions
+
+choose the candidate with the highest sentence score</span></div>
+
+      <table class="grid2">
+        <tr><th>architecture</th><th>accuracy (%)</th></tr>
+        <tr><td>4-gram</td><td class="num">39</td></tr>
+        <tr><td>average LSA similarity</td><td class="num">49</td></tr>
+        <tr><td>log-bilinear model</td><td class="num">54.8</td></tr>
+        <tr><td>recurrent LMs (previous best)</td><td class="num">55.4</td></tr>
+        <tr><td>skip-gram</td><td class="num">48.0</td></tr>
+        <tr class="hl"><td><b>skip-gram + recurrent LMs</b> (weighted combination)</td><td class="num">58.9</td></tr>
+      </table>
+      <p>The combined 58.9% splits as 59.2% on the development part and 58.7% on the test part of the set. Skip-gram on its own does not beat LSA similarity (48.0 vs 49): a bag of local predictions is a weak sentence model, but a different kind of signal from what a left-to-right LM captures.</p>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="examples" data-nav="Learned relationships">
+      <h3><span class="idx">14</span> Examples of learned relationships — read the misses too</h3>
+      <p class="lede">The relationship is a subtraction of two word vectors, added to a third word: for example <code>Paris − France + Italy = Rome</code>. Vectors here are the best from §11: skip-gram, 300 dims, 783M words. <b>Under the exact-match metric these examples would score only about 60%</b>, and the paper lists the misses alongside the hits.</p>
+
+      <table class="grid2">
+        <tr><th>relationship</th><th>example 1</th><th>example 2</th><th>example 3</th></tr>
+        <tr><td>France − Paris</td><td>Italy: Rome</td><td>Japan: Tokyo</td><td>Florida: Tallahassee</td></tr>
+        <tr><td>big − bigger</td><td class="miss">small: larger</td><td>cold: colder</td><td>quick: quicker</td></tr>
+        <tr><td>Miami − Florida</td><td>Baltimore: Maryland</td><td>Dallas: Texas</td><td>Kona: Hawaii</td></tr>
+        <tr><td>Einstein − scientist</td><td class="miss">Messi: midfielder</td><td class="miss">Mozart: violinist</td><td>Picasso: painter</td></tr>
+        <tr><td>Sarkozy − France</td><td>Berlusconi: Italy</td><td>Merkel: Germany</td><td>Koizumi: Japan</td></tr>
+        <tr><td>copper − Cu</td><td>zinc: Zn</td><td>gold: Au</td><td class="miss">uranium: plutonium</td></tr>
+        <tr><td>Berlusconi − Silvio</td><td>Sarkozy: Nicolas</td><td class="miss">Putin: Medvedev</td><td>Obama: Barack</td></tr>
+        <tr><td>Japan − sushi</td><td>Germany: bratwurst</td><td class="miss">France: tapas</td><td>USA: pizza</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">A selection of the paper's rows. Red marks entries we judge wrong or debatable under exact match (our annotation, not the paper's): "larger" for "smaller" is the right relation on the wrong stem; "midfielder" and "violinist" are near-misses in the right field; "plutonium" is a related element, not a symbol; "Medvedev" is an associated person, not a first name. The remaining rows in the paper (technology companies with their products and executives) contain similar near-misses.</p>
+
+      <ul class="notes">
+        <li><b>The misses are informative.</b> They are rarely random: the answer usually shares the topic or the relation's general type. The exact-match metric charges full price for these, which is one reason the paper calls it a lower bound on usefulness.</li>
+        <li><b>More examples per relation help:</b> averaging the offset over ten pairs instead of one improved the best models by about 10 points absolute (the toy in §09 lets you see why).</li>
+        <li><b>Other vector operations work too:</b> the paper reports good accuracy on "which word does not belong" — average the vectors of a word list and return the most distant word.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="limits" data-nav="Limitations">
+      <h3><span class="idx">15</span> Limitations, stated and implied</h3>
+      <div class="cards">
+        <div class="box bad"><div class="n">stated · morphology</div><div class="t">No access to word structure</div><div class="g">Each word is an atomic input, so <i>easiest</i> cannot be inferred from <i>easy</i> + "-est". The paper expects further progress from incorporating word structure, especially on syntactic questions. Subword models address exactly this (<a href="../embeddings.html#glove-fasttext">fastText on the hub</a>, and <a href="../tokenization.html">tokenization</a>).</div></div>
+        <div class="box warn"><div class="n">stated · metric</div><div class="t">Exact match understates quality</div><div class="g">Synonyms and near-misses score zero; 100% is likely unreachable. The test set also excludes multi-word entities.</div></div>
+        <div class="box warn"><div class="n">stated · design</div><div class="t">Less expressive by construction</div><div class="g">Removing the hidden layer trades the ability to model the data precisely for throughput. The vectors are good for linear regularities; the model is not a usable language model.</div></div>
+        <div class="box bad"><div class="n">implied · one vector per type</div><div class="t">No word sense</div><div class="g">Each word type gets one vector regardless of context, so senses are blended. The hub's <a href="../embeddings.html#contextual">static → contextual section</a> covers the fix.</div></div>
+        <div class="box warn"><div class="n">implied · evaluation</div><div class="t">Single runs, one family of test</div><div class="g">No variance across seeds is reported (§10 has a non-monotone cell), and the main benchmark is the paper's own analogy set; the sentence-completion result shows standalone performance on another task can be weak.</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 16 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="beyond" data-nav="Beyond this paper">
+      <h3><span class="idx">16</span> Beyond this paper: what "word2vec" usually means today</h3>
+      <p class="lede">Everything above is this paper. Much of what is now called "word2vec" — and what the hub page summarises — comes from the <b>follow-up paper</b> on distributed representations of words and phrases, published later the same year.</p>
+      <table class="grid2">
+        <tr><th style="width:200px">idea</th><th>what it is</th><th>source</th></tr>
+        <tr><td><b>negative sampling</b></td><td>replace the tree walk with binary logistic regression: push up the true (word, context) pair, push down <code>k</code> sampled noise words — an early relative of the objective on the <a href="../../deep-learning/contrastive-learning.html#nt-xent">contrastive learning</a> page</td><td>follow-up paper, not this one</td></tr>
+        <tr><td><b>subsampling frequent words</b></td><td>randomly discard very frequent tokens during training; speeds training and improves rare-word vectors</td><td>follow-up paper, not this one</td></tr>
+        <tr><td><b>phrases</b></td><td>merge frequent collocations into single tokens so multi-word entities get vectors</td><td>follow-up paper, not this one</td></tr>
+        <tr><td><b>fast released code</b></td><td>single-machine multi-threaded C++ implementation of both architectures, training on the order of billions of words per hour; more than 1.4 million named-entity vectors trained on more than 100 billion words</td><td>this paper's follow-up-work note (v3)</td></tr>
+      </table>
+      <p>The full softmax formula on the hub (<code>P(o | i) = exp(u_o · v_i) / ∑_w exp(u_w · v_i)</code>) is the objective that both hierarchical softmax (this paper) and negative sampling (the follow-up) avoid computing. For where static vectors sit in the larger story — GloVe, fastText, then contextual encoders and LLM embeddings — go back to the <a href="../embeddings.html">embeddings hub</a>.</p>
+    </section>
+
+    <!-- ═══ 17 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">17</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"The original word2vec paper introduced negative sampling."</span> <span class="fix">No — this paper uses hierarchical softmax over a Huffman tree.</span> Negative sampling and frequent-word subsampling are from the follow-up paper (§16).</div>
+      <div class="wrong"><span class="say">"Word2vec is a (shallow) neural language model."</span> <span class="fix">It is a pair of log-linear classifiers with no hidden layer.</span> CBOW uses future words, skip-gram predicts each neighbour independently from one word; neither gives a usable next-word distribution. Deleting the hidden layer is the whole point (§03).</div>
+      <div class="wrong"><span class="say">"Skip-gram is better than CBOW."</span> <span class="fix">Depends on the question type.</span> In the controlled comparison skip-gram leads semantics 55 vs 24, but CBOW leads syntax 64 vs 59 — and CBOW is roughly 3× cheaper on one machine (§11).</div>
+      <div class="wrong"><span class="say">"Hierarchical softmax costs log₂ V per word."</span> <span class="fix">For a balanced tree. The paper's Huffman tree costs about log₂(unigram perplexity) on average</span> — roughly half as many output units at a 1M vocabulary — while individual rare words can cost more than log₂ V (§04).</div>
+      <div class="wrong"><span class="say">"king − man + woman lands exactly on queen."</span> <span class="fix">It lands nearest to queen once the three input words are excluded</span> — and nearest by cosine, not equal. Under exact match even the paper's showcase examples score about 60% (§14).</div>
+      <div class="wrong"><span class="say">"More dimensions always give better vectors."</span> <span class="fix">Only with enough data.</span> At 24M words, 600 dims scores 24.0 against 13.4 at 50; at 783M words the same change is 23.2 → 50.4 (§10).</div>
+    </section>
+
+    <!-- ═══ 18 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">18</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Training cost is <code>O = E × T × Q</code></b>, with <code>Q</code> the parameters accessed per training word; the paper makes <code>Q</code> small so <code>T</code> can be huge.</li>
+        <li><b>NNLM: <code>N·D + N·D·H + H·V</code>; RNNLM: <code>H·H + H·V</code>.</b> A tree-structured output turns <code>× V</code> into <code>× log₂ V</code>, leaving the hidden layer dominant — so the hidden layer goes.</li>
+        <li><b>Hierarchical softmax over a Huffman tree</b> walks about <code>log₂(unigram perplexity)</code> binary decisions per word, about 2× fewer than a balanced tree at 1M words.</li>
+        <li><b>CBOW:</b> average 4 + 4 context vectors, predict the middle word, <code>Q = N·D + D·log₂ V</code>. <b>Skip-gram:</b> predict up to <code>R ≤ C</code> words each side, <code>Q = C·(D + D·log₂ V)</code>, with <code>C = 10</code> and random <code>R</code> down-weighting distant words.</li>
+        <li><b>The test set:</b> 8 869 semantic + 10 675 syntactic analogy questions, answered by <code>b − a + c</code> and cosine nearest neighbour excluding the inputs, scored by exact match.</li>
+        <li><b>Results:</b> skip-gram wins semantics, CBOW wins syntax; one epoch on twice the data beats three epochs; 1000-dim models on 6B words reach 63.7% (CBOW) and 65.6% (skip-gram) at a fraction of an NNLM's CPU-days; skip-gram + RNNLMs reach 58.9% on sentence completion.</li>
+        <li><b>Limits:</b> no morphology, one vector per word type, an exact-match metric that understates quality, and much of today's "word2vec" (negative sampling, subsampling) is from the follow-up paper.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Embeddings" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../embeddings.html">← Embeddings</a>
+      <a href="../embeddings.html" style="color:var(--muted)">Embeddings · overview</a>
+      <a href="../language-models.html">Language Models →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="word2vec.viz.js"></script>
+</body>
+</html>

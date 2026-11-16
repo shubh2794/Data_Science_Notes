@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Caching</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Caching — Keeping Hot Data Close</h1>
+      <p>A cache stores a copy of data somewhere faster or nearer than its source, betting that what was asked for recently will be asked for again. Because real workloads are <b>skewed</b>, a cache holding a few percent of the data can absorb most of the traffic. The hard parts are not the lookup — they are deciding <b>what to evict</b>, keeping copies <b>fresh</b>, and surviving the moment a hot entry <b>expires</b>. Caching is one of the core <a href="scalability.html">scalability</a> patterns.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Systems</span>
+        <span class="pill">Eviction Policies</span>
+        <span class="pill">Consistency</span>
+        <span class="pill">ML Serving</span>
+      </div>
+    </header>
+
+    <section class="topic" id="why">
+      <h3><span class="idx">01</span> Why caches work: locality and skew</h3>
+      <ul class="notes">
+        <li><b>Temporal locality:</b> an item used now is likely to be used again soon. <b>Spatial locality:</b> its neighbours are likely next (the reason CPUs fetch 64-byte lines, and why <a href="../dsa/data-structures/arrays-strings/multidim-locality-strings.html">memory layout</a> matters).</li>
+        <li><b>Popularity skew:</b> request frequencies typically follow a power law (Zipf): the item of rank r is requested with probability proportional to <code>1/rᵅ</code>. With α ≈ 1, the top 1% of items can draw a large share of all requests.</li>
+        <li>Skew is what makes caching cheap: you do not need to hold the dataset, only its head. Uniform access (every key equally likely) is the case where caches fail — hit ratio equals the fraction cached.</li>
+      </ul>
+      <div class="formula"><span class="eq">P(rank r) = r⁻ᵅ / ∑<sub>i=1..N</sub> i⁻ᵅ</span>      <span class="lbl">(Zipf popularity; <span class="keep">α ≈ 0.6–1.2</span> in many request logs)</span></div>
+    </section>
+
+    <section class="topic" id="hierarchy">
+      <h3><span class="idx">02</span> The cache hierarchy — from CPU registers to the CDN</h3>
+      <table class="cmp">
+        <tr><th>Layer</th><th>Typical size</th><th>Latency</th><th>Managed by</th></tr>
+        <tr><td>CPU L1 / L2 / L3</td><td>KB → tens of MB</td><td>~1 ns → ~10–40 ns</td><td>Hardware</td></tr>
+        <tr><td>OS page cache</td><td>Free RAM</td><td>~100 ns (vs µs–ms from disk)</td><td>Kernel</td></tr>
+        <tr><td>In-process cache</td><td>MB → GB per process</td><td>~100 ns</td><td>Application (a hash map with eviction)</td></tr>
+        <tr><td>Distributed cache (Redis, memcached)</td><td>GB → TB across a cluster</td><td>~0.2–1 ms (network hop)</td><td>Cache service</td></tr>
+        <tr><td>Database buffer pool</td><td>Configured RAM</td><td>µs</td><td>Database engine</td></tr>
+        <tr><td>CDN / edge cache</td><td>PB across points of presence</td><td>~5–30 ms (vs 100+ ms to origin)</td><td>CDN, via HTTP cache headers</td></tr>
+        <tr><td>Browser / client cache</td><td>MB</td><td>~0 (no network)</td><td>Client, via <code>Cache-Control</code> / <code>ETag</code></td></tr>
+      </table>
+      <p>Each layer caches the one below. A request that misses everywhere pays every lookup on the way down — which is why a cache with a poor hit ratio can make things <i>slower</i>.</p>
+    </section>
+
+    <section class="topic" id="hitratio">
+      <h3><span class="idx">03</span> Hit ratio, effective latency and origin load</h3>
+      <div class="formula"><span class="eq">h = hits / (hits + misses)</span><br>
+<span class="eq">T<sub>eff</sub> = h · t<sub>hit</sub> + (1 − h) · (t<sub>hit</sub> + t<sub>miss</sub>)</span>      <span class="lbl">(a miss pays the lookup and then the origin)</span><br>
+<span class="eq">origin load = (1 − h) · λ</span></div>
+      <ul class="notes">
+        <li>With t<sub>hit</sub> = 0.5 ms and t<sub>miss</sub> = 20 ms: h = 90% → T<sub>eff</sub> = 2.5 ms; h = 99% → 0.7 ms. More importantly, origin load drops <b>10×</b> between 90% and 99%. <b>Think in miss ratio</b>, not hit ratio: 1% vs 10% misses is the number your database feels.</li>
+        <li>This is the danger: a database sized for a 1% miss ratio is <b>undersized by 10×</b> the moment the cache is cold (restart, deploy, failover, a new key space). Plan cache warm-up and treat the cache as load-bearing.</li>
+        <li>Byte hit ratio (bytes served from cache) matters more than request hit ratio for CDNs, where a few huge objects dominate bandwidth.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="eviction">
+      <h3><span class="idx">04</span> Eviction policies</h3>
+      <table class="cmp">
+        <tr><th>Policy</th><th>Evicts</th><th>Strength · weakness</th></tr>
+        <tr><td><b>FIFO</b></td><td>The oldest inserted item</td><td>Trivial, lock-friendly · ignores reuse entirely</td></tr>
+        <tr><td><b>LRU</b></td><td>The least recently used item</td><td>Adapts to recency; O(1) with a hash map + doubly linked list · one large scan flushes the whole cache</td></tr>
+        <tr><td><b>CLOCK</b></td><td>An LRU approximation: a "referenced" bit swept by a hand</td><td>Cheap, no list reordering on hit; used by OS page caches</td></tr>
+        <tr><td><b>LFU</b></td><td>The least frequently used item</td><td>Keeps the stable head under Zipf · stale popularity lingers when tastes shift; needs counter ageing</td></tr>
+        <tr><td><b>ARC</b></td><td>Balances a recency list and a frequency list, sized adaptively using "ghost" lists of recently evicted keys</td><td>Scan-resistant and self-tuning, no parameter · more bookkeeping</td></tr>
+        <tr><td><b>W-TinyLFU</b></td><td>Admits a new item only if its sketched frequency beats the eviction victim's</td><td>Near-optimal hit ratios with tiny metadata (count-min sketch)</td></tr>
+        <tr><td><b>TTL</b></td><td>Anything older than its time-to-live</td><td>Bounds <b>staleness</b>, not memory — combine it with one of the above</td></tr>
+        <tr><td><b>OPT (Belady)</b></td><td>The item whose next use is furthest in the future</td><td>Optimal but needs the future — the yardstick for the others</td></tr>
+      </table>
+      <ul class="notes">
+        <li>Online algorithms theory makes this precise: with cache size k, LRU and FIFO are <b>k-competitive</b> against OPT, and no deterministic policy does better in the worst case — see <a href="../dsa/algorithms/online-randomized/paging-list-update.html">Online Paging &amp; List Update</a>.</li>
+        <li>Redis does <b>approximate</b> LRU/LFU: on eviction it samples a handful of keys and evicts the best candidate among them, avoiding a global list. Its policies (<code>allkeys-lru</code>, <code>allkeys-lfu</code>, <code>volatile-ttl</code>, <code>noeviction</code>, …) decide <i>which</i> keys are eligible.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="sim">
+      <h3><span class="idx">05</span> Simulator — hit ratio vs cache size under different workloads</h3>
+      <p class="lede">A catalogue of 1 000 items, a seeded trace of 12 000 requests. Curves show the hit ratio of each policy for cache sizes from 1% to 50% of the catalogue. Switch the workload to see where each policy breaks.</p>
+      <div class="viz" id="viz-cache">
+        <div class="vhead">
+          <span class="vtitle">Eviction policy hit-ratio curves</span>
+          <span class="vhint">dashed = Belady's OPT, the unreachable upper bound</span>
+        </div>
+        <div class="controls">
+          <label>workload
+            <select id="ca-w">
+              <option value="zipf">stationary Zipf</option>
+              <option value="scan">Zipf + periodic scans</option>
+              <option value="shift">Zipf with popularity shift</option>
+            </select>
+          </label>
+          <label>skew α <input type="range" id="ca-a" min="0.5" max="1.4" step="0.05" value="0.9"><span id="ca-a-v" class="lbl"></span></label>
+          <label>cache size <input type="range" id="ca-c" min="1" max="50" step="1" value="10"><span id="ca-c-v" class="lbl"></span></label>
+        </div>
+        <svg id="ca-svg" width="640" height="280" viewBox="0 0 640 280" role="img" aria-label="Interactive chart: hit ratio versus cache size for FIFO, LRU, LFU and optimal eviction under several workloads"></svg>
+        <div class="legend"><span><span class="dot" style="background:#9aa3b2"></span>FIFO</span><span><span class="dot" style="background:#5b9cff"></span>LRU</span><span><span class="dot" style="background:#4ade80"></span>LFU</span><span><span class="dot" style="background:#ffb454"></span>OPT</span></div>
+        <div class="readout" aria-live="polite" id="ca-read"></div>
+      </div>
+      <ul class="notes">
+        <li><b>Scans</b> (a nightly export, a crawler, a full-table read) push hundreds of one-time keys through the cache; LRU and FIFO evict the hot set to make room, LFU ignores them.</li>
+        <li><b>Popularity shifts</b> (yesterday's trending item) punish LFU: old counts keep dead items resident. Practical LFU implementations decay counters over time for exactly this reason.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="patterns">
+      <h3><span class="idx">06</span> Read and write patterns</h3>
+      <table class="cmp">
+        <tr><th>Pattern</th><th>Read path</th><th>Write path</th><th>Trade-off</th></tr>
+        <tr><td><b>Cache-aside</b> (lazy loading)</td><td>App reads cache; on miss reads DB and fills cache</td><td>App writes DB, then <b>deletes</b> the cache key</td><td>Simple, cache failure is survivable; first read after a change is a miss; races can leave stale data</td></tr>
+        <tr><td><b>Read-through</b></td><td>Cache itself loads from DB on miss</td><td>—</td><td>Cleaner app code; cache must know the data source</td></tr>
+        <tr><td><b>Write-through</b></td><td>Reads always hit fresh data</td><td>Write to cache and DB synchronously</td><td>Cache never stale for these keys; every write pays both latencies; caches data that may never be read</td></tr>
+        <tr><td><b>Write-back</b> (write-behind)</td><td>Reads from cache</td><td>Write to cache, flush to DB asynchronously, often batched</td><td>Lowest write latency, absorbs write bursts · <b>data loss</b> if the cache dies before flushing</td></tr>
+        <tr><td><b>Write-around</b></td><td>Cache-aside reads</td><td>Write straight to DB, bypassing the cache</td><td>Avoids polluting the cache with write-once data; next read misses</td></tr>
+      </table>
+      <p>CPUs use write-back caches with coherence protocols; application caches overwhelmingly use <b>cache-aside with delete-on-write</b>, because deleting is idempotent and safe to retry while updating in place is not.</p>
+    </section>
+
+    <section class="topic" id="invalidation">
+      <h3><span class="idx">07</span> Invalidation and consistency</h3>
+      <ul class="notes">
+        <li><b>TTL-only:</b> accept bounded staleness (≤ TTL). The simplest correct model when the business tolerates it; add random <b>jitter</b> to TTLs so keys filled together do not expire together.</li>
+        <li><b>Explicit invalidation:</b> delete on write. The classic race: reader A misses and reads the old value from the DB; writer B updates the DB and deletes the key; A then writes the <i>old</i> value into the cache, where it lives until TTL. Mitigations: short TTLs as a backstop, <b>leases</b> (the cache hands the reader a token that a concurrent delete invalidates), or delayed double-delete.</li>
+        <li><b>Versioned keys:</b> embed a version or content hash in the key (<code>user:42:v17</code>); writes bump the version, old entries simply age out. Excellent for immutable artefacts — model files, feature snapshots, static assets.</li>
+        <li><b>Change-data-capture invalidation:</b> tail the database's replication log and invalidate (or update) cache keys from it, so invalidation is driven by committed writes rather than by every code path remembering to do it. This rides on a <a href="message-queues.html">message log</a>.</li>
+        <li>A cache is a <b>replica without a consensus protocol</b>. It cannot give you <a href="transactions-acid.html">transactional</a> guarantees; if a read must be fresh (balances, permissions), read the source.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="stampede">
+      <h3><span class="idx">08</span> Stampedes and the thundering herd</h3>
+      <p class="lede">When a hot key expires, every concurrent request misses at once and all of them recompute or hit the database — a load spike proportional to request rate × recompute time, exactly when the origin is least able to absorb it.</p>
+      <ul class="notes">
+        <li><b>Request coalescing (single-flight):</b> the first miss recomputes; the others wait for its result. One origin call per expiry per cache node.</li>
+        <li><b>Locks / leases:</b> the same idea across processes — only the lease holder recomputes; others get a short wait or the stale value.</li>
+        <li><b>Stale-while-revalidate:</b> keep serving the expired value while one background refresh runs. Users never see the miss latency.</li>
+        <li><b>Probabilistic early expiration:</b> each reader independently decides to refresh <i>before</i> expiry, with a probability that rises as expiry approaches and with the cost of recomputation:</li>
+      </ul>
+      <div class="formula"><span class="eq">refresh early if  now − δ · β · ln(u) ≥ expiry</span>      <span class="lbl">(<span class="keep">u ~ uniform(0,1)</span> · <span class="keep">δ</span> = recompute time · <span class="keep">β ≥ 1</span>, default 1)</span></div>
+      <div class="viz" id="viz-herd">
+        <div class="vhead">
+          <span class="vtitle">Origin load around expiries of one hot key</span>
+          <span class="vhint">TTL = 10 s · bars = origin calls per 250 ms</span>
+        </div>
+        <div class="controls">
+          <label>strategy
+            <select id="hd-s">
+              <option value="none">naive cache-aside</option>
+              <option value="sf">single-flight</option>
+              <option value="xf">probabilistic early refresh</option>
+            </select>
+          </label>
+          <label>request rate (req/s) <input type="range" id="hd-r" min="50" max="2000" step="50" value="800"><span id="hd-r-v" class="lbl"></span></label>
+          <label>recompute time δ (ms) <input type="range" id="hd-d" min="20" max="1000" step="10" value="300"><span id="hd-d-v" class="lbl"></span></label>
+        </div>
+        <svg id="hd-svg" width="640" height="210" viewBox="0 0 640 210" role="img" aria-label="Interactive chart: database calls over time when a hot cache key expires, comparing naive, single-flight and probabilistic early refresh"></svg>
+        <div class="readout" aria-live="polite" id="hd-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="distributed">
+      <h3><span class="idx">09</span> Distributed caches: Redis and memcached</h3>
+      <table class="cmp">
+        <tr><th></th><th>memcached</th><th>Redis (and compatible forks)</th></tr>
+        <tr><td><b>Data model</b></td><td>Opaque byte strings by key</td><td>Strings, hashes, lists, sets, sorted sets, streams, bitmaps, HyperLogLog</td></tr>
+        <tr><td><b>Threading</b></td><td>Multi-threaded</td><td>Command execution essentially single-threaded per shard (I/O can be threaded) — scale by sharding</td></tr>
+        <tr><td><b>Persistence &amp; replication</b></td><td>None — pure cache</td><td>Optional snapshots / append-only log; primary–replica replication; cluster mode with hash slots</td></tr>
+        <tr><td><b>Memory</b></td><td>Slab allocator, per-slab LRU</td><td>Configurable <code>maxmemory</code> + eviction policy</td></tr>
+        <tr><td><b>Use when</b></td><td>Simple, very high-throughput look-aside caching</td><td>You also want counters, rate limiters, leaderboards, queues, locks</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Partitioning:</b> keys are spread across nodes by <a href="load-balancing.html#consistent">consistent hashing</a> or fixed hash slots, so adding a node remaps only a fraction of keys (each remapped key is a miss).</li>
+        <li><b>Hot keys:</b> one celebrity key can saturate one shard regardless of cluster size. Fixes: a small in-process cache in front (L1 + L2), replicating hot keys to several suffixed copies, or read replicas.</li>
+        <li><b>Big values</b> (multi-MB) block a single-threaded server and saturate NICs; compress, split, or store the blob in <a href="distributed-storage.html">object storage</a> and cache a pointer.</li>
+        <li>Do not let the cache become the system of record by accident: if losing it loses data, it is a database and needs to be operated as one.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="ml">
+      <h3><span class="idx">10</span> Caching in ML systems</h3>
+      <table class="cmp">
+        <tr><th>Cache</th><th>What is stored</th><th>Key concern</th></tr>
+        <tr><td><b>Online feature cache</b></td><td>Precomputed features per entity (user, item) served at inference time</td><td>Freshness SLAs and <b>train–serve skew</b> — see <a href="../data-engineering/feature-stores.html">Feature Stores</a></td></tr>
+        <tr><td><b>Embedding cache</b></td><td>Vectors for items/documents so they are not re-encoded per request</td><td>Versioned by model: a new encoder invalidates every vector (<a href="../nlp/embeddings.html">Embeddings</a>, <a href="vector-databases.html">Vector Databases</a>)</td></tr>
+        <tr><td><b>Prediction cache</b></td><td>Model outputs for repeated inputs (popular queries, batch-scored users)</td><td>Key must include the model version and every input feature</td></tr>
+        <tr><td><b>KV cache</b></td><td>Attention keys/values of already-processed tokens in a transformer</td><td>GPU memory is the limit; paging, eviction and quantisation — see <a href="../mlops/llm-serving.html">LLM Serving</a></td></tr>
+        <tr><td><b>Prefix / prompt cache</b></td><td>KV state for a shared prompt prefix (system prompt, few-shot examples, document)</td><td>Hit ratio depends on routing requests with the same prefix to the same replica</td></tr>
+        <tr><td><b>Semantic cache</b></td><td>Responses keyed by embedding similarity of the query</td><td>A "near" hit can be a <b>wrong</b> answer; threshold carefully and never for personalised or factual-critical answers</td></tr>
+        <tr><td><b>Dataset cache</b></td><td>Training shards on local NVMe in front of object storage</td><td>Multi-epoch training rereads everything — see <a href="distributed-storage.html#ml">Distributed Storage</a></td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">11</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Skew is the reason caches work</b>; under uniform access they barely help.</li>
+        <li><b>Think in miss ratio:</b> origin load is <code>(1 − h)·λ</code>, and a cold cache multiplies it.</li>
+        <li><b>Pick eviction for the workload:</b> LRU for recency, LFU (with decay) for stable popularity, ARC / W-TinyLFU when scans and shifts both happen; TTL bounds staleness.</li>
+        <li><b>Cache-aside + delete-on-write + TTL backstop</b> is the default; know its race and use leases or versioned keys where it matters.</li>
+        <li><b>Defend hot-key expiry</b> with single-flight, stale-while-revalidate or probabilistic early refresh.</li>
+        <li><b>In ML, version every cache key by model</b> — features, embeddings and predictions are only valid for the model that produced or consumes them.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="caching.viz.js"></script>
+</body>
+</html>

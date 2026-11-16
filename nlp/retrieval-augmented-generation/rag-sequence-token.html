@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · RAG-Sequence &amp; RAG-Token: the original RAG model</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../retrieval-augmented-generation.html">Retrieval-Augmented Generation</a> · deep dive</p>
+      <h1>RAG-Sequence &amp; RAG-Token: the original RAG model</h1>
+      <p>The 2020 study that named retrieval-augmented generation did not paste search results into a prompt. It built one probabilistic model: a dense retriever over a Wikipedia index supplies <b>latent documents</b>, a pretrained seq2seq generator conditions on each, and the documents are <b>marginalised out</b> — either once for the whole output (RAG-Sequence) or afresh at every token (RAG-Token). Both halves are fine-tuned end to end from input–output pairs alone. This page covers the two formulations, how they are trained and decoded, what the reported results do and do not show, and how today's "RAG" drifted away from it.</p>
+      <div style="margin-top:10px">
+        <span class="pill">NLP</span>
+        <span class="pill">Retrieval</span>
+        <span class="pill">parametric vs non-parametric memory · latent documents · top-k marginalisation · frozen index · thorough vs fast decoding · open-domain QA · FEVER · index hot-swap</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="motivation" data-nav="Two kinds of memory">
+      <h3><span class="idx">01</span> Two kinds of memory, and the gap the study aimed at</h3>
+      <p class="lede"><b>A pretrained language model stores knowledge in its weights — parametric memory.</b> It cannot easily expand or revise that memory, cannot show where an answer came from, and may hallucinate. A <b>non-parametric memory</b> — a retrievable collection of text — can be revised, expanded, inspected and interpreted directly. The study's goal was a hybrid of the two for <i>generation</i>.</p>
+
+      <ul class="notes">
+        <li><b>Knowledge-intensive tasks</b> are defined in the study as tasks a human could not reasonably be expected to do without access to an external knowledge source: open-domain question answering, fact verification, factual question generation.</li>
+        <li><b>What existed.</b> Two earlier hybrids (REALM and ORQA) combined a masked language model with a differentiable retriever, but had only been explored for open-domain <i>extractive</i> QA — the answer is a span copied out of a retrieved passage.</li>
+        <li><b>What was missing.</b> The same hybrid for sequence-to-sequence models, which the study calls the "workhorse of NLP": a general-purpose fine-tuning recipe that works on any input-to-output-text task, where both the parametric memory (a pretrained seq2seq model) and the non-parametric memory (a dense Wikipedia index with a pretrained retriever) come <b>pre-trained and pre-loaded</b>, so knowledge access works before any task training.</li>
+      </ul>
+
+      <table class="grid2">
+        <tr><th style="width:150px"></th><th>parametric only ("closed book")</th><th>retrieve-and-extract</th><th>RAG</th></tr>
+        <tr><td><b>where knowledge lives</b></td><td>generator weights</td><td>retrieved passages</td><td>both: weights <i>and</i> a text index</td></tr>
+        <tr><td><b>output</b></td><td>free text</td><td>a span of a retrieved passage</td><td>free text, conditioned on retrieved passages</td></tr>
+        <tr><td><b>update knowledge</b></td><td>retrain</td><td>change the corpus</td><td>swap the index, no retraining (§10)</td></tr>
+        <tr><td><b>provenance</b></td><td>none</td><td>the source passage</td><td>the retrieved passages and their posterior weights (§07)</td></tr>
+      </table>
+      <p>The broader motivation for retrieval — cutoffs, provenance, private data — and the full modern pipeline are on the <a href="../retrieval-augmented-generation.html#overview">RAG hub</a>; this page is about the specific model that introduced the name.</p>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="architecture" data-nav="Retriever, index, generator">
+      <h3><span class="idx">02</span> The components: a dense retriever, a 21M-passage index, a seq2seq generator</h3>
+      <p class="lede">Two parameterised pieces: a <b>retriever</b> <code>p_η(z | x)</code> that returns a top-k truncated distribution over passages <code>z</code> for an input <code>x</code>, and a <b>generator</b> <code>p_θ(yᵢ | x, z, y₁:ᵢ₋₁)</code> that produces the next output token given the input, one passage and the tokens so far.</p>
+
+      <div class="formula"><span class="lbl">the retriever: a bi-encoder scored by inner product</span><span class="eq">p_η(z | x)  ∝  exp( d(z)ᵀ q(x) )
+
+d(z) = BERT_d(z)      document encoder (BERT-base)
+q(x) = BERT_q(x)      query encoder    (BERT-base)
+
+top-k( p_η(· | x) )  =  the k passages with the largest d(z)ᵀ q(x)
+                     =  a maximum inner product search (MIPS),
+                        solvable approximately in sub-linear time</span>
+<span class="lbl">the generator: a pretrained encoder–decoder</span><span class="eq">p_θ(yᵢ | x, z, y₁:ᵢ₋₁)      BART-large (≈400M parameters)
+                             input = x and z simply concatenated</span></div>
+
+      <ul class="notes">
+        <li><b>Retriever initialisation.</b> Both encoders and the document index come from a pre-trained dense passage retriever (DPR) bi-encoder, which had been trained to retrieve passages containing answers to TriviaQA and Natural Questions questions. Remember this when reading "no retrieval supervision" later (§04, §13). The bi-encoder idea itself — encode query and document independently so all document vectors can be precomputed — is on the hub's <a href="../retrieval-augmented-generation.html#embeddings">embeddings &amp; similarity</a> section; BERT is on its <a href="../../models/bert.html">model page</a>.</li>
+        <li><b>Generator.</b> BART-large is a seq2seq transformer pre-trained with a denoising objective (its objective is compared with others on the <a href="../../models/nlp-models.html#objectives">NLP models</a> page). Any encoder–decoder could fill this slot; the study chose BART for its state-of-the-art results on a range of generation tasks, where it outperforms comparably sized T5 models (<a href="../../models/t5.html">T5</a>). The study calls the BART parameters <code>θ</code> the parametric memory and the document index the non-parametric memory.</li>
+        <li><b>Normalisation.</b> The distribution over passages is <i>top-k truncated</i>: only the k retrieved passages receive probability, so in practice the softmax runs over the k retrieved scores.</li>
+      </ul>
+
+      <h4>The index</h4>
+      <div class="cards">
+        <div class="box"><div class="n">corpus</div><div class="t">Wikipedia, December 2018</div><div class="g">One dump for every experiment. Each article split into disjoint 100-word chunks: <b>21M</b> passages ("documents").</div></div>
+        <div class="box"><div class="n">search</div><div class="t">One MIPS index, HNSW approximation</div><div class="g">Every passage embedded once by the document encoder; a single FAISS index with a Hierarchical Navigable Small World approximation for fast retrieval. HNSW itself is explained on the <a href="../../databases/vector-databases.html#search">vector databases</a> page.</div></div>
+        <div class="box"><div class="n">footprint</div><div class="t">~100 GB of CPU memory</div><div class="g">Search on CPU was fast enough, so the vectors were kept in CPU memory: about 100 GB for all of Wikipedia, reduced to 36 GB with the index library's compression in a later port. The appendix counts 21M vectors, 15.3B values.</div></div>
+      </div>
+
+      <div class="formula"><span class="lbl">parameter count, as reported in the appendix</span><span class="eq">query encoder (BERT-base)       110M
+document encoder (BERT-base)    110M     (counted, but not trained — §04)
+generator (BART-large)          406M
+                                ─────
+reported total                  626M "trainable parameters"
+
+actually updated during fine-tuning (our arithmetic):  110M + 406M = 516M
+index:  21M vectors, 15.3B values — not trainable parameters</span></div>
+      <p style="font-size:12.5px;color:var(--muted)">The appendix gives the vectors as 728-dimensional; 21M × 728 ≈ 15.3B is consistent with that, but BERT-base's hidden size is 768 (general knowledge), which would give ≈ 16.1B. The page reports the stated 15.3B and flags the dimension as probably a typo.</p>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="models" data-nav="The two formulations">
+      <h3><span class="idx">03</span> The two formulations: one document per answer, or one per token</h3>
+      <p class="lede"><b>The retrieved passage is a latent variable</b>: nobody says which passage should produce the answer, so the model sums over the top-k. The two variants differ only in <i>where</i> the sum sits relative to the product over output tokens.</p>
+
+      <div class="formula"><span class="lbl">RAG-Sequence — the same document generates the whole output</span><span class="eq">p_RAG-Sequence(y | x)  ≈  ∑_(z ∈ top-k(p(·|x)))  p_η(z | x) · p_θ(y | x, z)
+
+                       =  ∑_(z ∈ top-k)  p_η(z | x) · ∏ᵢ₌₁ᴺ p_θ(yᵢ | x, z, y₁:ᵢ₋₁)
+
+                          mix over documents  OF  whole-sequence products</span>
+<span class="lbl">RAG-Token — a different document may generate each token</span><span class="eq">p_RAG-Token(y | x)  ≈  ∏ᵢ₌₁ᴺ  ∑_(z ∈ top-k(p(·|x)))  p_η(z | x) · p_θ(yᵢ | x, z, y₁:ᵢ₋₁)
+
+                       product over tokens  OF  per-token mixtures</span>
+<span class="lbl">classification: a target of length one</span><span class="eq">N = 1   ⇒   ∑_z p_η(z|x) p_θ(y₁|x,z)   in both   ⇒   RAG-Sequence ≡ RAG-Token</span></div>
+
+      <ul class="notes">
+        <li><b>RAG-Sequence</b> is a mixture model over complete answers: pick a document from the retriever's distribution, then generate the entire answer from it. An answer scores well if <i>some</i> single high-prior passage supports all of it.</li>
+        <li><b>RAG-Token</b> re-chooses the document at every step, so it can stitch content from several passages into one output — useful when an answer has two separate facts that live in two passages. Note that the mixing weights are the retriever prior <code>p_η(z|x)</code> at every step; they are not updated by the tokens already generated.</li>
+        <li><b>Neither is larger in general.</b> Both are proper distributions over outputs, so if one gives a particular <code>y</code> more probability, it gives some other output less. Which one prefers a given answer depends on how the support is spread across documents — the explorer below makes this concrete.</li>
+      </ul>
+
+      <h4>Which document generated which token: the posterior</h4>
+      <div class="formula"><span class="lbl">document posteriors implied by each model (our derivation from the definitions)</span><span class="eq">RAG-Token, at step i:
+  p(z | x, y₁:ᵢ)  =  p_η(z|x) · p_θ(yᵢ | x, z, y₁:ᵢ₋₁)  /  ∑_z′ p_η(z′|x) · p_θ(yᵢ | x, z′, y₁:ᵢ₋₁)
+
+RAG-Sequence, after the prefix y₁:ᵢ:
+  p(z | x, y₁:ᵢ)  ∝  p_η(z|x) · ∏ⱼ₌₁ⁱ p_θ(yⱼ | x, z, y₁:ⱼ₋₁)      evidence accumulates;
+                                                                  one document tends to win</span></div>
+      <p>The RAG-Token posterior is what the study plots for its Jeopardy example (§07): it can jump from one document to another between tokens. The RAG-Sequence posterior can only sharpen as the prefix grows, because every token's likelihood multiplies into the same per-document product.</p>
+
+      <div class="viz" id="viz-mx">
+        <div class="vhead">
+          <span class="vtitle">Marginalisation explorer: the same retrieved documents, scored by both formulations</span>
+          <span class="vhint">illustrative toy values, not reported numbers — try k = 1, then the "two passages" preset, then "one passage has it all"</span>
+        </div>
+        <div class="controls">
+          <label>scenario <select id="mx-preset">
+            <option value="split" selected>two passages, one fact each</option>
+            <option value="single">one passage has it all</option>
+            <option value="flat">no passage helps (parametric only)</option>
+          </select></label>
+          <label>retrieved k <input type="range" id="mx-k" min="1" max="10" step="1" value="4" /><span id="mx-kv" style="min-width:20px;display:inline-block">4</span></label>
+          <label>retriever sharpness <input type="range" id="mx-t" min="0" max="3" step="0.1" value="1" /><span id="mx-tv" style="min-width:28px;display:inline-block">1.0</span></label>
+          <label>edit score of <select id="mx-doc"></select></label>
+          <label>score <input type="range" id="mx-s" min="-3" max="3" step="0.1" value="2" /><span id="mx-sv" style="min-width:34px;display:inline-block">2.0</span></label>
+          <label>generator noise <input type="range" id="mx-n" min="0" max="0.6" step="0.05" value="0.2" /><span id="mx-nv" style="min-width:32px;display:inline-block">0.20</span></label>
+          <label>posterior shown <select id="mx-post">
+            <option value="token" selected>RAG-Token, per token</option>
+            <option value="seq">RAG-Sequence, after prefix</option>
+          </select></label>
+          <button id="mx-seed" type="button">re-draw noise</button>
+        </div>
+        <svg id="mx-svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-label="Three aligned panels with one row per retrieved document, ordered by retrieval score. Left: horizontal bars of the retriever prior p of z given x, a softmax over the k retrieved scores. Middle: a grid of generator probabilities, one cell per document and per target token of the four-token answer Farewell, Arms, Sun, Rises, each cell shaded and labelled with its value. Right: a heat map of the document posterior for each token, either the RAG-Token per-token posterior or the RAG-Sequence posterior after each prefix. In the two-passages preset the RAG-Token posterior jumps from document 1 on Farewell to document 2 on Sun and is flatter on Arms and Rises, which every document predicts. Bottom: two bars on a logarithmic scale comparing the RAG-Sequence likelihood, a mixture of per-document sequence products, with the RAG-Token likelihood, a product of per-token mixtures. With k equal to 1 the bars are identical. The readout gives both likelihoods, their ratio, which is higher and why, and the gradient each model sends to the top document's retrieval score."></svg>
+        <div class="readout" aria-live="polite" id="mx-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>When they agree.</b> Exactly at <code>k = 1</code> (one term in every sum). Also when every document gives the same token probabilities (then both reduce to <code>∏ᵢ p(yᵢ)</code> — the "no passage helps" preset with zero noise), and approximately when the retriever puts almost all its mass on one document (high sharpness).</li>
+        <li><b>When RAG-Token is higher.</b> When different tokens are supported by different documents: each document alone makes the other's fact unlikely, so every per-document product is small, while the per-token mixture can take each fact from wherever it lives.</li>
+        <li><b>When RAG-Sequence is higher.</b> When one document supports the whole answer: the mixture of products keeps that document's large product weighted by its prior once, while the product of mixtures pays the prior's dilution at every content token. (Formally, a mean of products versus a product of means; with perfectly correlated support Jensen's inequality favours RAG-Sequence.)</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="training" data-nav="Training: latent retrieval">
+      <h3><span class="idx">04</span> Training: maximum marginal likelihood, a frozen index, no labels on retrieval</h3>
+      <p class="lede">Given input–output pairs <code>(xⱼ, yⱼ)</code>, the study minimises the <b>negative marginal log-likelihood</b> of each target with Adam. Retriever and generator are trained jointly, and <b>nothing tells the model which passage it should have retrieved</b> — the retrieved document is a latent variable.</p>
+
+      <div class="formula"><span class="lbl">the objective</span><span class="eq">minimise   ∑ⱼ  − log p(yⱼ | xⱼ)        with p = p_RAG-Sequence or p_RAG-Token</span>
+<span class="lbl">what reaches the retriever (our derivation, scores s_z = d(z)ᵀq(x) over the top-k)</span><span class="eq">RAG-Sequence:   ∂ log p(y|x) / ∂ s_z   =   p(z | x, y)  −  p_η(z | x)
+
+RAG-Token:      ∂ log p(y|x) / ∂ s_z   =   ∑ᵢ [ p(z | x, y₁:ᵢ)  −  p_η(z | x) ]
+
+posterior above prior  →  raise this passage's score
+posterior below prior  →  lower it</span></div>
+      <p>So the retriever is taught by the generator: passages that made the target answer more likely than the retriever expected get pulled toward the query; passages that did not, get pushed away. The gradient flows into <code>q(x)</code> through the scores of the k passages that were actually retrieved; the top-k selection itself is a discrete search and is not differentiated (general knowledge about this setup).</p>
+
+      <h4>Why the document encoder and the index stay frozen</h4>
+      <ul class="notes">
+        <li><b>Cost.</b> Updating <code>BERT_d</code> would change every one of the 21M passage vectors, so the index would have to be periodically re-encoded and rebuilt during training — which REALM does during its pre-training.</li>
+        <li><b>The study's position.</b> "We do not find this step necessary for strong performance": the document encoder and index are kept fixed, and only the query encoder <code>BERT_q</code> and the BART generator are fine-tuned.</li>
+        <li><b>What the ablation actually tests.</b> The reported retrieval ablation (§09) freezes the <i>whole</i> retriever, including the query encoder, and shows learning the query encoder helps on almost every task. There is no reported ablation that also trains the document encoder; the claim that doing so is unnecessary rests on the study's statement, not on a table.</li>
+      </ul>
+
+      <h4>Training set-up (as reported)</h4>
+      <ul class="notes">
+        <li><code>k ∈ {5, 10}</code> retrieved documents per training query; test-time <code>k</code> chosen on dev data. Training with 5 or 10 made no significant difference (§09).</li>
+        <li>Mixed-precision training on 8 GPUs with 32 GB each, though the study notes training and inference can run on one GPU.</li>
+        <li>For Natural Questions and WebQuestions, each of a question's multiple reference answers is used as a separate training pair, which gave a small accuracy increase. TriviaQA answer candidates are dropped if they do not occur in the top 1000 retrieved documents.</li>
+        <li>The small sets — CuratedTrec and WebQuestions — are initialised from the Natural Questions RAG model.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="decoding" data-nav="Decoding each variant">
+      <h3><span class="idx">05</span> Decoding: one beam search, or one per document</h3>
+      <p class="lede">At test time each variant needs its own approximation to <code>argmax_y p(y | x)</code>. RAG-Token factorises over tokens, so ordinary beam search works. RAG-Sequence does not, so it needs a beam per document and a way to score hypotheses that some beams never produced.</p>
+
+      <div class="formula"><span class="lbl">RAG-Token: a standard autoregressive decoder with a mixed transition</span><span class="eq">p′_θ(yᵢ | x, y₁:ᵢ₋₁)  =  ∑_(z ∈ top-k)  p_η(z | x) · p_θ(yᵢ | x, z, y₁:ᵢ₋₁)
+
+plug p′_θ into any standard beam decoder</span>
+<span class="lbl">RAG-Sequence: thorough decoding</span><span class="eq">for each retrieved z:  beam search scored by p_θ(yᵢ | x, z, y₁:ᵢ₋₁)   →  hypotheses
+Y  =  union of all beams' hypotheses
+
+for each y ∈ Y and each z whose beam did NOT contain y:
+      run an extra forward pass to get p_θ(y | x, z)
+p(y | x)  =  ∑_z p_η(z | x) · p_θ(y | x, z)        → return the best y</span>
+<span class="lbl">RAG-Sequence: fast decoding</span><span class="eq">assume  p_θ(y | x, z) ≈ 0  whenever y was not produced by z's beam
+⇒ no extra forward passes once Y is built</span></div>
+
+      <p>The cost of thorough decoding grows with <code>|Y|</code>, which is large for long outputs: in the worst case it is <code>k</code> beam searches plus up to <code>k · |Y|</code> additional scoring passes (our arithmetic). Fast decoding drops those passes and in exchange under-counts hypotheses that only some documents found.</p>
+
+      <table class="grid2">
+        <tr><th>task</th><th>RAG-Token at test</th><th>RAG-Sequence at test</th><th>search</th></tr>
+        <tr><td><b>open-domain QA</b></td><td class="num">15 docs</td><td class="num">50 docs, thorough decoding</td><td>greedy — beam search did not improve results; answers are short</td></tr>
+        <tr><td><b>MS-MARCO, Jeopardy generation</b></td><td class="num">10 docs</td><td class="num">10 docs, fast decoding</td><td>beam size 4; thorough decoding did not improve performance</td></tr>
+      </table>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="qa" data-nav="Open-domain QA results">
+      <h3><span class="idx">06</span> Open-domain QA: generating answers beats extracting them</h3>
+      <p class="lede">Questions and answers are treated as plain text pairs and the model is trained directly on the answers' negative log-likelihood. RAG is compared with <b>closed-book</b> generators (T5, no retrieval) and with <b>open-book</b> retrieve-and-extract systems (REALM, DPR). Metric: exact match.</p>
+
+      <table class="grid2">
+        <tr><th>test exact match</th><th>Natural Questions</th><th>TriviaQA open test / Wiki test</th><th>WebQuestions</th><th>CuratedTrec</th></tr>
+        <tr><td>closed book · T5-11B</td><td class="num">34.5</td><td class="num">– / 50.1</td><td class="num">37.4</td><td class="num">–</td></tr>
+        <tr><td>closed book · T5-11B + salient span masking</td><td class="num">36.6</td><td class="num">– / 60.5</td><td class="num">44.7</td><td class="num">–</td></tr>
+        <tr><td>open book · REALM</td><td class="num">40.4</td><td class="num">– / –</td><td class="num">40.7</td><td class="num">46.8</td></tr>
+        <tr><td>open book · DPR</td><td class="num">41.5</td><td class="num">57.9 / –</td><td class="num">41.1</td><td class="num">50.6</td></tr>
+        <tr class="hl"><td><b>RAG-Token</b></td><td class="num">44.1</td><td class="num">55.2 / 66.1</td><td class="num">45.5</td><td class="num">50.0</td></tr>
+        <tr class="hl"><td><b>RAG-Sequence</b></td><td class="num">44.5</td><td class="num">56.8 / 68.0</td><td class="num">45.2</td><td class="num">52.2</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">TriviaQA has two conventional test sets: the open-domain one used by DPR (the public web development split) and the official Wiki test set used by the T5 closed-book work. The study reports both, and notes its scores are much higher on the Wiki set, which it attributes to those questions being simpler to answer from Wikipedia. The state of the art claim on TriviaQA holds only on the T5-comparable (Wiki) split — DPR's 57.9 on the open test is above both RAG models.</p>
+
+      <ul class="notes">
+        <li><b>No re-ranker, no extractive reader.</b> The DPR system re-ranks passages with a BERT cross-encoder and then extracts a span; RAG does neither and still scores higher on three of the four datasets. And unlike REALM and T5 + SSM, it needed no salient-span-masking pre-training.</li>
+        <li><b>Generation can use clues.</b> A passage that hints at the answer without containing it verbatim can still raise the probability of the right answer — impossible for a span extractor. On Natural Questions, when the correct answer is in <b>none</b> of the retrieved documents, RAG still answers <b>11.8%</b> correctly; an extractive model would score 0% by construction.</li>
+        <li><b>Parameters.</b> The appendix compares with the T5 model nearest in size: T5-large (770M parameters) scores <b>28.9</b> exact match on Natural Questions, against 44.5 for RAG-Sequence with 626M reported trainable parameters — and T5-11B, the best closed-book model, has 11B. That is about 18× fewer trainable parameters than T5-11B for about 10 points more (our arithmetic).</li>
+        <li><b>The variants are close.</b> RAG-Sequence is ahead on four of the five columns, RAG-Token on WebQuestions; the largest gap is 2.2 points, on CuratedTrec, the smallest dataset.</li>
+      </ul>
+
+      <div class="viz" id="viz-rs">
+        <div class="vhead">
+          <span class="vtitle">Reported results explorer: open-domain QA, generation &amp; classification, and the dev-set ablations</span>
+          <span class="vhint">pick a table and a column; the axis starts at 0 unless you tick "zoom"</span>
+        </div>
+        <div class="controls">
+          <label>table <select id="rs-t">
+            <option value="t1" selected>open-domain QA · test exact match</option>
+            <option value="t2">generation &amp; classification · test</option>
+            <option value="t6">ablations · dev set</option>
+          </select></label>
+          <label>column <select id="rs-c"></select></label>
+          <label><input type="checkbox" id="rs-z" /> zoom axis</label>
+        </div>
+        <svg id="rs-svg" width="760" height="340" viewBox="0 0 760 340" role="img" aria-label="Horizontal bar chart of reported scores for one column of one results table. Open-domain QA view: one bar per method, closed-book T5 models in grey, retrieve-and-extract REALM and DPR in blue, RAG-Token in teal and RAG-Sequence in amber, with methods that did not report the column listed as not reported. On Natural Questions the bars rise from T5-large at 28.9 to RAG-Sequence at 44.5. Generation view: the previous state of the art, BART and the two RAG variants, with state-of-the-art bars that used gold passages or evidence drawn hatched. Ablation view: six RAG variants, BM25 retriever, frozen dense retriever and learned dense retriever for each formulation, with BM25 bars faintest; on question answering the learned retriever is highest and BM25 lowest, while on FEVER BM25 is highest. The axis starts at zero unless zoom is ticked, which the chart states. The readout names the best method in the column and the difference between the two RAG variants."></svg>
+        <div class="readout" aria-live="polite" id="rs-readout"></div>
+      </div>
+
+      <h4>The benchmarks</h4>
+      <table class="grid2">
+        <tr><th>dataset</th><th>train</th><th>dev</th><th>test</th></tr>
+        <tr><td>Natural Questions</td><td class="num">79 169</td><td class="num">8 758</td><td class="num">3 611</td></tr>
+        <tr><td>TriviaQA</td><td class="num">78 786</td><td class="num">8 838</td><td class="num">11 314</td></tr>
+        <tr><td>WebQuestions</td><td class="num">3 418</td><td class="num">362</td><td class="num">2 033</td></tr>
+        <tr><td>CuratedTrec</td><td class="num">635</td><td class="num">134</td><td class="num">635</td></tr>
+        <tr><td>Jeopardy question generation</td><td class="num">97 392</td><td class="num">13 714</td><td class="num">26 849</td></tr>
+        <tr><td>MS-MARCO</td><td class="num">153 726</td><td class="num">12 468</td><td class="num">101 093 (hidden subset evaluated)</td></tr>
+        <tr><td>FEVER 3-way</td><td class="num">145 450</td><td class="num">10 000</td><td class="num">10 000</td></tr>
+        <tr><td>FEVER 2-way</td><td class="num">96 966</td><td class="num">6 666</td><td class="num">6 666</td></tr>
+      </table>
+      <p>CuratedTrec gives answers as regular expressions, awkward targets for a generator; the study retrieves the top 1000 documents per question and uses the most frequent regex match as the training target. How open-domain QA is set up in general — retriever plus reader, and why exact match is a blunt metric for generated answers — is on the <a href="../question-answering.html#open-domain">question answering</a> page.</p>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="generation" data-nav="Generation: MS-MARCO, Jeopardy">
+      <h3><span class="idx">07</span> Knowledge-intensive generation: abstractive QA and Jeopardy questions</h3>
+      <p class="lede">Two generation tasks against a BART-large baseline with no retrieval, trained by the study for comparison. RAG is more accurate on the automatic metrics, judged <b>more factual and more specific</b> by people, and produces <b>more diverse</b> text without any diversity-promoting decoding.</p>
+
+      <h4>Abstractive QA: MS-MARCO NLG v2.1, without the gold passages</h4>
+      <p>The task supplies ten search-engine passages per question and a full-sentence reference answer. RAG uses only the questions and answers and retrieves from Wikipedia instead, turning it into open-domain abstractive QA. That handicaps it: some questions cannot match the reference without the gold passages ("What is the weather in Volcano, CA?"), and some are not answerable from Wikipedia at all — there RAG falls back on parametric knowledge.</p>
+
+      <table class="grid2">
+        <tr><th>test</th><th>Jeopardy BLEU-1</th><th>Jeopardy Q-BLEU-1</th><th>MS-MARCO ROUGE-L</th><th>MS-MARCO BLEU-1</th></tr>
+        <tr><td>previous state of the art</td><td class="num">–</td><td class="num">–</td><td class="num">49.8 *</td><td class="num">49.9 *</td></tr>
+        <tr><td>BART (no retrieval)</td><td class="num">15.1</td><td class="num">19.7</td><td class="num">38.2</td><td class="num">41.6</td></tr>
+        <tr class="hl"><td><b>RAG-Token</b></td><td class="num">17.3</td><td class="num">22.2</td><td class="num">40.1</td><td class="num">41.5</td></tr>
+        <tr class="hl"><td><b>RAG-Sequence</b></td><td class="num">14.7</td><td class="num">21.4</td><td class="num">40.8</td><td class="num">44.2</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">* uses the gold passages. RAG-Sequence beats BART on MS-MARCO by 2.6 BLEU and 2.6 ROUGE-L points. BLEU and ROUGE are explained on the <a href="../evaluation-metrics.html#ngram">evaluation metrics</a> page; Q-BLEU-1 is a BLEU variant that weights matching entities more and correlates better with human judgement for question generation.</p>
+
+      <h4>Jeopardy question generation</h4>
+      <p>Given an answer entity, write a Jeopardy-style clue for it — a precise factual statement that identifies the entity (the study's example: "The World Cup" ← "In 1986 Mexico scored as the first country to host this international sports competition twice."). Data: the SearchQA splits, about 100K / 14K / 27K. On Q-BLEU-1 both RAG variants beat BART, and RAG-Token beats RAG-Sequence.</p>
+
+      <table class="grid2">
+        <tr><th>human evaluation, 452 pairs, BART vs RAG-Token</th><th>factuality</th><th>specificity</th></tr>
+        <tr><td>BART better</td><td class="num">7.1%</td><td class="num">16.8%</td></tr>
+        <tr class="hl"><td><b>RAG better</b></td><td class="num">42.7%</td><td class="num">37.4%</td></tr>
+        <tr><td>both good</td><td class="num">11.7%</td><td class="num">11.8%</td></tr>
+        <tr><td>both poor</td><td class="num">17.7%</td><td class="num">6.9%</td></tr>
+        <tr><td>no majority</td><td class="num">20.8%</td><td class="num">20.1%</td></tr>
+      </table>
+      <p>Evaluators saw an answer and two generated questions in random positions and picked "A better", "B better", "both good" or "neither good"; they were encouraged to research the topic online, and two annotators who failed embedded gold checks were removed. Factuality means the statement can be corroborated by trusted external sources; specificity means high mutual dependence between input and output. (The prose of the study says both were factual "in a further 17%" of cases, while its table gives 11.7% for "both good"; the table value is shown here.)</p>
+
+      <table class="grid2">
+        <tr><th>input</th><th>model</th><th>generated question (the study's examples)</th></tr>
+        <tr><td rowspan="3"><b>Washington</b></td><td>BART</td><td>This state has the largest number of counties in the U.S. — <i>marked factually incorrect</i></td></tr>
+        <tr><td>RAG-Token</td><td>It's the only U.S. state named for a U.S. president</td></tr>
+        <tr><td>RAG-Sequence</td><td>It's the state where you'll find Mount Rainier National Park</td></tr>
+        <tr><td rowspan="3"><b>The Divine Comedy</b></td><td>BART</td><td>This epic poem by Dante is divided into 3 parts: the Inferno, the Purgatorio &amp; the Purgatorio — <i>partially correct</i></td></tr>
+        <tr><td>RAG-Token</td><td>Dante's "Inferno" is the first part of this epic poem</td></tr>
+        <tr><td>RAG-Sequence</td><td>This 14th century work is divided into 3 sections: "Inferno", "Purgatorio" &amp; "Paradiso"</td></tr>
+      </table>
+
+      <h4>Why RAG-Token wins here: the "Hemingway" posterior</h4>
+      <p>Jeopardy clues often combine two separate pieces of information, which suits per-token marginalisation. The study plots the RAG-Token document posterior for each generated token with input "Hemingway" and 5 retrieved documents, for a clue naming two of his novels. The posterior is high for <b>document 2</b>, which mentions "The Sun Also Rises", when generating "Sun", and <b>document 1</b> dominates when "A Farewell to Arms" is generated. Then, after the <i>first</i> token of each title, the posterior <b>flattens</b>: the rest of the title does not depend on any particular document.</p>
+      <div class="callout"><b>Parametric and non-parametric memory working together.</b> The study's reading is that the generator completes the titles from its own weights. As a check, the BART-only baseline given the partial clue ending in "The Sun" completes "The Sun Also Rises", and given a partial clue ending in "A" completes "A Farewell to Arms" — the titles are stored in BART's parameters. Retrieval steers <i>which</i> knowledge comes out; the weights supply the rest. The toy explorer in §03 has the same structure: the second and fourth tokens are predicted by every document.</div>
+
+      <h4>Diversity</h4>
+      <table class="grid2">
+        <tr><th>distinct / total trigrams</th><th>MS-MARCO</th><th>Jeopardy question generation</th></tr>
+        <tr><td>gold references</td><td class="num">89.6%</td><td class="num">90.0%</td></tr>
+        <tr><td>BART</td><td class="num">70.7%</td><td class="num">32.4%</td></tr>
+        <tr><td>RAG-Token</td><td class="num">77.8%</td><td class="num">46.8%</td></tr>
+        <tr class="hl"><td><b>RAG-Sequence</b></td><td class="num">83.5%</td><td class="num">53.8%</td></tr>
+      </table>
+      <p>RAG-Sequence is the most diverse, RAG-Token next, both well above BART — with no diversity-promoting decoding. Qualitatively, the study also finds RAG hallucinates less than BART on MS-MARCO; what "hallucination" covers and how retrieval is used against it in general is on the <a href="../../llm/hallucination-factuality.html#mitigation">hallucination &amp; factuality</a> page.</p>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="fever" data-nav="FEVER fact verification">
+      <h3><span class="idx">08</span> Fact verification without evidence labels: FEVER</h3>
+      <p class="lede">FEVER asks whether a claim is <i>supported</i> or <i>refuted</i> by Wikipedia, or whether there is <i>not enough info</i> — retrieval plus an entailment-style judgement (see <a href="../textual-entailment.html">textual entailment</a>). Each label is mapped to a single output token, so RAG-Sequence and RAG-Token are the same model here (§03). Crucially, the study trains on <b>claim–label pairs only</b>, with no supervision on which evidence to retrieve.</p>
+
+      <table class="grid2">
+        <tr><th>test label accuracy</th><th>FEVER 3-way</th><th>FEVER 2-way (supports / refutes)</th></tr>
+        <tr><td>previous best</td><td class="num">76.8 — a pipeline trained with retrieval supervision</td><td class="num">92.2 * — RoBERTa given the gold evidence sentence</td></tr>
+        <tr><td>BART (no retrieval)</td><td class="num">64.0</td><td class="num">81.1</td></tr>
+        <tr class="hl"><td><b>RAG</b> (either variant)</td><td class="num">72.5</td><td class="num">89.5</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Within 4.3 points</b> of the 3-way state of the art, which used complex domain-specific pipelines, substantial engineering and intermediate retrieval supervision; <b>within 2.7 points</b> of the 2-way model that was handed the gold evidence, while RAG gets only the claim and retrieves its own. Against BART alone, retrieval adds 8.5 and 8.4 points (our arithmetic).</li>
+        <li><b>Does it retrieve the right evidence anyway?</b> Comparing article titles of RAG's retrieved documents with the gold evidence annotations: the top retrieved document comes from a gold article in <b>71%</b> of cases, and a gold article is in the top 10 in <b>90%</b>.</li>
+        <li><b>How classification is done.</b> Following BART's practice, the model re-generates the claim and classifies from the final hidden state, then marginalises across documents to get class probabilities. FEVER's second sub-task, extracting evidence sentences, was not attempted because FEVER uses a different Wikipedia dump.</li>
+      </ul>
+      <p>In the dev-set ablation (§09) FEVER is the one task where a plain BM25 retriever does best — the study suggests because FEVER claims are heavily entity-centric and so suit word-overlap retrieval.</p>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ablations" data-nav="Ablations: retriever, k">
+      <h3><span class="idx">09</span> Ablations: which retriever, learned or frozen, and how many documents</h3>
+      <p class="lede">Two retriever ablations on the dev sets: <b>freeze</b> the dense retriever during training, or <b>replace</b> it with a fixed BM25 system whose scores are used as the logits of <code>p(z|x)</code>. Learned dense retrieval wins on open-domain QA by a wide margin; BM25 wins on FEVER.</p>
+
+      <table class="grid2">
+        <tr><th>dev set</th><th>NQ</th><th>TQA</th><th>WQ</th><th>CT</th><th>Jeop. B-1 / QB-1</th><th>MS-MARCO R-L / B-1</th><th>FEVER-3 / -2</th></tr>
+        <tr><td>RAG-Token · BM25</td><td class="num">29.7</td><td class="num">41.5</td><td class="num">32.1</td><td class="num">33.1</td><td class="num">17.5 / 22.3</td><td class="num">55.5 / 48.4</td><td class="num" rowspan="2">75.1 / 91.6</td></tr>
+        <tr><td>RAG-Sequence · BM25</td><td class="num">31.8</td><td class="num">44.1</td><td class="num">36.6</td><td class="num">33.8</td><td class="num">11.1 / 19.5</td><td class="num">56.5 / 46.9</td></tr>
+        <tr><td>RAG-Token · frozen</td><td class="num">37.8</td><td class="num">50.1</td><td class="num">37.1</td><td class="num">51.1</td><td class="num">16.7 / 21.7</td><td class="num">55.9 / 49.4</td><td class="num" rowspan="2">72.9 / 89.4</td></tr>
+        <tr><td>RAG-Sequence · frozen</td><td class="num">41.2</td><td class="num">52.1</td><td class="num">41.8</td><td class="num">52.6</td><td class="num">11.8 / 19.6</td><td class="num">56.7 / 47.3</td></tr>
+        <tr class="hl"><td><b>RAG-Token</b></td><td class="num">43.5</td><td class="num">54.8</td><td class="num">46.5</td><td class="num">51.9</td><td class="num">17.9 / 22.6</td><td class="num">56.2 / 49.4</td><td class="num" rowspan="2">74.5 / 90.6</td></tr>
+        <tr class="hl"><td><b>RAG-Sequence</b></td><td class="num">44.0</td><td class="num">55.8</td><td class="num">44.9</td><td class="num">53.4</td><td class="num">15.3 / 21.5</td><td class="num">57.2 / 47.5</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">FEVER cells span both variants because a one-token target makes them the same model. The explorer in §06 plots any column of this table (choose "ablations · dev set").</p>
+
+      <ul class="notes">
+        <li><b>Learning the query encoder helps</b> — the study states learned retrieval improves results for all tasks. Cell by cell it is near-universal; the exception is MS-MARCO BLEU-1 for RAG-Token, where frozen and learned tie at 49.4. The gains are largest on QA: on Natural Questions, +5.7 for RAG-Token and +2.8 for RAG-Sequence (our arithmetic).</li>
+        <li><b>Dense beats BM25 except on FEVER.</b> On open-domain QA the gap is very large — Natural Questions 43.5 vs 29.7 (RAG-Token), CuratedTrec 51.9 vs 33.1 — the study calls differentiable retrieval "crucial" there. On FEVER, BM25 (75.1 / 91.6) beats the learned dense retriever (74.5 / 90.6). Sparse vs dense retrieval in general: the hub's <a href="../retrieval-augmented-generation.html#retriever">sparse vs dense</a> section.</li>
+        <li><b>The variant gap depends on the task.</b> RAG-Sequence leads on most QA columns; RAG-Token leads clearly on Jeopardy (17.9 vs 15.3 BLEU-1) and on MS-MARCO BLEU-1 — but on the test set (§07) RAG-Sequence led MS-MARCO BLEU-1. Small dev/test reversals like this are a reason not to over-read single-point differences.</li>
+      </ul>
+
+      <h4>How many documents: k at training and at test</h4>
+      <ul class="notes">
+        <li><b>Training:</b> models trained with 5 or 10 retrieved documents showed no significant difference.</li>
+        <li><b>Test, open-domain QA:</b> retrieving more documents improves Natural Questions results <b>monotonically for RAG-Sequence</b>, while <b>RAG-Token peaks at 10</b> documents. (This is why the QA test numbers use 50 documents for RAG-Sequence but 15 for RAG-Token, §05.)</li>
+        <li><b>Test, MS-MARCO:</b> more documents give RAG-Token higher ROUGE-L at the expense of BLEU-1; the effect is less pronounced for RAG-Sequence.</li>
+        <li>The figure behind these statements also plots retrieval recall on Natural Questions as k grows. Its individual values are not reproduced on this page.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="hotswap" data-nav="Index hot-swapping">
+      <h3><span class="idx">10</span> Index hot-swapping: updating knowledge without retraining</h3>
+      <p class="lede">Because knowledge lives partly in a text index, it can be changed at test time. A parametric-only model like T5 or BART would need further training to learn that the world has changed; RAG only needs a different index.</p>
+
+      <p>The experiment: build a second index from an older Wikipedia dump (December 2016), list <b>82 world leaders</b> who changed between 2016 and 2018, and ask the Natural Questions RAG model "Who is {position}?" (for example, "Who is the President of Peru?") with each index.</p>
+
+      <table class="grid2">
+        <tr><th>accuracy</th><th>2016 leaders (the right answer in 2016)</th><th>2018 leaders (the right answer in 2018)</th></tr>
+        <tr class="hl"><td><b>2016 index</b></td><td class="num">70%</td><td class="num">4%</td></tr>
+        <tr class="hl"><td><b>2018 index</b></td><td class="num">12%</td><td class="num">68%</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>The diagonal is the point.</b> Same model, same weights — swap the index and the answer follows the index. Matched index and question year: 70% and 68%; mismatched: 12% and 4%.</li>
+        <li><b>It is not a guarantee.</b> Even with the matched index, about three in ten answers are wrong. Hot-swapping updates what the model <i>can</i> retrieve; the answer is still only as good as retrieval and generation on that question.</li>
+        <li>The study frames the index as both <b>human-readable</b> (a form of interpretability) and <b>human-writable</b> (the memory can be edited directly), because it holds raw text rather than learned vectors of facts.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="limits" data-nav="Limitations">
+      <h3><span class="idx">11</span> Limitations and broader impact the original study states</h3>
+      <div class="cards">
+        <div class="box bad"><div class="n">training</div><div class="t">Retrieval can collapse</div><div class="g">In preliminary experiments on tasks such as story generation, the retriever learned to return the same documents regardless of input; the generator then learned to ignore them and the model behaved like BART. Suggested causes: less explicit need for factual knowledge, or longer targets giving less informative gradients to the retriever.</div></div>
+        <div class="box warn"><div class="n">supervision</div><div class="t">Not retrieval-label-free from scratch</div><div class="g">Fine-tuning uses no retrieval labels, but the retriever starts from a bi-encoder trained with retrieval supervision on Natural Questions and TriviaQA — the study notes this when comparing with DPR.</div></div>
+        <div class="box warn"><div class="n">knowledge source</div><div class="t">The index has its own errors and biases</div><div class="g">Wikipedia, or any external knowledge source, will probably never be entirely factual and free of bias.</div></div>
+        <div class="box bad"><div class="n">misuse</div><div class="t">The concerns of any language model</div><div class="g">Arguably to a lesser extent than for unconstrained language models: abuse, faked or misleading news and social media content, impersonation, and automated spam or phishing; and job automation in the longer term.</div></div>
+        <div class="box warn"><div class="n">null retrieval</div><div class="t">No explicit "nothing useful" option</div><div class="g">A REALM-style null document (learned embedding, static bias, or predicted logit) did not improve performance and was dropped. On MS-MARCO the model instead learned to retrieve a fixed set of documents for questions unlikely to benefit from retrieval.</div></div>
+        <div class="box good"><div class="n">future work</div><div class="t">Joint pre-training</div><div class="g">Whether retriever and generator can be pre-trained jointly from scratch, with a BART-like denoising or other objective, is left open — as is how best to combine the two memories.</div></div>
+      </div>
+      <p>On the positive side the study argues that grounding in real factual knowledge makes generations hallucinate less, and gives more control and interpretability — with the example of a medical index for open-domain medical questions.</p>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="practice" data-nav="In practice (beyond the study)">
+      <h3><span class="idx">12</span> In practice: how "RAG" diverged from this model</h3>
+      <p class="lede">Everything above is the original model and its reported evidence. This section is <b>later practice and general knowledge</b> — fast-moving and not part of the original study's claims.</p>
+
+      <table class="grid2">
+        <tr><th style="width:170px"></th><th>original RAG (this study)</th><th>typical "RAG" in LLM applications</th></tr>
+        <tr><td><b>generator</b></td><td>a ~400M seq2seq model, <b>fine-tuned</b> on the task</td><td>a large decoder-only LLM used <b>frozen</b>, through a prompt</td></tr>
+        <tr><td><b>how passages enter</b></td><td>one passage per forward pass, concatenated with the input</td><td>several chunks pasted into one prompt together (<a href="../retrieval-augmented-generation.html#generation">generation &amp; context injection</a>)</td></tr>
+        <tr><td><b>combining passages</b></td><td>probabilistic marginalisation, per sequence or per token</td><td>none explicit — the LLM's attention reads all chunks at once</td></tr>
+        <tr><td><b>retriever</b></td><td>query encoder trained through the generator's likelihood</td><td>an off-the-shelf embedding model, often plus BM25 and a cross-encoder re-ranker (<a href="../retrieval-augmented-generation.html#hybrid-rerank">hybrid search &amp; re-ranking</a>)</td></tr>
+        <tr><td><b>corpus unit</b></td><td>fixed 100-word Wikipedia chunks</td><td>chunking tuned to the documents (<a href="../retrieval-augmented-generation.html#chunking">chunking</a>)</td></tr>
+        <tr><td><b>evaluation</b></td><td>task metrics: exact match, BLEU, ROUGE, label accuracy, human pairwise judgements</td><td>retrieval metrics plus faithfulness / groundedness scoring (<a href="../retrieval-augmented-generation.html#evaluation">evaluation</a>)</td></tr>
+      </table>
+
+      <ul class="notes">
+        <li><b>What survived.</b> The architecture split — a dense bi-encoder over a precomputed ANN index feeding a generator — and the two arguments for it: knowledge can be updated by changing the index (§10), and retrieved text gives provenance.</li>
+        <li><b>What mostly did not.</b> Joint fine-tuning and latent-document marginalisation. With a frozen general-purpose LLM there is no gradient path back to the retriever, so retrievers are tuned separately, if at all.</li>
+        <li><b>A well-known successor, one line:</b> fusion-in-decoder (FiD) encodes each retrieved passage together with the question separately and lets the decoder attend over all of them jointly, instead of marginalising over per-passage outputs — closer in spirit to how passages are combined in today's long-context prompts.</li>
+      </ul>
+      <p>Choosing between retrieval and fine-tuning for a given problem is covered on the hub (<a href="../retrieval-augmented-generation.html#rag-vs-ft">RAG vs fine-tuning</a>), and query rewriting, multi-hop and iterative retrieval under <a href="../retrieval-augmented-generation.html#advanced">advanced RAG</a>.</p>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">13</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"RAG means pasting retrieved passages into an LLM's prompt."</span> <span class="fix">Not originally.</span> The model that introduced the name fine-tunes the generator and query encoder jointly and treats the passage as a latent variable that is summed out (§03–§04). Prompt-stuffing a frozen LLM is a later, simpler pattern (§12).</div>
+      <div class="wrong"><span class="say">"RAG-Token is the better variant because it can use several documents."</span> <span class="fix">Neither dominates.</span> RAG-Token wins on Jeopardy question generation; RAG-Sequence wins on most QA columns, on MS-MARCO at test and on diversity (§06–§07). The explorer in §03 shows why: which is higher depends on how the evidence is spread across passages.</div>
+      <div class="wrong"><span class="say">"RAG learns to retrieve with no retrieval supervision at all."</span> <span class="fix">Only during fine-tuning.</span> The retriever is initialised from a dense passage retriever trained with retrieval supervision on Natural Questions and TriviaQA (§02, §11).</div>
+      <div class="wrong"><span class="say">"The whole retriever is trained end to end."</span> <span class="fix">The document encoder and the index are frozen.</span> Only the query encoder and the generator are updated; re-encoding 21M passages during training was judged unnecessary (§04).</div>
+      <div class="wrong"><span class="say">"A generator with retrieval can only repeat what the passages say."</span> <span class="fix">It also draws on its weights.</span> On Natural Questions RAG answers 11.8% correctly when the answer is in none of the retrieved documents (§06), and the "Hemingway" posterior shows titles being completed from parametric memory (§07).</div>
+      <div class="wrong"><span class="say">"Swapping the index keeps the model fully up to date."</span> <span class="fix">It changes what can be retrieved, not how well.</span> Matched index and question year gave 70% and 68% — far above the 12% and 4% mismatched, but far from 100% (§10).</div>
+      <div class="wrong"><span class="say">"Marginalising over more documents always helps."</span> <span class="fix">Not for RAG-Token.</span> Its open-domain QA performance peaks at 10 retrieved documents, while RAG-Sequence keeps improving (§09).</div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">14</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Hybrid memory:</b> a pretrained seq2seq generator (parametric) plus a dense index of 21M 100-word Wikipedia passages searched by inner product (non-parametric), both pre-trained before any task training.</li>
+        <li><b>Retrieved passages are latent:</b> RAG-Sequence is <code>∑_z p_η(z|x) ∏ᵢ p_θ(yᵢ|…)</code> — one document per answer; RAG-Token is <code>∏ᵢ ∑_z p_η(z|x) p_θ(yᵢ|…)</code> — one per token. Identical for one-token targets and for <code>k = 1</code>.</li>
+        <li><b>Training</b> maximises the marginal likelihood of the target; the retriever learns from the gap between each passage's posterior and its prior. The document encoder and index stay frozen.</li>
+        <li><b>Decoding:</b> RAG-Token is a normal beam search on the mixed transition; RAG-Sequence needs a beam per document, with thorough or fast scoring of the union.</li>
+        <li><b>Results:</b> state of the art on three open-domain QA sets plus the T5-comparable TriviaQA split without re-ranker or extractive reader; more factual, specific and diverse generation than BART; FEVER within 4.3 points of supervised pipelines with no evidence labels.</li>
+        <li><b>The index is the update mechanism:</b> swapping a 2016 for a 2018 Wikipedia index moved world-leader answers with it, no retraining.</li>
+        <li><b>Modern "RAG"</b> kept the retriever-plus-index architecture and dropped the joint training and marginalisation.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Retrieval-augmented generation" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../retrieval-augmented-generation.html">← Retrieval-Augmented Generation</a>
+      <a href="../retrieval-augmented-generation.html" style="color:var(--muted)">RAG · overview</a>
+      <a href="../question-answering.html">Question Answering →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="rag-sequence-token.viz.js"></script>
+</body>
+</html>

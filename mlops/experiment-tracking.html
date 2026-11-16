@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Experiment Tracking</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Experiment Tracking</h1>
+      <p>Model development is a search through hundreds of runs that differ by one flag, one data snapshot, or one library version. Experiment tracking is the lab notebook that records every run in a queryable form — so a number on a slide can be traced back to the exact code, data, configuration, and environment that produced it, and reproduced on demand.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">MLOps &amp; Deployment</span>
+        <span class="pill">Reproducibility</span>
+        <span class="pill">Lineage</span>
+        <span class="pill">Model registry</span>
+      </div>
+    </header>
+
+    <section class="topic" id="why">
+      <h3><span class="idx">01</span> The problem: results without provenance</h3>
+      <p class="lede">Without tracking, the best model is a file called <code>final_v3_really_final.pt</code> and nobody knows which learning rate or which week's data produced it.</p>
+      <ul class="notes">
+        <li>ML code is <b>data-dependent</b>: the same commit trained on Tuesday's and Wednesday's snapshot gives two different models. Version control of code alone (see <a href="../programming/git.html">Git</a>) is necessary but nowhere near sufficient.</li>
+        <li>Iteration is <b>wide</b>: a tuning sweep produces dozens to thousands of runs. Spreadsheets and filenames break at about the tenth one.</li>
+        <li>Three questions a tracker must answer instantly: <b>What did I run?</b> (configuration and inputs) <b>What happened?</b> (metrics, curves, outputs) <b>Can I get it back?</b> (artifacts plus everything needed to regenerate them).</li>
+        <li>Downstream consumers — reviewers, the deployment pipeline, auditors — need the same answers. Tracking is the foundation that the model registry, <a href="../mlops/ci-cd.html">CI/CD</a> promotion gates and <a href="../mlops/monitoring-and-drift.html">monitoring</a> baselines are built on.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> a metric without lineage is an anecdote. The goal is not pretty charts; it is being able to answer "where did this number come from?" six months later.</div>
+    </section>
+
+    <section class="topic" id="datamodel">
+      <h3><span class="idx">02</span> The data model: experiments, runs, and what hangs off them</h3>
+      <p class="lede">Most trackers converge on the same small schema. Knowing it lets you move between tools and design your own logging conventions.</p>
+      <table class="cmp">
+        <tr><th>Entity</th><th>What it is</th><th>Mutability</th><th>Examples</th></tr>
+        <tr><td><b>Project / experiment</b></td><td>A named container grouping runs that answer one question</td><td>Long-lived</td><td><code>churn-model</code>, <code>ranker-v2-ablation</code></td></tr>
+        <tr><td><b>Run</b></td><td>One execution of training or evaluation code; has an id, start/end time, status</td><td>Append-only while running, then frozen</td><td>run <code>8f3a…</code>, status <code>FINISHED</code></td></tr>
+        <tr><td><b>Parameters</b></td><td>Inputs fixed at launch — hyperparameters and config</td><td>Write-once per key</td><td><code>lr=3e-4</code>, <code>max_depth=8</code></td></tr>
+        <tr><td><b>Metrics</b></td><td>Numeric time series indexed by step (and wall time)</td><td>Append-only</td><td><code>val_loss@step 1200 = 0.412</code></td></tr>
+        <tr><td><b>Artifacts</b></td><td>Files produced or consumed: weights, plots, predictions, data manifests</td><td>Immutable blobs in object storage</td><td><code>model.onnx</code>, <code>confusion.png</code></td></tr>
+        <tr><td><b>Tags / notes</b></td><td>Free-form, searchable labels</td><td>Mutable</td><td><code>baseline</code>, <code>candidate</code></td></tr>
+        <tr><td><b>System metadata</b></td><td>Captured automatically: commit hash, dirty flag, host, GPU, package versions</td><td>Write-once</td><td><code>git_sha=1c9e…</code>, <code>torch=2.x</code></td></tr>
+      </table>
+      <ul class="notes">
+        <li>The split matters operationally: <b>parameters</b> are scalars you filter on, <b>metrics</b> are series you plot, <b>artifacts</b> are blobs you download. Logging a 50 MB embedding table as a "metric" or a learning rate as an artifact makes both unsearchable.</li>
+        <li><b>Nested runs</b> (parent/child) model sweeps and cross-validation folds: the parent holds the search space and the best result; each child is one trial or one fold.</li>
+        <li>Behind the scenes a tracker is two stores: a <b>metadata store</b> (a relational database holding runs, params, metrics, tags) and an <b>artifact store</b> (object storage holding blobs, referenced by URI). See §10.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="repro">
+      <h3><span class="idx">03</span> Reproducibility: the five things a run is a function of</h3>
+      <p class="lede">A trained model is the output of a function. To reproduce it you must pin every argument — and know which ones are silently nondeterministic.</p>
+      <div class="formula"><span class="lbl">a run as a pure function (the goal)</span><span class="eq">model = train(code, data, config, environment, seed)</span></div>
+      <table class="cmp">
+        <tr><th>Argument</th><th>Pin it with</th><th>Typical leak</th></tr>
+        <tr><td><b>code</b></td><td>Commit hash, recorded automatically; refuse or flag runs from a dirty tree</td><td>Uncommitted local edits; notebook state executed out of order</td></tr>
+        <tr><td><b>data</b></td><td>Immutable snapshot id or content hash of a manifest (file list + checksums); table version or time-travel timestamp</td><td>"Latest" tables that are overwritten nightly; a query with <code>NOW()</code> in it</td></tr>
+        <tr><td><b>config</b></td><td>The full resolved config logged as params and as an artifact</td><td>Defaults that changed between library versions; CLI overrides not captured</td></tr>
+        <tr><td><b>environment</b></td><td>Lockfile with exact versions; container image digest (not a mutable tag); driver/accelerator versions</td><td><code>pip install</code> resolving a new minor version; a <code>latest</code> image tag</td></tr>
+        <tr><td><b>seed</b></td><td>Seed every generator: language-level, numeric library, framework, data loader workers</td><td>Seeding only one RNG; worker processes reseeded from the clock</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Bitwise vs statistical reproducibility.</b> GPU kernels that use atomic adds, autotuned convolution algorithms, and multi-worker data order make bitwise-identical results expensive or impossible. Frameworks expose a "deterministic" mode that trades speed for repeatability. The practical standard is usually <b>statistical</b>: re-running yields a metric inside the run-to-run noise band.</li>
+        <li>That means you must <b>measure the noise band</b>: train the same config with 3–5 seeds and report mean ± spread. A "+0.3%" improvement that sits inside a ±0.5% seed spread is not an improvement.</li>
+        <li>Data lineage extends upstream: the snapshot id should point back through the <a href="../data-engineering/etl-pipelines.html">ETL pipeline</a> run that built it and, for features, the <a href="../data-engineering/feature-stores.html">feature store</a> definitions and the point-in-time join used.</li>
+      </ul>
+      <div class="formula"><span class="lbl">seed noise band — report this next to every headline number</span><span class="eq">m̄ = (1/k) ∑ⱼ mⱼ</span>     <span class="eq">s = √( ∑ⱼ (mⱼ − m̄)² / (k − 1) )</span>     <span class="eq">report  m̄ ± s  over k seeds</span></div>
+    </section>
+
+    <section class="topic" id="logging">
+      <h3><span class="idx">04</span> What and how to log</h3>
+      <ul class="notes">
+        <li><b>At launch:</b> resolved config, data snapshot id, commit hash, environment digest, seed, hardware. These are cheap and are the ones people forget.</li>
+        <li><b>During training:</b> loss and key metrics per step (or every N steps), learning-rate schedule, gradient norm, throughput (samples/s), accelerator memory and utilization. Log with both <b>step</b> and wall time so runs on different hardware stay comparable.</li>
+        <li><b>At the end:</b> final metrics on validation <i>and</i> per-slice breakdowns, the model artifact with its input/output signature, an example input, evaluation plots, and the prediction file for error analysis.</li>
+        <li><b>Autologging</b> hooks into framework training loops and captures params, metrics and the model with one line. Useful as a floor, but it does not know your data snapshot id or business metric — add those explicitly.</li>
+        <li><b>Operational hygiene:</b> log asynchronously and buffer locally so a tracker outage never kills a multi-day training job; throttle per-step logging (millions of points per run make the UI unusable); keep naming conventions (<code>val/auc</code>, <code>train/loss</code>) consistent so cross-run queries work.</li>
+        <li><b>Log failures too.</b> Crashed and diverged runs are evidence about the search space. Deleting them biases every later conclusion toward configurations that happened to be stable.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="compare">
+      <h3><span class="idx">05</span> Comparing runs and reading a sweep</h3>
+      <p class="lede">A run table answers "which run won"; overlaid curves answer "how did it get there"; parallel coordinates answer "which region of the search space is good".</p>
+      <ul class="notes">
+        <li><b>Run table:</b> one row per run, columns for chosen params and summary metrics, sortable and filterable. The minimal comparison view.</li>
+        <li><b>Overlaid learning curves:</b> spot divergence, overfitting (train falls while validation rises), and runs stopped too early. Smooth with an exponential moving average but keep the raw series visible.</li>
+        <li><b>Parallel coordinates:</b> one vertical axis per hyperparameter plus the metric; each run is a polyline. Brushing an interval on the metric axis reveals which parameter ranges the good runs share. Use a log axis for scale-like parameters (learning rate, weight decay).</li>
+        <li><b>Parameter importance:</b> fit a quick surrogate (random forest or correlation) from params to metric to rank which knobs matter — a hint for narrowing the next sweep, not a causal claim.</li>
+      </ul>
+
+      <div class="viz" id="viz-pc">
+        <div class="vhead">
+          <span class="vtitle">Parallel coordinates over a synthetic 80-run sweep</span>
+          <span class="vhint">drag vertically on any axis to brush · click an axis outside the brush to clear</span>
+        </div>
+        <div class="controls">
+          <label><button id="pc-new" class="btn ghost" type="button">new sweep</button></label>
+          <label><button id="pc-top" class="btn ghost" type="button">brush top 10%</button></label>
+          <label><button id="pc-clear" class="btn ghost" type="button">clear brushes</button></label>
+        </div>
+        <svg id="pc-svg" width="680" height="300" viewBox="0 0 680 300" role="img" aria-label="Interactive parallel coordinates plot of a hyperparameter sweep with brushable axes"></svg>
+        <div class="readout" aria-live="polite" id="pc-read"></div>
+      </div>
+      <div class="callout"><b>Reading it:</b> in this synthetic sweep the metric depends strongly on learning rate (an interior optimum on a log scale), moderately on dropout, and barely on batch size. Brush the top runs and the learning-rate axis collapses to a narrow band while batch size stays spread out — that is the visual signature of an unimportant parameter.</div>
+    </section>
+
+    <section class="topic" id="sweeps">
+      <h3><span class="idx">06</span> Sweeps as tracked objects</h3>
+      <ul class="notes">
+        <li>A sweep is a <b>search space + search strategy + objective + budget</b>. Store all four with the parent run so the search itself is reproducible. Strategies (grid, random, Bayesian optimization, Hyperband-style early stopping) are covered in <a href="../machine-learning/hyperparameter-tuning.html">Hyperparameter Tuning</a>.</li>
+        <li>Early-stopped trials must be <b>marked as pruned</b>, not deleted — their partial curves are what the scheduler used to decide.</li>
+        <li>Record the <b>number of trials</b> and total compute. Both are needed to interpret the winner (§07) and to compare methods fairly: a method that "wins" with ten times the trials has not won.</li>
+        <li>Parallel workers write to the same experiment concurrently; the tracker must handle concurrent appends and give each trial a unique id independent of worker hostname.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="selection">
+      <h3><span class="idx">07</span> The pitfall: selection bias from many runs on one validation set</h3>
+      <p class="lede">Every time you pick the best of N runs by validation score, you select partly on noise. The reported validation score of the winner is optimistically biased, and the bias grows with N.</p>
+      <ul class="notes">
+        <li>Each validation score is <code>v̂ᵢ = vᵢ + εᵢ</code>: true quality plus sampling noise from a finite validation set. Taking the max picks runs whose noise happened to be positive — the <b>winner's curse</b>.</li>
+        <li>For accuracy on <code>n</code> validation examples the noise standard deviation is roughly <code>√(p(1 − p)/n)</code>. With <code>n = 2,000</code> and <code>p ≈ 0.8</code> that is about 0.9 percentage points — larger than many claimed improvements.</li>
+        <li>When true qualities are close, the expected max of N noisy draws grows like the extreme-value rate below, so 200 runs can inflate the winner by two to three noise standard deviations.</li>
+      </ul>
+      <div class="formula"><span class="lbl">noise per validation score, and the optimism of the best of N</span><span class="eq">σ̂ ≈ √( p(1 − p) / n_val )</span>     <span class="eq">E[ max<sub>i≤N</sub> εᵢ ] ≈ σ̂ · √(2 ln N)</span>     <span class="lbl">(asymptotic; overstates the bias for small N — the simulation shows the exact value)</span></div>
+
+      <div class="viz" id="viz-wc">
+        <div class="vhead">
+          <span class="vtitle">Winner's curse simulator</span>
+          <span class="vhint">N runs with nearly identical true accuracy, scored on a finite validation set</span>
+        </div>
+        <div class="controls">
+          <label>runs N <span id="wc-n-v" class="lbl"></span>
+            <input id="wc-n" type="range" min="1" max="500" step="1" value="100">
+          </label>
+          <label>validation size <span id="wc-v-v" class="lbl"></span>
+            <input id="wc-v" type="range" min="2.5" max="5" step="0.05" value="3.3">
+          </label>
+          <label>true spread between runs <span id="wc-s-v" class="lbl"></span>
+            <input id="wc-s" type="range" min="0" max="0.02" step="0.001" value="0.004">
+          </label>
+          <label><button id="wc-re" class="btn ghost" type="button">resample</button></label>
+        </div>
+        <svg id="wc-svg" width="640" height="260" viewBox="0 0 640 260" role="img" aria-label="Scatter plot of true accuracy against validation accuracy for N runs with the selected winner highlighted"></svg>
+        <div class="readout" aria-live="polite" id="wc-read"></div>
+      </div>
+      <h4>Remedies</h4>
+      <ul class="notes">
+        <li><b>A test set touched once.</b> Select on validation, report on a held-out test set that never influenced any decision. If you look at test results and then change something, it has become a second validation set.</li>
+        <li><b>Re-evaluate the finalists.</b> Retrain the top-k configs with fresh seeds and score them on fresh data; the ranking often reshuffles.</li>
+        <li><b>Nested cross-validation</b> when data is small: the inner loop selects, the outer loop estimates (see <a href="../machine-learning/model-evaluation.html">Model Evaluation</a>).</li>
+        <li><b>Report N.</b> "Best of 300 runs" and "best of 3 runs" with the same score are different claims. Comparing many configurations is a multiple-comparisons problem — the same logic as in <a href="../math/statistics/anova.html">ANOVA &amp; Multiple Comparisons</a>.</li>
+        <li><b>Rotate or refresh validation data</b> on long-lived projects; a validation set used for a year of decisions is overfit by the team, not just the model.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="registry">
+      <h3><span class="idx">08</span> The model registry: from run to deployable version</h3>
+      <p class="lede">The tracker records everything that was tried; the registry records the few things that are candidates for production, with an auditable lifecycle.</p>
+      <ul class="notes">
+        <li>A <b>registered model</b> is a named entity (<code>fraud-scorer</code>); each registration of an artifact creates an immutable, monotonically numbered <b>version</b> that links back to its source run — and therefore to code, data, config and environment.</li>
+        <li><b>Lifecycle labels.</b> The classic scheme uses fixed stages — <code>None → Staging → Production → Archived</code>. Newer registries favour free-form, movable <b>aliases</b> (<code>@champion</code>, <code>@challenger</code>) plus tags (<code>validation_status=approved</code>), because fixed stages cannot express "two production models in two regions" or shadow candidates.</li>
+        <li><b>Serving resolves an alias, not a version number.</b> Promotion and rollback become a metadata update — point <code>@champion</code> at version 12 or back at 11 — with no rebuild. The rollout mechanics are in <a href="../mlops/model-deployment.html">Model Deployment</a>.</li>
+        <li><b>Gate the transitions.</b> Moving an alias to production should require passing automated checks (quality vs the current champion, latency, data validation, fairness slices) and, for regulated domains, a human approval recorded with who and when. These gates are pipeline stages in <a href="../mlops/ci-cd.html">CI/CD</a>.</li>
+        <li><b>Model metadata</b> travels with the version: input/output schema, intended use, training data window, evaluation per slice, known limitations — a model card. This is the governance record auditors ask for (see <a href="../data-engineering/data-quality-governance.html">Data Quality &amp; Governance</a>).</li>
+      </ul>
+      <div class="formula"><span class="lbl">lineage chain the registry must make walkable</span><span class="eq">deployed endpoint → alias → model version → run → { commit, data snapshot, config, env digest, seed }</span></div>
+    </section>
+
+    <section class="topic" id="architecture">
+      <h3><span class="idx">09</span> Tracker architecture and failure modes</h3>
+      <ul class="notes">
+        <li><b>Clients</b> (training scripts, notebooks) call a tracking API. The <b>server</b> writes run metadata to a relational <b>metadata store</b> and either uploads artifacts itself or hands clients signed URLs to write directly to an <b>artifact store</b> (object storage).</li>
+        <li><b>Scaling pressure</b> is almost always metric points: 1,000 runs × 100k steps × 20 metrics is 2 billion rows. Downsample at log time, store summary metrics separately, and index the columns you filter on.</li>
+        <li><b>Artifacts dominate storage cost.</b> Checkpoints every epoch for every sweep trial add up to terabytes. Apply retention policies: keep the best and last checkpoint, expire the rest, never expire anything a registry version references.</li>
+        <li><b>Access control and PII.</b> Logged prediction samples and example inputs can contain personal data; the artifact store inherits the data's governance obligations.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Choice</th><th>Self-hosted open-source tracker</th><th>Managed tracking service</th></tr>
+        <tr><td>Control / data residency</td><td>Full; data never leaves your infrastructure</td><td>Vendor-hosted unless a private deployment is purchased</td></tr>
+        <tr><td>Operational burden</td><td>You run the database, object store, auth, upgrades</td><td>Minimal</td></tr>
+        <tr><td>Collaboration UI, reports</td><td>Functional, often simpler</td><td>Usually richer dashboards and sharing</td></tr>
+        <tr><td>Cost profile</td><td>Infrastructure + engineer time</td><td>Per-seat or usage pricing</td></tr>
+        <tr><td>Lock-in</td><td>Low; open schema</td><td>Export paths vary — check before committing</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="pitfalls">
+      <h3><span class="idx">10</span> Common failure modes</h3>
+      <table class="cmp">
+        <tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr>
+        <tr><td>Cannot reproduce last quarter's model</td><td>Data read from a mutable "latest" table</td><td>Log a snapshot id / content hash; read through versioned tables</td></tr>
+        <tr><td>Two runs with identical params differ by 1%</td><td>Unseeded worker RNGs or nondeterministic kernels</td><td>Seed all generators; measure and report the seed band</td></tr>
+        <tr><td>Production model has no source run</td><td>Model trained on a laptop and copied to a bucket</td><td>Registry accepts only artifacts from tracked runs; deployment reads only from the registry</td></tr>
+        <tr><td>Offline gain vanishes online</td><td>Winner's curse on validation; train/serve skew</td><td>Fresh-seed re-evaluation, untouched test set, then an <a href="../mlops/ab-testing.html">A/B test</a></td></tr>
+        <tr><td>Tracker UI times out</td><td>Per-step logging of dozens of metrics across thousands of runs</td><td>Log every N steps; summary metrics table; archive old experiments</td></tr>
+        <tr><td>Metric names drift (<code>valAcc</code>, <code>val_acc</code>, <code>accuracy/val</code>)</td><td>No convention</td><td>A shared logging helper that owns metric names</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">11</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Schema:</b> experiments contain runs; runs carry write-once params, append-only metrics, immutable artifacts, and auto-captured system metadata.</li>
+        <li><b>Reproducibility</b> means pinning code, data, config, environment and seed — and measuring the seed noise band, since bitwise determinism is often unaffordable.</li>
+        <li><b>Selecting the best of N on one validation set inflates the score</b> by roughly <code>σ̂·√(2 ln N)</code>; keep an untouched test set and report N.</li>
+        <li><b>The registry</b> turns a run into a versioned, aliased, gated deployable; serving resolves aliases so promotion and rollback are metadata changes.</li>
+        <li><b>Lineage must be walkable</b> from the live endpoint back to the data snapshot — that is the test of whether tracking is working.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="experiment-tracking.viz.js"></script>
+</body>
+</html>

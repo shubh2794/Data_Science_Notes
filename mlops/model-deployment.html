@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Model Deployment</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Model Deployment</h1>
+      <p>Deployment is where a trained artifact becomes a service with an interface, a latency budget, a cost, and an on-call rotation. The model is usually the easy part; the hard parts are choosing the serving pattern, packaging reproducibly, meeting tail latency under load, rolling out without breaking anything, and making sure the features seen in production are the features seen in training.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">MLOps &amp; Deployment</span>
+        <span class="pill">Serving</span>
+        <span class="pill">Latency &amp; throughput</span>
+        <span class="pill">Progressive delivery</span>
+      </div>
+    </header>
+
+    <section class="topic" id="what">
+      <h3><span class="idx">01</span> What "deploying a model" actually means</h3>
+      <p class="lede">A deployment is four things bound together: an <b>artifact</b>, a <b>runtime</b> that executes it, an <b>interface</b> callers depend on, and a <b>rollout</b> that moves traffic onto it safely.</p>
+      <ul class="notes">
+        <li><b>Artifact:</b> weights plus the preprocessing that must run identically to training, an input/output signature, and a link back to its training run (see <a href="../mlops/experiment-tracking.html">Experiment Tracking</a>).</li>
+        <li><b>Runtime:</b> a model server, a batch job, a stream processor, or an on-device library — chosen by the serving pattern (§02).</li>
+        <li><b>Interface:</b> the contract — request schema, response schema, error semantics, latency SLO. Changing it breaks callers; changing the model behind it should not.</li>
+        <li><b>Rollout:</b> how traffic moves from the incumbent to the candidate, and how it moves back (§07).</li>
+        <li>Neighbouring pages go deeper on parts of this: making models smaller and faster in <a href="../mlops/model-acceleration.html">Model Acceleration</a>, serving large generative models in <a href="../mlops/llm-serving.html">LLM Serving</a>, statistically comparing variants in <a href="../mlops/ab-testing.html">A/B Testing</a>, and watching production in <a href="../mlops/monitoring-and-drift.html">Monitoring &amp; Drift</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="patterns">
+      <h3><span class="idx">02</span> Serving patterns: batch, online, streaming, edge</h3>
+      <p class="lede">The first decision is <i>when</i> a prediction is computed relative to when it is needed. It sets the latency budget, the cost model, and which failures you will have.</p>
+      <table class="cmp">
+        <tr><th>Pattern</th><th>When the prediction is made</th><th>Latency need</th><th>Strengths</th><th>Failure modes</th><th>Typical use</th></tr>
+        <tr><td><b>Batch (offline)</b></td><td>On a schedule over a whole table; results written to a store and looked up later</td><td>Minutes to hours for the job; lookup is fast</td><td>Cheap, simple, easy to rerun and audit; large models are fine</td><td>Stale predictions; wasted compute on entities never queried; new entities have no score</td><td>Churn scores, nightly recommendations, risk tiers</td></tr>
+        <tr><td><b>Online (request/response)</b></td><td>Synchronously, when a caller asks</td><td>Tens to hundreds of ms, tail-sensitive</td><td>Fresh, uses request-time context, covers new entities</td><td>Tail latency, capacity planning, feature freshness skew, cascading failures</td><td>Search ranking, fraud at checkout, ad scoring</td></tr>
+        <tr><td><b>Streaming</b></td><td>Asynchronously, as events arrive on a log or queue</td><td>Seconds; throughput-bound</td><td>Fresh features from event streams; decoupled producers and consumers</td><td>Backpressure, consumer lag, exactly-once headaches, reprocessing</td><td>Anomaly detection, real-time personalization features</td></tr>
+        <tr><td><b>Edge / on-device</b></td><td>On the user's device or a gateway</td><td>Milliseconds, no network</td><td>Privacy, offline operation, zero serving cost per call</td><td>Memory/power limits, slow update rollout, fragmented hardware, no central logging</td><td>Keyboards, camera effects, wake-word detection</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Hybrid is normal.</b> Precompute expensive embeddings in batch, combine with request-time features online; or run a small on-device model with a server fallback.</li>
+        <li>Streaming deployments sit on the infrastructure of <a href="../data-engineering/stream-processing.html">Stream Processing</a> and <a href="../databases/message-queues.html">Message Queues</a>; batch deployments are just another job in the <a href="../data-engineering/etl-pipelines.html">ETL pipeline</a>.</li>
+        <li><b>Rule of thumb:</b> if predictions can be precomputed for every entity that matters and staleness of hours is acceptable, choose batch. It removes an entire class of on-call incidents.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="packaging">
+      <h3><span class="idx">03</span> Packaging: formats, containers, and servers</h3>
+      <ul class="notes">
+        <li><b>Framework-native formats</b> (pickled estimators, framework checkpoints) are simplest but tie the runtime to the exact library version used in training. Unpickling untrusted files executes code — treat them as code, not data.</li>
+        <li><b>ONNX</b> is an interchange format: a graph of standard operators plus weights, runnable by several runtimes on CPU, GPU and mobile. It decouples training framework from serving runtime and enables graph-level optimization. Caveats: custom ops and dynamic control flow may not export; always assert numerical parity (e.g. max absolute difference below a tolerance on a fixed test batch) after conversion.</li>
+        <li><b>Compiled engines</b> specialize a graph for one hardware target and precision — the subject of <a href="../mlops/model-acceleration.html">Model Acceleration</a>. Faster, but rebuilt per target and harder to debug.</li>
+        <li><b>Containers</b> freeze the OS libraries, language runtime, and dependencies. Deploy by <b>image digest</b>, not a mutable tag, so what you tested is byte-for-byte what runs. Choose whether the model is <i>baked into</i> the image (immutable, larger, slower to build) or <i>pulled at startup</i> from the registry (smaller image, but startup depends on the artifact store).</li>
+        <li><b>Model server vs custom app.</b> A dedicated model server gives batching, multi-model hosting, metrics, and health endpoints for free; a thin custom web app gives full control over pre/post-processing. A common split: a custom service for business logic calling a model server for inference.</li>
+        <li><b>Preprocessing belongs with the model.</b> Shipping tokenizers, scalers, and encoders as part of the artifact (or the same library used offline) is the strongest single defence against training/serving skew (§10).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="interfaces">
+      <h3><span class="idx">04</span> Interfaces: REST, gRPC, and async</h3>
+      <table class="cmp">
+        <tr><th></th><th>REST + JSON</th><th>gRPC + protobuf</th><th>Async (queue / callback)</th></tr>
+        <tr><td>Payload</td><td>Text, self-describing, verbose</td><td>Binary, schema-defined, compact</td><td>Any; message on a queue</td></tr>
+        <tr><td>Transport</td><td>HTTP/1.1 or HTTP/2</td><td>HTTP/2, multiplexed, bidirectional streaming</td><td>Broker</td></tr>
+        <tr><td>Schema evolution</td><td>By convention (optional fields, versioned paths)</td><td>Field numbers; add-only changes are backward compatible</td><td>Versioned message schema</td></tr>
+        <tr><td>Best for</td><td>Public APIs, browsers, easy debugging</td><td>Internal service-to-service, large tensors, streaming tokens</td><td>Long jobs (seconds to hours), bursty load, retries</td></tr>
+        <tr><td>Cost</td><td>JSON encode/decode of large arrays is measurable CPU</td><td>Code generation, harder to inspect by hand</td><td>No immediate answer; callers poll or subscribe</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Version the contract, not just the model.</b> A path or package version (<code>/v2/score</code>) lets old clients keep working while new ones migrate.</li>
+        <li><b>Timeouts and retries are part of the interface.</b> A caller with a 200 ms timeout retrying three times can triple load on an already slow service. Use deadlines propagated across calls, bounded retries with jittered backoff, and idempotent requests.</li>
+        <li><b>Return metadata:</b> model version, latency, and a request id in every response make debugging and attribution possible.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="latency">
+      <h3><span class="idx">05</span> Latency budgets, tails, and queueing</h3>
+      <p class="lede">Users feel the tail, not the mean. A budget is set on a percentile (p99 &lt; 150 ms), and every hop in the request path consumes part of it.</p>
+      <div class="formula"><span class="lbl">end-to-end budget is a sum of hops</span><span class="eq">T_total = T_network + T_feature_fetch + T_queue + T_preprocess + T_inference + T_postprocess</span></div>
+      <ul class="notes">
+        <li><b>Feature fetch</b> is often the largest term, not inference: several lookups against a <a href="../data-engineering/feature-stores.html">feature store</a> or cache (see <a href="../databases/caching.html">Caching</a>), each with its own tail.</li>
+        <li><b>Fan-out amplifies tails.</b> If a request waits on k parallel calls and each is slow with probability q, the request is slow whenever <i>any</i> is:</li>
+      </ul>
+      <div class="formula"><span class="lbl">tail amplification under fan-out</span><span class="eq">P(request slow) = 1 − (1 − q)ᵏ</span>     <span class="eq">q = 1%, k = 100  →  ≈ 63%</span></div>
+      <ul class="notes">
+        <li><b>Queueing dominates near saturation.</b> With arrival rate λ and service rate μ per server, utilization is <code>ρ = λ/μ</code>. In the simplest single-server queue, mean time in system blows up as ρ → 1, which is why services are provisioned for 50–70% utilization at peak, not 95%.</li>
+      </ul>
+      <div class="formula"><span class="lbl">utilization, simple single-server queue, and little's law</span><span class="eq">ρ = λ / μ</span>     <span class="eq">W = 1 / (μ − λ)   (ρ &lt; 1)</span>     <span class="eq">L = λ · W</span></div>
+      <ul class="notes">
+        <li><b>Tail-cutting tactics:</b> hedged requests (send a duplicate after the p95 delay, take the first answer), timeouts with fallbacks (cached or default prediction), load shedding of low-priority traffic, and keeping p99 feature lookups on a fast path.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="batching">
+      <h3><span class="idx">06</span> Dynamic batching and replicas — interactive</h3>
+      <p class="lede">Accelerators amortize a large fixed cost per call over every item in a batch, so batching multiplies throughput. The price is waiting: a request may sit in a queue until the batch fills or a timeout fires.</p>
+      <div class="formula"><span class="lbl">batch service time and per-replica capacity</span><span class="eq">s(b) = s₀ + s₁ · b</span>     <span class="eq">capacity(B) = B / (s₀ + s₁ · B)</span>     <span class="eq">stable iff  λ / replicas &lt; capacity(B)</span></div>
+      <ul class="notes">
+        <li><b>Max batch size</b> caps both throughput gain and worst-case compute time per batch. <b>Batch timeout</b> bounds the wait at low load; at high load batches fill before the timeout, so it stops mattering.</li>
+        <li>Generative models batch differently — at the token level, admitting new sequences into a running batch every step (continuous batching). That is covered in <a href="../mlops/llm-serving.html">LLM Serving</a>.</li>
+      </ul>
+      <div class="viz" id="viz-batch">
+        <div class="vhead">
+          <span class="vtitle">Discrete-event simulation of a batched model server</span>
+          <span class="vhint">s₀ = 12 ms fixed · s₁ = 1.2 ms per item · Poisson arrivals · random routing</span>
+        </div>
+        <div class="controls">
+          <label>traffic λ (req/s) <span id="bt-l-v" class="lbl"></span>
+            <input id="bt-l" type="range" min="20" max="2000" step="10" value="300">
+          </label>
+          <label>replicas <span id="bt-r-v" class="lbl"></span>
+            <input id="bt-r" type="range" min="1" max="8" step="1" value="1">
+          </label>
+          <label>max batch <span id="bt-b-v" class="lbl"></span>
+            <input id="bt-b" type="range" min="1" max="64" step="1" value="8">
+          </label>
+          <label>batch timeout (ms) <span id="bt-t-v" class="lbl"></span>
+            <input id="bt-t" type="range" min="0" max="40" step="1" value="5">
+          </label>
+          <label>p99 SLO (ms) <span id="bt-s-v" class="lbl"></span>
+            <input id="bt-s" type="range" min="30" max="300" step="5" value="100">
+          </label>
+        </div>
+        <svg id="bt-svg" width="640" height="230" viewBox="0 0 640 230" role="img" aria-label="Histogram of simulated request latencies with p50, p99 and SLO markers"></svg>
+        <div id="bt-state" style="margin-top:10px;font-weight:600;font-size:14px;"></div>
+        <div class="readout" aria-live="polite" id="bt-read"></div>
+      </div>
+      <div class="callout"><b>Try:</b> at λ = 300 with max batch 1 the single replica is overloaded (capacity ≈ 76 req/s) and latency explodes. Raise max batch to 8 and the same hardware copes. Then push λ to 1500: either add replicas or raise max batch — and watch the timeout trade median latency for throughput at low load.</div>
+    </section>
+
+    <section class="topic" id="autoscaling">
+      <h3><span class="idx">07</span> Autoscaling</h3>
+      <ul class="notes">
+        <li><b>Target tracking</b> is the standard rule: keep a load metric near a target per replica by scaling the replica count proportionally.</li>
+      </ul>
+      <div class="formula"><span class="lbl">proportional scaling rule</span><span class="eq">desired = ⌈ current · (observed metric / target metric) ⌉</span>     <span class="eq">clamped to [min, max] replicas</span></div>
+      <ul class="notes">
+        <li><b>Pick the right signal.</b> CPU utilization works for CPU-bound models. For accelerator serving, utilization is a poor signal (a batched GPU can be "busy" yet have headroom); scale on <b>queue depth, in-flight requests per replica, or measured p95 latency</b> instead.</li>
+        <li><b>Cold starts</b> are the enemy: pulling a multi-gigabyte image and model, then warming up kernels, can take minutes. Mitigate with minimum replicas, pre-pulled images, smaller artifacts, and warm-up requests before marking a replica ready.</li>
+        <li><b>Asymmetric speed:</b> scale up fast (traffic spikes hurt immediately), scale down slowly with a stabilization window (flapping wastes cold starts).</li>
+        <li><b>Scale to zero</b> saves money for rarely used models but guarantees a cold start on the first request — acceptable for internal tools, rarely for user-facing paths.</li>
+        <li><b>Predictive / scheduled scaling</b> for known daily peaks beats reactive scaling that always lags by one cold start.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="rollout">
+      <h3><span class="idx">08</span> Rollout strategies and rollback</h3>
+      <p class="lede">Never move 100% of traffic to an unproven model in one step. Progressive delivery limits the <b>blast radius</b> — how many requests a bad model can harm before it is caught.</p>
+      <table class="cmp">
+        <tr><th>Strategy</th><th>Mechanism</th><th>Users exposed to candidate</th><th>Rollback</th><th>Catches</th><th>Cost / caveat</th></tr>
+        <tr><td><b>Shadow</b></td><td>Mirror live requests to the candidate; log its outputs, serve the incumbent's</td><td>None</td><td>Nothing to roll back</td><td>Crashes, latency, output distribution shifts, disagreement with incumbent</td><td>Double inference cost; cannot measure user response; side-effecting calls must be stubbed</td></tr>
+        <tr><td><b>Canary</b></td><td>Route a small, growing fraction (1% → 5% → 25% → 100%) with automated checks at each step</td><td>Small then growing</td><td>Route the fraction back to 0</td><td>Error rate, latency, business guardrails at real load</td><td>Small early fractions have low statistical power (see viz)</td></tr>
+        <tr><td><b>Blue-green</b></td><td>Two full environments; switch the router from blue to green at once</td><td>All, after switch</td><td>Instant: switch back to blue</td><td>Deployment and integration failures</td><td>Double capacity during cutover; no gradual exposure</td></tr>
+        <tr><td><b>Rolling</b></td><td>Replace replicas a few at a time</td><td>Growing with replicas replaced</td><td>Roll forward or redeploy old version</td><td>Crashes on startup</td><td>Mixed versions serve simultaneously; slow rollback</td></tr>
+        <tr><td><b>A/B test</b></td><td>Randomized split held fixed for a pre-planned duration</td><td>Fixed share</td><td>End the experiment</td><td>Causal effect on product metrics</td><td>Needs sample size planning — see <a href="../mlops/ab-testing.html">A/B Testing</a></td></tr>
+      </table>
+      <ul class="notes">
+        <li>A typical sequence chains them: <b>shadow</b> to prove the candidate is operationally safe, <b>canary</b> to prove it does not regress guardrails, <b>A/B</b> to prove it improves the product, then full rollout.</li>
+        <li><b>Rollback must be boring.</b> Keep the previous version deployed (or instantly redeployable), make rollback a single config change — e.g. moving the registry alias back — and rehearse it. Models with schema changes need backward-compatible features or rollback breaks.</li>
+        <li><b>Automate the decision.</b> Canary analysis compares candidate vs baseline <i>during the same window</i> (not candidate vs last week) and aborts automatically on a statistically significant regression or a hard threshold breach.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="canary">
+      <h3><span class="idx">09</span> Canary analysis — interactive</h3>
+      <p class="lede">Step a candidate through traffic fractions. At each step the canary and baseline error rates are compared with a one-sided two-proportion test. Small steps protect users but can only detect large regressions.</p>
+      <div class="formula"><span class="lbl">two-proportion z-test per step (one-sided, abort if z &gt; 2.33)</span><span class="eq">z = (p̂_c − p̂_b) / √( p̄(1 − p̄) · (1/n_c + 1/n_b) )</span>     <span class="eq">excess failures = n_c · (p_c − p_b)</span></div>
+      <div class="viz" id="viz-canary">
+        <div class="vhead">
+          <span class="vtitle">Progressive canary: 1% → 5% → 25% → 50% → 100%</span>
+          <span class="vhint">baseline error 1.0% · 50,000 requests per step window</span>
+        </div>
+        <div class="controls">
+          <label>candidate true error rate <span id="cn-e-v" class="lbl"></span>
+            <input id="cn-e" type="range" min="0.5" max="3" step="0.05" value="1.3">
+          </label>
+          <label><button id="cn-step" class="btn" type="button">advance one step</button></label>
+          <label><button id="cn-auto" class="btn ghost" type="button">run to completion</button></label>
+          <label><button id="cn-reset" class="btn ghost" type="button">reset</button></label>
+        </div>
+        <svg id="cn-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Canary rollout chart of baseline and candidate error rates with confidence intervals per traffic step"></svg>
+        <div id="cn-state" style="margin-top:10px;font-weight:600;font-size:14px;"></div>
+        <div class="readout" aria-live="polite" id="cn-read"></div>
+      </div>
+      <div class="callout"><b>Notice:</b> with a 1.3% candidate (30% relative regression) the 1% step usually passes — 500 requests cannot resolve 1.0% vs 1.3%. The regression is typically caught at 25% or 50%, by which point roughly 50 excess failures have reached users per 50,000-request window — multiply by real traffic volume to see the true blast radius. A 2.5% candidate is usually caught at the 1% or 5% step. Real canary systems therefore add hard absolute thresholds, longer early windows, and cumulative (sequential) tests rather than relying on early steps alone.</div>
+    </section>
+
+    <section class="topic" id="skew">
+      <h3><span class="idx">10</span> Training/serving skew</h3>
+      <p class="lede">The model is evaluated on features computed one way offline and then served features computed another way online. Accuracy drops with no error in any log.</p>
+      <table class="cmp">
+        <tr><th>Kind</th><th>Example</th><th>Defence</th></tr>
+        <tr><td><b>Code-path skew</b></td><td>Offline feature in SQL, online in a service language; different null handling, rounding, or tokenization</td><td>One feature definition used by both paths; shared preprocessing library shipped in the artifact</td></tr>
+        <tr><td><b>Time / leakage skew</b></td><td>Training joined "latest" values that were not known at prediction time</td><td>Point-in-time-correct joins (a core job of <a href="../data-engineering/feature-stores.html">Feature Stores</a>)</td></tr>
+        <tr><td><b>Freshness skew</b></td><td>Training used features updated hourly; serving cache is a day stale</td><td>Monitor feature age; set freshness SLOs</td></tr>
+        <tr><td><b>Distribution skew</b></td><td>Training sample filtered differently from live traffic (bots removed offline only)</td><td>Apply the same filters; compare live vs training distributions (see <a href="../mlops/monitoring-and-drift.html">Monitoring &amp; Drift</a>)</td></tr>
+        <tr><td><b>Environment skew</b></td><td>Different library version changes a default</td><td>Pinned container digest; parity test in CI</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Log what you served.</b> Record the exact feature vector the model received at serving time, then train the next model on those logged features. This closes the skew loop by construction.</li>
+        <li><b>Parity test before rollout:</b> replay a sample of logged requests through the offline feature pipeline and the online path; assert per-feature agreement within tolerance. Wire it in as a gate in <a href="../mlops/ci-cd.html">CI/CD</a>.</li>
+        <li>Cleaning and transformation choices made in <a href="../data-engineering/data-preprocessing.html">Data Preprocessing</a> are exactly what must be replicated online.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="ops">
+      <h3><span class="idx">11</span> Running it: health, fallbacks, and observability</h3>
+      <ul class="notes">
+        <li><b>Liveness vs readiness.</b> Liveness says "the process is not wedged"; readiness says "the model is loaded and warmed — send traffic". Conflating them sends requests to replicas still loading weights.</li>
+        <li><b>Fallback chain:</b> candidate → incumbent → cached prediction → rule-based default. A ranking service that returns a popularity list when the model times out degrades gracefully instead of failing.</li>
+        <li><b>Circuit breakers and load shedding</b> stop a slow model from exhausting caller thread pools and cascading the outage upstream.</li>
+        <li><b>The four golden signals</b> per model version: latency (percentiles), traffic, errors, saturation — plus model-specific signals: prediction distribution, feature null rates, and outcome metrics once labels arrive (see <a href="../mlops/monitoring-and-drift.html">Monitoring &amp; Drift</a>).</li>
+        <li><b>Cost per prediction</b> is an operating metric: replicas × hourly price ÷ predictions served. It is what makes batch, quantization, or a smaller model the right call.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">12</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Choose the serving pattern first</b> — batch when staleness is acceptable, online when context is needed, streaming for event-driven freshness, edge for privacy and offline use.</li>
+        <li><b>Package immutably:</b> artifact with its preprocessing, container by digest, parity-checked conversions.</li>
+        <li><b>Budget the tail:</b> feature fetches and queueing often cost more than inference; fan-out amplifies tails; provision below saturation.</li>
+        <li><b>Batching trades latency for throughput;</b> replicas and autoscaling on queue depth handle the rest.</li>
+        <li><b>Shadow → canary → A/B → full</b>, with automated analysis and a rehearsed one-step rollback.</li>
+        <li><b>Kill training/serving skew</b> with shared feature definitions, point-in-time joins, and logging served features.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="model-deployment.viz.js"></script>
+</body>
+</html>

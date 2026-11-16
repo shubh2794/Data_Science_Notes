@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Transactions (ACID)</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Transactions (ACID)</h1>
+      <p>A transaction groups several reads and writes into one unit that either happens completely or not at all, and is isolated from other transactions running at the same time. This page covers what each ACID letter guarantees and how engines implement it (write-ahead logging, locking, multi-versioning), the anomalies each isolation level allows, and why distributed commits are harder.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Systems</span>
+        <span class="pill">Concurrency Control</span>
+        <span class="pill">Isolation Levels</span>
+        <span class="pill">Recovery</span>
+      </div>
+    </header>
+
+    <section class="topic" id="what">
+      <h3><span class="idx">01</span> What a transaction promises</h3>
+      <table class="cmp">
+        <tr><th>Letter</th><th>Guarantee</th><th>Implemented by</th></tr>
+        <tr><td><b>A</b>tomicity</td><td>All of the transaction's writes take effect, or none do, including across a crash. In practice the defining feature is "abortability".</td><td>Undo information in the log, or old versions kept by MVCC</td></tr>
+        <tr><td><b>C</b>onsistency</td><td>Each transaction moves the database from one valid state to another. "Valid" means your invariants: constraints, foreign keys, "balance ≥ 0".</td><td>Mostly the <b>application</b>. The database enforces only the constraints you declare.</td></tr>
+        <tr><td><b>I</b>solation</td><td>Concurrent transactions don't see each other's partial work. Ideally the result equals some serial order.</td><td>Locking (2PL), MVCC snapshots, serializable validation</td></tr>
+        <tr><td><b>D</b>urability</td><td>Once commit is acknowledged, the data survives crashes and power loss.</td><td>WAL plus <code>fsync</code>, and/or synchronous replication</td></tr>
+      </table>
+      <div class="callout"><b>One line:</b> A and D are about <b>failures</b>, I is about <b>concurrency</b>, and C is the application's goal that A, I and D make possible.</div>
+    </section>
+
+    <section class="topic" id="wal">
+      <h3><span class="idx">02</span> Atomicity and durability: the write-ahead log</h3>
+      <p class="lede">The rule is to log before writing the data page. Every change is first appended to a sequential log. A transaction is committed at the moment its COMMIT record is durable on disk. Data pages can be written back later, in any order.</p>
+      <ul class="notes">
+        <li><b>Steal / no-force:</b> the buffer pool may flush pages containing uncommitted changes (steal), and doesn't have to flush pages at commit (no-force). That gives the best performance, but it means recovery needs both <b>redo</b> (committed changes not yet on disk) and <b>undo</b> (uncommitted changes that reached disk).</li>
+        <li><b>Recovery</b> (ARIES-style): <i>analysis</i> finds the transactions that were active at the crash, <i>redo</i> replays history from the last checkpoint, and <i>undo</i> rolls back the transactions that never committed.</li>
+        <li><b>Group commit</b> batches many transactions' COMMIT records into one <code>fsync</code>. Durability per transaction stays the same and throughput goes up. "Async commit" modes acknowledge before the <code>fsync</code> and can lose the last few milliseconds of commits on a crash.</li>
+        <li>The same log feeds <b>replication</b> and change-data-capture. Followers replay it (see <a href="sharding-replication.html">Sharding &amp; Replication</a>).</li>
+      </ul>
+      <div class="viz" id="viz-wal">
+        <div class="vhead">
+          <span class="vtitle">Crash recovery from the WAL</span>
+          <span class="vhint">drag the crash point; committed transactions are redone, the rest undone</span>
+        </div>
+        <div class="controls">
+          <label>crash after log record <input type="range" id="wal-k" min="1" max="12" step="1" value="8"></label>
+        </div>
+        <svg id="wal-svg" width="640" height="200" viewBox="0 0 640 200" role="img" aria-label="Interactive diagram: write-ahead log records, crash point and redo or undo decisions per transaction"></svg>
+        <div class="readout" aria-live="polite" id="wal-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="anomalies">
+      <h3><span class="idx">03</span> Isolation anomalies</h3>
+      <p class="lede">Full isolation (serializability) costs throughput, so engines offer weaker levels. Each weaker level permits specific <b>anomalies</b>, which are interleavings whose result matches no serial order.</p>
+      <table class="cmp">
+        <tr><th>Anomaly</th><th>Pattern</th><th>Example harm</th></tr>
+        <tr><td><b>Dirty write</b></td><td>T2 overwrites T1's uncommitted write</td><td>Rollback becomes undefined. Every real level forbids it.</td></tr>
+        <tr><td><b>Dirty read</b></td><td>T2 reads T1's uncommitted write, then T1 aborts</td><td>Acting on data that never existed</td></tr>
+        <tr><td><b>Non-repeatable (fuzzy) read</b></td><td>T1 reads x, T2 updates x and commits, T1 reads x again and gets a different value</td><td>A report whose totals don't add up</td></tr>
+        <tr><td><b>Read skew</b></td><td>T1 reads x, then reads y after T2 changed both</td><td>Seeing a transfer debited but not yet credited</td></tr>
+        <tr><td><b>Lost update</b></td><td>T1 and T2 both read x, both write x+1; one increment disappears</td><td>Counters, inventory, balances</td></tr>
+        <tr><td><b>Phantom</b></td><td>T1 queries rows matching a predicate; T2 inserts a matching row; T1's view of the set is now wrong</td><td>A count that changes inside a transaction; double-booking</td></tr>
+        <tr><td><b>Write skew</b></td><td>T1 and T2 read an overlapping set, then each writes a <i>different</i> row based on what it read; together they break an invariant</td><td>Two doctors both go off call, leaving nobody on call</td></tr>
+      </table>
+      <div class="viz" id="viz-iso">
+        <div class="vhead">
+          <span class="vtitle">Anomaly simulator: two transactions, four isolation levels</span>
+          <span class="vhint">pick a scenario and a level, then step the interleaving</span>
+        </div>
+        <div class="controls">
+          <label>scenario <select id="iso-s">
+            <option value="dirty">dirty read</option>
+            <option value="fuzzy">non-repeatable read</option>
+            <option value="lost">lost update</option>
+            <option value="phantom">phantom</option>
+            <option value="skew" selected>write skew (on-call doctors)</option>
+          </select></label>
+          <label>isolation <select id="iso-l">
+            <option value="RU">Read Uncommitted</option>
+            <option value="RC">Read Committed</option>
+            <option value="SI" selected>Snapshot Isolation</option>
+            <option value="SER">Serializable</option>
+          </select></label>
+          <button type="button" class="btn" id="iso-step">▶ step</button>
+          <button type="button" class="btn ghost" id="iso-all">⏭ run all</button>
+          <button type="button" class="btn ghost" id="iso-reset">⟲ reset</button>
+        </div>
+        <svg id="iso-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Interactive diagram: interleaved operations of two transactions and the outcome under the chosen isolation level"></svg>
+        <div class="readout" aria-live="polite" id="iso-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="levels">
+      <h3><span class="idx">04</span> Isolation levels: the standard and what engines ship</h3>
+      <table class="cmp">
+        <tr><th>Level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom</th><th>Lost update</th><th>Write skew</th></tr>
+        <tr><td><b>Read Uncommitted</b></td><td>possible</td><td>possible</td><td>possible</td><td>possible</td><td>possible</td></tr>
+        <tr><td><b>Read Committed</b></td><td>prevented</td><td>possible</td><td>possible</td><td>possible</td><td>possible</td></tr>
+        <tr><td><b>Repeatable Read</b> (lock-based)</td><td>prevented</td><td>prevented</td><td>possible</td><td>prevented</td><td>possible*</td></tr>
+        <tr><td><b>Snapshot Isolation</b></td><td>prevented</td><td>prevented</td><td>prevented for reads</td><td>prevented (first-committer wins)</td><td><b>possible</b></td></tr>
+        <tr><td><b>Serializable</b></td><td>prevented</td><td>prevented</td><td>prevented</td><td>prevented</td><td>prevented</td></tr>
+      </table>
+      <p>*Lock-based repeatable read holds read locks on the rows it has read, which prevents write skew over those rows. It still allows the phantom form of write skew, where the conflict is over rows that don't exist yet.</p>
+      <ul class="notes">
+        <li><b>The ANSI SQL definitions are ambiguous.</b> They are phrased in terms of three phenomena and leave out lost update, read skew and write skew. They also don't place snapshot isolation anywhere. As a result, <b>the same level name means different things in different engines</b>.</li>
+        <li>Examples: PostgreSQL's <code>REPEATABLE READ</code> is snapshot isolation and its <code>SERIALIZABLE</code> is serializable snapshot isolation. Oracle's <code>SERIALIZABLE</code> is snapshot isolation. MySQL/InnoDB defaults to <code>REPEATABLE READ</code> with snapshot reads, but locking reads and updates see the latest version, so an application-side read-then-write can still lose an update.</li>
+        <li><b>Defaults are weak.</b> Most engines default to Read Committed (InnoDB: Repeatable Read). Unless you've asked for more, assume your code is exposed to every anomaly in that row of the table.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="serial">
+      <h3><span class="idx">05</span> Serializability, formally</h3>
+      <p class="lede">A schedule is <b>conflict-serializable</b> if you can reorder its non-conflicting operations to get a serial schedule. Two operations conflict when they come from different transactions, touch the same item, and at least one of them is a write.</p>
+      <div class="formula"><span class="lbl">Precedence (serialization) graph</span><span class="eq">edge Tᵢ → Tⱼ  if an op of Tᵢ conflicts with and precedes an op of Tⱼ   (w→r, r→w, w→w)</span>
+<span class="eq">schedule is conflict-serializable  ⇔  the precedence graph is acyclic</span></div>
+      <ul class="notes">
+        <li>Write skew shows up in the graph as a <b>cycle of two read→write anti-dependencies</b>: T1 read what T2 later wrote, and T2 read what T1 later wrote. Neither transaction overwrote the other, which is why snapshot isolation doesn't notice.</li>
+        <li><b>Strict serializability</b> = serializable <i>and</i> consistent with real time: if T1 commits before T2 starts, T1 comes first in the serial order. It is serializability combined with <a href="cap-theorem.html">linearizability</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="twopl">
+      <h3><span class="idx">06</span> Two-phase locking (2PL)</h3>
+      <ul class="notes">
+        <li><b>Rule:</b> a transaction acquires locks in a <i>growing</i> phase and releases them in a <i>shrinking</i> phase, and it never acquires a lock after releasing one. This alone guarantees conflict-serializability. <b>Strict 2PL</b> holds write locks (and in practice all locks) until commit, which also prevents cascading aborts.</li>
+        <li><b>Lock modes:</b> shared (S) for reads and exclusive (X) for writes. S is compatible with S. X is compatible with nothing. <b>Readers block writers and writers block readers.</b></li>
+        <li><b>Phantoms</b> need <i>predicate</i> locks: lock "all rows where room = 1 and time overlaps 10:00–11:00", including rows that don't exist yet. Engines approximate this with <b>next-key / gap locks</b> on index ranges, and without a suitable index the gap lock can grow to the whole table.</li>
+        <li><b>Deadlocks</b> are inevitable. The engine keeps a waits-for graph, detects cycles, and aborts a victim. The application must <b>retry</b>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="mvcc">
+      <h3><span class="idx">07</span> MVCC and snapshot isolation</h3>
+      <p class="lede">Instead of overwriting rows, a writer creates a new <b>version</b> tagged with its transaction id. Each transaction reads from a <b>snapshot</b>: the newest version committed before the snapshot was taken.</p>
+      <div class="formula"><span class="lbl">Visibility rule (simplified)</span><span class="eq">version v is visible to snapshot S  ⇔  creator(v) committed before S  ∧  ¬(deleter(v) committed before S)</span></div>
+      <ul class="notes">
+        <li><b>Readers never block writers, and writers never block readers.</b> Only write–write conflicts need coordination. This is why MVCC dominates OLTP engines.</li>
+        <li><b>Snapshot isolation</b> adds <b>first-committer-wins</b> (or first-updater-wins): if two concurrent transactions write the same row, the second to commit is aborted. That prevents lost updates.</li>
+        <li><b>The costs:</b> old versions pile up and must be garbage-collected (vacuum or purge). A long-running transaction pins old snapshots, so bloat grows and index scans slow down. Alert on transaction age.</li>
+        <li><b>Serializable snapshot isolation (SSI)</b> keeps snapshot reads but tracks read→write anti-dependencies between concurrent transactions. When it sees two consecutive ones (a "dangerous structure") it aborts a transaction. It is optimistic: no blocking, occasional false-positive aborts.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th></th><th>Strict 2PL</th><th>MVCC + SI</th><th>SSI</th></tr>
+        <tr><td>Guarantee</td><td>Serializable</td><td>Snapshot (write skew possible)</td><td>Serializable</td></tr>
+        <tr><td>Read/write blocking</td><td>Yes</td><td>No</td><td>No</td></tr>
+        <tr><td>Failure mode</td><td>Deadlocks, lock convoys</td><td>Silent write skew</td><td>Serialization-failure aborts that need retries</td></tr>
+        <tr><td>Best when</td><td>Short, high-contention transactions</td><td>Read-heavy, invariants per row</td><td>Mixed workloads that need correctness without blocking</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="twopc">
+      <h3><span class="idx">08</span> Distributed transactions: two-phase commit</h3>
+      <p class="lede">When one transaction spans several shards or systems, each participant can commit locally, but all of them must make the <i>same</i> decision.</p>
+      <ol class="notes">
+        <li><b>Prepare:</b> the coordinator asks every participant to prepare. A participant that votes YES has durably logged enough to commit and has <b>promised</b> it will commit if told to, even after a crash. It keeps holding its locks.</li>
+        <li><b>Commit/abort:</b> if every vote is YES, the coordinator logs COMMIT and tells everyone. If any vote is NO or a participant times out, everyone aborts.</li>
+      </ol>
+      <ul class="notes">
+        <li><b>2PC blocks.</b> If the coordinator dies after participants voted YES, they are <i>in doubt</i>: they may not commit or abort on their own, so they hold locks until the coordinator recovers. Running the coordinator's decision through a consensus group (Paxos or Raft) removes the single point of failure at the cost of extra round trips.</li>
+        <li><b>Latency:</b> at least two network round trips plus forced log writes on every participant. Cross-region 2PC is slow.</li>
+        <li><b>Alternatives:</b> design aggregates so that one operation touches one shard. Use <b>sagas</b> (a sequence of local transactions with compensating actions) and an <b>outbox</b> with idempotent consumers when the steps span services.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="practice">
+      <h3><span class="idx">09</span> Operational practice</h3>
+      <ul class="notes">
+        <li><b>Always write a retry loop</b> for serialization failures and deadlocks (SQLSTATE <code>40001</code> / <code>40P01</code>). The transaction body must be safe to re-run, so keep side effects such as emails and payments outside it or make them idempotent.</li>
+        <li><b>Keep transactions short.</b> Never wait for user input or a remote API call while holding a transaction open. Long transactions hold locks (2PL) or pin snapshots (MVCC).</li>
+        <li><b>Fix specific anomalies cheaply:</b> atomic updates (<code>UPDATE … SET n = n + 1</code>) instead of read-modify-write, <code>SELECT … FOR UPDATE</code> to lock what you read, unique or exclusion constraints to stop double-booking, or "materialising the conflict" as a row everyone must lock.</li>
+        <li><b>Durability is a setting.</b> Check the <code>fsync</code>/sync-commit settings, the disk write cache, and whether commit waits for a replica. Test it by actually cutting power to a staging node.</li>
+        <li><b>Monitor:</b> abort and retry rates, lock waits, deadlocks per minute, oldest running transaction, MVCC bloat and replication lag. A climbing serialization-failure rate is an early sign of a contention hotspot.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">10</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>The WAL gives you atomicity and durability.</b> Commit is the moment the COMMIT record is durable, and recovery redoes committed work and undoes the rest.</li>
+        <li><b>Isolation levels are lists of permitted anomalies.</b> The same name can mean different things in different engines, so check what yours actually prevents.</li>
+        <li><b>Snapshot isolation is not serializable:</b> write skew and its phantom form get through. SSI or 2PL closes the gap.</li>
+        <li><b>2PL</b> is pessimistic, blocks, and deadlocks. <b>MVCC</b> doesn't block but needs garbage collection. <b>SSI</b> doesn't block but aborts and needs retries.</li>
+        <li><b>2PC</b> makes multi-shard commits atomic but blocks when the coordinator fails. Prefer single-shard designs or sagas.</li>
+        <li>Related pages: <a href="cap-theorem.html">CAP Theorem</a>, <a href="indexing.html">Indexing</a>, <a href="nosql.html">NoSQL</a>, <a href="../programming/sql.html">SQL</a>.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="transactions-acid.viz.js"></script>
+</body>
+</html>

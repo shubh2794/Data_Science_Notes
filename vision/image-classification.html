@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Image Classification</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .keyline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;margin:12px 0}
+  .keyline span{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .keyline i{color:var(--muted);font-style:normal}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.cmp td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="index.html">Classical Vision hub</a> · Computer Vision task page</p>
+      <h1>Image Classification</h1>
+      <p>Give the network a whole image and ask for one label. It is the simplest vision task to state and the one the field was built on. Almost every backbone you will meet, from <a href="../deep-learning/convolutional-networks.html">CNNs</a> to <a href="vision-transformers.html">Vision Transformers</a>, was first judged by its ImageNet top-1 accuracy. The pretrained classifier then became the starting point for <a href="object-detection.html">detection</a>, <a href="segmentation.html">segmentation</a> and nearly everything else. This page covers the objective, the benchmarks, the forty-year arc of architectures, the training tricks that now matter as much as the architecture, and the things a single accuracy number hides: calibration, per-class failure and distribution shift.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Computer Vision</span>
+        <span class="pill">Softmax cross-entropy</span>
+        <span class="pill">ImageNet top-1 / top-5</span>
+        <span class="pill">CNN → ViT → CLIP</span>
+        <span class="pill">Augmentation &amp; label smoothing</span>
+        <span class="pill">Transfer learning</span>
+        <span class="pill">Calibration</span>
+        <span class="pill">Distribution shift</span>
+        <span class="pill">2 visualizations</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="task" data-nav="The task">
+      <h3><span class="idx">01</span> The task: one image in, one distribution over labels out</h3>
+      <p class="lede">A classifier is a function <code>f: ℝ^(H×W×3) → Δ^(K−1)</code>. It maps an image to a probability vector over <code>K</code> fixed classes. Every architecture on this page is a different way of building <code>f</code>, and every training trick is a different way of choosing it.</p>
+      <div class="keyline">
+        <span>pixels x</span><i>→</i><span>backbone (conv / attention)</span><i>→</i><span>feature map</span><i>→</i><span>global pool or [CLS]</span><i>→</i><span>vector h ∈ ℝᵈ</span><i>→</i><span>linear head W h + b</span><i>→</i><span>logits z ∈ ℝᴷ</span><i>→</i><span>softmax</span><i>→</i><span>p</span>
+      </div>
+      <ul class="notes">
+        <li><b>The backbone does almost all the work, and the head is linear.</b> Everything before the last layer is a learned feature extractor. The last layer is a plain multinomial <a href="../machine-learning/logistic-regression.html">logistic regression</a> on those features. That split is why a classifier transfers so well: you keep the extractor and swap the head (§08).</li>
+        <li><b>The spatial axes have to disappear somewhere.</b> A CNN collapses its final <code>h×w×d</code> map with global average pooling. A ViT reads a <code>[CLS]</code> token or averages its patch tokens. Either way the label is <b>invariant</b> to where the object sits, which is what classification wants and exactly what <a href="object-detection.html">detection</a> and <a href="segmentation.html">segmentation</a> must undo.</li>
+        <li><b>The assumption that breaks first is "one object per image".</b> Many ImageNet photos contain several valid classes. When the labels allow several at once, the problem is multi-label (§09), and softmax is the wrong output.</li>
+      </ul>
+      <div class="callout"><b>Where the neighbouring material lives.</b> The convolution itself, pooling and receptive fields are on <a href="../deep-learning/convolutional-networks.html">Convolutional Networks</a> and <a href="../deep-learning/convolutional-networks/arithmetic-receptive-fields.html">Conv Arithmetic &amp; Receptive Fields</a>. Patch embedding and the encoder are on <a href="vision-transformers.html">Vision Transformers</a>. Specific model cards are on <a href="../models/vision-models.html">Vision Models</a>, <a href="../models/efficientnet.html">EfficientNet</a> and <a href="../models/clip.html">CLIP</a>. This page is about the <i>task</i>: what is optimised, how it is scored, and what goes wrong.</div>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="softmax-ce" data-nav="Softmax &amp; cross-entropy">
+      <h3><span class="idx">02</span> Softmax cross-entropy, and the gradient it actually sends</h3>
+      <p class="lede">The objective is the negative log-likelihood of the true class under a categorical distribution whose logits the network produces. It is worth knowing in three forms: the loss, the loss as a divergence from a target, and its gradient. The gradient is the one that explains label smoothing, temperature and calibration.</p>
+      <div class="formula"><span class="lbl">softmax with temperature T, and the cross-entropy against a target distribution q</span><span class="eq">pₖ = exp(zₖ/T) / ∑ⱼ exp(zⱼ/T)</span>
+<span class="eq">L(z, q) = −∑ₖ qₖ · log pₖ  =  H(q) + KL(q ‖ p)</span>
+<span class="lbl">one-hot target (q = e_y): the familiar form</span><span class="eq">L = −log p_y = −z_y/T + log ∑ⱼ exp(zⱼ/T)</span>
+<span class="lbl">the gradient w.r.t. the logits, for any target q</span><span class="eq">∂L/∂zₖ = (pₖ − qₖ) / T</span></div>
+      <ul class="notes">
+        <li><b>"Probability minus target" is the whole learning signal.</b> The true class is pushed up by <code>1 − p_y</code>. Every wrong class is pushed down by its own probability, so the most confusable classes get the strongest push. That is the logic of <a href="../deep-learning/neural-network-training/loss-backprop.html#loss">Losses &amp; Backpropagation</a>, specialised to a <code>K</code>-way head.</li>
+        <li><b>With a one-hot target the loss has no minimum, only an infimum.</b> <code>−log p_y → 0</code> needs <code>z_y − zⱼ → ∞</code>. Once the training set is fitted, the network can keep lowering the loss by scaling its logits up without changing a single prediction. That runaway is the root cause of the over-confidence in §11.</li>
+        <li><b>The <code>H(q)</code> term is a floor you cannot go below.</b> With a soft target (label smoothing, mixup, distillation) the loss bottoms out at the target's entropy, not at zero. Only the <code>KL</code> part measures fit, so comparing raw losses across smoothing settings is meaningless.</li>
+      </ul>
+
+      <div class="viz" id="viz-softmax">
+        <div class="vhead">
+          <span class="vtitle">Five logits, one target, and the gradient that the head receives</span>
+          <span class="vhint">drag the logit bars; then raise ε and watch the target stop being one-hot</span>
+        </div>
+        <div class="controls">
+          <label>true class
+            <select id="sm-y">
+              <option value="0" selected>cat</option><option value="1">dog</option><option value="2">fox</option><option value="3">car</option><option value="4">truck</option>
+            </select>
+          </label>
+          <label>temperature T <input type="range" id="sm-T" min="0.25" max="4" step="0.05" value="1" /><span id="sm-Tv" style="min-width:32px;display:inline-block">1.00</span></label>
+          <label>label smoothing ε <input type="range" id="sm-eps" min="0" max="0.4" step="0.01" value="0" /><span id="sm-epsv" style="min-width:32px;display:inline-block">0.00</span></label>
+          <button class="btn ghost" id="sm-reset">reset logits</button>
+        </div>
+        <svg id="sm-svg" width="760" height="330" viewBox="0 0 760 330" role="img" aria-label="Three bar-chart panels for a five-class classifier over cat, dog, fox, car and truck. Left: the five logits, each a vertical bar that can be dragged up or down between minus six and six, with the true class drawn in amber. Middle: for each class, the softmax probability at the chosen temperature side by side with the target probability, which is one-hot when label smoothing is zero and spreads epsilon over K classes otherwise. Right: the gradient of the cross-entropy with respect to each logit, probability minus target divided by temperature, green where the logit is being pushed up and red where it is pushed down. A readout gives the loss, its floor at the target entropy, the excess KL divergence, and the logit gap that minimises the loss under smoothing."></svg>
+        <div class="readout" aria-live="polite" id="sm-readout"></div>
+      </div>
+      <ul class="notes">
+        <li><b>At the default (cat true, ε = 0, T = 1)</b> the model gives cat <code>p = 0.585</code>, the loss is <code>0.536</code> and the gradient on the cat logit is <code>−0.415</code>. Drag the cat bar up and the loss keeps falling with no end in sight.</li>
+        <li><b>Set ε = 0.10.</b> The target becomes <code>(0.92, 0.02, 0.02, 0.02, 0.02)</code>, the floor <code>H(q)</code> rises to <code>0.390</code>, and the gradient on truck flips sign to <code>−0.004</code>. Truck is now <i>below</i> its target of 0.02, so the loss pulls it back up. Label smoothing sets a finite best gap of <code>log(0.92/0.02) = 3.83</code> nats between the true logit and every other one. Past that gap, pushing further <i>raises</i> the loss.</li>
+        <li><b>Temperature changes p without changing the argmax.</b> At T = 0.5 cat reaches <code>0.807</code>; at T = 2 it drops to <code>0.402</code>. The predicted class is the same in both. This is the single fact that makes temperature scaling (§11) safe to apply after training.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="benchmarks" data-nav="Datasets &amp; benchmarks">
+      <h3><span class="idx">03</span> Datasets and benchmarks: what "ImageNet top-1" does and does not mean</h3>
+      <p class="lede">The field's progress is mostly written in one number: top-1 accuracy on the 50 000-image validation set of the ILSVRC-2012 subset of ImageNet (1000 classes, about 1.28 M training images). It is worth knowing what that number measures before trusting a 0.3-point gain.</p>
+      <div class="formula"><span class="lbl">top-k accuracy over a labelled set of n images</span><span class="eq">top-k = (1/n) ∑ᵢ 𝟙[ yᵢ ∈ the k classes with the largest pᵢ ]</span>
+<span class="lbl">top-1 is plain accuracy; top-5 forgives the model for ranking the right answer anywhere in its first five</span></div>
+      <table class="cmp">
+        <tr><th style="width:20%">Dataset</th><th style="width:22%">Scale</th><th>What it is used for</th></tr>
+        <tr><td><b>MNIST / Fashion-MNIST</b></td><td>70 k grey 28×28, 10 classes</td><td>Smoke tests and teaching. Solved; differences between methods are noise.</td></tr>
+        <tr><td><b>CIFAR-10 / CIFAR-100</b></td><td>60 k colour 32×32, 10 / 100 classes</td><td>Fast ablations of augmentation and regularisation. Low resolution, so results do not always carry over to large images.</td></tr>
+        <tr><td><b>ImageNet-1k (ILSVRC-2012)</b></td><td>≈1.28 M train · 50 k val · 1000 classes</td><td>The standard benchmark and the standard pretraining set. Fine-grained in places (over a hundred dog breeds), coarse elsewhere.</td></tr>
+        <tr><td><b>ImageNet-21k, JFT, web image–text pairs</b></td><td>14 M to billions</td><td>Pretraining only. ViTs need this scale to beat CNNs (§06), and CLIP replaces class labels with captions entirely.</td></tr>
+        <tr><td><b>ImageNet-V2, -C, -R, -Sketch, ObjectNet</b></td><td>test sets only</td><td>Measuring robustness: how much accuracy survives a new sample, a corruption, a rendition or a pose change (§12).</td></tr>
+      </table>
+      <div class="wrong"><span class="say">The trap.</span> Reading top-1 as "fraction of images understood". <span class="fix">It is the agreement with one annotator's single label per image</span>, and that label is sometimes wrong and often incomplete. Re-annotation studies of the ImageNet validation set found a few percent of the labels to be errors, and many images contain more than one valid class. Near the top of the leaderboard, some "mistakes" are correct answers to a question the label did not ask. Multi-label re-annotations and top-5 exist to soften exactly this.</div>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="handcrafted" data-nav="Hand-crafted features">
+      <h3><span class="idx">04</span> Before deep learning: hand-crafted features and linear classifiers</h3>
+      <p class="lede">Until 2012 the pipeline had the same shape as today's: a feature extractor followed by a linear classifier. The extractor was designed by hand instead of learned, and that one difference accounts for most of the accuracy gap.</p>
+      <div class="keyline">
+        <span>image</span><i>→</i><span>dense SIFT / HOG patches</span><i>→</i><span>encode against a visual vocabulary</span><i>→</i><span>spatial-pyramid pooling</span><i>→</i><span>linear SVM</span>
+      </div>
+      <ul class="notes">
+        <li><b>Local descriptors</b> such as SIFT and HOG are histograms of oriented gradients over small cells. They are built to be invariant to illumination and small shifts, as <a href="features.html">Features &amp; Matching</a> derives. They are good at describing a patch and know nothing about what "dog" means.</li>
+        <li><b>Bag of visual words</b> clusters the descriptors with k-means and represents an image as a histogram of cluster assignments. <b>Fisher vectors</b> and VLAD keep first- and second-order statistics of the residuals to each cluster instead of counts, which made the strongest pre-2012 ImageNet entries.</li>
+        <li><b>Spatial pyramids</b> pool the codes over a 1×1, 2×2 and 4×4 grid and concatenate, bringing back coarse layout. This is the hand-built ancestor of the pooling hierarchy a CNN learns.</li>
+        <li><b>The classifier was a linear SVM</b> because the encoded vectors were huge (tens of thousands of dimensions) and kernels did not scale. The best ImageNet systems of 2010–2011 sat at roughly 26–28% top-5 <i>error</i>.</li>
+      </ul>
+      <div class="callout"><b>What survived.</b> The overall structure: local filtering, non-linear encoding, pooling, a linear readout. A CNN is that pipeline with every stage learned end to end by gradient descent. The intuitions behind the hand-designed filters are on <a href="image-processing.html">Image Processing</a> and the <a href="index.html">Classical Vision</a> hub, and they are still the best way to understand what a network's first layer converges to.</div>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="cnn-arc" data-nav="The CNN arc">
+      <h3><span class="idx">05</span> The CNN arc: LeNet → AlexNet → VGG → ResNet → EfficientNet</h3>
+      <p class="lede">Each step in the lineage removed one obstacle to going deeper or wider. Read the table for <i>what the step unlocked</i>, not just for the accuracy column.</p>
+      <table class="cmp">
+        <tr><th style="width:15%">Model</th><th style="width:8%">Year</th><th style="width:15%">Size</th><th style="width:18%">ImageNet</th><th>What it changed</th></tr>
+        <tr><td><b>LeNet-5</b></td><td>1998</td><td>≈60 k params</td><td>— (digits)</td><td>Convolution + subsampling + fully connected, trained by backprop. The template, at a scale where the data and compute of the day sufficed.</td></tr>
+        <tr><td><b>AlexNet</b></td><td>2012</td><td>≈60 M params</td><td>15.3% top-5 error (ILSVRC-12)</td><td>ReLU, dropout, heavy augmentation and two GPUs. Beat the runner-up's 26.2% by more than ten points, which ended the hand-crafted era in one year. <a href="../deep-learning/convolutional-networks/alexnet.html">Paper deep dive →</a></td></tr>
+        <tr><td><b>VGG-16/19</b></td><td>2014</td><td>≈138 M params</td><td>≈7.3% top-5 (ensemble)</td><td>Only 3×3 convolutions, stacked deep. Two 3×3 layers see a 5×5 region with fewer parameters and an extra non-linearity (<a href="../deep-learning/convolutional-networks/arithmetic-receptive-fields.html#rf">receptive fields</a>).</td></tr>
+        <tr><td><b>ResNet-50/152</b></td><td>2015</td><td>25.6 M (ResNet-50)</td><td>≈76% top-1 (R-50) · 3.57% top-5 (ensemble, ILSVRC-15)</td><td><a href="../deep-learning/residual-skip-connections.html">Residual connections</a> <code>y = x + F(x)</code> fixed the degradation problem, so 100+ layers train. Batch norm and the bottleneck block made it cheap. Still the default baseline backbone.</td></tr>
+        <tr><td><b>EfficientNet-B0…B7</b></td><td>2019</td><td>5.3 M → 66 M</td><td>77.1% → 84.3% top-1</td><td>Searched MBConv block plus <a href="../models/efficientnet.html">compound scaling</a> of depth, width and resolution together. Excellent accuracy per FLOP, though not per GPU millisecond.</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Two biases did the heavy lifting: locality and weight sharing.</b> They make a CNN translation-equivariant and very sample-efficient, which is why it beat everything on 1.28 M images. See <a href="../deep-learning/convolutional-networks.html">Convolutional Networks</a> for the argument in full.</li>
+        <li><b>Not every gain in the table is architectural.</b> Later re-trainings of a plain ResNet-50 with a modern recipe (long schedules, the augmentation of §07, label smoothing, cosine learning rate) add several top-1 points with no change to the network. Compare architectures only under the same recipe.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="vit-clip" data-nav="ViTs &amp; CLIP zero-shot">
+      <h3><span class="idx">06</span> Transformers and language supervision: ViT and CLIP zero-shot</h3>
+      <p class="lede">Two later shifts changed what a classifier is. The ViT dropped convolution's built-in assumptions and let scale supply them. CLIP dropped the fixed label set, so the class list becomes an input at test time.</p>
+      <h4>Vision Transformers</h4>
+      <p>A <a href="vision-transformers.html">ViT</a> cuts the image into 16×16 patches, embeds each as a token, adds position embeddings and runs a standard Transformer encoder. The classifier reads the <code>[CLS]</code> token. With weak inductive bias it <b>loses to ResNets when trained on ImageNet-1k alone</b>. It wins once it is pretrained on ImageNet-21k or larger (ViT-H/14 reached about 88.5% top-1 after JFT-300M pretraining). DeiT closed much of the small-data gap with strong augmentation and distillation, and convolutional designs modernised in response (ConvNeXt). The comparison is laid out on <a href="vision-transformers.html#vit-vs-cnn">ViT vs CNN</a>.</p>
+      <h4>CLIP: the label set becomes a prompt</h4>
+      <div class="formula"><span class="lbl">zero-shot classification with a contrastively trained image encoder f and text encoder g</span><span class="eq">tₖ = g("a photo of a {classₖ}.") / ‖·‖          one text embedding per class name</span>
+<span class="eq">u = f(x) / ‖f(x)‖</span>
+<span class="eq">p(k | x) = softmax_k( τ · uᵀtₖ )               τ is the learned logit scale</span>
+<span class="lbl">the text embeddings are the rows of a linear head W that nobody trained on this label set</span></div>
+      <ul class="notes">
+        <li><b>A classifier you never trained.</b> <a href="../models/clip.html">CLIP</a>'s largest model reaches about 76% ImageNet top-1 zero-shot, roughly matching a supervised ResNet-50, without seeing one of ImageNet's 1.28 M training labels. Prompt templates and ensembling over templates are worth several points (<a href="../models/clip/zero-shot-evaluation.html#prompts">CLIP: Zero-Shot Transfer</a>).</li>
+        <li><b>It is strongest where labels are scarce and weakest on fine or abstract categories</b>: counting, distances, satellite and medical imagery, specific aircraft variants. A linear probe or fine-tune on CLIP features usually beats zero-shot when a few labelled examples per class exist.</li>
+        <li><b>Its robustness is the headline result</b> and belongs in §12: zero-shot CLIP loses far less accuracy under distribution shift than an ImageNet-trained model of equal in-distribution accuracy.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="augmentation" data-nav="Augmentation &amp; label smoothing">
+      <h3><span class="idx">07</span> Regularising the input and the target: augmentation, mixup, CutMix, label smoothing</h3>
+      <p class="lede">A modern ImageNet recipe spends as much effort on what the network sees as on the network. Augmentation tells the model which changes should <i>not</i> change the label. Soft targets tell it not to be certain.</p>
+      <div class="cards">
+        <div class="box plain"><div class="n">baseline · always on</div><div class="t">Random-resized crop + flip</div><div class="g">Crop a random 8–100% area at a random aspect ratio, resize to 224, flip horizontally half the time. Teaches scale and position invariance. Its side effect is that objects look larger in training than in the centre-cropped test images, which is why testing at a slightly higher resolution helps (the FixRes effect).</div></div>
+        <div class="box good"><div class="n">policy · two knobs</div><div class="t">RandAugment</div><div class="g">For each image apply <code>N</code> operations drawn uniformly from a fixed list of about 14 (rotate, shear, translate, colour, contrast, posterize, solarize, equalize…), all at one shared magnitude <code>M</code>. It replaced searched policies (AutoAugment) with a two-parameter grid search and matched them.</div></div>
+        <div class="box good"><div class="n">mix two images</div><div class="t">mixup</div><div class="g">Blend two images pixel-wise and blend their one-hot labels by the same weight. The model is pushed to behave linearly between examples, which smooths the decision boundary.</div></div>
+        <div class="box good"><div class="n">paste two images</div><div class="t">CutMix</div><div class="g">Cut a rectangle out of one image and paste it from another. The label weight is the pasted area fraction. Every pixel stays natural, which suits localisation better than mixup's ghosted blends.</div></div>
+      </div>
+      <div class="formula"><span class="lbl">mixup — <span class="keep">λ</span> ~ Beta(<span class="keep">α</span>, <span class="keep">α</span>), with <span class="keep">α</span> around 0.2 on ImageNet</span><span class="eq">x̃ = λ·xᵢ + (1 − λ)·xⱼ          ỹ = λ·yᵢ + (1 − λ)·yⱼ</span>
+<span class="lbl">CutMix — binary mask M zero inside a random box of area (1 − <span class="keep">λ</span>)·HW</span><span class="eq">x̃ = M ⊙ xᵢ + (1 − M) ⊙ xⱼ        ỹ = λ·yᵢ + (1 − λ)·yⱼ,   λ = 1 − box area / HW</span>
+<span class="lbl">label smoothing with <span class="keep">ε</span> over K classes (usually <span class="keep">ε</span> = 0.1)</span><span class="eq">qₖ = (1 − ε)·𝟙[k = y] + ε/K</span>
+<span class="eq">optimum logit gap  z_y − zₖ = log( (1 − ε + ε/K) / (ε/K) )      finite for any ε &gt; 0</span></div>
+      <ul class="notes">
+        <li><b>All three soft-target methods train on <code>H(q) + KL(q‖p)</code></b> with a non-one-hot <code>q</code>, so the logits stay bounded (§02's figure shows the finite gap). The effect is a regulariser on the <i>head</i>, and usually better calibration.</li>
+        <li><b>Label smoothing has a known cost.</b> It squeezes each class's penultimate features into tight, equally spaced clusters and throws away information about which wrong classes are similar. That makes the network a worse <a href="../deep-learning/knowledge-distillation.html">distillation teacher</a> even when it is a better classifier.</li>
+        <li><b>Stack carefully.</b> Mixup or CutMix plus label smoothing plus heavy RandAugment can over-regularise a small model and leave it <i>under</i>-confident, the reverse failure in §11. Weight decay, dropout, stochastic depth and the rest are covered on <a href="../deep-learning/neural-network-training/normalization-regularization.html">Normalization &amp; Regularization</a>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="transfer" data-nav="Transfer &amp; fine-tuning">
+      <h3><span class="idx">08</span> Transfer learning and fine-tuning recipes</h3>
+      <p class="lede">Almost nobody trains an image classifier from scratch. You start from a backbone pretrained on ImageNet, a larger labelled set or image–text pairs, and choose how much of it to move. The choice depends on two things: how much labelled data you have, and how far your images are from the pretraining images.</p>
+      <table class="cmp">
+        <tr><th style="width:20%">Regime</th><th style="width:26%">What is trained</th><th>When it is the right call</th></tr>
+        <tr><td><b>Linear probe</b></td><td>Only a new head on frozen features</td><td>Tens of examples per class, or a domain close to the pretraining data. Cheap, hard to overfit, and the honest measure of representation quality.</td></tr>
+        <tr><td><b>Partial fine-tune</b></td><td>Head + the last stage(s); early layers frozen</td><td>Medium data. Early filters (edges, colour blobs) are generic. Later ones are task-specific and benefit most from moving.</td></tr>
+        <tr><td><b>Full fine-tune</b></td><td>Everything, with a learning rate 10–100× below the from-scratch rate</td><td>Thousands of examples per class, or a domain far from the pretraining data (medical, satellite, documents).</td></tr>
+        <tr><td><b>LP-FT</b></td><td>Linear probe first, then full fine-tune from that head</td><td>When out-of-distribution robustness matters. A random head sends large gradients that distort good features before the head is sensible, and probing first avoids that.</td></tr>
+      </table>
+      <ol class="notes">
+        <li><b>Match the preprocessing</b> the backbone was trained with: resolution, normalisation mean/std, colour order. Getting it wrong costs points silently, with no error raised.</li>
+        <li><b>Use discriminative learning rates</b>: smaller for early layers, larger for the head, with warm-up and cosine decay. Use a light version of the §07 augmentation.</li>
+        <li><b>Mind batch norm.</b> In small-batch fine-tuning, freeze its running statistics or switch to evaluation-mode BN, or the statistics drift to a noisy estimate.</li>
+        <li><b>Select by validation loss and calibrated accuracy</b>, not by the final epoch. Fine-tuning overfits fast on small sets.</li>
+      </ol>
+      <div class="callout"><b>Better ImageNet models usually transfer better</b>, but the correlation is weaker for fine-grained or far-domain tasks, and is broken by regularisers that hurt the penultimate features (label smoothing again). The full treatment, covering feature generality by layer, the data size × similarity grid, forgetting, domain adaptation and parameter-efficient methods, is on <a href="../deep-learning/fine-tuning-transfer-learning.html">Fine-Tuning &amp; Transfer Learning</a>.</div>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="multilabel" data-nav="Multi-label vs multi-class">
+      <h3><span class="idx">09</span> Multi-label versus multi-class: when softmax is the wrong output</h3>
+      <p class="lede">Softmax makes the classes compete for one unit of probability, which encodes "exactly one of these is true". If an image can be both <i>beach</i> and <i>dog</i>, that assumption is false. The fix is to make each class an independent yes/no question.</p>
+      <div class="formula"><span class="lbl">multi-class: one softmax, one categorical label</span><span class="eq">p = softmax(z)            L = −log p_y                 predict argmaxₖ pₖ</span>
+<span class="lbl">multi-label: K sigmoids, K binary labels yₖ ∈ {0,1}</span><span class="eq">pₖ = σ(zₖ) = 1 / (1 + e^(−zₖ))</span>
+<span class="eq">L = −∑ₖ [ yₖ·log pₖ + (1 − yₖ)·log(1 − pₖ) ]           predict { k : pₖ ≥ tₖ }</span></div>
+      <table class="cmp">
+        <tr><th style="width:22%"></th><th style="width:39%">Multi-class (softmax)</th><th>Multi-label (sigmoid + BCE)</th></tr>
+        <tr><td><b>Output constraint</b></td><td><code>∑ pₖ = 1</code>; classes are mutually exclusive</td><td>Each <code>pₖ ∈ [0,1]</code> independently; any subset is possible, including none</td></tr>
+        <tr><td><b>Decision</b></td><td>argmax, no threshold needed</td><td>A threshold per class. Tune <code>tₖ</code> on validation data, because 0.5 is rarely right for rare classes</td></tr>
+        <tr><td><b>Imbalance</b></td><td>Mild: every example is a positive for some class</td><td>Severe: most labels are negatives for most classes. Use positive weights, focal or asymmetric losses (<a href="object-detection.html#one-stage">focal loss</a>), and see <a href="../data-engineering/data-sampling-imbalance.html">Data Sampling &amp; Imbalance</a></td></tr>
+        <tr><td><b>Headline metric</b></td><td>Top-1 / top-5 accuracy</td><td>Mean average precision over classes, plus per-class F₁ at the chosen thresholds</td></tr>
+        <tr><td><b>Typical data</b></td><td>ImageNet, CIFAR, species ID</td><td>Photo tagging, Open Images, chest X-ray findings, attributes</td></tr>
+      </table>
+      <div class="wrong"><span class="say">The trap.</span> Training multi-label data with softmax and taking the top few classes. <span class="fix">Softmax divides probability between co-occurring labels</span>, so an image with three true tags gets about a third each and none clears a sensible threshold. Worse, the model learns that tags compete when they actually co-occur. The same distinction appears for text on <a href="../nlp/text-classification.html">Text Classification</a>.</div>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="evaluation" data-nav="Confusion matrix &amp; per-class">
+      <h3><span class="idx">10</span> Evaluation beyond accuracy: the confusion matrix and per-class metrics</h3>
+      <p class="lede">Accuracy is one number from a <code>K×K</code> table, and it weights classes by how often they occur. The table itself says which classes are confused with which and whether a rare class is being sacrificed.</p>
+      <table class="cmp" style="max-width:560px">
+        <tr><th>true ↓ / predicted →</th><th>cat</th><th>dog</th><th>fox</th><th>support</th><th>recall</th></tr>
+        <tr><td><b>cat</b></td><td class="num"><b>50</b></td><td class="num">8</td><td class="num">2</td><td class="num">60</td><td class="num">0.833</td></tr>
+        <tr><td><b>dog</b></td><td class="num">10</td><td class="num"><b>70</b></td><td class="num">0</td><td class="num">80</td><td class="num">0.875</td></tr>
+        <tr><td><b>fox</b></td><td class="num">5</td><td class="num">5</td><td class="num"><b>10</b></td><td class="num">20</td><td class="num">0.500</td></tr>
+        <tr><td><b>precision</b></td><td class="num">0.769</td><td class="num">0.843</td><td class="num">0.833</td><td></td><td></td></tr>
+        <tr><td><b>F₁</b></td><td class="num">0.800</td><td class="num">0.859</td><td class="num">0.625</td><td></td><td></td></tr>
+      </table>
+      <div class="formula"><span class="lbl">per class k, from the confusion matrix C (rows true, columns predicted)</span><span class="eq">precisionₖ = Cₖₖ / ∑ᵢ Cᵢₖ        recallₖ = Cₖₖ / ∑ⱼ Cₖⱼ        F₁ₖ = 2·P·R / (P + R)</span>
+<span class="lbl">the averages disagree, by design</span><span class="eq">accuracy = micro-F₁ = 130 / 160 = 0.8125</span>
+<span class="eq">macro-F₁ = (0.800 + 0.859 + 0.625) / 3 = 0.761          balanced accuracy = mean recall = 0.736</span></div>
+      <ul class="notes">
+        <li><b>The rare class is where the model is failing</b>, and accuracy barely shows it. Fox recall is 0.5: half of all foxes are called cats or dogs. Because fox is only 12.5% of the data, it moves accuracy far less than it moves macro-F₁ or balanced accuracy.</li>
+        <li><b>For single-label multi-class, micro-averaged precision, recall and F₁ all equal accuracy.</b> Every error is a false positive for one class and a false negative for another, so reporting "micro-F₁" next to accuracy adds nothing.</li>
+        <li><b>Read the off-diagonal for structure.</b> Cat↔dog confusion (8 and 10) is between visually similar classes and is often a labelling question. A large off-diagonal between dissimilar classes usually points to a data bug: a mislabelled folder, or a background shortcut. <a href="../machine-learning/model-interpretability.html">Model Interpretability</a> tools such as saliency maps are how you check which.</li>
+      </ul>
+      <div class="callout"><b>The general methodology</b> (held-out splits, cross-validation, threshold-free curves, confidence intervals on a metric, leakage) is on <a href="../machine-learning/model-evaluation.html#metrics">Model Evaluation</a>. Two vision-specific leaks deserve naming: near-duplicate images split across train and test, and pretraining sets that already contain the benchmark's test images.</div>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="calibration" data-nav="Calibration">
+      <h3><span class="idx">11</span> Calibration: is "90% confident" right 90% of the time?</h3>
+      <p class="lede">A classifier is calibrated if, among all the predictions it makes with confidence 0.9, about 90% are correct. Accuracy says nothing about this. A model can be right more often than another and still be badly wrong about <i>how sure</i> it should be, which matters for thresholds, abstention, triage and any downstream system that consumes <code>p</code>.</p>
+      <div class="formula"><span class="lbl">expected calibration error over B equal-width confidence bins Bᵦ</span><span class="eq">ECE = ∑ᵦ (|Bᵦ| / n) · | acc(Bᵦ) − conf(Bᵦ) |</span>
+<span class="lbl">temperature scaling — one scalar fitted on held-out data by minimising NLL; the argmax is unchanged</span><span class="eq">p̂ = softmax(z / T)          T* = argmin_T  −∑ᵢ log softmax(zᵢ / T)_{yᵢ}</span></div>
+      <ul class="notes">
+        <li><b>Modern deep networks tend to be over-confident.</b> §02's runaway logits are the mechanism. Depth, width, batch norm and long training at low weight decay all make it worse, while accuracy keeps rising. Temperature scaling with <code>T &gt; 1</code> is a strong, nearly free fix, and it cannot change accuracy because it rescales all logits equally.</li>
+        <li><b>ECE is a convenient summary with real flaws</b>: it depends on the bin count, it is noisy for small sets, and a model can game it by always predicting its average accuracy. Pair it with a proper scoring rule such as NLL or the Brier score, and read the diagram itself.</li>
+        <li><b>Calibration is not robust to shift.</b> Temperature fitted on in-distribution validation data under-corrects on shifted data, where accuracy falls faster than confidence (§12).</li>
+      </ul>
+
+      <div class="viz" id="viz-cal">
+        <div class="vhead">
+          <span class="vtitle">One fixed set of predictions, rescaled by a temperature: the reliability diagram, ECE and NLL move; accuracy does not</span>
+          <span class="vhint">slide T until the bars sit on the diagonal</span>
+        </div>
+        <div class="controls">
+          <label>model
+            <select id="cal-model">
+              <option value="2.5" selected>over-confident (logits ×2.5)</option>
+              <option value="1">calibrated (logits ×1)</option>
+              <option value="0.6">under-confident (logits ×0.6)</option>
+            </select>
+          </label>
+          <label>temperature T <input type="range" id="cal-T" min="0.4" max="6" step="0.01" value="1" /><span id="cal-Tv" style="min-width:34px;display:inline-block">1.00</span></label>
+          <label>bins
+            <select id="cal-bins"><option value="10" selected>10</option><option value="15">15</option><option value="5">5</option></select>
+          </label>
+        </div>
+        <svg id="cal-svg" width="760" height="340" viewBox="0 0 760 340" role="img" aria-label="Left: a reliability diagram for 3000 synthetic predictions on a ten-class problem. The x axis is confidence, binned; each bar's height is the accuracy within that bin, and the dashed diagonal is perfect calibration. The gap between each bar's accuracy and its mean confidence is shaded red where the model is over-confident and green where it is under-confident. Right: expected calibration error and negative log-likelihood plotted against temperature on a log scale from 0.4 to 6, with a vertical marker at the current temperature. Accuracy is printed in the readout and stays the same at every temperature."></svg>
+        <div class="readout" aria-live="polite" id="cal-readout"></div>
+      </div>
+      <ul class="notes">
+        <li><b>The default model is right 67.3% of the time and claims 84.4%.</b> ECE is <code>17.1%</code> and every bar sits below the diagonal. The labels were drawn from <code>softmax(z)</code> and the model reports <code>softmax(2.5·z)</code>, so the right answer is known to be <code>T = 2.5</code>.</li>
+        <li><b>Slide to T ≈ 2.4.</b> Mean confidence falls to about 66%, ECE to about 2%, and NLL from <code>1.280</code> to <code>0.928</code>. Accuracy reads <code>67.3%</code> the whole time. On the grid, NLL bottoms out at T ≈ 2.43, the grid point nearest the true 2.5.</li>
+        <li><b>ECE never reaches zero, even at the true temperature.</b> With 3000 samples the residual is finite-sample noise, and the ECE minimum (T ≈ 2.33) is not at the true T. NLL, a proper score, finds the right temperature. ECE only approximately does, which is why T is fitted on NLL.</li>
+        <li><b>Switch to the under-confident model</b>, the over-regularised failure of §07. The bars rise above the diagonal (green), ECE is about 16% at T = 1, and the fix is <code>T &lt; 1</code>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="robustness" data-nav="Robustness &amp; takeaways">
+      <h3><span class="idx">12</span> Robustness and distribution shift, then the takeaways</h3>
+      <p class="lede">An i.i.d. test set measures interpolation. Deployed classifiers meet new cameras, new lighting, sketches, compression artefacts and objects in unusual poses, and accuracy can fall by tens of points. This is the same problem <a href="../mlops/monitoring-and-drift.html">Monitoring &amp; Drift</a> treats from the operations side.</p>
+      <table class="cmp">
+        <tr><th style="width:22%">Test set</th><th style="width:30%">What shifts</th><th>What it revealed</th></tr>
+        <tr><td><b>ImageNet-V2</b></td><td>A fresh sample collected with the original procedure</td><td>Accuracy drops of roughly 11–14 points across models, yet the <i>ranking</i> of models is almost perfectly preserved. A small change in the collection process is already a shift.</td></tr>
+        <tr><td><b>ImageNet-C</b></td><td>15 synthetic corruptions (noise, blur, weather, JPEG) × 5 severities</td><td>Networks are brittle to perturbations humans ignore. Augmentation that targets the corruption helps on that corruption and less on others.</td></tr>
+        <tr><td><b>ImageNet-R, -Sketch</b></td><td>Renditions: paintings, cartoons, sketches</td><td>ImageNet CNNs rely heavily on texture over shape. Remove the texture and much of the accuracy goes with it.</td></tr>
+        <tr><td><b>ObjectNet</b></td><td>Controlled rotations, viewpoints and backgrounds</td><td>Large drops for supervised models, showing how much they lean on canonical poses and backgrounds.</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Effective robustness</b> is accuracy under shift <i>beyond</i> what in-distribution accuracy predicts. For most models, shifted accuracy lies on a line set by ImageNet accuracy, so almost nothing helps except being more accurate. Zero-shot CLIP lies well above that line. Fine-tuning it on ImageNet pulls it back towards the line, which is the motivation for LP-FT and weight-space ensembling (<a href="../models/clip/zero-shot-evaluation.html#robustness">CLIP robustness</a>).</li>
+        <li><b>What helps in practice</b>: more diverse pretraining data (the biggest lever), shape-biasing and corruption augmentation, test-time adaptation of normalisation statistics, and monitoring the input distribution in production so you know when you have left the training support.</li>
+      </ul>
+      <h4>Takeaways</h4>
+      <ul class="notes">
+        <li><b>A classifier is a learned feature extractor plus a linear softmax head</b>, trained on cross-entropy whose gradient is <code>p − q</code>.</li>
+        <li><b>The architecture arc</b> (hand-crafted → LeNet → AlexNet → VGG → ResNet → EfficientNet → ViT → CLIP) is a story of removing obstacles to scale. Above all it is a story of learning the features instead of designing them.</li>
+        <li><b>The recipe matters as much as the network</b>: augmentation, mixup/CutMix and label smoothing regularise input and target. Compare models only under the same recipe.</li>
+        <li><b>Start from a pretrained backbone</b> and pick probe, partial or full fine-tune by data size and domain distance.</li>
+        <li><b>Use sigmoids for multi-label</b>, report per-class metrics for imbalanced classes, <b>calibrate with a temperature</b>, and <b>test under shift</b> before trusting a top-1 number.</li>
+      </ul>
+      <div class="callout"><b>Where this goes next.</b> <a href="object-detection.html">Object Detection</a> keeps the classifier and adds <i>where</i>: a box per object, plus a classification head run on many regions at once. <a href="segmentation.html">Segmentation</a> takes it to every pixel. <a href="../mlops/model-deployment.html">Model Deployment</a> and <a href="../mlops/model-acceleration.html">Model Acceleration</a> cover what happens when the classifier has to run on a phone in a few milliseconds.</div>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="image-classification.viz.js"></script>
+</body>
+</html>

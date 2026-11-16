@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Mamba: Selective State Spaces</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+  .twocol{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../state-space-models.html">State Space Models</a> · deep dive</p>
+      <h1>Mamba: Linear-Time Sequence Modeling with Selective State Spaces</h1>
+      <p>A linear state space model that lets its step size <code>Δ</code> and its read/write matrices <code>B</code>, <code>C</code> depend on the current token. That one change lets a recurrence decide what to keep and what to ignore, which time-invariant SSMs cannot do. It also rules out the convolution trick those models train with, so the paper pairs it with a fused, hardware-aware scan. This page works through the motivation and the zero-order-hold discretization, then shows why <code>Δ</code> is a generalised RNN gate. After that come the kernel, the block, the results on text, DNA and audio, the ablations, and the limits the paper states.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Deep Learning</span>
+        <span class="pill">Sequences</span>
+        <span class="pill">selection · ZOH · S4 vs S6 · Δ as a gate · fused scan · Mamba block · ablations · limits</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="motivation" data-nav="Compression vs selection">
+      <h3><span class="idx">01</span> The motivation: compress the context, but choose what goes in</h3>
+      <p class="lede"><b>The paper frames sequence modelling as compressing the context into a state.</b> How well a model does depends on how well that state summarises the past. How fast it runs depends on how small the state is.</p>
+
+      <div class="cards">
+        <div class="box warn"><div class="n">attention</div><div class="t">Does not compress at all</div><div class="g">It keeps every past key and value, the <a href="../attention/kv-cache-gqa-mla.html#kvcache">KV cache</a>. That makes it effective, since any token can be looked up exactly. It is also expensive: per-step inference cost and memory grow with the context, and training is quadratic in length (<a href="../state-space-models.html#scaling">the hub's cost chart</a>).</div></div>
+        <div class="box warn"><div class="n">recurrences &amp; LTI SSMs</div><div class="t">Compress, but blindly</div><div class="g">A fixed-size state means constant-time steps and linear-time training. But a <i>time-invariant</i> model applies the same dynamics to every token. It cannot decide, based on what a token <i>is</i>, to store it or to skip it.</div></div>
+        <div class="box good"><div class="n">selective SSM</div><div class="t">Compress, selectively</div><div class="g">Make the dynamics a function of the input. The state can then ignore filler, latch onto relevant tokens, and reset when the context changes. It stays fixed-size and linear in length.</div></div>
+      </div>
+
+      <p>The paper's central claim follows from this framing. <b>Efficiency vs effectiveness is a question of state size, and the way to get a small but good state is <i>selection</i>.</b> Selection means input-dependent control over how information enters and leaves the state. Everything else on this page either implements selection (§04–§05) or pays for what it costs (§07).</p>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="background" data-nav="SSMs, ZOH, LTI duality">
+      <h3><span class="idx">02</span> Background: continuous SSM → discretization → recurrence ≡ convolution</h3>
+      <p class="lede">The <a href="../state-space-models.html#recurrence">hub's recurrence</a> starts already discrete. Selection only makes sense if you know where the discrete matrices come from: a continuous system sampled with a step <code>Δ</code>.</p>
+
+      <div class="formula"><span class="lbl">continuous-time state space model (per input channel)</span><span class="eq">h′(t)  =  A h(t) + B x(t)          h(t) ∈ ℝᴺ,  x(t), y(t) ∈ ℝ
+y(t)   =  C h(t)                   A ∈ ℝᴺˣᴺ,  B ∈ ℝᴺˣ¹,  C ∈ ℝ¹ˣᴺ</span>
+<span class="lbl">zero-order hold (input held constant over each step of length Δ)</span><span class="eq">Ā  =  exp(ΔA)
+B̄  =  (ΔA)⁻¹ (exp(ΔA) − I) · ΔB</span>
+<span class="lbl">the discrete recurrence that is actually computed</span><span class="eq">hₜ  =  Ā hₜ₋₁ + B̄ xₜ
+yₜ  =  C hₜ</span></div>
+
+      <p>Where the ZOH formulas come from: hold <code>x</code> fixed over one step and solve the linear ODE exactly. You get <code>h(t+Δ) = e^(ΔA) h(t) + (∫₀^Δ e^(sA) ds) B x</code>, and the integral evaluates to <code>A⁻¹(e^(ΔA) − I)</code>. For diagonal <code>A</code> (what S4-style models and Mamba use) everything is elementwise. Each state coordinate <code>n</code> has its own decay <code>Āₙ = exp(Δ aₙ)</code>, and <code>aₙ &lt; 0</code> keeps <code>Āₙ ∈ (0, 1)</code>, so the recurrence is stable.</p>
+
+      <div class="callout"><b>A simplification you will meet in code (general knowledge, not from the paper's text).</b> The reference implementation keeps <code>Ā = exp(ΔA)</code> but replaces <code>B̄</code> with the first-order <code>B̄ ≈ ΔB</code>. For small <code>ΔA</code> the two agree, because <code>(e^z − 1)/z ≈ 1</code>. The worked derivation in §05 uses the exact ZOH form, which is what makes the gate come out exactly.</div>
+
+      <h4>Linear time invariance: the convolution view</h4>
+      <p>When <code>Δ, A, B, C</code> are the same at every step, which is the <b>linear time-invariant (LTI)</b> case, the recurrence can be unrolled from <code>h₀ = 0</code>:</p>
+      <div class="formula"><span class="lbl">unrolling an LTI SSM gives one long, fixed convolution kernel</span><span class="eq">yₜ  =  C B̄ xₜ + C Ā B̄ xₜ₋₁ + C Ā² B̄ xₜ₋₂ + …  =  ∑ₖ  C Āᵏ B̄ · xₜ₋ₖ
+
+y  =  x ∗ K̄          K̄  =  (CB̄,  CĀB̄,  CĀ²B̄,  …,  CĀᵏB̄,  …)</span></div>
+      <ul class="notes">
+        <li><b>Two ways to compute the same model.</b> In training the whole sequence is known, so you build <code>K̄</code> once and apply it as a parallel (FFT-able) convolution. In generation you step the recurrence and keep only <code>hₜ</code>. This duality is how S4-family models train in parallel and still decode in constant time per token.</li>
+        <li><b>The catch is in the name.</b> The weight on <code>xₜ₋ₖ</code> is <code>CĀᵏB̄</code>. It depends <i>only on the lag <code>k</code></i>, never on what <code>xₜ₋ₖ</code> or <code>xₜ</code> is. An LTI model can learn <i>where</i> to look, at fixed offsets, but never <i>what</i> to look at.</li>
+        <li><b>S4 in one line.</b> S4 is a structured LTI SSM: a carefully initialised (HiPPO-style) <code>A</code>, applied independently to each of <code>D</code> channels, trained through <code>K̄</code>. Mamba keeps the SSM skeleton and the per-channel structure and drops the time invariance.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="synthetic" data-nav="Why LTI fails: two tasks">
+      <h3><span class="idx">03</span> Two synthetic tasks that time invariance cannot solve</h3>
+      <p class="lede">The paper uses two toy tasks to show exactly what a fixed kernel lacks.</p>
+
+      <div class="twocol">
+        <div class="cards" style="margin:0"><div class="box warn"><div class="n">copying vs selective copying</div><div class="t">Remember the tokens, not the positions</div><div class="g">In standard <b>Copying</b>, the tokens to memorise sit at a fixed spacing, so a time-aware model only needs the right lags. An LTI convolution with the right kernel solves it. In <b>Selective Copying</b>, the same tokens are scattered among filler tokens at <i>random</i> positions. To output them in order, the model must pass over filler and store the content tokens, wherever they fall. That decision depends on content, and no fixed <code>K̄</code> can make it.</div></div></div>
+        <div class="cards" style="margin:0"><div class="box warn"><div class="n">induction heads</div><div class="t">Recall what followed a cue</div><div class="g">After a special token appears, the model must later output the token that followed it, as in "Harry Potter … Harry → Potter". This is associative recall, the mechanism behind much of in-context learning in language models. The model must recognise the cue by its <i>content</i> and store the next token, at whatever distance.</div></div></div>
+      </div>
+
+      <p>Both tasks need the same capability: <b>let the token decide what happens to the state.</b> Filler should leave the state alone. A relevant token should be written in, overwriting older content if needed. The figure in §05 makes this concrete with a one-dimensional state, and §09 gives the numbers: on Selective Copying an LTI S4 layer reaches 18.3% while the selective version reaches 97.0%.</p>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="selection" data-nav="S4 vs S6: the selection mechanism">
+      <h3><span class="idx">04</span> The selection mechanism: S4 vs S6, shape by shape</h3>
+      <p class="lede">The whole change is to give three parameters a length dimension: <b><code>B</code>, <code>C</code> and <code>Δ</code> become functions of the input <code>x</code></b>. The paper calls the result S6, an S4 model with selection, computed with a scan.</p>
+
+      <table class="grid2">
+        <tr><th style="width:110px">tensor</th><th>S4 (LTI) — Algorithm 1</th><th>S6 (selective) — Algorithm 2</th></tr>
+        <tr><td><b>input x</b></td><td class="num">(B, L, D)</td><td class="num">(B, L, D)</td></tr>
+        <tr><td><b>A</b></td><td>Parameter, <span class="num">(D, N)</span></td><td>Parameter, <span class="num">(D, N)</span> — <b>still not selective</b></td></tr>
+        <tr><td><b>B</b></td><td>Parameter, <span class="num">(D, N)</span></td><td><code>s_B(x)</code>, <span class="num">(B, L, N)</span></td></tr>
+        <tr><td><b>C</b></td><td>Parameter, <span class="num">(D, N)</span></td><td><code>s_C(x)</code>, <span class="num">(B, L, N)</span></td></tr>
+        <tr><td><b>Δ</b></td><td><code>τ_Δ(Parameter)</code>, <span class="num">(D)</span></td><td><code>τ_Δ(Parameter + s_Δ(x))</code>, <span class="num">(B, L, D)</span></td></tr>
+        <tr><td><b>Ā, B̄</b></td><td><span class="num">(D, N)</span> — one pair for all time steps</td><td><span class="num">(B, L, D, N)</span> — one pair per token per channel</td></tr>
+        <tr class="hl"><td><b>compute</b></td><td>time-invariant ⇒ <b>convolution</b> or recurrence</td><td>time-varying ⇒ <b>recurrence (scan) only</b></td></tr>
+      </table>
+
+      <div class="formula"><span class="lbl">the selection functions the paper chooses</span><span class="eq">s_B(x)  =  Linear_N(x)                  project each token to N numbers
+s_C(x)  =  Linear_N(x)
+s_Δ(x)  =  Broadcast_D( Linear_1(x) )   one scalar per token, copied to all D channels
+τ_Δ     =  softplus                     keeps Δ &gt; 0</span>
+<span class="lbl">per token t, channel d, state coordinate n (diagonal A)</span><span class="eq">Δₜ,d   =  softplus( p_d + s_Δ(xₜ)_d )
+Āₜ,d,n =  exp( Δₜ,d · A_d,n )
+B̄ₜ,d,n ≈  Δₜ,d · Bₜ,n            (or the exact ZOH form, §02)
+hₜ,d,n =  Āₜ,d,n · hₜ₋₁,d,n + B̄ₜ,d,n · xₜ,d
+yₜ,d   =  ∑ₙ Cₜ,n · hₜ,d,n</span></div>
+
+      <ul class="notes">
+        <li><b>Shared vs per-channel.</b> <code>B</code> and <code>C</code> have shape <code>(B, L, N)</code>, so at a given token they are shared across all <code>D</code> channels. <code>Δ</code> has shape <code>(B, L, D)</code> and varies per channel. In the appendix the <code>Linear_1</code> generalises to a low-rank projection <code>Linear_D(Linear_R(x))</code> with <code>R</code> a small fraction of <code>D</code>. The ablation in §11 shows that widening it helps.</li>
+        <li><b>Why <code>A</code> stays fixed.</b> <code>A</code> only ever acts through <code>Ā = exp(ΔA)</code>. Once <code>Δ</code> is selective, <code>Ā</code> is already input-dependent, so making <code>A</code> selective too would add little. The paper notes it could be, and expects similar performance.</li>
+        <li><b>Why <code>Δ</code> matters most.</b> <code>Δ</code> is the only parameter that controls both how much old state survives (<code>Ā</code>) and how much of the new input is written (<code>B̄</code>). §05 makes that exact, and §11 confirms it: <code>Δ</code> alone is the single most useful thing to make selective.</li>
+        <li><b>The price.</b> <code>Ā, B̄</code> are now <code>(B, L, D, N)</code>: <code>N</code> times larger than the input and different at every step. There is no single kernel <code>K̄</code> to build, so the convolution mode is gone. That is the problem §07 solves.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="gate" data-nav="Δ as a gate (Theorem 1)">
+      <h3><span class="idx">05</span> <code>Δ</code> is a generalised RNN gate (Theorem 1, worked out)</h3>
+      <p class="lede">Strip the selective SSM to its smallest case and it becomes a classic gated recurrence. This is the cleanest way to see what selection does.</p>
+
+      <div class="formula"><span class="lbl">set N = 1, A = −1, B = 1, s_Δ = Linear(x), softplus for the Δ map</span><span class="eq">Δₜ   =  softplus(zₜ)                 zₜ = Linear(xₜ)
+Āₜ   =  exp(−Δₜ)
+B̄ₜ   =  (ΔA)⁻¹(exp(ΔA) − 1)·ΔB  =  (−Δₜ)⁻¹(e^(−Δₜ) − 1)·Δₜ  =  1 − e^(−Δₜ)</span>
+<span class="lbl">the identity that closes it: exp(−softplus(z)) = 1 / (1 + eᶻ) = 1 − sigmoid(z)</span><span class="eq">gₜ  =  σ(zₜ)  =  σ(Linear(xₜ))
+Āₜ  =  1 − gₜ          B̄ₜ  =  gₜ
+
+hₜ  =  (1 − gₜ) · hₜ₋₁  +  gₜ · xₜ</span></div>
+
+      <p>That is the gated update from the <a href="../rnns-lstms/lstm-gru.html#gru">GRU</a>, with a single gate playing both the forget role and the input role. Read it in terms of <code>Δ</code>:</p>
+      <ul class="notes">
+        <li><b>Large <code>Δ</code> (g → 1): reset and focus.</b> <code>Ā → 0</code> wipes the old state and <code>B̄ → 1</code> writes the current token in. The model "spends a long time" on this input.</li>
+        <li><b>Small <code>Δ</code> (g → 0): hold and ignore.</b> <code>Ā → 1</code> keeps the state untouched and <code>B̄ → 0</code> lets the token through without effect. The input is treated as a negligible blip in continuous time.</li>
+        <li><b>The general case is richer than one gate.</b> With <code>N &gt; 1</code>, each state coordinate has its own <code>aₙ</code>, so one <code>Δ</code> produces a whole spectrum of decay rates. <code>B</code> and <code>C</code> separately choose <i>which</i> coordinates a token writes to and is read from. The paper's interpretation: <code>Δ</code> is a discretization step, and selecting it means choosing per token whether to persist the state or to attend to the input.</li>
+      </ul>
+
+      <div class="viz" id="viz-sel">
+        <div class="vhead">
+          <span class="vtitle">Selection playground: a scalar SSM that should hold the most recent signal token</span>
+          <span class="vhint">with one fixed Δ, filler either washes the state out or dilutes it; let Δ depend on the token and the state latches</span>
+        </div>
+        <div class="controls">
+          <label>mode <select id="sel-m">
+            <option value="lti">LTI: one Δ for every token</option>
+            <option value="sel" selected>selective: Δ depends on the token</option>
+          </select></label>
+          <label>fixed Δ (LTI) <input type="range" id="sel-d" min="0.02" max="4" step="0.02" value="0.5" /><span id="sel-dv" style="min-width:34px;display:inline-block">0.50</span></label>
+          <label>Δ on signal <input type="range" id="sel-ds" min="0.02" max="6" step="0.02" value="4" /><span id="sel-dsv" style="min-width:34px;display:inline-block">4.00</span></label>
+          <label>Δ on filler <input type="range" id="sel-df" min="0" max="1" step="0.01" value="0.02" /><span id="sel-dfv" style="min-width:34px;display:inline-block">0.02</span></label>
+          <label>filler noise <input type="range" id="sel-n" min="0" max="1" step="0.05" value="0.5" /><span id="sel-nv" style="min-width:30px;display:inline-block">0.50</span></label>
+          <button id="sel-new" type="button">new sequence</button>
+        </div>
+        <svg id="sel-svg" width="760" height="450" viewBox="0 0 760 450" role="img" aria-label="Four aligned rows over a 32-token sequence. Top row: the tokens, with signal tokens drawn in teal and labelled with their values at random positions, and filler tokens drawn in grey. Second row: a bar per token showing the retention factor A-bar equals exp of minus delta, the fraction of the previous state kept at that step. In selective mode the bars are near zero on signal tokens and near one on filler. In LTI mode every bar has the same height. Third row: the state h over time as a teal line, against a dashed amber step line marking the value of the most recent signal token, which is what the state should hold. In selective mode the line jumps to each signal value and stays flat through filler. In LTI mode it either chases every filler value or drifts as a blurred average. Bottom row: for each token, the weight its value carries in the final state, the product of its write gate and every later retention factor. Selective mode puts nearly all the weight on the last signal token. LTI mode spreads it over the most recent tokens regardless of content. The readout gives the final state, the target, the tracking error, the best error any single fixed delta can reach on this sequence, and the share of final-state weight that sits on filler."></svg>
+        <div class="readout" aria-live="polite" id="sel-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>What the figure computes.</b> It runs exactly the Theorem 1 recurrence: <code>Āₜ = e^(−Δₜ)</code>, <code>B̄ₜ = 1 − e^(−Δₜ)</code>, <code>hₜ = Āₜhₜ₋₁ + B̄ₜxₜ</code>. Signal tokens carry values in <code>±[0.3, 1]</code>; filler tokens carry noise of the chosen amplitude. In selective mode <code>Δ</code> is a stand-in for <code>softplus(p + s_Δ(xₜ))</code> with a learned projection that recognises signal tokens. The two sliders are the values that projection would output.</li>
+        <li><b>The LTI dilemma is visible in the "best fixed Δ" readout.</b> A large <code>Δ</code> copies every token, filler included. A small one averages everything into mush. Every intermediate value trades one failure for the other. Turn filler noise to zero and the problem remains: filler with value 0 still pulls the state toward zero unless <code>Δ</code> can be zero on filler alone.</li>
+        <li><b>This is a 1-D toy.</b> Selective copying needs several tokens held at once. A real layer gets that from <code>N</code> state coordinates per channel, across <code>D = E·d_model</code> channels, with <code>B</code> and <code>C</code> choosing where each token is written and read.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="effects" data-nav="What selection buys">
+      <h3><span class="idx">06</span> What selection buys: three behaviours a fixed kernel cannot have</h3>
+      <div class="cards">
+        <div class="box good"><div class="n">variable spacing</div><div class="t">Filter out filler</div><div class="g">Skip noise tokens between the relevant ones, such as "um"s in speech or padding and filler in text. In the playground this is <code>Δ ≈ 0</code> on filler.</div></div>
+        <div class="box good"><div class="n">filtering context</div><div class="t">Longer context stops hurting</div><div class="g">Many sequence models fail to improve with more context, because irrelevant history pollutes the state. A selective model can drop it at any time. The paper reports performance improving <i>monotonically</i> with context length, on DNA and audio up to sequences of a million (§09).</div></div>
+        <div class="box good"><div class="n">boundary resetting</div><div class="t">Wipe state at document breaks</div><div class="g">When independent sequences are packed together for training, an LTI model bleeds information across the boundary. A selective model can fire a large <code>Δ</code> at the boundary (<code>Ā → 0</code>) and start clean.</div></div>
+      </div>
+      <p>The paper also gives each parameter a role. <b><code>B</code></b> decides whether a token enters the state, and <b><code>C</code></b> decides whether state content reaches the output. Both work on content, the way a token's representation picks what it interacts with. <b><code>Δ</code></b> controls the balance between remembering and focusing on the present, as §05 showed.</p>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="scan" data-nav="Hardware-aware scan">
+      <h3><span class="idx">07</span> The hardware-aware algorithm: never write the big state to HBM</h3>
+      <p class="lede">Selection removes the convolution mode, so training must run the recurrence over the time-varying <code>(B, L, D, N)</code> tensors. Done naively, that means storing a state <code>N</code> times larger than the activations. <b>The fix: keep the expanded state in on-chip SRAM, fuse discretize + scan + readout into one kernel, use a parallel scan, and recompute states in the backward pass.</b></p>
+
+      <h4>Where the cost really is</h4>
+      <p>A GPU has a large but slow off-chip memory (HBM) and a small, fast on-chip SRAM (<a href="../gpu-kernels.html#gpu-arch">GPU architecture</a>). Apart from matrix multiplies, most deep-learning operations are bound by memory bandwidth, not FLOPs. The scan does only <code>O(BLDN)</code> FLOPs, linear in <code>L</code>. The danger is the bytes. Computing <code>Ā, B̄</code> in one op, writing them to HBM, and reading them back for the scan moves <code>(B, L, D, N)</code> tensors through HBM several times.</p>
+
+      <div class="formula"><span class="lbl">the fused selective-scan kernel</span><span class="eq">1. read  Δ, A, B, C   (and x)  from HBM → SRAM          O(BLD + BLN + DN) bytes
+2. in SRAM:  discretize  Ā = exp(ΔA),  B̄ = f(Δ, B)        (B, L, D, N) — never leaves the chip
+3. in SRAM:  parallel scan  hₜ = Āₜ hₜ₋₁ + B̄ₜ xₜ
+4. in SRAM:  yₜ = Cₜ hₜ
+5. write  y  (B, L, D)  back to HBM</span>
+<span class="lbl">effect, as reported</span><span class="eq">memory IO reduced by a factor ≈ N  →  20–40× faster than a standard (PyTorch) scan
+faster than FlashAttention-2 beyond sequence length 2K;  up to 7× faster than attention at 32K   (N = 16, A100)</span></div>
+
+      <h4>A parallel scan for a recurrence that is not a convolution</h4>
+      <p>A recurrence looks inherently sequential. But each step <code>h ↦ aₜh + bₜ</code> (with <code>aₜ = Āₜ</code> and <code>bₜ = B̄ₜxₜ</code>) is an affine map, and composing affine maps is <b>associative</b>. So the prefix compositions, which are exactly the states <code>hₜ</code>, can be computed by a parallel prefix scan in <code>O(log L)</code> depth. The paper uses a work-efficient variant. The general algorithm is on the <a href="../../dsa/algorithms/parallel/parallel-scan.html#work-efficient-scan">parallel scan</a> page.</p>
+      <div class="formula"><span class="lbl">the associative operator (apply the earlier step first, then the later one)</span><span class="eq">(a₂, b₂) ∘ (a₁, b₁)  =  (a₂a₁,  a₂b₁ + b₂)
+
+check:  a₂(a₁h + b₁) + b₂  =  (a₂a₁)h + (a₂b₁ + b₂)        identity element  (1, 0)
+prefix  (aₜ,bₜ) ∘ … ∘ (a₁,b₁)  applied to h₀ = 0   gives   hₜ  =  its b-component</span></div>
+
+      <div class="viz" id="viz-scan">
+        <div class="vhead">
+          <span class="vtitle">Parallel scan over the affine steps (aₜ, bₜ) of an 8-token selective recurrence</span>
+          <span class="vhint">step through the stages; every algorithm ends with the same hₜ, they differ in depth and total work</span>
+        </div>
+        <div class="controls">
+          <label>algorithm <select id="scan-a">
+            <option value="seq">sequential (the RNN loop)</option>
+            <option value="hs">Hillis–Steele (step-efficient)</option>
+            <option value="bl" selected>Blelloch (work-efficient)</option>
+          </select></label>
+          <label>show up to stage <input type="range" id="scan-s" min="0" max="7" step="1" value="7" /><span id="scan-sv" style="min-width:20px;display:inline-block">7</span></label>
+          <button id="scan-new" type="button">new aₜ, bₜ</button>
+        </div>
+        <svg id="scan-svg" width="760" height="440" viewBox="0 0 760 440" role="img" aria-label="A grid with eight columns, one per token, and one row per stage of the chosen scan algorithm, starting from the inputs at the top. Each cell is labelled with the range of steps it has composed so far, such as 1 to 4, and the b component of that composition. Lines connect a cell to the cells of the previous row that were combined to produce it, and cells not updated in a stage are drawn faint. The sequential algorithm uses seven stages of one combine each. Hillis–Steele uses three stages that combine elements 1, 2 and 4 positions apart, for seventeen combines. Blelloch uses an up-sweep that builds a tree of partial compositions, a down-sweep that distributes exclusive prefixes with the empty range shown as the identity, and a final pass that adds each token's own step, for twenty-two combines but only work linear in length. Rows after the selected stage are dimmed. The readout reports stages, combines, and the largest difference between the scan's final states and the sequential recurrence, which is at rounding level."></svg>
+        <div class="readout" aria-live="polite" id="scan-readout"></div>
+      </div>
+
+      <h4>Recomputation instead of storage</h4>
+      <p>Backpropagation normally needs the intermediate states. Storing the <code>(B, L, D, N)</code> states would bring back exactly the memory the fusion avoided. Instead the backward pass <b>recomputes</b> them: it reloads <code>Δ, A, B, C</code> from HBM and reruns the scan in SRAM. Recomputing is cheaper than reading a tensor <code>N</code> times larger. The same trade is used for the activations around the scan, so the whole selective SSM layer has <b>the same memory requirement as an optimised Transformer with FlashAttention</b>. The appendix measurement at 125M scale gives 4.6 GB for the Transformer (FlashAttention-2) vs 4.8 GB for Mamba at batch size 1, and 34.5 GB vs 38.2 GB at batch 32. This is the same IO-aware reasoning as <a href="../attention/efficient-attention.html#flash">FlashAttention</a>; the general technique is <a href="../gpu-kernels.html#kernel-fusion">kernel fusion</a>.</p>
+
+      <div class="viz" id="viz-io">
+        <div class="vhead">
+          <span class="vtitle">Memory calculator: the expanded state, the fused kernel's IO, and inference state vs KV cache</span>
+          <span class="vhint">raise N and the expanded tensor grows while fused IO barely moves; raise L and only the KV cache and training tensors grow</span>
+        </div>
+        <div class="controls">
+          <label>batch B <input type="range" id="io-b" min="0" max="6" step="1" value="0" /><span id="io-bv" style="min-width:22px;display:inline-block">1</span></label>
+          <label>sequence L <input type="range" id="io-l" min="8" max="20" step="1" value="13" /><span id="io-lv" style="min-width:60px;display:inline-block">8,192</span></label>
+          <label>d_model <select id="io-d">
+            <option value="768">768</option><option value="1024">1024</option><option value="1536">1536</option><option value="2048" selected>2048</option><option value="2560">2560</option><option value="4096">4096</option>
+          </select></label>
+          <label>state size N <input type="range" id="io-n" min="1" max="64" step="1" value="16" /><span id="io-nv" style="min-width:20px;display:inline-block">16</span></label>
+          <label>bytes / element <select id="io-s">
+            <option value="2" selected>2 (16-bit)</option><option value="4">4 (fp32)</option>
+          </select></label>
+        </div>
+        <svg id="io-svg" width="760" height="300" viewBox="0 0 760 300" role="img" aria-label="Four horizontal bars on a shared logarithmic bytes axis. The first two are for training one selective SSM layer: the size of the expanded state tensor of shape batch by length by channels by N if it were materialised in HBM, and the HBM traffic of the fused kernel, which reads the inputs and parameters and writes only the output of shape batch by length by channels. The expanded bar is roughly N over three times longer. The last two are for inference: the key-value cache of one Transformer block at the chosen context length, and the recurrent state of two Mamba blocks, which have about the same parameter count. The cache grows linearly with context length while the Mamba state does not depend on length at all. Each bar is labelled with its size in bytes. The readout gives the exact byte counts, the ratios between them, and the assumptions used."></svg>
+        <div class="readout" aria-live="polite" id="io-readout"></div>
+      </div>
+      <p style="font-size:12.5px;color:var(--muted)">Calculator assumptions (own arithmetic, not the paper's): the SSM runs on <code>D = E·d_model</code> channels with <code>E = 2</code>. Fused IO counts one read of <code>x, Δ</code> and one write of <code>y</code> at <code>(B, L, D)</code> each, plus <code>B, C</code> at <code>(B, L, N)</code> and <code>A</code> at <code>(D, N)</code>. The naive path would move the expanded tensors through HBM several times, so the bar shows a lower bound on the naive cost. The KV cache is full multi-head (keys + values, <code>2·L·d_model</code> per block); <a href="../attention/kv-cache-gqa-mla.html">GQA/MLA</a> shrink it by a constant. The Mamba inference state per block is <code>D·N</code> for the SSM plus <code>D·3</code> for a width-4 causal convolution. Kernel width 4 comes from the reference implementation (general knowledge).</p>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="block" data-nav="The Mamba block">
+      <h3><span class="idx">08</span> The Mamba block: H3 and a gated MLP merged into one</h3>
+      <p class="lede">The paper simplifies the usual pattern of an SSM layer followed by an MLP block. It merges the <b>H3</b> block (an SSM wrapped with a short convolution and multiplicative gating) and the <b>gated MLP</b> into a single homogeneous block. That block is repeated, with residual connections and normalization, like a Transformer's blocks.</p>
+
+      <svg width="760" height="270" viewBox="0 0 760 270" role="img" aria-label="Block diagram of one Mamba block, flowing left to right. The input of shape batch by length by D passes a normalization and an input projection to twice E times D channels, which is split into two branches. The upper main branch runs a short causal convolution, a SiLU activation and the selective SSM scan, whose delta, B and C are computed from that branch's own activations. The lower gate branch applies only a SiLU. The two branches are multiplied elementwise, projected back from E times D to D channels by an output projection, and added to a residual connection that bypasses the whole block. Tensor shapes are printed beside each arrow." style="max-width:100%;height:auto;display:block;margin:10px 0">
+        <defs><marker id="mb-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#9aa3b2"/></marker></defs>
+        <g font-family="sans-serif" font-size="12" fill="#e6e9ef">
+          <path d="M22,140 L22,22 L712,22 L712,122" fill="none" stroke="#9aa3b2" stroke-dasharray="5 4" marker-end="url(#mb-arr)"/>
+          <text x="360" y="16" text-anchor="middle" fill="#9aa3b2" font-size="11">residual</text>
+          <text x="6" y="160" fill="#9aa3b2" font-size="11">x</text>
+          <path d="M14,140 L44,140" stroke="#9aa3b2" marker-end="url(#mb-arr)"/>
+          <rect x="46" y="123" width="62" height="34" rx="6" fill="#1b1f27" stroke="#2a2f3a"/><text x="77" y="144" text-anchor="middle">norm</text>
+          <path d="M108,140 L126,140" stroke="#9aa3b2" marker-end="url(#mb-arr)"/>
+          <rect x="128" y="123" width="98" height="34" rx="6" fill="#1b1f27" stroke="#5b9cff"/><text x="177" y="138" text-anchor="middle">in_proj</text><text x="177" y="151" text-anchor="middle" fill="#9aa3b2" font-size="10.5">D → 2ED</text>
+          <text x="128" y="176" fill="#9aa3b2" font-size="10.5">(B, L, 2ED)</text>
+          <path d="M226,140 L240,140 L240,76 L258,76" fill="none" stroke="#9aa3b2" marker-end="url(#mb-arr)"/>
+          <path d="M240,140 L240,214 L388,214" fill="none" stroke="#9aa3b2" marker-end="url(#mb-arr)"/>
+          <rect x="260" y="59" width="110" height="34" rx="6" fill="#1b1f27" stroke="#2a2f3a"/><text x="315" y="74" text-anchor="middle">conv1d</text><text x="315" y="87" text-anchor="middle" fill="#9aa3b2" font-size="10.5">short, causal</text>
+          <path d="M370,76 L388,76" stroke="#9aa3b2" marker-end="url(#mb-arr)"/>
+          <rect x="390" y="59" width="56" height="34" rx="6" fill="#1b1f27" stroke="#2a2f3a"/><text x="418" y="80" text-anchor="middle">SiLU</text>
+          <path d="M446,76 L464,76" stroke="#9aa3b2" marker-end="url(#mb-arr)"/>
+          <rect x="466" y="54" width="112" height="44" rx="6" fill="#1d2a2a" stroke="#2dd4bf"/><text x="522" y="72" text-anchor="middle" fill="#2dd4bf" font-weight="600">S6 scan</text><text x="522" y="88" text-anchor="middle" fill="#9aa3b2" font-size="10.5">Δ, B, C = f(x)</text>
+          <text x="466" y="116" fill="#9aa3b2" font-size="10.5">(B, L, ED)</text>
+          <rect x="390" y="197" width="56" height="34" rx="6" fill="#1b1f27" stroke="#2a2f3a"/><text x="418" y="218" text-anchor="middle">SiLU</text>
+          <text x="456" y="250" fill="#9aa3b2" font-size="10.5">gate branch (B, L, ED)</text>
+          <path d="M578,76 L604,76 L604,126" fill="none" stroke="#9aa3b2" marker-end="url(#mb-arr)"/>
+          <path d="M446,214 L604,214 L604,156" fill="none" stroke="#9aa3b2" marker-end="url(#mb-arr)"/>
+          <circle cx="604" cy="140" r="13" fill="#1b1f27" stroke="#ffb454"/><text x="604" y="145" text-anchor="middle" fill="#ffb454" font-size="15">×</text>
+          <path d="M617,140 L628,140" stroke="#9aa3b2" marker-end="url(#mb-arr)"/>
+          <rect x="630" y="123" width="68" height="34" rx="6" fill="#1b1f27" stroke="#5b9cff"/><text x="664" y="138" text-anchor="middle">out_proj</text><text x="664" y="151" text-anchor="middle" fill="#9aa3b2" font-size="10.5">ED → D</text>
+          <circle cx="712" cy="140" r="11" fill="#1b1f27" stroke="#9aa3b2"/><text x="712" y="145" text-anchor="middle" font-size="14">+</text>
+          <path d="M698,140 L700,140" stroke="#9aa3b2"/>
+          <path d="M723,140 L752,140" stroke="#9aa3b2" marker-end="url(#mb-arr)"/>
+          <text x="722" y="176" fill="#9aa3b2" font-size="10.5">(B, L, D)</text>
+        </g>
+      </svg>
+
+      <table class="grid2">
+        <tr><th style="width:120px">block</th><th>structure</th><th>what Mamba keeps or changes</th></tr>
+        <tr><td><b>H3</b></td><td>projections into an SSM, with a short local convolution before the main SSM and multiplicative gating around it</td><td>keeps the short convolution in front of the SSM; replaces the LTI SSM with S6</td></tr>
+        <tr><td><b>gated MLP</b></td><td>two up-projections, one passed through an activation, multiplied, then a down-projection</td><td>becomes the skeleton: the "value" branch gets conv + S6, the other branch is the SiLU gate</td></tr>
+        <tr class="hl"><td><b>Mamba</b></td><td>one homogeneous block, stacked; no separate MLP block</td><td>expansion factor <code>E = 2</code>; SiLU activations; most parameters sit in the projections</td></tr>
+      </table>
+
+      <div class="formula"><span class="lbl">parameter accounting, as stated: model width D, expansion E = 2</span><span class="eq">input projection  D → 2ED       2ED²
+output projection ED → D         ED²
+one Mamba block               ≈  3ED²  =  6D²        (SSM, conv, Δ params are much smaller)
+
+two Mamba blocks              ≈  12D²
+one Transformer block            MHA 4D²  +  MLP 8D²   =  12D²</span>
+<span class="lbl">own arithmetic at d_model = 768, N = 16 (Δ rank R = 48 and conv width 4 are reference-implementation choices, general knowledge)</span><span class="eq">in_proj + out_proj                 6 · 768²                     =  3 538 944
+x → (Δ_R, B, C)    1536 · (48 + 16 + 16)                         =    122 880
+Δ up-projection    48 · 1536 + 1536 (bias p)                     =     75 264
+A (diagonal)       1536 · 16                                     =     24 576
+conv1d             1536 · 4 + 1536                               =      7 680
+skip D (y += D·x)  1536                                          =      1 536
+                                                          total  ≈  3.77M  — 94% in the two projections</span></div>
+      <p>So a Mamba LM with twice as many layers as a Transformer has about the same parameter count. That is why Mamba models at a given width and size have twice the layer count. For example, the 130M model is 24 layers at width 768, where a GPT-3-style 125M Transformer has 12 (layer counts are general knowledge of the released configurations). The selective part (<code>Δ, B, C</code> projections and <code>A</code>) is a few percent of the block, so selection is cheap in parameters. Its cost is in compute and memory traffic, which is what §07 handles. The skip term <code>D·x</code> (<code>+ D·xₜ</code> in <a href="../state-space-models.html#recurrence">the hub's recurrence</a>) is part of the reference implementation.</p>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="results" data-nav="Results: synthetic, text, DNA, audio">
+      <h3><span class="idx">09</span> Results: synthetic tasks, language, DNA and audio</h3>
+
+      <h4>Selective Copying: architecture vs inner layer (accuracy %)</h4>
+      <table class="grid2">
+        <tr><th>model</th><th>inner SSM layer</th><th>accuracy</th></tr>
+        <tr><td>S4 (no gate)</td><td>S4</td><td class="num">18.3</td></tr>
+        <tr class="hl"><td>S6 (no gate)</td><td>S6</td><td class="num">97.0</td></tr>
+        <tr><td>H3</td><td>S4</td><td class="num">57.0</td></tr>
+        <tr><td>H3</td><td>Hyena</td><td class="num">30.1</td></tr>
+        <tr class="hl"><td>H3</td><td>S6</td><td class="num">99.7</td></tr>
+        <tr><td>Mamba</td><td>S4</td><td class="num">56.4</td></tr>
+        <tr><td>Mamba</td><td>Hyena</td><td class="num">28.4</td></tr>
+        <tr class="hl"><td>Mamba</td><td>S6</td><td class="num">99.8</td></tr>
+      </table>
+      <p>The inner layer decides the outcome, not the wrapper. Gating architectures (H3, Mamba) help a time-invariant layer somewhat, from 18.3 to about 57. Any architecture with S6 inside solves the task. A bare S6 with no gate already gets 97.0.</p>
+
+      <h4>Induction heads: length extrapolation</h4>
+      <ul class="notes">
+        <li>Trained at sequence length 256, Mamba solves the task <b>perfectly up to length 1,048,576 (2²⁰)</b>, about 4000× its training length.</li>
+        <li>No other method tested generalises beyond 2× its training length. H3 and Hyena degrade, and attention variants run out of memory at long lengths (they were tested to 16384).</li>
+        <li>This is what <code>Δ</code> buys. The state is written on the cue and on the token after it and is held through everything else, so the distance between them does not matter.</li>
+      </ul>
+
+      <h4>Language modelling on the Pile</h4>
+      <p>Under a Chinchilla-style protocol from about 125M to 1.3B parameters, Mamba is <b>the first attention-free model to match a strong Transformer++ recipe</b>. That baseline, in general-knowledge terms, is a Transformer with rotary embeddings, SwiGLU MLPs, RMSNorm, no biases and a higher learning rate. The paper stresses that the match holds particularly as sequence length grows. Zero-shot downstream average accuracy against same-tokeniser open models:</p>
+
+      <div class="viz" id="viz-lm">
+        <div class="vhead">
+          <span class="vtitle">Zero-shot average accuracy vs parameters: Mamba against Pythia and GPT-J</span>
+          <span class="vhint">hover a point; the claim to check is "matches Transformers twice its size"</span>
+        </div>
+        <svg id="lm-svg" width="760" height="320" viewBox="0 0 760 320" role="img" aria-label="Scatter chart of average zero-shot accuracy against parameter count on a logarithmic horizontal axis from 100 million to 8 billion. A teal line joins the five Mamba models, 130M, 370M, 790M, 1.4B and 2.8B, at 44.7, 50.0, 57.1, 59.7 and 63.3. An amber line joins the six Pythia models, 160M, 410M, 1B, 1.4B, 2.8B and 6.9B, at 40.6, 48.2, 51.9, 55.2, 59.1 and 61.7. A violet point marks GPT-J 6B at 63.0. The Mamba line lies above the Pythia line at every size, and Mamba 2.8B sits above Pythia 6.9B and level with GPT-J 6B. Hovering a point prints its model, size and score, and its nearest comparison in the readout."></svg>
+        <div class="readout" aria-live="polite" id="lm-readout"></div>
+      </div>
+
+      <table class="grid2">
+        <tr><th>Mamba</th><th>avg acc</th><th>Pythia (similar size)</th><th>avg acc</th></tr>
+        <tr><td>Mamba-130M</td><td class="num">44.7</td><td>Pythia-160M</td><td class="num">40.6</td></tr>
+        <tr><td>Mamba-370M</td><td class="num">50.0</td><td>Pythia-410M</td><td class="num">48.2</td></tr>
+        <tr><td>Mamba-790M</td><td class="num">57.1</td><td>Pythia-1B</td><td class="num">51.9</td></tr>
+        <tr><td>Mamba-1.4B</td><td class="num">59.7</td><td>Pythia-1.4B</td><td class="num">55.2</td></tr>
+        <tr class="hl"><td><b>Mamba-2.8B</b></td><td class="num">63.3</td><td>Pythia-2.8B</td><td class="num">59.1</td></tr>
+        <tr><td></td><td></td><td>Pythia-6.9B · GPT-J-6B</td><td class="num">61.7 · 63.0</td></tr>
+      </table>
+      <p>The headline claim, <b>"Mamba-3B outperforms Transformers of the same size and matches Transformers twice its size"</b>, is the last two rows. Mamba-2.8B, at 63.3, is above Pythia-6.9B (61.7) and level with GPT-J-6B (63.0).</p>
+
+      <h4>DNA (human genome, HG38)</h4>
+      <ul class="notes">
+        <li><b>Parameter efficiency.</b> Mamba matches Transformer++ and HyenaDNA with roughly 3–4× fewer parameters (about 40M).</li>
+        <li><b>Context.</b> Pretraining perplexity <i>improves</i> as context grows from 2¹⁰ to 2²⁰ base pairs, while HyenaDNA's gets <i>worse</i> with longer context. This is the "filtering context" behaviour of §06.</li>
+      </ul>
+      <table class="grid2">
+        <tr><th>Great Apes species classification (5 classes, chance 20%), length 2²⁰</th><th>params</th><th>accuracy %</th></tr>
+        <tr><td>HyenaDNA</td><td class="num">1.4M</td><td class="num">54.87</td></tr>
+        <tr><td>Mamba</td><td class="num">1.4M</td><td class="num">71.67</td></tr>
+        <tr class="hl"><td><b>Mamba</b></td><td class="num">7M</td><td class="num">81.31</td></tr>
+      </table>
+
+      <h4>Audio</h4>
+      <ul class="notes">
+        <li><b>Long-context pretraining (YouTubeMix).</b> Mamba beats the SaShiMi baseline, and the gap <i>widens</i> as context grows to about 10⁶ samples.</li>
+        <li><b>SC09 speech generation.</b> A small Mamba-UNet (6.1M) reaches NLL 1.852 and FID 0.94. At 24.3M, FID drops to 0.67, against 1.42 for the best baseline (DiffWave + SaShiMi).</li>
+        <li>One caveat, which §12 returns to: on raw audio waveforms the paper finds that selection can <i>hamper</i> performance. The setting that wins on text, real-valued and fully selective, is not automatically best for continuous signals.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="speed" data-nav="Speed and memory">
+      <h3><span class="idx">10</span> Speed and memory: training and inference</h3>
+      <div class="cards">
+        <div class="box good"><div class="n">training kernel</div><div class="t">20–40× over a naive scan</div><div class="g">The fused scan vs a standard PyTorch scan implementation. It is faster than FlashAttention-2 beyond length 2K and up to 7× faster than attention at 32K (<code>N = 16</code>, A100). FLOPs are <code>O(BLDN)</code>, linear in <code>L</code>.</div></div>
+        <div class="box good"><div class="n">inference throughput</div><div class="t">~5× a same-size Transformer</div><div class="g">With no KV cache the per-sequence state is small, so many more sequences fit in a batch. That is where most of the throughput gain comes from. Each generation step takes constant time, whatever the context length.</div></div>
+        <div class="box warn"><div class="n">training memory</div><div class="t">Comparable, not lower</div><div class="g">Thanks to fusion and recomputation, memory is on par with a FlashAttention-2 Transformer: 4.6 GB (Transformer) vs 4.8 GB (Mamba) at 125M, batch 1, and slightly more than the Transformer at every batch size reported.</div></div>
+      </div>
+      <p>The asymmetry is worth stating plainly. In <b>training</b>, Mamba's win is asymptotic in <code>L</code>: at short lengths a tuned attention kernel is competitive. In <b>inference</b> the win is structural. The <a href="../attention/kv-cache-gqa-mla.html#kvcache">KV cache</a> grows with every generated token, while the Mamba state is fixed at <code>D·N</code> (plus a few conv taps) per layer. The calculator in §07 shows the gap.</p>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ablations" data-nav="Ablations">
+      <h3><span class="idx">11</span> Ablations: which parts matter (Pile perplexity, ~350M scale)</h3>
+      <div class="twocol">
+        <table class="grid2">
+          <tr><th>architecture + inner layer</th><th>ppl</th></tr>
+          <tr><td>H3 + S4 (complex)</td><td class="num">10.30</td></tr>
+          <tr><td>H3 + S4 (real)</td><td class="num">10.34</td></tr>
+          <tr><td>H3 + S6</td><td class="num">8.95</td></tr>
+          <tr><td>Mamba + Hyena</td><td class="num">10.75</td></tr>
+          <tr><td>Mamba + S4 (complex)</td><td class="num">10.54</td></tr>
+          <tr><td>Mamba + S4 (real)</td><td class="num">10.56</td></tr>
+          <tr class="hl"><td><b>Mamba + S6</b></td><td class="num">8.69</td></tr>
+        </table>
+        <table class="grid2">
+          <tr><th>which parameters are selective</th><th>ppl</th></tr>
+          <tr><td>none (LTI)</td><td class="num">10.93</td></tr>
+          <tr><td>B only</td><td class="num">10.15</td></tr>
+          <tr><td>C only</td><td class="num">9.98</td></tr>
+          <tr><td>Δ only</td><td class="num">9.81</td></tr>
+          <tr class="hl"><td><b>Δ + B + C</b></td><td class="num">8.71</td></tr>
+        </table>
+      </div>
+      <ul class="notes">
+        <li><b>Selection dominates the block choice.</b> Swapping S4 → S6 gains about 1.3–1.9 perplexity in either wrapper. Swapping H3 ↔ Mamba with the same inner layer moves it by only about 0.2–0.3. Among LTI layers, complex vs real makes almost no difference.</li>
+        <li><b><code>Δ</code> is the most important single selective parameter</b>, as §04–§05 predicted. The three together are much better than any one of them: the gains compound.</li>
+      </ul>
+
+      <div class="twocol">
+        <table class="grid2">
+          <tr><th>initialisation of A</th><th>ppl</th></tr>
+          <tr><td>complex, Aₙ = −½ + n·i</td><td class="num">9.16</td></tr>
+          <tr><td>real, Aₙ = −½</td><td class="num">8.85</td></tr>
+          <tr class="hl"><td><b>real, Aₙ = −(n + 1)</b> (S4D-Real)</td><td class="num">8.71</td></tr>
+          <tr><td>real, random exp(𝒩(0, 1))</td><td class="num">8.71</td></tr>
+        </table>
+        <table class="grid2">
+          <tr><th>Δ projection size</th><th>params</th><th>ppl</th></tr>
+          <tr><td>none (Δ not input-dependent)</td><td class="num">358.9M</td><td class="num">9.12</td></tr>
+          <tr><td>rank 1</td><td class="num">359.1M</td><td class="num">8.97</td></tr>
+          <tr class="hl"><td><b>rank 64</b></td><td class="num">371.5M</td><td class="num">8.71</td></tr>
+        </table>
+      </div>
+      <table class="grid2">
+        <tr><th>state size N</th><th>B, C constant (LTI in B, C)</th><th>B, C selective</th><th>params (selective)</th></tr>
+        <tr><td class="num">1</td><td class="num">9.88</td><td class="num">9.73</td><td class="num">367.1M</td></tr>
+        <tr class="hl"><td class="num">16</td><td class="num">9.81</td><td class="num">8.71</td><td class="num">371.5M</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Real-valued <code>A</code> is enough for language.</b> The complex initialisation, standard in earlier SSMs, is the <i>worst</i> option here. Even a random real init matches the structured one. The paper's reading is that complex values help continuous modalities such as audio and video, not discrete text.</li>
+        <li><b>The <code>Δ</code> bottleneck is cheap and worth widening.</b> Going from rank 1 to rank 64 costs about 12M parameters (3.4%) and gains 0.26 perplexity.</li>
+        <li><b>State size only pays when <code>B</code> and <code>C</code> are selective.</b> With constant <code>B, C</code>, going from <code>N = 1</code> to <code>16</code> barely helps (9.88 → 9.81). With selective <code>B, C</code> it gains more than 1.0 perplexity for about 1% more parameters. A larger state is only useful if the model can choose what to put in it. Note that the kernel cost grows with <code>N</code> (§07); the fused scan is what makes <code>N = 16</code> affordable.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="limits" data-nav="Limitations">
+      <h3><span class="idx">12</span> Limitations the paper states, and one it does not</h3>
+      <div class="cards">
+        <div class="box bad"><div class="n">no free lunch</div><div class="t">Continuous vs discrete</div><div class="g">Selection helps discrete, information-dense data (text, DNA), but it can hurt where LTI SSMs excel. On raw audio waveforms the paper finds that selection hampers performance. Time-invariant dynamics are a good inductive bias for smooth signals.</div></div>
+        <div class="box warn"><div class="n">affordances</div><div class="t">Downstream use untested</div><div class="g">Whether Mamba LMs support the same downstream affordances as Transformers, such as fine-tuning, adaptation, prompting, in-context learning and RLHF, is left open.</div></div>
+        <div class="box warn"><div class="n">scale</div><div class="t">Below ~3B parameters</div><div class="g">All language experiments are below about 3B parameters. Behaviour at larger scale, and the engineering needed to get there, are unknown.</div></div>
+        <div class="box warn"><div class="n">post-paper, general knowledge</div><div class="t">Weaker exact recall</div><div class="g">Later work, not this paper, found that fixed-state models lag attention on tasks that need exact retrieval of arbitrary earlier tokens. Examples are long-context copying and multi-query associative recall. A finite state cannot hold everything. This is why later designs interleave attention layers with SSM layers (<a href="../state-space-models.html#vs">the hub's comparison</a>).</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misreadings" data-nav="Common misreadings">
+      <h3><span class="idx">13</span> Common misreadings</h3>
+      <div class="wrong"><span class="say">"Mamba is a long convolution, like S4."</span> <span class="fix">No. Selection breaks the convolution.</span> With <code>Δ, B, C</code> varying per token there is no single kernel <code>K̄</code>. Mamba trains with a parallel scan over the recurrence (§07). Its short causal conv1d (§08) is a separate, tiny local filter, not the SSM.</div>
+      <div class="wrong"><span class="say">"A, B and C are all input-dependent."</span> <span class="fix"><code>A</code> is a fixed parameter. <code>Δ</code>, <code>B</code> and <code>C</code> are selective.</span> The effective transition <code>Ā = exp(ΔA)</code> does vary per token, but only through <code>Δ</code> (§04).</div>
+      <div class="wrong"><span class="say">"Selection is free: strictly better than LTI."</span> <span class="fix">Not in compute and not on every modality.</span> It costs the convolution mode and needs a custom fused kernel to be practical. It is also a worse inductive bias for raw audio, where the paper finds LTI layers do better (§12).</div>
+      <div class="wrong"><span class="say">"Recurrent, so it trains sequentially like an RNN."</span> <span class="fix">The recurrence is linear in <code>h</code>, so it is a scan.</span> Affine steps compose associatively, so training runs in <code>O(log L)</code> depth on parallel hardware (the scan figure in §07). Only <i>generation</i> is step by step, and there each step costs a constant amount.</div>
+      <div class="wrong"><span class="say">"No KV cache means no inference memory."</span> <span class="fix">There is still a state, but its size is fixed.</span> It is <code>D·N</code> numbers per layer (plus conv taps), independent of context length. Compare it with the cache in the §07 calculator.</div>
+      <div class="wrong"><span class="say">"Linear time means it is always faster than attention."</span> <span class="fix">The reported crossover is around length 2K.</span> Below that, FlashAttention-2 is competitive. The large training wins come at long sequences, and the large inference win comes from batch size, not from per-token FLOPs (§10).</div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">14</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Sequence modelling is compressing context into a state.</b> Attention does not compress. LTI SSMs compress but cannot choose by content. Selection is the missing piece.</li>
+        <li><b>S6 makes <code>Δ, B, C</code> functions of the token</b>: <code>B, C</code> are <code>(B, L, N)</code>, <code>Δ</code> is <code>(B, L, D)</code>, and <code>A</code> stays a parameter. Time invariance, and with it the convolution mode, is gone.</li>
+        <li><b><code>Δ</code> is a gate.</b> With <code>N = 1, A = −1, B = 1</code> and ZOH, <code>hₜ = (1 − gₜ)hₜ₋₁ + gₜxₜ</code> with <code>gₜ = σ(Linear(xₜ))</code>. Large <code>Δ</code> resets and writes; small <code>Δ</code> holds and ignores.</li>
+        <li><b>The hardware-aware scan</b> keeps the <code>(B, L, D, N)</code> state in SRAM, fuses discretization, scan and readout, uses a work-efficient parallel scan, and recomputes in the backward pass. The result is 20–40× over a naive scan and memory on par with FlashAttention-2.</li>
+        <li><b>The Mamba block</b> merges H3 and the gated MLP: about <code>3ED²</code> parameters, so two blocks ≈ one Transformer block.</li>
+        <li><b>Results:</b> it solves Selective Copying, extrapolates induction heads to 2²⁰, matches Transformer++ on the Pile, and Mamba-2.8B matches Transformers twice its size. It is better with longer context on DNA and audio, and gives about 5× inference throughput.</li>
+        <li><b>Limits:</b> selection can hurt continuous signals; it is untested beyond about 3B parameters and for downstream affordances; exact recall over long contexts is a later-identified weakness.</li>
+      </ul>
+      <p>Back to the <a href="../state-space-models.html">State Space Models hub</a>. Related pages: <a href="../attention.html">attention</a>, <a href="../transformers.html">transformers</a>, <a href="../attention/efficient-attention.html#linear">linear attention</a> (another fixed-state recurrence), and <a href="../dl-architectures-compared.html">DL architectures compared</a>.</p>
+    </section>
+
+    <nav class="pager" aria-label="State space models" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../state-space-models.html">← State Space Models</a>
+      <a href="../state-space-models.html" style="color:var(--muted)">SSMs · overview</a>
+      <a href="../dl-architectures-compared.html">DL Architectures Compared →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="mamba.viz.js"></script>
+</body>
+</html>

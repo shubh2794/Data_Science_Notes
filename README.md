@@ -79,14 +79,14 @@ data-eng/MLOps/viz stubs).
 | NLP | `nlp/` | ✅ 11/11 (Tokenization, Embeddings, LMs, RAG, Preprocessing, NER, MT, Entailment, Doc Intelligence, KGs, HMMs/CRFs) |
 | LLMs & Generative AI | `llm/` | ✅ 10/10 (LLMs, Context Eng, PEFT, Preference Opt, Reasoning, Hallucination, LLM-as-Judge, VLM, Diffusion LLMs, Context-Length Ext) |
 | Agentic AI | `agentic/` | ✅ 5/5 (Agents, Agentic RL, Agent Skills, Design Patterns, Computer Control) |
-| Data Engineering | `data-engineering/` | 🟡 Data Preprocessing, Sampling/Imbalance, Quality/Governance, Differential Privacy (originals ETL/Warehouse/Feature Store/Stream = stubs) |
-| MLOps & Deployment | `mlops/` | 🟡 LLMOps, Model Acceleration, A/B Testing, Federated Learning (originals Deploy/Monitor/CI-CD/Tracking = stubs) |
+| Data Engineering | `data-engineering/` | ✅ ETL Pipelines, Data Warehousing (incl. lakes & lakehouses), Feature Stores, Stream Processing (incl. Kafka), Data Preprocessing, Sampling/Imbalance, Quality/Governance, Differential Privacy (8/8) |
+| MLOps & Deployment | `mlops/` | ✅ Model Deployment, Monitoring & Drift, CI/CD, Experiment Tracking, LLMOps, Model Acceleration, LLM Serving, Speculative Decoding, A/B Testing, Federated Learning (10/10) |
 | Speech & Audio | `speech/` | ✅ Speech Processing (1/1) |
 | Model Architectures | `models/` | ✅ six category hubs — Vision (EfficientNet), NLP (BERT, T5), LLM Families (GPT, Llama), Audio (Whisper), Multimodal (CLIP), Document AI (LayoutLM v1/v2/v3, Donut) — models are level-3 pages under their hub (each with notes + research papers + visuals) — add more models here |
 | Math & Statistics | `math/` | 🟡 Linear Algebra (hub + 6 sub-topic pages: Vectors & Vector Spaces, Matrices & Rank, Systems/Determinants/Inverses, Projections & Least-Squares, Eigendecomposition & SVD, Quadratic Forms/Covariance/PCA), Calculus, Optimization — Probability, Statistics = stubs |
-| Programming & Tools | `programming-tools/` | ⏳ Scaffold nodes only |
-| Data Systems | `databases/` | 🟡 Vector Databases (HNSW) — relational/NoSQL, indexing, transactions, distributed storage, streaming, lakes, scaling patterns = stubs |
-| Data Viz & Communication | `data-viz/` | ⏳ Scaffold nodes only (Dashboards, Data Storytelling) |
+| Programming & Tools | `programming/` | ✅ Python, SQL, Pandas & NumPy, Git, R, Apache Spark |
+| Data Systems | `databases/` | 🟡 NoSQL, Indexing, Transactions (ACID), Sharding & Replication, Vector Databases (HNSW), Hadoop & MapReduce, Distributed Storage, Scalability, Load Balancing, Caching, Message Queues, CAP Theorem — Relational & SQL, Streaming (Kafka), Data Lakes, Warehouses & Lakehouses = page-less (merge candidates into SQL / Stream Processing / Data Warehousing) |
+| Data Viz & Communication | `data-viz/` | ✅ Dashboards, Data Storytelling (2/2) |
 
 ## Architecture
 

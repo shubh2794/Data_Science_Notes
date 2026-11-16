@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Stream Processing &amp; Kafka</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Stream Processing &amp; Kafka</h1>
+      <p>Batch pipelines answer "what happened yesterday?". Stream processing answers "what is happening now?" by computing continuously over <b>unbounded</b> data. The hard part isn't speed — it's <b>time</b>: events arrive late and out of order, so a stream processor must decide when a result is complete enough to emit, keep state safely across failures, and never double-count. A durable, replayable log (Kafka) underneath is what makes all of that tractable.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Engineering</span>
+        <span class="pill">Event time</span>
+        <span class="pill">Watermarks</span>
+        <span class="pill">Exactly-once</span>
+        <span class="pill">Kafka</span>
+      </div>
+    </header>
+
+    <section class="topic" id="bounded" data-nav="Bounded vs unbounded">
+      <h3><span class="idx">01</span> Bounded vs unbounded data</h3>
+      <ul class="notes">
+        <li><b>Batch</b> processes a <b>bounded</b> dataset: all input exists before the job starts, so "the total for Tuesday" is computed once and is final.</li>
+        <li><b>Streaming</b> processes an <b>unbounded</b> dataset: input never ends, so every result is computed over some window of it, and the processor must decide <i>when</i> a window's answer is final.</li>
+        <li><b>Batch is a special case of streaming</b> — a stream that happens to end. Modern engines (Flink, Spark Structured Streaming) use one API for both; the difference is whether the source has an end and how results are triggered.</li>
+        <li><b>Why bother:</b> fraud scoring, real-time features for models (see <a href="feature-stores.html">Feature Stores</a>), alerting, operational dashboards, CDC replication — anywhere the value of data decays in seconds or minutes.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Latency need</th><th>Typical approach</th></tr>
+        <tr><td>Hours to a day</td><td>Scheduled batch (<a href="etl-pipelines.html">ETL pipelines</a>)</td></tr>
+        <tr><td>Minutes</td><td>Micro-batch or frequent incremental batch</td></tr>
+        <tr><td>Seconds to sub-second</td><td>Continuous stream processing with event-time windows and managed state</td></tr>
+        <tr><td>Milliseconds, per request</td><td>Online serving path; the stream keeps the features it reads fresh</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="time" data-nav="Event vs processing time">
+      <h3><span class="idx">02</span> Event time vs processing time</h3>
+      <p class="lede">Every event has two timestamps: when it <b>happened</b> (event time, stamped by the producer) and when the processor <b>sees</b> it (processing time). The gap between them is variable and unbounded.</p>
+      <div class="formula"><span class="eq">skew(e) = t<sub>processing</sub>(e) − t<sub>event</sub>(e)  ≥ 0</span>      <span class="eq">— varies per event: network delays, retries, phones offline for hours</span></div>
+      <ul class="notes">
+        <li><b>Processing-time windows</b> are trivial to implement (bucket by the wall clock on arrival) but give answers that depend on network weather and change on replay. A backlog drained after an outage piles hours of events into one "minute".</li>
+        <li><b>Event-time windows</b> assign each event to the window in which it happened, so results are deterministic and replayable — but the processor can never be sure it has seen every event for a window. That uncertainty is what watermarks manage (§04).</li>
+        <li><b>Out of order is normal.</b> A mobile app batching events, a partitioned log read in parallel, and producer retries all reorder events. Correctness must not depend on arrival order.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="windows" data-nav="Windows">
+      <h3><span class="idx">03</span> Windows: tumbling, sliding, session</h3>
+      <table class="cmp">
+        <tr><th>Window</th><th>Definition</th><th>Each event belongs to</th><th>Use</th></tr>
+        <tr><td><b>Tumbling</b></td><td>Fixed size w, non-overlapping, aligned</td><td>Exactly one window</td><td>Per-minute counts, hourly billing</td></tr>
+        <tr><td><b>Sliding / hopping</b></td><td>Size w, advancing every s &lt; w</td><td>⌈w / s⌉ windows</td><td>"Transactions in the last 10 min, updated every minute"</td></tr>
+        <tr><td><b>Session</b></td><td>Per key, closes after a gap g with no events</td><td>One session; sessions merge when a late event bridges a gap</td><td>User sessions, device activity bursts</td></tr>
+        <tr><td><b>Global</b> + custom trigger</td><td>One window per key, fired by count or condition</td><td>The single window</td><td>"Every 100 events per user"</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">window assignment for an event at event time t</span><span class="eq">tumbling:  [⌊t / w⌋ · w,  ⌊t / w⌋ · w + w)</span>
+<span class="eq">sliding:   all [k·s, k·s + w)  with  k·s ≤ t &lt; k·s + w</span>
+<span class="eq">session:   merge events of a key while  tᵢ₊₁ − tᵢ &lt; g</span></div>
+      <p>Below, events are placed at their <b>event time</b> (x) and fall from the top in <b>processing-time</b> order. Change the window type and the watermark delay, then step processing time forward: windows fire when the watermark passes their end, and events that arrive after that are dropped as late.</p>
+
+      <div class="viz" id="viz-win">
+        <div class="vhead">
+          <span class="vtitle">Event-time windows, watermarks and late data</span>
+          <span class="vhint">pick a window · set the allowed delay · advance processing time</span>
+        </div>
+        <div class="controls">
+          <label>window <select id="sw-type"><option value="tumble">tumbling 10s</option><option value="slide">sliding 10s / 5s</option><option value="session">session (gap 4s)</option></select></label>
+          <label>watermark delay <input type="range" id="sw-delay" min="0" max="12" step="1" value="3"> <b id="sw-delayv">3s</b></label>
+          <label>processing time <input type="range" id="sw-pt" min="0" max="52" step="1" value="52"> <b id="sw-ptv">52s</b></label>
+        </div>
+        <svg id="sw-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Interactive diagram: events placed by event time, assigned to windows, with a watermark that fires windows and drops late events"></svg>
+        <div class="readout" aria-live="polite" id="sw-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="watermarks" data-nav="Watermarks &amp; late data">
+      <h3><span class="idx">04</span> Watermarks and late data</h3>
+      <p class="lede">A watermark is the processor's running assertion: "I believe no more events with event time earlier than W will arrive." It turns an unanswerable question (is this window complete?) into a tunable policy.</p>
+      <div class="formula"><span class="lbl">bounded-out-of-orderness watermark (the common heuristic)</span><span class="eq">W(now) = max event time seen so far − d</span>
+<span class="eq">window [a, b) fires when  W ≥ b</span>      <span class="eq">event e is late if  t<sub>event</sub>(e) &lt; W  when it arrives</span>
+<span class="lbl">parallel sources: the operator's watermark is the minimum over its inputs</span><span class="eq">W<sub>op</sub> = minᵢ Wᵢ</span>      <span class="eq">— one idle or slow partition holds everyone back</span></div>
+      <ul class="notes">
+        <li><b>The trade-off is completeness vs latency.</b> A larger delay d waits longer and drops fewer late events; a smaller d emits sooner and drops more. There is no setting that is both instant and complete.</li>
+        <li><b>Late-data policies:</b> drop (and count — a late-drop metric is essential); <b>allowed lateness</b>, which keeps window state a bit longer and emits <i>updated</i> results; or route late events to a <b>side output</b> for a batch correction job.</li>
+        <li><b>Idle partitions.</b> Because the watermark is a minimum over inputs, a partition that stops receiving data freezes it and no window ever fires. Engines offer idleness timeouts that exclude quiet partitions.</li>
+        <li><b>State is bounded by the watermark.</b> Once W passes a window's end (plus allowed lateness), its state can be discarded. Without a watermark, a windowed aggregation's state grows forever — the most common cause of streaming jobs slowly running out of memory.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="state" data-nav="Stateful operators">
+      <h3><span class="idx">05</span> Stateful operators</h3>
+      <ul class="notes">
+        <li><b>Stateless</b> operators (map, filter, parse) look at one event at a time and scale trivially. <b>Stateful</b> ones — aggregations, windows, joins, deduplication, pattern detection — remember things across events.</li>
+        <li><b>Keyed state.</b> Streams are partitioned by key so that all events for a key reach the same parallel task, which holds that key's state locally. This is the streaming version of a shuffle, and key skew hurts the same way.</li>
+        <li><b>State backends:</b> in-memory hash maps for small state; an embedded on-disk key-value store (RocksDB-style LSM) for state far larger than memory, with incremental checkpoints. State of hundreds of GB per job is routine.</li>
+        <li><b>State TTL.</b> Deduplication ("have I seen this event id?") and per-user features need an expiry, or state grows with every distinct key ever seen.</li>
+        <li><b>Stream–stream joins</b> must buffer both sides; a time bound (<code>b.t BETWEEN a.t AND a.t + 15 min</code>) plus watermarks lets the engine evict buffered rows. A stream–table join (enrich events with a slowly changing table, often fed by CDC) keeps the table side as state.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="kafka" data-nav="Kafka: the durable log">
+      <h3><span class="idx">06</span> Kafka as the durable log</h3>
+      <p class="lede">Kafka is not a queue that deletes messages once read; it is a <b>partitioned, replicated, append-only log</b>. Consumers track their own position in it, so data can be re-read, by many independent consumers, at their own pace.</p>
+      <table class="cmp">
+        <tr><th>Concept</th><th>Meaning</th><th>Operational consequence</th></tr>
+        <tr><td><b>Topic</b></td><td>A named stream of records</td><td>The unit of schema and access control</td></tr>
+        <tr><td><b>Partition</b></td><td>An ordered, append-only sequence within a topic; the unit of parallelism</td><td>Ordering is guaranteed <b>only within a partition</b></td></tr>
+        <tr><td><b>Key → partition</b></td><td>Default: hash(key) mod #partitions</td><td>Same key ⇒ same partition ⇒ per-key order. Adding partitions remaps keys and breaks that order for existing keys</td></tr>
+        <tr><td><b>Offset</b></td><td>A record's position in its partition</td><td>Consumers commit offsets; rewinding an offset = replay</td></tr>
+        <tr><td><b>Retention</b></td><td>Delete by age or size, or <b>log compaction</b> (keep the latest record per key)</td><td>Retention bounds how long a consumer may be down, and how far back you can reprocess; compacted topics act as a changelog / table snapshot</td></tr>
+        <tr><td><b>Consumer group</b></td><td>Consumers sharing a group id split the partitions; each partition goes to exactly one member</td><td>Parallelism ≤ #partitions; extra consumers sit idle. Membership changes trigger a rebalance</td></tr>
+        <tr><td><b>Replication</b></td><td>Each partition has a leader and followers; the in-sync replica set (ISR) tracks caught-up followers</td><td>Durability via <code>acks=all</code> + <code>min.insync.replicas=2</code> with replication factor 3</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">consumer lag — the first metric to alert on</span><span class="eq">lag<sub>p</sub> = log-end offset<sub>p</sub> − committed offset<sub>p</sub></span>      <span class="eq">time to drain ≈ lag / (consume rate − produce rate)</span></div>
+
+      <div class="viz" id="viz-kafka">
+        <div class="vhead">
+          <span class="vtitle">Partitions, keys, and a consumer group</span>
+          <span class="vhint">change partitions and consumers · skew the keys · throttle a consumer</span>
+        </div>
+        <div class="controls">
+          <label>partitions <input type="range" id="kf-p" min="1" max="8" step="1" value="4"> <b id="kf-pv">4</b></label>
+          <label>consumers <input type="range" id="kf-c" min="1" max="8" step="1" value="3"> <b id="kf-cv">3</b></label>
+          <label>hot-key share <input type="range" id="kf-hot" min="0" max="0.7" step="0.05" value="0.1"> <b id="kf-hotv">10%</b></label>
+          <label><input type="checkbox" id="kf-slow"> consumer 0 runs at half speed</label>
+        </div>
+        <svg id="kf-svg" width="640" height="290" viewBox="0 0 640 290" role="img" aria-label="Interactive diagram: producers hashing keys into Kafka partitions, assigned to consumers in a group, with per-partition lag"></svg>
+        <div class="readout" aria-live="polite" id="kf-read"></div>
+      </div>
+      <ul class="notes">
+        <li>Since version 4.0, Kafka runs only in KRaft mode — cluster metadata is managed by an internal Raft quorum of controller nodes rather than an external ZooKeeper ensemble.</li>
+        <li>Choose the partition count for peak consumer parallelism with headroom; it is cheap to over-provision moderately and disruptive to change later for keyed topics.</li>
+        <li>Pair topics with a <b>schema registry</b> and compatibility rules so producers can't publish a breaking change (the streaming form of a <a href="etl-pipelines.html#contracts">data contract</a>). For queue semantics in general, see <a href="../databases/message-queues.html">Message Queues</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="semantics" data-nav="Delivery semantics">
+      <h3><span class="idx">07</span> Delivery semantics and exactly-once</h3>
+      <table class="cmp">
+        <tr><th>Guarantee</th><th>How it arises</th><th>Effect of a crash</th></tr>
+        <tr><td><b>At-most-once</b></td><td>Commit offset <i>before</i> processing</td><td>Events in flight are lost</td></tr>
+        <tr><td><b>At-least-once</b></td><td>Commit offset <i>after</i> processing</td><td>Events in flight are re-processed → duplicates downstream</td></tr>
+        <tr><td><b>Exactly-once (effectively-once)</b></td><td>State, output, and input position commit atomically, or output is idempotent</td><td>Replays leave results unchanged</td></tr>
+      </table>
+      <ul class="notes">
+        <li>Exactly-once never means "each event is physically processed once" — after a failure, events <b>are</b> re-processed. It means the <b>observable effect</b> (state and sink contents) is as if each were processed once.</li>
+        <li><b>The end-to-end recipe:</b> (1) a <b>replayable source</b> with offsets (Kafka); (2) <b>checkpointed state</b> consistent with those offsets (§08); (3) a sink that is either <b>transactional</b> (commit output together with the checkpoint, two-phase commit) or <b>idempotent</b> (upsert by a deterministic key, so a replay overwrites identical values).</li>
+        <li><b>Inside Kafka:</b> the idempotent producer (sequence numbers per partition) removes retry duplicates; transactions write to several partitions plus the consumer offsets atomically; consumers reading with <code>isolation.level=read_committed</code> skip aborted data.</li>
+        <li><b>The weakest link decides.</b> A job that writes to a plain HTTP API or sends emails is at-least-once no matter how good the engine is — design the sink for idempotency (see <a href="etl-pipelines.html#idempotency">idempotency</a>).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="checkpoint" data-nav="Checkpointing">
+      <h3><span class="idx">08</span> Checkpointing: consistent snapshots of a running job</h3>
+      <p class="lede">To recover, a job needs a snapshot in which every operator's state reflects exactly the same prefix of the input. Stopping the world to take it would be too slow.</p>
+      <ul class="notes">
+        <li><b>Barrier snapshots</b> (a variant of the Chandy–Lamport algorithm): the coordinator injects a numbered <b>barrier</b> into each source partition. When an operator has received barrier n on all inputs, it snapshots its state asynchronously and forwards the barrier. When all sinks acknowledge, checkpoint n is complete and records the source offsets.</li>
+        <li><b>Aligned</b> checkpoints buffer inputs that delivered the barrier early until the others catch up — exact but slow under backpressure. <b>Unaligned</b> checkpoints include in-flight buffers in the snapshot instead, keeping checkpoint time bounded under load at the cost of bigger snapshots.</li>
+        <li><b>Recovery</b> = restore every operator's state from checkpoint n, rewind sources to its offsets, and resume. Events after the checkpoint are re-processed; transactional sinks discard their uncommitted output so nothing is duplicated.</li>
+        <li>Micro-batch engines get the same effect more simply: each batch's offsets and state are committed to a checkpoint directory before the next batch starts.</li>
+      </ul>
+      <div class="formula"><span class="lbl">cost of the checkpoint interval Δ</span><span class="eq">expected replay after a failure ≈ rate · (Δ / 2 + restart time)</span>
+<span class="eq">transactional sinks commit once per checkpoint  ⇒  end-to-end latency for consumers ≥ Δ</span></div>
+      <div class="callout"><b>Tuning:</b> short intervals mean little replay and fresh transactional output but more overhead; long intervals the reverse. Seconds to a few minutes is typical; measure checkpoint duration and alert when it approaches the interval.</div>
+    </section>
+
+    <section class="topic" id="engines" data-nav="Engines">
+      <h3><span class="idx">09</span> Engines: Flink, Spark Structured Streaming, Kafka Streams</h3>
+      <table class="cmp">
+        <tr><th></th><th>Flink</th><th>Spark Structured Streaming</th><th>Kafka Streams</th></tr>
+        <tr><td>Execution model</td><td>Continuous, per-event pipelined operators</td><td>Micro-batch by default (unbounded table, incremental query)</td><td>Library embedded in your app; per-event</td></tr>
+        <tr><td>Typical latency</td><td>Milliseconds</td><td>~100 ms to seconds</td><td>Milliseconds</td></tr>
+        <tr><td>Event time &amp; watermarks</td><td>First-class; rich window and trigger APIs</td><td>Watermarks on event-time columns; windows and sessions</td><td>Windows with grace periods</td></tr>
+        <tr><td>State</td><td>Large keyed state, RocksDB backend, incremental checkpoints</td><td>State store per partition, checkpointed per batch</td><td>Local stores backed by compacted changelog topics</td></tr>
+        <tr><td>Exactly-once</td><td>Barrier checkpoints + two-phase-commit sinks</td><td>Offsets + state per batch + idempotent/transactional sinks</td><td>Kafka transactions (Kafka in and out only)</td></tr>
+        <tr><td>Sweet spot</td><td>Low-latency, complex stateful event processing</td><td>Teams already on Spark; unified batch + streaming over lakehouse tables</td><td>Kafka-to-Kafka microservices without a cluster to run</td></tr>
+      </table>
+      <p>See <a href="../programming/apache-spark.html#streaming">Apache Spark</a> for the Structured Streaming API in context.</p>
+    </section>
+
+    <section class="topic" id="architecture" data-nav="Lambda vs kappa">
+      <h3><span class="idx">10</span> Lambda vs kappa architecture</h3>
+      <table class="cmp">
+        <tr><th></th><th>Lambda</th><th>Kappa</th></tr>
+        <tr><td>Structure</td><td>A batch layer recomputes accurate views from all history; a speed layer streams approximate recent results; a serving layer merges them</td><td>One streaming pipeline over a replayable log; reprocessing = replay the log through a new version of the job</td></tr>
+        <tr><td>Code paths</td><td>Two implementations of the same logic, which drift apart</td><td>One</td></tr>
+        <tr><td>Correction of mistakes</td><td>Batch layer overwrites the speed layer's answers</td><td>Deploy fixed job, replay from an earlier offset into a new output, switch readers</td></tr>
+        <tr><td>Requires</td><td>Batch + stream infrastructure</td><td>Long log retention (or tiered storage), exactly-once stream engine</td></tr>
+        <tr><td>When it still makes sense</td><td>Very expensive history recomputation that streaming can't express; legacy stacks</td><td>Default for new systems</td></tr>
+      </table>
+      <ul class="notes">
+        <li>Lambda existed because early stream processors were lossy and approximate. Exactly-once engines and durable logs removed that reason; the remaining cost of kappa is retention — replaying a year of events needs a year of log, often in tiered object storage or a lakehouse table that the stream engine can also read.</li>
+        <li>A pragmatic hybrid is common: stream into lakehouse tables (see <a href="data-warehousing.html#lakehouse">Data Warehousing</a>) and run batch over the same tables, with one transformation codebase.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="operations" data-nav="Operating streams">
+      <h3><span class="idx">11</span> Operating streaming systems</h3>
+      <table class="cmp">
+        <tr><th>Failure mode</th><th>Symptom</th><th>Mitigation</th></tr>
+        <tr><td><b>Backpressure</b></td><td>Lag grows, checkpoint durations climb</td><td>Scale the bottleneck operator; fix skew; unaligned checkpoints</td></tr>
+        <tr><td><b>Hot partition / key</b></td><td>One task at 100% CPU, others idle</td><td>Better keys, salting with two-stage aggregation, pre-aggregation</td></tr>
+        <tr><td><b>Poison message</b></td><td>Job crash-loops on the same offset</td><td>Dead-letter topic for unparseable records; never block the stream on one event</td></tr>
+        <tr><td><b>Rebalance storms</b></td><td>Repeated pauses as consumers join/leave</td><td>Cooperative/incremental rebalancing, static membership, stable session timeouts</td></tr>
+        <tr><td><b>State explosion</b></td><td>Memory/disk grows steadily until OOM</td><td>Watermarks on every windowed op, state TTL, bounded joins</td></tr>
+        <tr><td><b>Retention breach</b></td><td>Consumer down longer than retention ⇒ data gone</td><td>Alert on lag in time units; retention ≫ worst recovery time</td></tr>
+        <tr><td><b>Schema break</b></td><td>Deserialisation errors downstream</td><td>Schema registry with compatibility checks in producer CI</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Golden signals:</b> consumer lag (records and seconds), end-to-end latency (event time → sink commit), throughput, checkpoint duration and failures, late-drop count, state size.</li>
+        <li>Downstream model monitoring (<a href="../mlops/monitoring-and-drift.html">Monitoring &amp; Drift</a>) often runs as a stream job itself — windowed feature statistics compared against a reference.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">12</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Window by event time</b>, not arrival time, for deterministic and replayable results.</li>
+        <li><b>Watermarks trade latency for completeness</b> (W = max event time − d); measure late drops, use allowed lateness or side outputs; watermarks also bound state.</li>
+        <li><b>Kafka is a replayable log:</b> per-partition order, key-based partitioning, offsets owned by consumers, retention as the replay horizon, parallelism capped by partitions.</li>
+        <li><b>Exactly-once = replayable source + consistent checkpoints + transactional or idempotent sink.</b> The sink is usually the weak link.</li>
+        <li><b>Prefer kappa</b> (one codebase, replay to fix) over lambda for new systems.</li>
+        <li>Related: <a href="../databases/message-queues.html">Message Queues</a>, <a href="../programming/apache-spark.html">Apache Spark</a>, <a href="feature-stores.html">Feature Stores</a> (streaming feature freshness), <a href="etl-pipelines.html#cdc">CDC</a>.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="stream-processing.viz.js"></script>
+</body>
+</html>

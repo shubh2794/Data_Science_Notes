@@ -207,8 +207,8 @@ const nodes = [
   {id:"Recording & Branching", group:"prog", level:3, link:"programming/git/recording-branching.html", desc:"The everyday cycle done well: staging and committing coherent snapshots, ignoring what should never be tracked, cheap branches as movable pointers, and three-way merge — fast-forward, true merges, and what a conflict actually is."},
   {id:"Rebase, Undo & History Search", group:"prog", level:3, link:"programming/git/rewriting-recovering.html", desc:"Operations on history itself: rebase as replay and when not to use it, the safety ladder of checkout, restore, reset, revert and the reflog, and searching history — log pickaxe, blame, and bisect as binary search over commits."},
   {id:"Git Collaboration & Data Science", group:"prog", level:3, link:"programming/git/collaboration-ds.html", desc:"Working with others and with data: remotes and the fetch/push contract, the branching workflows that scale to teams, why notebooks diff badly and data does not belong in commits, DVC and LFS, and the internals in practice — packfiles, GC and what a clone copies."},
-  {id:"R", group:"prog", level:2, desc:"A statistics-first language strong in inference and visualization."},
-  {id:"Apache Spark", group:"prog", level:2, desc:"Distributed computation for datasets too large for one machine."},
+  {id:"R", group:"prog", level:2, link:"programming/r.html", desc:"A statistics-first language strong in inference and visualization."},
+  {id:"Apache Spark", group:"prog", level:2, link:"programming/apache-spark.html", desc:"Distributed computation for datasets too large for one machine."},
   {id:"Data Structures & Algorithms", group:"dsa", level:1, link:"dsa/data-structures-algorithms.html", desc:"The CS core: arrays, trees, graphs, sorting/searching, dynamic programming, and Big-O complexity analysis."},
   {id:"Data Systems", group:"dsys", level:1, desc:"The infrastructure data lives in: relational and NoSQL stores, indexing and transactions, distributed storage and compute, streaming, lakes and warehouses, and the scaling patterns (caching, queues, load balancing, CAP) that hold it together at volume."},
   // DSA — two level-2 series, each a hub with level-3 parts
@@ -328,26 +328,26 @@ const nodes = [
   {id:"Modular Arithmetic, Fast Exponentiation & CRT", group:"dsa", level:4, link:"dsa/algorithms/number-theory/modular-arithmetic-crt.html", desc:"The groups Zₙ and Zₙ* and Euler's φ counting the invertible residues, modular inverses and linear congruences via extended Euclid, Fermat's little theorem, Euler's theorem, orders and primitive roots, modular exponentiation by repeated squaring in O(log e) multiplications, and the Chinese remainder theorem with its uses."},
   {id:"Primality Testing, RSA & Factoring", group:"dsa", level:4, link:"dsa/algorithms/number-theory/primality-rsa-factoring.html", desc:"Primality by trial division and the Fermat test that Carmichael numbers defeat, Miller–Rabin with error at most (¼)ᵏ after k rounds, generating large primes from the prime number theorem, RSA key generation and why decryption works through Euler and the CRT, why textbook RSA is insecure, and factoring by Pollard's rho."},
   {id:"Relational & SQL", group:"dsys", level:2, desc:"Tables, keys, joins, and the SQL query language over normalized relational schemas."},
-  {id:"NoSQL", group:"dsys", level:2, desc:"Non-relational stores — key-value, document, columnar, graph — for scale and flexibility."},
-  {id:"Indexing", group:"dsys", level:2, desc:"Data structures (B-trees, hashes) that make lookups fast at some write/space cost."},
-  {id:"Transactions (ACID)", group:"dsys", level:2, desc:"Atomicity, consistency, isolation, durability — guarantees for correct concurrent writes."},
-  {id:"Sharding & Replication", group:"dsys", level:2, desc:"Partitioning data across machines and copying it for scale and availability."},
-  {id:"Hadoop & MapReduce", group:"dsys", level:2, desc:"The batch paradigm that started big data: distribute work as map and reduce steps over a cluster."},
+  {id:"NoSQL", group:"dsys", level:2, link:"databases/nosql.html", desc:"Non-relational stores — key-value, document, columnar, graph — for scale and flexibility."},
+  {id:"Indexing", group:"dsys", level:2, link:"databases/indexing.html", desc:"Data structures (B-trees, hashes) that make lookups fast at some write/space cost."},
+  {id:"Transactions (ACID)", group:"dsys", level:2, link:"databases/transactions-acid.html", desc:"Atomicity, consistency, isolation, durability — guarantees for correct concurrent writes."},
+  {id:"Sharding & Replication", group:"dsys", level:2, link:"databases/sharding-replication.html", desc:"Partitioning data across machines and copying it for scale and availability."},
+  {id:"Hadoop & MapReduce", group:"dsys", level:2, link:"databases/hadoop-mapreduce.html", desc:"The batch paradigm that started big data: distribute work as map and reduce steps over a cluster."},
   {id:"Streaming (Kafka)", group:"dsys", level:2, desc:"Processing unbounded event streams in near-real-time; Kafka as the durable log."},
   {id:"Data Lakes", group:"dsys", level:2, desc:"Store raw data at scale in open formats, schema-on-read, for flexible downstream use."},
-  {id:"Distributed Storage", group:"dsys", level:2, desc:"Spreading data across nodes (HDFS, object stores) for capacity and fault tolerance."},
+  {id:"Distributed Storage", group:"dsys", level:2, link:"databases/distributed-storage.html", desc:"Spreading data across nodes (HDFS, object stores) for capacity and fault tolerance."},
   {id:"Warehouses & Lakehouses", group:"dsys", level:2, desc:"Structured analytical stores and the lakehouse blend of lake flexibility + warehouse speed."},
-  {id:"Scalability", group:"dsys", level:2, desc:"Handling growth by scaling up (bigger) or out (more machines); statelessness and partitioning."},
-  {id:"Load Balancing", group:"dsys", level:2, desc:"Distributing requests across servers for throughput and resilience."},
-  {id:"Caching", group:"dsys", level:2, desc:"Storing hot results closer to compute to cut latency and load (CDN, Redis, app cache)."},
-  {id:"Message Queues", group:"dsys", level:2, desc:"Decoupling producers and consumers with async queues (Kafka, RabbitMQ, SQS)."},
-  {id:"CAP Theorem", group:"dsys", level:2, desc:"Under partition, choose consistency or availability — the core distributed-systems trade-off."},
+  {id:"Scalability", group:"dsys", level:2, link:"databases/scalability.html", desc:"Handling growth by scaling up (bigger) or out (more machines); statelessness and partitioning."},
+  {id:"Load Balancing", group:"dsys", level:2, link:"databases/load-balancing.html", desc:"Distributing requests across servers for throughput and resilience."},
+  {id:"Caching", group:"dsys", level:2, link:"databases/caching.html", desc:"Storing hot results closer to compute to cut latency and load (CDN, Redis, app cache)."},
+  {id:"Message Queues", group:"dsys", level:2, link:"databases/message-queues.html", desc:"Decoupling producers and consumers with async queues (Kafka, RabbitMQ, SQS)."},
+  {id:"CAP Theorem", group:"dsys", level:2, link:"databases/cap-theorem.html", desc:"Under partition, choose consistency or availability — the core distributed-systems trade-off."},
 
   // Data Engineering
-  {id:"ETL Pipelines", group:"deng", level:2, desc:"Extract-Transform-Load workflows that move and reshape data between systems."},
-  {id:"Data Warehousing", group:"deng", level:2, desc:"Central analytical stores (Snowflake, BigQuery) optimized for queries over large history."},
-  {id:"Feature Stores", group:"deng", level:2, desc:"Managed repositories of curated features, shared and consistent across training and serving."},
-  {id:"Stream Processing", group:"deng", level:2, desc:"Processing data in real time as it arrives (Kafka, Flink)."},
+  {id:"ETL Pipelines", group:"deng", level:2, link:"data-engineering/etl-pipelines.html", desc:"Extract-Transform-Load workflows that move and reshape data between systems."},
+  {id:"Data Warehousing", group:"deng", level:2, link:"data-engineering/data-warehousing.html", desc:"Central analytical stores (Snowflake, BigQuery) optimized for queries over large history."},
+  {id:"Feature Stores", group:"deng", level:2, link:"data-engineering/feature-stores.html", desc:"Managed repositories of curated features, shared and consistent across training and serving."},
+  {id:"Stream Processing", group:"deng", level:2, link:"data-engineering/stream-processing.html", desc:"Processing data in real time as it arrives (Kafka, Flink)."},
 
   // Machine Learning — specific algorithms (one notes page each)
   {id:"Linear & Logistic Regression", group:"ml", level:2, link:"machine-learning/linear-logistic-regression.html", desc:"Fit a line for continuous targets, or a sigmoid-squashed line for class probabilities. Hub page: what the two share, how they differ, scaling, regularization, and when to use them; each model is a sub-topic."},
@@ -361,6 +361,10 @@ const nodes = [
   {id:"Decision Trees & Ensembles", group:"ml", level:2, link:"machine-learning/decision-trees.html", desc:"Recursive impurity-reducing splits, combined via bagging (forests) and boosting."},
   {id:"Regularization", group:"ml", level:2, link:"machine-learning/regularization.html", desc:"Prevent overfitting by penalizing complex models: L1 (Lasso) drives weights to zero for sparsity, while L2 (Ridge) shrinks weights uniformly. Includes deep learning dropout and label smoothing."},
   {id:"Reinforcement Learning", group:"ml", level:2, link:"machine-learning/reinforcement-learning.html", desc:"The third ML paradigm (beyond supervised/unsupervised): an agent learns a policy by trial-and-error to maximize reward from environment feedback."},
+  // --- RL & classical-ML paper batch (DQN, PPO, XGBoost) — level-3 deep dives ---
+  {id:"DQN", group:"ml", level:3, link:"machine-learning/reinforcement-learning/dqn.html", desc:"Deep Q-learning from raw pixels in depth: a convolutional Q-network over four stacked 84×84 frames, experience replay to break correlation, ε-greedy annealed from 1.0 to 0.1, reward clipping and frame skipping, why the original version had no separate target network, and the seven-game Atari results against Sarsa, contingency, neuroevolution and human baselines."},
+  {id:"PPO", group:"ml", level:3, link:"machine-learning/reinforcement-learning/ppo.html", desc:"Proximal Policy Optimization in depth: the probability ratio rₜ(θ), the clipped surrogate as a pessimistic lower bound on the TRPO objective, the adaptive-KL alternative, the joint policy-value-entropy loss, truncated GAE, K epochs of minibatch updates over N·T samples, and the MuJoCo ablation, Roboschool humanoid and 49-game Atari results."},
+  {id:"XGBoost", group:"ml", level:3, link:"machine-learning/decision-trees/xgboost.html", desc:"Scalable tree boosting in depth: the γT + ½λ‖w‖² regularised objective, a second-order Taylor step giving closed-form leaf weights and the split gain, the hessian-weighted quantile sketch for approximate splits, sparsity-aware default directions, and the column-block, cache-aware, compressed and sharded out-of-core system behind it."},
   {id:"Model Evaluation", group:"ml", level:2, link:"machine-learning/model-evaluation.html", desc:"A CROSS-CUTTING methodology (not an algorithm): how to score ANY model honestly — train/test splits, cross-validation, precision/recall, ROC-AUC."},
 
   // Deep Learning  (most link to the notes page)
@@ -375,6 +379,7 @@ const nodes = [
   {id:"Pooling & Convolution Variants", group:"dl", level:3, link:"deep-learning/convolutional-networks/pooling-variants.html", desc:"The layer and its relatives: 1×1 convolutions as channel mixing and bottleneck, pooling and what it destroys, equivariance against invariance stated precisely, strided convolution and aliasing, grouped and depthwise-separable convolutions with their cost ratios, dilated convolution, and transposed convolution with its checkerboard."},
   {id:"Conv Blocks, Backprop & Learned Features", group:"dl", level:3, link:"deep-learning/convolutional-networks/blocks-backprop-features.html", desc:"The convolution as a trainable, computable block: conv, norm and activation and where the norm goes, backpropagation through a convolution derived and audited numerically, convolution as one matrix product via im2col and the Toeplitz view, and what a trained convolutional network actually learns layer by layer."},
   {id:"CNN Lineage, Capsules & ViTs", group:"dl", level:3, link:"deep-learning/convolutional-networks/lineage-capsules-vit.html", desc:"The architectures and their challengers: what each generation of the convnet lineage actually changed, locally connected layers that refuse to share, the critique of pooling and the viewpoint problem, capsule networks with routing by agreement and why they did not win, convnets against vision transformers, and convolution beyond images."},
+  {id:"AlexNet", group:"dl", level:3, link:"deep-learning/convolutional-networks/alexnet.html", desc:"The 2012 ImageNet network in depth: five conv and three fully connected layers split across two GPUs, ReLU against saturating units, local response normalisation, overlapping pooling, translation-and-reflection crops plus PCA colour jitter, dropout in the dense layers, the SGD recipe, the ablations, and the ILSVRC-2010/2012 results that ended hand-crafted features."},
   {id:"RNNs & LSTMs", group:"dl", level:2, link:"deep-learning/rnns-lstms.html", desc:"Recurrent networks that process sequences by carrying hidden state through time."},
   {id:"Recurrent Cells & Unrolling", group:"dl", level:3, link:"deep-learning/rnns-lstms/recurrent-cells.html", desc:"What recurrence buys over a feedforward net: one set of weights shared across time, the cell and its hidden state, the shapes of the unrolled forward pass, the five input–output wiring patterns and what each can express, and the loss summed over a sequence."},
   {id:"Backpropagation Through Time", group:"dl", level:3, link:"deep-learning/rnns-lstms/bptt.html", desc:"Backpropagation through time derived weight by weight: the easy output gradient, ∂L/∂W as a sum over paths, the input and bias gradients, the O(T) recursion that computes them, a worked numeric example checked by finite differences, the memory and compute cost, and truncated BPTT with its bias measured."},
@@ -399,19 +404,23 @@ const nodes = [
   {id:"Mixture of Experts", group:"dl", level:2, link:"deep-learning/mixture-of-experts.html", desc:"Sparse scaling: replace the dense FFN with many expert FFNs and route each token to only the top-k — huge parameter count, small per-token compute (Switch, Mixtral, DeepSeek)."},
   {id:"GANs", group:"dl", level:2, link:"deep-learning/generative-adversarial-networks.html", desc:"A generator and discriminator competing in a minimax game: the JSD and Wasserstein views, mode collapse and the stabilisation toolkit, the DCGAN-to-StyleGAN lineage, evaluation, image-to-image translation (Pix2Pix U-Net + PatchGAN, CycleGAN cycle consistency), neural style transfer and AdaIN, deepfake face swaps and detection, and where diffusion has taken over."},
   {id:"Diffusion Models", group:"dl", level:2, link:"deep-learning/diffusion-models.html", desc:"Generate data by learning to reverse a gradual noising process — SOTA for image synthesis."},
+  {id:"DDPM", group:"dl", level:3, link:"deep-learning/diffusion-models/ddpm.html", desc:"Denoising diffusion probabilistic models in depth: the fixed forward chain and its closed form, the variational bound term by term, why ε-prediction turns each KL into a denoising-score-matching loss, the unweighted L_simple objective, the parameterisation and variance ablation, CIFAR-10 FID 3.17 against a 3.75 bits/dim likelihood, the rate–distortion reading of the sampler, and its stated limits."},
+  {id:"Latent Diffusion Models", group:"dl", level:3, link:"deep-learning/diffusion-models/latent-diffusion.html", desc:"Diffusion in a learned latent space in depth: separating perceptual from semantic compression, the KL- and VQ-regularised autoencoder, the downsampling-factor ablation that favours f = 4–8, cross-attention conditioning through a domain encoder τθ, latent rescaling and SNR, and the results and compute bill on unconditional, class-conditional, text-to-image, super-resolution and inpainting tasks."},
   {id:"Autoencoders & VAEs", group:"dl", level:2, link:"deep-learning/autoencoders-vaes.html", desc:"Learning a compressed code by reconstructing the input: the undercomplete autoencoder and its relation to PCA, denoising and sparse variants, the variational autoencoder's latent distribution and the reparameterisation trick, the ELBO and its reconstruction/KL trade-off, posterior collapse, VQ-VAE's discrete codebook, and the latent space that modern diffusion models actually operate in."},
   {id:"Undercomplete Autoencoders & PCA", group:"dl", level:3, link:"deep-learning/autoencoders-vaes/undercomplete-pca.html", desc:"The bottleneck autoencoder taken precisely: the undercomplete code, the exact sense in which a linear autoencoder recovers the PCA subspace and the loose version that is wrong, nonlinear autoencoders as curved PCA, the capacity trap that defeats a bottleneck, and what depth adds."},
   {id:"Regularized Autoencoders & Manifolds", group:"dl", level:3, link:"deep-learning/autoencoders-vaes/regularized-manifolds.html", desc:"Autoencoders constrained by a penalty instead of a bottleneck: sparse codes, denoising and the reconstruction field that estimates the score, the bridge to diffusion, contractive penalties on the Jacobian, manifolds and tangent spaces, stochastic encoders and decoders, predictive sparse decomposition, and real uses."},
   {id:"VAE: ELBO & Reparameterization", group:"dl", level:3, link:"deep-learning/autoencoders-vaes/vae-elbo-reparam.html", desc:"The variational autoencoder derived: the latent-variable model and its two intractable integrals, the evidence lower bound in two decompositions with its gap, the reparameterisation trick against the score-function estimator it replaces, the full model end to end, and the scale trap in the decoder likelihood."},
   {id:"β-VAE, Posterior Collapse & VQ-VAE", group:"dl", level:3, link:"deep-learning/autoencoders-vaes/beta-collapse-vqvae.html", desc:"What shapes a trained VAE: the reconstruction–KL trade-off read as rate and distortion and what β buys, posterior collapse and its remedies, traversal and holes in the latent space, the honest reasons samples blur, tighter bounds and richer posteriors, and VQ-VAE's discrete codebook."},
-  {id:"Model Interpretability", group:"ml", level:2, desc:"Explaining what a fitted model is doing: intrinsic vs post-hoc methods, permutation importance, partial dependence and ICE curves, local surrogates, Shapley values and their additive attribution, saliency and class-activation maps for vision models, attention as an explanation and why that is contested, and the gap between an explanation that is faithful and one that is merely plausible."},
+  {id:"Model Interpretability", group:"ml", level:2, link:"machine-learning/model-interpretability.html", desc:"Explaining what a fitted model is doing: intrinsic vs post-hoc methods, permutation importance, partial dependence and ICE curves, local surrogates, Shapley values and their additive attribution, saliency and class-activation maps for vision models, attention as an explanation and why that is contested, and the gap between an explanation that is faithful and one that is merely plausible."},
   {id:"Graph Neural Networks", group:"dl", level:2, link:"deep-learning/graph-neural-networks.html", desc:"Deep learning on graphs via neighbor message passing."},
+  {id:"GCN", group:"dl", level:3, link:"deep-learning/graph-neural-networks/gcn.html", desc:"Graph Convolutional Networks in depth: spectral graph convolution, the Chebyshev approximation cut to first order, parameter tying and the renormalization trick Ã = A + I, the two-layer semi-supervised model trained on labelled nodes only, results on Citeseer, Cora, Pubmed and NELL, the propagation-model ablation, depth and residuals, and the limits."},
 
   // NLP
   {id:"Tokenization", group:"nlp", level:2, link:"nlp/tokenization.html", desc:"Splitting text into sub-word units that models can consume."},
   {id:"Embeddings", group:"nlp", level:2, link:"nlp/embeddings.html", desc:"Dense vector representations where semantic similarity becomes geometric proximity."},
   {id:"Language Models", group:"nlp", level:2, link:"nlp/language-models.html", desc:"Models that predict the next token; scaled up, they become LLMs."},
   {id:"RAG", group:"nlp", level:2, link:"nlp/retrieval-augmented-generation.html", desc:"Retrieval-Augmented Generation — grounding LLM answers in retrieved documents."},
+  {id:"RAG-Sequence & RAG-Token", group:"nlp", level:3, link:"nlp/retrieval-augmented-generation/rag-sequence-token.html", desc:"The original retrieval-augmented generator in depth: a dense passage retriever over a Wikipedia index as non-parametric memory, a seq2seq generator as parametric memory, retrieved passages as a latent variable marginalised per sequence or per token, end-to-end training without retrieval supervision, decoding for each variant, and the open-domain QA, generation, fact-verification and index hot-swap results."},
   {id:"Vision Models", group:"models", level:2, link:"models/vision-models.html", desc:"Image and video backbones and task models — convolutional (EfficientNet) and transformer-based (ViT family, DETR, SAM, DINOv2): what each architecture changed and how the families compare."},
   {id:"NLP Models", group:"models", level:2, link:"models/nlp-models.html", desc:"Encoder-only and encoder–decoder language models — BERT and its successors, T5, BART: pretraining objectives, input formats, and when an encoder or seq2seq model beats a decoder."},
   {id:"LLM Families", group:"models", level:2, link:"models/llm-families.html", desc:"Decoder-only large language model families — GPT, Llama, Mistral/Mixtral, Qwen, Gemma, DeepSeek: configs, attention variants (GQA, MLA, sliding window), MoE, and training recipes compared."},
@@ -425,24 +434,27 @@ const nodes = [
   {id:"BERT: Fine-Tuning, Probing & Results", group:"models", level:4, link:"models/bert/fine-tuning-results.html", desc:"Using and measuring a pretrained BERT: what the pooled [CLS] vector really is, the four task-head shapes, start/end span scoring with a no-answer threshold, the fine-tuning grid and its restart instability, frozen feature extraction, attention and probing analyses, the model-size ablation, and the GLUE, SQuAD and SWAG results."},
   {id:"BERT: RoBERTa, ELECTRA & Successors", group:"models", level:4, link:"models/bert/successors-practice.html", desc:"The encoder family after BERT and how to use it: ELECTRA's loss on every token, RoBERTa's longer training, ALBERT's parameter sharing, DistilBERT, DeBERTa and ModernBERT with the numbers behind each, BERT set against GPT and T5, Sentence-BERT bi-encoders for embeddings, and practical use through the Transformers library."},
   // Computer Vision
-  {id:"Image Classification", group:"cv", level:2, desc:"Assigning a label to a whole image — the canonical vision task."},
-  {id:"Object Detection", group:"cv", level:2, desc:"Locating and classifying multiple objects within an image (YOLO, Faster R-CNN)."},
+  {id:"Image Classification", group:"cv", level:2, link:"vision/image-classification.html", desc:"Assigning a label to a whole image — the canonical vision task."},
+  {id:"Object Detection", group:"cv", level:2, link:"vision/object-detection.html", desc:"Locating and classifying multiple objects within an image (YOLO, Faster R-CNN)."},
 
   // MLOps
-  {id:"Model Deployment", group:"mlops", level:2, desc:"Serving models behind APIs, batch jobs, or on-device."},
+  {id:"Model Deployment", group:"mlops", level:2, link:"mlops/model-deployment.html", desc:"Serving models behind APIs, batch jobs, or on-device."},
   {id:"Monitoring & Drift", group:"mlops", level:2, link:"mlops/monitoring-and-drift.html", desc:"Tracking live performance and detecting when data shifts away from training."},
-  {id:"CI/CD", group:"mlops", level:2, desc:"Automated testing and deployment pipelines for code and models."},
-  {id:"Experiment Tracking", group:"mlops", level:2, desc:"Logging runs, params, and metrics for reproducibility (MLflow, W&B)."},
+  {id:"CI/CD", group:"mlops", level:2, link:"mlops/ci-cd.html", desc:"Automated testing and deployment pipelines for code and models."},
+  {id:"Experiment Tracking", group:"mlops", level:2, link:"mlops/experiment-tracking.html", desc:"Logging runs, params, and metrics for reproducibility (MLflow, W&B)."},
 
   // Viz
-  {id:"Dashboards", group:"viz", level:2, desc:"Interactive views that let stakeholders monitor metrics over time."},
-  {id:"Data Storytelling", group:"viz", level:2, desc:"Framing analysis as a clear narrative aimed at a decision."},
+  {id:"Dashboards", group:"viz", level:2, link:"data-viz/dashboards.html", desc:"Interactive views that let stakeholders monitor metrics over time."},
+  {id:"Data Storytelling", group:"viz", level:2, link:"data-viz/data-storytelling.html", desc:"Framing analysis as a clear narrative aimed at a decision."},
 
   // LLMs & Generative AI
   {id:"Large Language Models", group:"llm", level:2, link:"llm/large-language-models.html", desc:"Transformer decoders scaled up on massive text via next-token prediction — yielding emergent in-context learning, instruction following, and reasoning."},
   {id:"Context Engineering", group:"llm", level:2, link:"llm/context-engineering.html", desc:"Designing what goes into the context window: prompting, few-shot examples, retrieved context, tools, and memory — feeding the model the right information at inference."},
   {id:"Parameter-Efficient Fine-Tuning", group:"llm", level:2, link:"llm/parameter-efficient-fine-tuning.html", desc:"Adapt a frozen pretrained model by training a tiny set of extra weights — LoRA, adapters, prefix/prompt tuning — instead of all parameters."},
+  {id:"LoRA", group:"llm", level:3, link:"llm/parameter-efficient-fine-tuning/lora.html", desc:"Low-rank adaptation in depth: freeze W₀ and learn ΔW = BA with rank r ≪ min(d,k) — the intrinsic-rank hypothesis, zero-init B and α/r scaling, merging for zero inference latency, which attention matrices to adapt, why r = 1–4 suffices, how ΔW amplifies directions W₀ under-weights, and the results and limits on RoBERTa, DeBERTa, GPT-2 and GPT-3."},
+  {id:"QLoRA", group:"llm", level:3, link:"llm/parameter-efficient-fine-tuning/qlora.html", desc:"LoRA on a 4-bit frozen base: the NormalFloat4 data type built from normal quantiles, blockwise absmax quantization, double quantization of the constants, paged optimizers, why every linear layer must be adapted to match 16-bit fine-tuning, the memory arithmetic of a 65B model on one 48 GB GPU, and what the instruction-tuning study found about data quality versus size and chatbot evaluation."},
   {id:"Policy / Preference Optimization", group:"llm", level:2, link:"llm/policy-preference-optimization.html", desc:"Align models to human preferences: RLHF (PPO) and direct methods (DPO, GRPO) that optimize a policy against a reward or preference signal."},
+  {id:"DPO", group:"llm", level:3, link:"llm/policy-preference-optimization/dpo.html", desc:"Direct Preference Optimization in depth: the closed-form optimum of the KL-regularised reward objective, the reparameterisation that makes the policy its own reward model, why the partition function cancels under Bradley–Terry and Plackett–Luce, the gradient and its σ(−margin) weighting, the reward–KL frontier on controlled sentiment, and the summarisation and dialogue results against PPO."},
   {id:"LLM-as-a-Judge", group:"llm", level:2, link:"llm/llm-as-a-judge.html", desc:"Use a strong LLM to score or compare model outputs — scalable automated evaluation (autoraters), with care for bias, position effects, and calibration."},
   {id:"Diffusion LLMs", group:"llm", level:2, link:"llm/diffusion-llms.html", desc:"Generate text by iteratively denoising over discrete tokens rather than left-to-right — discrete/diffusion language models that can decode in parallel."},
   {id:"Vision-Language Models", group:"llm", level:2, link:"llm/vision-language-models.html", desc:"Multimodal models that jointly process images and text — a visual encoder bolted to an LLM for captioning, VQA, and grounded reasoning."},
@@ -451,6 +463,7 @@ const nodes = [
 
   // Agentic AI
   {id:"Agents", group:"agent", level:2, link:"agentic/agents.html", desc:"LLMs that plan, call tools, and act in loops to accomplish goals — the move from single-shot answers to multi-step autonomy."},
+  {id:"ReAct", group:"agent", level:3, link:"agentic/agents/react.html", desc:"Interleaving reasoning traces with actions in depth: the augmented action space where a thought is an action that changes only the context, dense versus sparse thoughts, the question-answering, fact-checking, text-game and web-shopping results against reason-only and act-only baselines, the error analysis of hallucination versus search failure, combining with chain-of-thought self-consistency, and fine-tuning on ReAct trajectories."},
   {id:"Agentic RL", group:"agent", level:2, link:"agentic/agentic-rl.html", desc:"Training agents with reinforcement learning over multi-step tool use and environment feedback — optimizing reward over trajectories, not single responses."},
   {id:"Agent Skills", group:"agent", level:2, link:"agentic/agent-skills.html", desc:"Reusable, composable capabilities an agent can invoke — packaged tools and procedures that extend what an agent can do."},
   {id:"Agentic Design Patterns", group:"agent", level:2, link:"agentic/agentic-design-patterns.html", desc:"Recurring architectures for agent systems — reflection, planning, tool use, and multi-agent collaboration."},
@@ -470,11 +483,14 @@ const nodes = [
   {id:"Losses & Backpropagation", group:"dl", level:3, link:"deep-learning/neural-network-training/loss-backprop.html", desc:"Where the gradient comes from: the risk you want against the surrogate you minimise, the loss read from the optimiser's side, the computational graph, backpropagation derived and run on real numbers, reverse against forward mode and finite differences, and why it is a schedule rather than the chain rule."},
   {id:"Gradient Flow & Initialization", group:"dl", level:3, link:"deep-learning/neural-network-training/gradient-flow-init.html", desc:"Keeping signal alive through depth: vanishing and exploding gradients measured layer by layer, how each non-linearity's derivative gates gradient flow, the dying ReLU as an optimisation pathology, the variance argument behind initialisation, Xavier and He with their assumptions, and what ten-times mis-scaling does."},
   {id:"Gradient Descent & Optimizers", group:"dl", level:3, link:"deep-learning/neural-network-training/optimizers.html", desc:"Turning a gradient into a step: minibatch SGD, curvature and the condition number that cap the learning rate, saddles, plateaus and cliffs, moving averages with bias correction, then the optimiser family from momentum and Nesterov through AdaGrad, RMSProp and Adam to AdamW's decoupled decay."},
+  {id:"Adam", group:"dl", level:4, link:"deep-learning/neural-network-training/optimizers/adam.html", desc:"Adam in depth: the algorithm and its defaults, the effective step bounded by the learning rate as a trust region, the signal-to-noise reading of m̂/√v̂, invariance to gradient scale, bias correction and the experiment that shows why it matters, the regret bound and why it was later found to be flawed, AdaMax and the ∞-norm, and the reported experiments."},
   {id:"LR Schedules, Batch Size & Precision", group:"dl", level:3, link:"deep-learning/neural-network-training/schedules-precision-memory.html", desc:"Making each step stable and affordable: learning-rate schedules and why warmup exists, the range test for choosing η, batch size with its memory arithmetic and coupling to the learning rate, mixed precision and loss scaling, and gradient accumulation with activation checkpointing."},
   {id:"Normalization Layers & Training Regularization", group:"dl", level:3, link:"deep-learning/neural-network-training/normalization-regularization.html", desc:"The layers and penalties that shape what training converges to: batch normalisation and its train/eval asymmetry, LayerNorm and RMSNorm with pre/post placement, the regularisation map, L2, L1 and weight decay, dropout as a cheap ensemble, early stopping, augmentation, noise injection and label smoothing."},
+  {id:"Batch Normalization", group:"dl", level:4, link:"deep-learning/neural-network-training/normalization-regularization/batch-normalization.html", desc:"Batch normalisation in depth: the internal-covariate-shift motivation and what later work found, the transform and why γ and β restore the identity, backprop through the batch statistics, population statistics at inference, the per-channel convolutional form, scale invariance and higher learning rates, and the ImageNet results — 14× fewer steps and the BN-x5/x30 ensembles."},
+  {id:"Dropout", group:"dl", level:4, link:"deep-learning/neural-network-training/normalization-regularization/dropout.html", desc:"Dropout in depth: the thinned-network ensemble and the weight-scaling rule, max-norm constraints with high learning rates, dropout RBMs, marginalising the noise into an adaptive L2 penalty, Gaussian multiplicative noise, what it does to features and sparsity, how the retention rate and dataset size interact, Monte Carlo against weight scaling, and the results across vision, speech, text and genetics."},
   {id:"Clipping, Tuning & Debugging Runs", group:"dl", level:3, link:"deep-learning/neural-network-training/tuning-debugging.html", desc:"Keeping a real run on the rails: gradient clipping that caps magnitude while keeping direction, which hyperparameters matter and why random search beats grid search, reading a training curve for the failure it encodes, and a systematic procedure for debugging a run that will not learn."},
   {id:"Fine-Tuning & Transfer Learning", group:"dl", level:2, link:"deep-learning/fine-tuning-transfer-learning.html", desc:"Reusing pretrained representations: feature generality by layer, feature extraction vs fine-tuning by data size × domain similarity, the freeze-then-unfreeze recipe and the BatchNorm trap, discriminative learning rates and gradual unfreezing, forgetting (L2-SP, EWC), LP-FT, domain adaptation, BERT and PEFT."},
-  {id:"Knowledge Distillation", group:"dl", level:2, link:"deep-learning/knowledge-distillation.html", desc:"Train a small student to mimic a large teacher — compressing a model's behaviour into far fewer parameters."},
+  {id:"Knowledge Distillation", group:"dl", level:2, link:"deep-learning/knowledge-distillation.html", desc:"Train a small student to mimic a large teacher: soft targets at temperature T and the T² scaling, logit matching as the high-temperature limit, the MNIST experiments including a digit the student never sees, a 10-model speech ensemble distilled into one model, specialists on a 15,000-class image set, and soft targets as a regulariser on 3% of the data."},
   {id:"Distributed Training", group:"dl", level:2, link:"deep-learning/distributed-training.html", desc:"Train models too big for one device: data, tensor, and pipeline parallelism, ZeRO sharding, plus gradient accumulation and checkpointing."},
   {id:"Data Parallelism, ZeRO & FSDP", group:"dl", level:3, link:"deep-learning/distributed-training/data-parallel-zero.html", desc:"Splitting the batch and then the model state: data parallelism with a gradient all-reduce, the sixteen bytes per parameter that mixed-precision Adam keeps on every GPU, ZeRO stages one to three and FSDP sharding optimiser state, gradients and parameters across ranks, and offloading to CPU memory and NVMe in exchange for bandwidth."},
   {id:"Collectives, Ring All-Reduce & DDP", group:"dl", level:3, link:"deep-learning/distributed-training/collectives-ddp.html", desc:"The traffic every parallel scheme pays for: the collectives — all-reduce, all-gather, reduce-scatter, all-to-all — and their latency and bandwidth cost, the ring all-reduce run step by step to show where 2·(n−1)/n · S comes from, and DDP in practice with one process per GPU, gradient buckets and accumulation."},
@@ -483,6 +499,7 @@ const nodes = [
   {id:"N-D Parallelism, Planning & Checkpointing", group:"dl", level:3, link:"deep-learning/distributed-training/nd-parallelism-practice.html", desc:"Putting the axes together and keeping the run alive: composing data, tensor, pipeline and context degrees on a device mesh, choosing degrees for a 70 B model on 64 and 512 GPUs with the page's memory and traffic formulas, what Transformers and Accelerate support, and checkpointing sharded state for fault tolerance at scale."},
   {id:"Encoder vs Decoder Models", group:"dl", level:2, link:"deep-learning/encoder-decoder-models.html", desc:"Three Transformer wirings — encoder-only (BERT), decoder-only (GPT), and encoder-decoder (T5) — and which task each suits."},
   {id:"State Space Models", group:"dl", level:2, link:"deep-learning/state-space-models.html", desc:"Sequence models (S4, Mamba) that scale linearly with length via a learned recurrence — a sub-quadratic alternative to attention."},
+  {id:"Mamba", group:"dl", level:3, link:"deep-learning/state-space-models/mamba.html", desc:"Selective state spaces in depth: why time-invariant SSMs fail content-based tasks, making Δ, B and C functions of the input, zero-order-hold discretization, Δ as a generalised RNN gate, the hardware-aware fused scan with recomputation, the Mamba block, and results on synthetic tasks, language, DNA and audio with the ablations and limits."},
   {id:"World Models & JEPA", group:"dl", level:2, link:"deep-learning/world-models-jepa.html", desc:"Models that learn predictive representations of how the world evolves — including JEPA, predicting in latent space rather than pixels."},
   {id:"DL Architectures Compared", group:"dl", level:2, link:"deep-learning/dl-architectures-compared.html", desc:"A map of the architecture zoo — MLPs, CNNs, RNNs, Transformers, SSMs — by inductive bias, cost, and the data each fits."},
   {id:"End-to-End Deep Learning", group:"dl", level:2, link:"deep-learning/end-to-end-learning.html", desc:"Replace a hand-engineered pipeline with a single network mapping raw input to output — when abundant (input→output) data makes it win, when a multi-stage pipeline is better, and how to choose pipeline components by data availability and task simplicity."},
@@ -520,6 +537,7 @@ const nodes = [
   // LLMs & Generative AI
   {id:"AI Engineering", group:"llm", level:2, link:"llm/ai-engineering.html", desc:"Building, evaluating, and operating production AI/LLM applications — the 5-layer architecture (context, guardrails, routing, caching, agents), evaluation-driven development, cost optimization, observability, and the user-feedback data flywheel."},
   {id:"Reasoning in LLMs", group:"llm", level:2, link:"llm/reasoning-in-llms.html", desc:"Eliciting multi-step thinking — chain-of-thought, self-consistency, tree/graph-of-thought, and reasoning-trained models."},
+  {id:"Chain-of-Thought Prompting", group:"llm", level:3, link:"llm/reasoning-in-llms/chain-of-thought.html", desc:"Few-shot exemplars that include worked intermediate steps, in depth: the ⟨input, chain of thought, output⟩ prompt, why the gain emerges only at large scale, the arithmetic, commonsense and symbolic-reasoning results, the ablations that rule out equations-only, extra-compute and answer-first explanations, robustness to annotator and exemplar choice, length generalisation, and what the method does not establish."},
   {id:"Hallucination & Factuality", group:"llm", level:2, link:"llm/hallucination-factuality.html", desc:"Why LLMs fabricate and how to catch it — measuring factuality, detecting hallucinations, and grounding/abstention mitigations."},
   {id:"Context-Length Extension", group:"llm", level:2, link:"llm/context-length-extension.html", desc:"Pushing the context window longer — positional interpolation, RoPE scaling, and efficient long-context attention."},
   {id:"GPT", group:"models", level:3, link:"models/gpt.html", desc:"Generative Pre-trained Transformer — the decoder-only autoregressive lineage (GPT-1→4) behind modern LLMs; the generative counterpart to BERT."},
@@ -593,6 +611,13 @@ const nodes = [
   {id:"Differential Privacy", group:"deng", level:2, link:"data-engineering/differential-privacy.html", desc:"A formal privacy guarantee — add calibrated noise so outputs barely change when any single record is added or removed, bounding information leakage."},
   {id:"Contrastive Learning", group:"dl", level:2, link:"deep-learning/contrastive-learning.html", desc:"Learn representations by pulling positive pairs together and pushing negatives — especially hard negatives — apart. The InfoNCE/NT-Xent objective behind SimCLR, MoCo, and CLIP-style multimodal embeddings."},
   {id:"Vision Transformers", group:"cv", level:2, link:"vision/vision-transformers.html", desc:"Apply the Transformer directly to images: split a picture into fixed-size patches, linearly embed them as a token sequence (plus a [CLS] token and positional embeddings), and run a standard encoder. At scale ViT matches or beats CNNs — the backbone behind CLIP, modern detectors/segmenters, and most vision-language models."},
+  /* --- sequence-models & transformers paper batch: child deep-dive pages --- */
+  {id:"Word2Vec", group:"nlp", level:3, link:"nlp/embeddings/word2vec.html", desc:"CBOW and continuous skip-gram in depth: why dropping the non-linear hidden layer made billion-word training cheap, the per-example cost Q of each architecture, hierarchical softmax over a Huffman tree, the semantic–syntactic analogy test and vector offsets, and the reported accuracy against dimension, data size and earlier neural language models."},
+  {id:"Seq2seq: Deep LSTM Translation", group:"nlp", level:3, link:"nlp/machine-translation/seq2seq-lstm.html", desc:"The 2014 encoder–decoder result in depth: one deep LSTM reads the source into a fixed vector and another decodes the translation, the source-reversal trick and why it shortens dependencies, the 4-layer 1000-cell setup, left-to-right beam search, ensembles and SMT rescoring on WMT'14 English→French, and what the sentence-length analysis showed."},
+  {id:"Learning to Align & Translate", group:"nlp", level:3, link:"nlp/machine-translation/align-and-translate.html", desc:"The paper that introduced attention for translation: a bidirectional-RNN encoder emitting one annotation per word, an additive alignment model scoring each annotation against the decoder state, a fresh context vector per output word, the fixed-vector baseline it beat as sentences got longer, and the soft alignments it learned without supervision."},
+  {id:"The Original Transformer (2017)", group:"dl", level:3, link:"deep-learning/transformers/original-transformer.html", desc:"The 2017 architecture paper read as a paper: why self-attention over recurrence (per-layer cost, sequential operations, path length), the base and big configurations, the warmup learning-rate schedule, dropout and label smoothing, WMT'14 BLEU and training cost against prior systems, the architecture-variation ablations, and constituency-parsing transfer."},
+  {id:"InstructGPT & RLHF", group:"models", level:4, link:"models/gpt/instructgpt.html", desc:"Training GPT-3 to follow instructions from human feedback, in depth: the API prompt distribution and labeller pipeline, SFT then a 6B reward model on ranked comparisons then PPO with a KL penalty and a pretraining mix, why a 1.3B aligned model beat 175B GPT-3 in preference, truthfulness, toxicity and bias results, the alignment tax, and the stated limitations."},
+  {id:"ViT: Scale Beats Inductive Bias", group:"cv", level:3, link:"vision/vision-transformers/vit.html", desc:"The Vision Transformer paper in depth: a standard encoder over 16×16 patch tokens with almost no image-specific bias, ViT-Base/Large/Huge, pre-training on ImageNet-21k and JFT-300M then fine-tuning at higher resolution, results against large ResNets at lower pre-training compute, the data-size crossover, hybrids, and what attention distance and position embeddings reveal."},
 ];
 
 const tree = {
@@ -651,13 +676,14 @@ const subtree = {
   "Heaps & Priority Queues":["Binary Heap Array & Sift Operations","Build-Heap & Heapsort","Heap Handles, d-ary & Mergeable Heaps","Fibonacci Heaps & van Emde Boas Trees","Heap Applications: Graphs, Top-k & Merging"],
   "Greedy Algorithms":["Greedy Proof Templates & Activity Selection","Exchange Arguments: Scheduling, Coins & Knapsack","Huffman Coding & Prefix Codes","Matroids & Greedy on Graphs","Greedy Approximation & Heuristics"],
   "Online & Randomized Algorithms":["Competitive Analysis & Ski Rental","Online Paging & List Update","Probabilistic Analysis: Hiring & Secretary","Las Vegas, Monte Carlo & Tail Bounds","Pseudo-Randomness, Shuffling & Reservoir Sampling"],
-  "Transformers":["Positional Encodings","Residual Stream, Norms & FFN","Transformer Stacks & Accounting","Transformer Training & Decoding","Depth, Width & the Logit Lens","Model Definitions & Loading","KV Cache & Generation"],
+  "Transformers":["Positional Encodings","Residual Stream, Norms & FFN","Transformer Stacks & Accounting","Transformer Training & Decoding","Depth, Width & the Logit Lens","Model Definitions & Loading","KV Cache & Generation","The Original Transformer (2017)"],
   "RNNs & LSTMs":["Recurrent Cells & Unrolling","Backpropagation Through Time","Vanishing & Exploding Gradients","LSTM & GRU Cells","Bidirectional, Stacked & Seq2seq RNNs"],
   "Attention":["Alignment, Scores & Scaling","Queries, Keys & Values","Multi-Head Attention & Masking","Attention Cost & Limits","KV Cache, GQA & MLA","Sparse, Linear & Flash Attention"],
   "Neural Network Training":["Losses & Backpropagation","Gradient Flow & Initialization","Gradient Descent & Optimizers","LR Schedules, Batch Size & Precision","Normalization Layers & Training Regularization","Clipping, Tuning & Debugging Runs"],
-  "CNNs":["Why Convolution: Sparsity, Sharing & Equivariance","Conv Arithmetic & Receptive Fields","Pooling & Convolution Variants","Conv Blocks, Backprop & Learned Features","CNN Lineage, Capsules & ViTs"],
+  "CNNs":["Why Convolution: Sparsity, Sharing & Equivariance","Conv Arithmetic & Receptive Fields","Pooling & Convolution Variants","Conv Blocks, Backprop & Learned Features","CNN Lineage, Capsules & ViTs","AlexNet"],
   "Feedforward / MLP":["Neurons, Nonlinearity & XOR","MLP Forward Pass & Hidden Units","Output Units & Likelihood Losses","MLP Expressivity, Depth & Inductive Bias"],
   "Autoencoders & VAEs":["Undercomplete Autoencoders & PCA","Regularized Autoencoders & Manifolds","VAE: ELBO & Reparameterization","β-VAE, Posterior Collapse & VQ-VAE"],
+  "Diffusion Models":["DDPM","Latent Diffusion Models"],
   "Segmentation":["Thresholding & Connected Components","Region Growing & Watershed","Active Contours & Level Sets","Mean Shift Segmentation","Normalised Cuts, Graph Cuts & Superpixels"],
   "Stereo & Structure from Motion":["Epipolar Geometry","Fundamental Matrix Estimation","Relative Pose & Triangulation","Dense Stereo Matching","Structure from Motion & Bundle Adjustment"],
   "Image Formation":["Homogeneous Coordinates & Transformations","3D Rotation Parameterisations","The Pinhole Camera & Projection","Optics, Reflectance & Shading","Colour, Gamma & the Sensor Pipeline"],
@@ -683,7 +709,7 @@ const subtree = {
   "Donut":["Donut: OCR-Free Design & Swin Encoder","Donut: Decoder, Prompts & JSON Tokens","Donut: Pretraining, SynthDoG & Fine-Tuning","Donut: Evaluation, Ablations & Limits","Donut: DONUT-hole, Relatives & Practice"],
   "BERT":["BERT: Inputs, WordPiece & Encoder Stack","BERT: Masked-LM & NSP Pretraining","BERT: Fine-Tuning, Probing & Results","BERT: RoBERTa, ELECTRA & Successors"],
   "T5":["T5: Text-to-Text Format & Architecture","T5: C4, SentencePiece & Span Corruption","T5: Transfer Study, Recipe & Results","T5: v1.1, mT5, Flan-T5 & Successors"],
-  "GPT":["GPT: Autoregressive Objective & Causal Masking","GPT: Decoder Block, Configs & Training Data","GPT: GPT-1 to GPT-3 & In-Context Learning","GPT: Decoding, InstructGPT & GPT-4"],
+  "GPT":["GPT: Autoregressive Objective & Causal Masking","GPT: Decoder Block, Configs & Training Data","GPT: GPT-1 to GPT-3 & In-Context Learning","GPT: Decoding, InstructGPT & GPT-4","InstructGPT & RLHF"],
   "Whisper":["Whisper: Weak-Supervision Data & Architecture","Whisper: Multitask Tokens, Sizes & Training","Whisper: WER, Robustness & Multilingual Results","Whisper: Long-Form Decoding, Releases & Practice"],
   "LayoutLM":["LayoutLM: OCR Inputs, 2-D Positions & v1","LayoutLM: v2 Spatial Attention & LayoutXLM","LayoutLM: v3 Patches, Parameters & Benchmarks","LayoutLM: Fine-Tuning, Relatives & Practice"],
   "Llama":["Llama: LLaMA 1 Recipe & the Decoder Block","Llama: GQA, Configurations & Compute","Llama: Chat RLHF, Long Context & Llama 4","Llama: Licence, Ecosystem & Practice"],
@@ -697,7 +723,26 @@ const subtree = {
   "Descriptive Statistics":["Shape, Centre & Spread","Boxplots, z-Scores & Outliers","The ECDF, Plug-In & Two Variables"],
   "Calculus":["Limits, Derivatives & Integrals","Gradients, Jacobians & Matrix Differentials","Backprop & Automatic Differentiation"],
   "Eigendecomposition & SVD":["Eigenvalues & Diagonalization","The Singular Value Decomposition"],
+  // DL-foundations paper batch (2026-11): level-4 deep dives under the training sub-pages
+  "Gradient Descent & Optimizers":["Adam"],
+  "Normalization Layers & Training Regularization":["Batch Normalization","Dropout"],
   "Matrices & Rank":["The Matrix Zoo & Multiplication","Linear Maps & Change of Basis","Rank & the Four Fundamental Subspaces"],
+  "Parameter-Efficient Fine-Tuning":["LoRA","QLoRA"],
+  "Graph Neural Networks":["GCN"],        // batch: multimodal/graphs/new-arch papers
+  "State Space Models":["Mamba"],         // batch: multimodal/graphs/new-arch papers
+  /* LLM adaptation/alignment/use paper batch: child deep-dive pages */
+  "RAG":["RAG-Sequence & RAG-Token"],
+  "Policy / Preference Optimization":["DPO"],
+  "Reasoning in LLMs":["Chain-of-Thought Prompting"],
+  "Agents":["ReAct"],
+  /* sequence-models & transformers paper batch: child deep-dive pages
+     (also appended: "The Original Transformer (2017)" to "Transformers", "InstructGPT & RLHF" to "GPT") */
+  "Embeddings":["Word2Vec"],
+  "Machine Translation":["Seq2seq: Deep LSTM Translation","Learning to Align & Translate"],
+  "Vision Transformers":["ViT: Scale Beats Inductive Bias"],
+  /* RL & classical-ML paper batch: child deep-dive pages */
+  "Reinforcement Learning":["DQN","PPO"],
+  "Decision Trees & Ensembles":["XGBoost"],
   "Systems, Determinants & Inverses":["Gaussian Elimination & RREF","Determinants & the Inverse","LU, QR, Cholesky & Conditioning"],
 };
 
@@ -1265,6 +1310,13 @@ const cross = [
   ["LayoutLM","Document Intelligence"],["LayoutLM","Named Entity Recognition"],["LayoutLM","Question Answering"],["LayoutLM","Tokenization"],["LayoutLM","Attention"],["LayoutLM","Object Detection"],["LayoutLM","Vision-Language Models"],["LayoutLM","Fine-Tuning & Transfer Learning"],["LayoutLM","Transformers"],["LayoutLM","Vision Transformers"],
   ["Donut","Document Intelligence"],["Donut","Vision-Language Models"],["Donut","Transformers"],["Donut","Tokenization"],["Donut","Model Acceleration"],["Donut","NLP Evaluation Metrics"],["Donut","Question Answering"],["Donut","Fine-Tuning & Transfer Learning"],["Donut","Encoder vs Decoder Models"],["Donut","End-to-End Deep Learning"],["Donut","Knowledge Distillation"],["Donut","Attention"],
   ["Vector Databases (HNSW)","Embeddings"],["Vector Databases (HNSW)","RAG"],["Vector Databases (HNSW)","k-Nearest Neighbors"],["Vector Databases (HNSW)","Indexing"],["Vector Databases (HNSW)","NoSQL"],
+  // DL-foundations paper batch (2026-11): AlexNet, Adam, Dropout, Batch Normalization, ResNet, distillation
+  ["AlexNet","Image Classification"],["AlexNet","Dropout"],["AlexNet","Distributed Training"],["AlexNet","Gradient Flow & Initialization"],
+  ["Adam","Optimization"],["Adam","LR Schedules, Batch Size & Precision"],["Adam","VAE: ELBO & Reparameterization"],
+  ["Dropout","Regularization"],["Dropout","Boltzmann Machines & RBMs"],["Dropout","Batch Normalization"],
+  ["Batch Normalization","Residual / Skip Connections"],["Batch Normalization","Residual Stream, Norms & FFN"],["Batch Normalization","Gradient Flow & Initialization"],
+  ["Residual / Skip Connections","Image Classification"],["Residual / Skip Connections","Object Detection"],
+  ["Knowledge Distillation","Mixture of Experts"],["Knowledge Distillation","Image Classification"],["Knowledge Distillation","Speech Processing"],
   // wire in previously-isolated built DL pages
   ["GANs","Diffusion Models"],["GANs","Residual / Skip Connections"],["GANs","Neural Network Training"],["GANs","CLIP"],
   ["Graph Neural Networks","Embeddings"],["Graph Neural Networks","Knowledge Graphs"],["Graph Neural Networks","Neural Network Training"],
@@ -1312,7 +1364,7 @@ const cross = [
   ["Gaussian Processes","Support Vector Machines"],["Gaussian Processes","Hyperparameter Tuning"],["Gaussian Processes","Probability"],["Gaussian Processes","Linear Algebra"],["Gaussian Processes","Optimization"],
   ["Probabilistic Graphical Models","Naive Bayes"],["Probabilistic Graphical Models","Clustering (k-Means)"],["Probabilistic Graphical Models","Probability"],["Probabilistic Graphical Models","Knowledge Graphs"],["Probabilistic Graphical Models","Hidden Markov Models & CRFs"],
   ["EM Algorithm & Mixture Models","Clustering (k-Means)"],["EM Algorithm & Mixture Models","Probability"],["EM Algorithm & Mixture Models","Naive Bayes"],["EM Algorithm & Mixture Models","Dimensionality Reduction (PCA)"],["EM Algorithm & Mixture Models","Hidden Markov Models & CRFs"],["EM Algorithm & Mixture Models","Variational Inference"],
-  ["Variational Inference","Probability"],["Variational Inference","Autoencoders & VAEs"],["Variational Inference","Clustering (k-Means)"],["Variational Inference","Optimization"],["Variational Inference","Hidden Markov Models & CRFs"],["Variational Inference","EM Algorithm & Mixture Models"],
+  ["Variational Inference","Probability"],["Variational Inference","Autoencoders & VAEs"],["Variational Inference","Clustering (k-Means)"],["Variational Inference","Optimization"],["Variational Inference","Hidden Markov Models & CRFs"],
   ["Semi-Supervised Learning","Learning Paradigms"],["Semi-Supervised Learning","Contrastive Learning"],["Semi-Supervised Learning","Fine-Tuning & Transfer Learning"],["Semi-Supervised Learning","Clustering (k-Means)"],["Semi-Supervised Learning","Support Vector Machines"],
   ["Splines & GAMs","Linear & Logistic Regression"],["Splines & GAMs","Regularization"],["Splines & GAMs","Bias-Variance Tradeoff"],["Splines & GAMs","Model Evaluation"],["Splines & GAMs","Hyperparameter Tuning"],
 
@@ -1353,6 +1405,61 @@ const cross = [
   ["Dataset Engineering","Large Language Models"],["Dataset Engineering","Data Quality & Governance"],["Dataset Engineering","Data Preprocessing"],["Dataset Engineering","Tokenization"],["Dataset Engineering","Policy / Preference Optimization"],["Dataset Engineering","Parameter-Efficient Fine-Tuning"],["Dataset Engineering","LLM-as-a-Judge"],["Dataset Engineering","Model Evaluation"],
   ["GPU Kernels","Distributed Training"],["GPU Kernels","Neural Network Training"],["GPU Kernels","Model Acceleration"],["GPU Kernels","LLM Serving"],["GPU Kernels","Attention"],["GPU Kernels","Transformers"],
   ["Topic Modeling","Embeddings"],["Topic Modeling","Clustering (k-Means)"],["Topic Modeling","Dimensionality Reduction (PCA)"],["Topic Modeling","Text Classification"],["Topic Modeling","The Singular Value Decomposition"],["Topic Modeling","The Multivariate Normal & Mixtures"],
+  ["LoRA","Model Merging"],["LoRA","The Singular Value Decomposition"],["LoRA","Queries, Keys & Values"],["LoRA","Fine-Tuning & Transfer Learning"],["LoRA","LLM Serving"],
+  // ── paper-ingest batch: multimodal, graphs & newer architectures (GCN, Mamba) ──
+  ["GCN","Semi-Supervised Learning"],["GCN","Eigenvalues & Diagonalization"],["GCN","Graph Storage: Matrix, Lists & CSR"],["GCN","Residual / Skip Connections"],
+  ["Mamba","Parallel Prefix Sums & Scan"],["Mamba","LSTM & GRU Cells"],["Mamba","Sparse, Linear & Flash Attention"],["Mamba","GPU Kernels"],["Mamba","KV Cache, GQA & MLA"],
+  // ── end paper-ingest batch (GCN, Mamba) ──
+  // 2026-11 paper batch: LLM adaptation, alignment and use (QLoRA, RAG, DPO, CoT, ReAct)
+  ["QLoRA","LoRA"],["QLoRA","Model Acceleration"],["QLoRA","LLM-as-a-Judge"],["QLoRA","Dataset Engineering"],
+  ["RAG-Sequence & RAG-Token","Question Answering"],["RAG-Sequence & RAG-Token","Embeddings"],["RAG-Sequence & RAG-Token","Hallucination & Factuality"],["RAG-Sequence & RAG-Token","Vector Databases (HNSW)"],
+  ["DPO","Reinforcement Learning"],["DPO","Logistic Regression"],["DPO","GPT: Decoding, InstructGPT & GPT-4"],["DPO","Agent Learning"],
+  ["Chain-of-Thought Prompting","Prompt Engineering"],["Chain-of-Thought Prompting","Large Language Models"],["Chain-of-Thought Prompting","ReAct"],
+  ["ReAct","Agentic Design Patterns"],["ReAct","Hallucination & Factuality"],["ReAct","Computer Control"],["ReAct","Agent Learning"],
+  // 2026-11 paper batch: generative models (DDPM, Latent Diffusion)
+  ["DDPM","VAE: ELBO & Reparameterization"],["DDPM","Regularized Autoencoders & Manifolds"],["DDPM","Ergodic Averages, MCMC & Queues"],["DDPM","GANs"],
+  ["Latent Diffusion Models","β-VAE, Posterior Collapse & VQ-VAE"],["Latent Diffusion Models","Attention"],["Latent Diffusion Models","GANs"],["Latent Diffusion Models","DDPM"],
+  // 2026-11 stub-page batch: data systems, MLOps, data viz, vision, ML, R + merge-candidate stub ties
+  ["Image Classification","Object Detection"],["Image Classification","Fine-Tuning & Transfer Learning"],["Image Classification","Model Evaluation"],["Object Detection","Attention"],
+  ["Object Detection","Model Evaluation"],["R","Python"],["R","Pandas & NumPy"],["R","Regression & Correlation"],
+  ["R","Linear Regression"],["R","Survival Analysis"],["R","Splines & GAMs"],["R","Data Storytelling"],
+  ["Model Interpretability","Logistic Regression"],["Model Interpretability","Splines & GAMs"],["Model Interpretability","CNNs"],["Model Interpretability","Image Classification"],
+  ["Model Interpretability","Resampling (Bootstrap & Permutation)"],["Scalability","Parallel Scheduling & Scaling Laws"],["Scalability","Distributed Training"],["Scalability","Ergodic Averages, MCMC & Queues"],
+  ["Scalability","Load Balancing"],["Scalability","Caching"],["Scalability","Sharding & Replication"],["Load Balancing","Sharding & Replication"],
+  ["Load Balancing","LLM Serving"],["Load Balancing","Model Deployment"],["Load Balancing","Hash Functions & Compression"],["Caching","LLM Serving"],
+  ["Caching","Feature Stores"],["Caching","Embeddings"],["Caching","Modern Hash Tables & Bloom Filters"],["Message Queues","Ergodic Averages, MCMC & Queues"],
+  ["Message Queues","Stream Processing"],["Message Queues","Streaming (Kafka)"],["Message Queues","Transactions (ACID)"],["Message Queues","Monitoring & Drift"],
+  ["Distributed Storage","Hadoop & MapReduce"],["Distributed Storage","Apache Spark"],["Distributed Storage","Data Lakes"],["Distributed Storage","Warehouses & Lakehouses"],
+  ["Distributed Storage","Distributed Training"],["Distributed Storage","Data Warehousing"],["Indexing","SQL"],["Indexing","Transactions (ACID)"],
+  ["Indexing","Data Warehousing"],["Indexing","NoSQL"],["NoSQL","Sharding & Replication"],["NoSQL","CAP Theorem"],
+  ["NoSQL","Feature Stores"],["NoSQL","Caching"],["NoSQL","Graph Representations & Traversal"],["NoSQL","Relational & SQL"],
+  ["Transactions (ACID)","CAP Theorem"],["Transactions (ACID)","Sharding & Replication"],["Transactions (ACID)","SQL"],["Transactions (ACID)","Distributed Storage"],
+  ["CAP Theorem","Sharding & Replication"],["CAP Theorem","Distributed Storage"],["CAP Theorem","Feature Stores"],["CAP Theorem","Streaming (Kafka)"],
+  ["Sharding & Replication","Distributed Storage"],["Sharding & Replication","Message Queues"],["Sharding & Replication","Caching"],["Experiment Tracking","Hyperparameter Tuning"],
+  ["Experiment Tracking","Model Evaluation"],["Experiment Tracking","ANOVA & Multiple Comparisons"],["Experiment Tracking","CI/CD"],["Model Deployment","A/B Testing"],
+  ["Model Deployment","LLM Serving"],["Model Deployment","Stream Processing"],["CI/CD","Data Quality & Governance"],["CI/CD","Hypothesis Testing"],
+  ["CI/CD","Model Deployment"],["CI/CD","ETL Pipelines"],["Dashboards","Descriptive Statistics"],["Dashboards","Data Warehousing"],
+  ["Dashboards","Data Storytelling"],["Dashboards","Caching"],["Data Storytelling","Model Interpretability"],["Data Storytelling","Estimation & Confidence Intervals"],
+  ["Data Storytelling","Model Evaluation"],["Data Storytelling","A/B Testing"],["Relational & SQL","SQL"],["Relational & SQL","Transactions (ACID)"],
+  ["Relational & SQL","Indexing"],["Streaming (Kafka)","Stream Processing"],["Data Lakes","Data Warehousing"],["Warehouses & Lakehouses","Data Warehousing"],
+  ["Warehouses & Lakehouses","Data Lakes"],
+  // 2026-11 stub-page batch: data engineering + Spark/Hadoop
+  ["Hadoop & MapReduce","Apache Spark"],["Hadoop & MapReduce","Sharding & Replication"],["Hadoop & MapReduce","Parallel Algorithms"],["Apache Spark","ETL Pipelines"],
+  ["Apache Spark","Data Warehousing"],["Apache Spark","Feature Stores"],["Apache Spark","Distributed Training"],["ETL Pipelines","Data Warehousing"],
+  ["ETL Pipelines","Stream Processing"],["ETL Pipelines","Transactions (ACID)"],["ETL Pipelines","Feature Stores"],["Data Warehousing","Transactions (ACID)"],
+  ["Data Warehousing","Feature Stores"],["Stream Processing","Feature Stores"],["Stream Processing","Monitoring & Drift"],["Stream Processing","Sharding & Replication"],
+  ["Feature Stores","Embeddings"],["Feature Stores","Vector Databases (HNSW)"],["Feature Stores","Monitoring & Drift"],
+  // --- sequence-models & transformers paper batch (word2vec, seq2seq, align&translate, Transformer, InstructGPT, ViT) cross edges ---
+  ["Word2Vec","Language Models"],["Word2Vec","Huffman Coding & Prefix Codes"],["Word2Vec","Contrastive Learning"],
+  ["Seq2seq: Deep LSTM Translation","Bidirectional, Stacked & Seq2seq RNNs"],["Seq2seq: Deep LSTM Translation","LSTM & GRU Cells"],["Seq2seq: Deep LSTM Translation","Encoder vs Decoder Models"],
+  ["Learning to Align & Translate","Alignment, Scores & Scaling"],["Learning to Align & Translate","Attention"],["Learning to Align & Translate","Seq2seq: Deep LSTM Translation"],
+  ["The Original Transformer (2017)","Machine Translation"],["The Original Transformer (2017)","Multi-Head Attention & Masking"],["The Original Transformer (2017)","Transformer Training & Decoding"],["The Original Transformer (2017)","Learning to Align & Translate"],
+  ["InstructGPT & RLHF","Policy / Preference Optimization"],["InstructGPT & RLHF","PPO"],["InstructGPT & RLHF","Hallucination & Factuality"],["InstructGPT & RLHF","GPT: Decoding, InstructGPT & GPT-4"],
+  ["ViT: Scale Beats Inductive Bias","CNNs"],["ViT: Scale Beats Inductive Bias","Transformers"],["ViT: Scale Beats Inductive Bias","Image Classification"],["ViT: Scale Beats Inductive Bias","Fine-Tuning & Transfer Learning"],
+  // --- RL & classical-ML paper batch (DQN, PPO, XGBoost) cross edges ---
+  ["DQN","CNNs"],["DQN","Gradient Descent & Optimizers"],["DQN","PPO"],
+  ["PPO","Policy / Preference Optimization"],["PPO","Agentic RL"],["PPO","Monte Carlo Estimation & Variance Reduction"],["PPO","Gradient Descent & Optimizers"],
+  ["XGBoost","Regularization"],["XGBoost","Optimization"],["XGBoost","Sample Quantiles & Extreme Values"],["XGBoost","Data Preprocessing"],
 ];
 
 /* ---- derived (shared by graph + sidebars) ---- */

@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Scalability</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Scalability — Scaling Up, Scaling Out, and Why It Stops</h1>
+      <p>A system is <b>scalable</b> if adding resources buys a proportional increase in the load it can carry, without latency falling apart. This page is the overview for the scaling patterns — <a href="load-balancing.html">load balancing</a>, <a href="caching.html">caching</a>, <a href="sharding-replication.html">sharding &amp; replication</a>, <a href="message-queues.html">queues</a> — and for the three laws that tell you where scaling stops paying: <b>Amdahl</b>, the <b>Universal Scalability Law</b>, and <b>Little's law</b>.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Systems</span>
+        <span class="pill">Capacity Planning</span>
+        <span class="pill">Queueing</span>
+        <span class="pill">Tail Latency</span>
+      </div>
+    </header>
+
+    <section class="topic" id="what">
+      <h3><span class="idx">01</span> What "scalable" actually means</h3>
+      <p class="lede">"Scalable" is not a property a system has; it is a question: <i>if load grows along this axis, what do we do, and what does it cost?</i> Answering it needs two vocabularies — how you describe load, and how you describe performance.</p>
+      <ul class="notes">
+        <li><b>Load parameters</b> are the numbers that describe demand: requests/s, read:write ratio, concurrent users, data volume, fan-out per request, hot-key skew. A system that handles 10× more users may still die at 10× more <i>writes per user</i>.</li>
+        <li><b>Performance</b> is <b>throughput</b> (work completed per second) and <b>latency</b> (time per request) — and latency is a <i>distribution</i>, not a number. Report percentiles: p50, p95, p99, p99.9.</li>
+        <li><b>Scalability</b> is the slope: how throughput changes as you add capacity <code>N</code>, and whether latency percentiles hold steady while it does. <b>Elasticity</b> is the operational version — how fast capacity can follow load up <i>and back down</i>.</li>
+      </ul>
+      <div class="callout"><b>One line:</b> a scalable design keeps the <b>cost per unit of load</b> roughly flat as load grows — the laws below explain the three forces (serial work, contention, coherence) that bend that line upward.</div>
+    </section>
+
+    <section class="topic" id="updown">
+      <h3><span class="idx">02</span> Vertical vs horizontal scaling</h3>
+      <table class="cmp">
+        <tr><th></th><th>Scale up (vertical)</th><th>Scale out (horizontal)</th></tr>
+        <tr><td><b>Move</b></td><td>Bigger machine: more cores, RAM, faster disks/GPUs</td><td>More machines behind a <a href="load-balancing.html">load balancer</a> or partitioned by key</td></tr>
+        <tr><td><b>Ceiling</b></td><td>Hard — the largest box you can buy; price grows super-linearly near the top</td><td>Soft — bounded by coordination cost (contention, coherence)</td></tr>
+        <tr><td><b>Complexity</b></td><td>Low: no distribution, no partial failure, transactions stay local</td><td>High: networks partition, nodes fail independently, data must be split (<a href="cap-theorem.html">CAP</a> applies)</td></tr>
+        <tr><td><b>Failure model</b></td><td>Single point of failure unless paired with a standby</td><td>Redundancy is natural; losing one of N nodes costs 1/N capacity</td></tr>
+        <tr><td><b>Best for</b></td><td>Stateful cores — a primary database, a big in-memory index, a single large model</td><td>Stateless tiers — web/API servers, inference replicas, workers</td></tr>
+      </table>
+      <ul class="notes">
+        <li>Real systems do both: scale the <b>stateless</b> tiers out cheaply and keep the <b>stateful</b> core vertical as long as possible, then <a href="sharding-replication.html">shard</a> it when a single node runs out. Premature sharding is one of the most expensive mistakes in data systems.</li>
+        <li><b>Diagonal scaling:</b> pick the instance size with the best price/performance, then scale out in units of that size.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="stateless">
+      <h3><span class="idx">03</span> Statelessness — the precondition for scaling out</h3>
+      <ul class="notes">
+        <li>A <b>stateless</b> server keeps nothing between requests that another replica would need: any request can go to any instance. That makes replicas interchangeable, so you can add, remove, restart or autoscale them freely.</li>
+        <li>State does not disappear — it <b>moves</b> to a dedicated tier: sessions into a shared <a href="caching.html">cache</a> or signed tokens, durable data into a database, files into <a href="distributed-storage.html">object storage</a>, work-in-progress into a <a href="message-queues.html">queue</a>.</li>
+        <li><b>The hidden-state traps:</b> local disk caches, in-process rate-limit counters, scheduled jobs that run "on one box", WebSocket connections, and in-memory model warm-up. Each one quietly breaks interchangeability.</li>
+        <li>For ML serving, model weights are read-only state — replicas stay effectively stateless, but <b>cold start</b> (pulling multi-GB weights, compiling kernels) is what limits elasticity. KV caches in <a href="../mlops/llm-serving.html">LLM serving</a> are per-replica state, which is why routing becomes cache-aware.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="amdahl">
+      <h3><span class="idx">04</span> Amdahl's law — the serial fraction caps the speed-up</h3>
+      <p class="lede">If a fraction <code>p</code> of the work parallelises perfectly and <code>1 − p</code> is inherently serial, then N workers give at most:</p>
+      <div class="formula"><span class="eq">S(N) = 1 / ( (1 − p) + p / N )</span>      <span class="eq">lim<sub>N→∞</sub> S(N) = 1 / (1 − p)</span></div>
+      <ul class="notes">
+        <li>With <code>p = 0.95</code> the ceiling is <b>20×</b>, no matter how many nodes you buy; at 64 nodes you already have 15.4×. The serial 5% — a global lock, a single coordinator, one un-sharded table — owns the result.</li>
+        <li><b>Gustafson's view</b> is the optimistic counterpart: if the problem grows with the machine (bigger datasets, more users), the scaled speed-up is <code>S(N) = (1 − p) + p·N</code>. Both are right; they answer different questions (fixed work vs fixed time).</li>
+        <li>Amdahl assumes coordination costs <i>nothing</i> beyond the serial part. Real clusters pay extra for every node they add — that is what the USL models. The algorithmic side (work, span, Brent's bound) is in <a href="../dsa/algorithms/parallel/scheduling-scaling.html">Parallel Scheduling &amp; Scaling Laws</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="usl">
+      <h3><span class="idx">05</span> The Universal Scalability Law — contention σ and coherence κ</h3>
+      <p class="lede">The USL adds a second penalty to Amdahl: nodes must keep each other <b>consistent</b>, and that cost grows with the number of <i>pairs</i> of nodes. Relative capacity at N nodes is:</p>
+      <div class="formula"><span class="eq">C(N) = N / ( 1 + σ·(N − 1) + κ·N·(N − 1) )</span><br>
+<span class="eq">N* = √( (1 − σ) / κ )</span>      <span class="lbl">(peak: adding nodes past <span class="keep">N*</span> reduces throughput)</span></div>
+      <table class="cmp">
+        <tr><th>Term</th><th>Physical cause</th><th>Effect on the curve</th></tr>
+        <tr><td><b>σ</b> contention</td><td>Queueing on a shared resource: a lock, a primary DB, a single partition, one coordinator</td><td>Throughput saturates at <code>1/σ</code> (this is Amdahl with <code>σ = 1 − p</code>)</td></tr>
+        <tr><td><b>κ</b> coherence (crosstalk)</td><td>Pairwise agreement: cache invalidation, distributed locks, gossip, all-reduce, two-phase commit</td><td>Throughput <b>peaks and then falls</b> — retrograde scaling</td></tr>
+      </table>
+      <div class="viz" id="viz-usl">
+        <div class="vhead">
+          <span class="vtitle">Amdahl vs USL — throughput as nodes are added</span>
+          <span class="vhint">drag σ and κ; the orange marker is your cluster size</span>
+        </div>
+        <div class="controls">
+          <label>contention σ <input type="range" id="usl-s" min="0" max="0.2" step="0.005" value="0.04"><span id="usl-s-v" class="lbl"></span></label>
+          <label>coherence κ <input type="range" id="usl-k" min="0" max="0.003" step="0.0001" value="0.0006"><span id="usl-k-v" class="lbl"></span></label>
+          <label>nodes N <input type="range" id="usl-n" min="1" max="128" step="1" value="24"><span id="usl-n-v" class="lbl"></span></label>
+        </div>
+        <svg id="usl-svg" width="640" height="280" viewBox="0 0 640 280" role="img" aria-label="Interactive chart: relative throughput versus number of nodes for linear, Amdahl and Universal Scalability Law models"></svg>
+        <div class="legend"><span><span class="dot" style="background:#9aa3b2"></span>ideal linear</span><span><span class="dot" style="background:#5b9cff"></span>Amdahl (κ = 0)</span><span><span class="dot" style="background:#4ade80"></span>USL</span></div>
+        <div class="readout" aria-live="polite" id="usl-read"></div>
+      </div>
+      <ul class="notes">
+        <li><b>Fitting the USL</b> needs only a handful of load-test points (N, throughput). Fit σ and κ by regression, then read off N* <i>before</i> you buy the hardware. A κ that is non-zero but tiny still sets a peak — it is just far away.</li>
+        <li>Reducing <b>σ</b> means removing shared bottlenecks (partition the hot table, shard the lock). Reducing <b>κ</b> means removing all-to-all chatter (avoid broadcast invalidation, prefer leader-based or partitioned designs, shrink the consistency domain).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="little">
+      <h3><span class="idx">06</span> Little's law, throughput vs latency, and the utilisation knee</h3>
+      <p class="lede">For any stable system — a server, a queue, a whole data centre — the average number of requests inside equals arrival rate times average time spent inside:</p>
+      <div class="formula"><span class="eq">L = λ · W</span>      <span class="lbl">(<span class="keep">L</span> = in-flight requests · <span class="keep">λ</span> = throughput · <span class="keep">W</span> = mean latency)</span></div>
+      <ul class="notes">
+        <li>It is distribution-free and indispensable for sizing: 5 000 req/s at 80 ms mean latency means <b>400 requests in flight</b> — that is your required concurrency (threads, connections, GPU batch slots) across the fleet.</li>
+        <li><b>Throughput and latency are not independent.</b> As utilisation <code>ρ = λ / (c·μ)</code> approaches 1, queues form and waiting time explodes. For a single M/M/1 server <code>W = 1 / (μ − λ)</code> — at ρ = 0.5 latency is 2× the service time, at ρ = 0.9 it is 10×, at ρ = 0.99 it is 100×. The derivation and simulation live in <a href="message-queues.html">Message Queues</a>.</li>
+        <li>This is why capacity plans target <b>50–70% utilisation</b> at peak, not 100%: the headroom is what keeps p99 flat. "We are only at 85% CPU" is not good news for tail latency.</li>
+        <li><b>Throughput-oriented</b> systems (batch ETL, training, offline inference) run hot and accept queueing; <b>latency-oriented</b> systems (online serving, search) run cool and buy headroom.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="tail">
+      <h3><span class="idx">07</span> Tail latency and fan-out</h3>
+      <p class="lede">At scale, the <b>slowest</b> responses dominate. If a request fans out to n servers and waits for all of them, it is slow whenever <i>any</i> leaf is slow:</p>
+      <div class="formula"><span class="eq">P(request is slow) = 1 − (1 − q)ⁿ</span>      <span class="lbl">(<span class="keep">q</span> = chance one leaf exceeds its p99 → <span class="keep">q = 0.01</span>)</span></div>
+      <div class="viz" id="viz-tail">
+        <div class="vhead">
+          <span class="vtitle">Fan-out amplifies the tail</span>
+          <span class="vhint">one leaf's p99 becomes the request's median</span>
+        </div>
+        <div class="controls">
+          <label>fan-out n <input type="range" id="tl-n" min="1" max="200" step="1" value="100"><span id="tl-n-v" class="lbl"></span></label>
+          <label>per-leaf slow prob q <input type="range" id="tl-q" min="0.001" max="0.05" step="0.001" value="0.01"><span id="tl-q-v" class="lbl"></span></label>
+          <label><input type="checkbox" id="tl-h"> hedged requests</label>
+        </div>
+        <svg id="tl-svg" width="640" height="220" viewBox="0 0 640 220" role="img" aria-label="Interactive chart: probability a fan-out request is slow as fan-out grows, with and without hedged requests"></svg>
+        <div class="readout" aria-live="polite" id="tl-read"></div>
+      </div>
+      <ul class="notes">
+        <li>With q = 1% and n = 100, <b>63%</b> of user requests see at least one p99-slow leaf. Tail behaviour of the parts becomes the median behaviour of the whole.</li>
+        <li><b>Causes of tail latency:</b> GC pauses, noisy neighbours, background compaction, queueing bursts, cold caches, retransmits, and long-tailed service time distributions (see <a href="../math/probability/continuous-distributions/heavy-tails-transforms.html">heavy tails</a>).</li>
+        <li><b>Tail-tolerant techniques:</b> <i>hedged requests</i> (send a duplicate to another replica after the p95 deadline; take the first reply — costs a few % extra load), <i>tied requests</i> (both copies cancel each other once one starts), timeouts with retry budgets, and <i>partial results</i> (answer from 98% of shards).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="envelope">
+      <h3><span class="idx">08</span> Back-of-envelope capacity planning</h3>
+      <p class="lede">Estimates within 2× are enough to choose an architecture. Know the orders of magnitude:</p>
+      <table class="cmp">
+        <tr><th>Operation</th><th>Approximate cost</th></tr>
+        <tr><td>L1 cache hit · main-memory reference</td><td>~1 ns · ~100 ns</td></tr>
+        <tr><td>NVMe SSD random read</td><td>~20–100 µs</td></tr>
+        <tr><td>Round trip within a data centre</td><td>~0.2–0.5 ms</td></tr>
+        <tr><td>In-memory cache lookup over the network</td><td>~0.2–1 ms</td></tr>
+        <tr><td>Spinning-disk seek</td><td>~5–10 ms</td></tr>
+        <tr><td>Cross-continent round trip</td><td>~70–150 ms</td></tr>
+        <tr><td>Seconds per day</td><td>86 400 ≈ 10⁵</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">Worked example — an API with 10 M daily users, 20 requests each</span><br>
+<span class="eq">average rate = 10⁷ × 20 / 86 400 ≈ 2 300 req/s</span>      <span class="eq">peak ≈ 3 × average ≈ 7 000 req/s</span><br>
+<span class="eq">per server: 16 cores / 20 ms CPU per request = 800 req/s at 100%  →  480 req/s at 60% target</span><br>
+<span class="eq">servers = 7 000 / 480 ≈ 15  →  +2 for N+2 redundancy  →  17</span><br>
+<span class="eq">in flight (Little): L = 7 000 × 0.1 s = 700 concurrent requests</span><br>
+<span class="eq">storage: 2 KB written / user / day → 20 GB/day ≈ 7.3 TB/yr → × 3 replicas ≈ 22 TB/yr</span></div>
+      <ul class="notes">
+        <li>Always size for <b>peak, not average</b>, then add failure headroom (N+1 or N+2, or a whole zone's worth). Check every tier — the database and the network usually saturate before the stateless servers.</li>
+        <li>Write the estimate down with its assumptions; the useful output is knowing <i>which</i> assumption, if wrong by 10×, changes the design.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="patterns">
+      <h3><span class="idx">09</span> The scaling toolbox — which pattern removes which bottleneck</h3>
+      <table class="cmp">
+        <tr><th>Bottleneck</th><th>Pattern</th><th>What it costs you</th></tr>
+        <tr><td>One server cannot handle the request rate</td><td><a href="load-balancing.html">Load balancing</a> across stateless replicas</td><td>Health checking, connection management, session handling</td></tr>
+        <tr><td>Repeated reads of the same data</td><td><a href="caching.html">Caching</a> (CDN, Redis, in-process)</td><td>Staleness, invalidation bugs, stampedes</td></tr>
+        <tr><td>Read load on a database</td><td>Read <a href="sharding-replication.html">replicas</a></td><td>Replication lag, read-your-writes anomalies</td></tr>
+        <tr><td>Write load or data size on a database</td><td><a href="sharding-replication.html">Sharding</a> / partitioning</td><td>Cross-shard queries and transactions, rebalancing, hot keys</td></tr>
+        <tr><td>Bursty or slow work on the request path</td><td><a href="message-queues.html">Message queues</a> and async workers</td><td>Eventual completion, retries, idempotency, ordering</td></tr>
+        <tr><td>Data larger than one machine</td><td><a href="distributed-storage.html">Distributed storage</a> and parallel compute (<a href="hadoop-mapreduce.html">MapReduce</a>, <a href="../programming/apache-spark.html">Spark</a>)</td><td>Replication overhead, data locality, small-file problems</td></tr>
+        <tr><td>Slow queries</td><td><a href="indexing.html">Indexing</a>, denormalisation, precomputation</td><td>Write amplification, storage, consistency of derived data</td></tr>
+      </table>
+      <p>Every row trades <b>consistency or simplicity for capacity</b> — the formal statement of that trade is the <a href="cap-theorem.html">CAP theorem</a>, and the per-row cost is what <a href="transactions-acid.html">transactions</a> no longer guarantee you once data spans machines.</p>
+    </section>
+
+    <section class="topic" id="ml">
+      <h3><span class="idx">10</span> Scaling ML systems</h3>
+      <ul class="notes">
+        <li><b>Online inference</b> scales out like any stateless service, but with GPU-specific twists: batching raises throughput at the price of latency, so autoscale on <b>queue depth or in-flight requests</b>, not CPU. See <a href="../mlops/llm-serving.html">LLM Serving</a> and <a href="../mlops/model-acceleration.html">Model Acceleration</a> (quantisation shrinks the per-replica cost).</li>
+        <li><b>Training</b> is a USL textbook case: data-parallel all-reduce is a coherence cost (κ), the parameter server or a slow data loader is contention (σ). Throughput per GPU dropping as you add GPUs is retrograde scaling in action — see <a href="../deep-learning/distributed-training.html">Distributed Training</a>.</li>
+        <li><b>Feature and embedding lookups</b> fan out per request — exactly the tail-latency setting of §07. <a href="../data-engineering/feature-stores.html">Feature stores</a> and <a href="vector-databases.html">vector databases</a> are scaled with caching, replication and sharding.</li>
+        <li><b>Data pipelines</b> are throughput-oriented: scale out with partitioned <a href="../data-engineering/stream-processing.html">stream processing</a> and batch <a href="../data-engineering/etl-pipelines.html">ETL</a>, and watch for skewed partitions (a hot key is σ in disguise).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">11</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Describe load and performance precisely</b> — load parameters plus latency percentiles, never averages alone.</li>
+        <li><b>Scale stateless tiers out; keep stateful cores up</b> until they cannot fit, then partition.</li>
+        <li><b>Amdahl:</b> serial work caps speed-up at <code>1/(1−p)</code>. <b>USL:</b> coherence <code>κ</code> makes throughput peak at <code>N* = √((1−σ)/κ)</code> and then fall.</li>
+        <li><b>Little's law</b> <code>L = λW</code> sizes concurrency; utilisation near 1 explodes latency — plan for 50–70%.</li>
+        <li><b>Fan-out turns rare slowness into common slowness</b>; hedge, time out, and degrade gracefully.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="scalability.viz.js"></script>
+</body>
+</html>

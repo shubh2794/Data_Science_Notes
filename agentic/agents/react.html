@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · ReAct: Reasoning and Acting, Interleaved</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../agents.html">Agents</a> · deep dive</p>
+      <h1>ReAct: Reasoning and Acting, Interleaved</h1>
+      <p>Let a language model emit free-text <b>thoughts</b> between its <b>actions</b>, and feed every observation back into the prompt. This page goes past the loop diagram: the augmented action space in which a thought is an action that changes only the context, which kinds of thought the original study found useful, why thoughts are dense for question answering and sparse for embodied tasks, the reported numbers on multi-hop QA, fact verification, a text game and a shopping site, the error analysis that explains why ReAct alone <i>loses</i> to chain-of-thought on one benchmark, the two hybrids that fix it, fine-tuning on ReAct trajectories, and where the method stops.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Agentic AI</span>
+        <span class="pill">Agents</span>
+        <span class="pill">Â = A ∪ L · thoughts · HotpotQA · FEVER · ALFWorld · WebShop · error analysis · ReAct ⇄ CoT-SC · fine-tuning · limits</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="motivation" data-nav="Two halves, studied apart">
+      <h3><span class="idx">01</span> The gap it targets: reasoning and acting were studied apart</h3>
+      <p class="lede"><b>Chain-of-thought prompting reasons over the model's own internal knowledge and never checks it against the world; action-generation work plans and acts in environments but does not reason in language about what it is doing.</b> The original study asks what happens if one frozen model does both in a single trajectory, each half informing the other.</p>
+
+      <ul class="notes">
+        <li><b>Reason-only is a static black box.</b> A <a href="../../llm/reasoning-in-llms/chain-of-thought.html">chain of thought</a> is generated from parameters alone. It cannot look anything up, so it cannot update a wrong premise — the study names fact hallucination and error propagation as its failure.</li>
+        <li><b>Act-only has no working memory of its own intent.</b> A model that maps observations straight to actions has nowhere to write down the goal, what it has learned so far, or what to try next. It must infer all of that, every step, from a raw action history.</li>
+        <li><b>The synergy claimed</b> runs both ways: <i>reason to act</i> (thoughts create, maintain and adjust plans) and <i>act to reason</i> (actions fetch external information that the next thought can use). The hub's <a href="../agents.html#loop">agent-loop section</a> has the generic Reason → Act → Observe stepper and the short argument for why interleaving beats either half; this page is the evidence behind it.</li>
+      </ul>
+      <div class="callout"><b>What the method is not.</b> No new training objective, no new architecture, no reward. The headline results come from a frozen 540B-parameter model prompted with one to six hand-written example trajectories. Fine-tuning appears only as a secondary experiment (§08).</div>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="formalism" data-nav="The augmented action space">
+      <h3><span class="idx">02</span> The formalism: a thought is an action that touches only the context</h3>
+      <p class="lede">Start from an ordinary agent interacting with an environment, then enlarge its action space with the space of all language. That one move is the whole method.</p>
+
+      <div class="formula"><span class="lbl">the base agent</span><span class="eq">at step t the agent receives an observation  oₜ ∈ O  and takes an action  aₜ ∈ A
+
+context     cₜ  =  (o₁, a₁, o₂, a₂, …, oₜ₋₁, aₜ₋₁, oₜ)
+policy      aₜ  ~  π(aₜ | cₜ)</span>
+<span class="lbl">the ReAct augmentation</span><span class="eq">Â  =  A ∪ L                       L = the space of language
+
+if  âₜ ∈ A   (an action):    the environment steps and returns oₜ₊₁
+                              cₜ₊₁  =  (cₜ, âₜ, oₜ₊₁)
+
+if  âₜ ∈ L   (a thought):    the environment is NOT touched, no observation is returned
+                              cₜ₊₁  =  (cₜ, âₜ)</span></div>
+
+      <ul class="notes">
+        <li><b>The thought's only effect is on the future policy.</b> Because <code>π</code> conditions on the whole context, writing "the composer is Ilse Varn; next I need her birthplace" into <code>cₜ₊₁</code> changes every later action distribution. The thought is a self-addressed message — a computed summary of the context placed where the next step will read it.</li>
+        <li><b>Why this is hard to learn, and why it is prompted.</b> <code>L</code> is unbounded, so learning a policy over <code>Â</code> from reward alone would need enormous exploration. The study's answer is to borrow a strong language prior: a large frozen model, shown a few example trajectories in the prompt, already produces sensible thoughts in the right format.</li>
+        <li><b>In the text interface</b> this is just alternating lines — <code>Thought:</code>, <code>Action:</code>, <code>Observation:</code> — where the runtime fills in observation lines and the model writes the rest. The model decides when it has written a thought and when it has written an action; the runtime only acts on the latter.</li>
+      </ul>
+
+      <div class="formula"><span class="lbl">the three prompting baselines as restrictions of the same trajectory</span><span class="eq">ReAct      thoughts + actions + observations        policy over Â = A ∪ L
+Act        drop the thoughts                         policy over A only
+CoT        drop actions and observations             one pass over L, then the answer
+Standard   drop everything                           question → answer</span></div>
+      <p>The baselines in §04–§09 are built exactly this way, by deleting parts of the same hand-written ReAct exemplars, so the comparison isolates what the thoughts and the actions each contribute.</p>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="thoughts" data-nav="Useful thoughts; dense vs sparse">
+      <h3><span class="idx">03</span> What a useful thought does — and how often to have one</h3>
+      <p class="lede">The study lists the jobs thoughts did in its trajectories. None of them is "reason harder about the answer" in the abstract; almost all are about managing the interaction itself.</p>
+
+      <div class="cards">
+        <div class="box good"><div class="n">plan</div><div class="t">Decompose the goal</div><div class="g">Break the task into sub-goals and write an action plan ("I need X, then Y, then Z").</div></div>
+        <div class="box good"><div class="n">knowledge</div><div class="t">Inject commonsense</div><div class="g">Bring in task-relevant background ("a pepper shaker is more likely on a countertop or in a cabinet").</div></div>
+        <div class="box good"><div class="n">read</div><div class="t">Extract from observations</div><div class="g">Pull the one fact that matters out of a long observation, so it sits in the context in usable form.</div></div>
+        <div class="box good"><div class="n">progress</div><div class="t">Track progress, switch plans</div><div class="g">Note which sub-goal is done and move on to the next.</div></div>
+        <div class="box warn"><div class="n">recover</div><div class="t">Handle exceptions, adjust the plan</div><div class="g">Notice that a search came back empty or an object is not where expected, and change course.</div></div>
+      </div>
+      <p style="font-size:12.5px;color:var(--muted)">The five categories are the study's list. The pepper-shaker phrasing paraphrases the style of its embodied-task exemplars; it is not a quoted line.</p>
+
+      <h4>Dense thoughts for reasoning tasks, sparse thoughts for decision tasks</h4>
+      <table class="grid2">
+        <tr><th style="width:170px"></th><th>knowledge-intensive reasoning (HotpotQA, FEVER)</th><th>decision making (ALFWorld, WebShop)</th></tr>
+        <tr><td><b>pattern</b></td><td>strict alternation: thought, action, observation, thought, action, …</td><td>the model decides for itself when a thought occurs; most steps are bare actions</td></tr>
+        <tr><td><b>why</b></td><td>reasoning is the main work; every retrieval needs interpreting and the next query composing</td><td>trajectories run to many actions; thoughts are needed only at a few key positions (start of a sub-goal, a surprise, the end)</td></tr>
+        <tr><td><b>episode length</b></td><td>a handful of steps — the hybrids in §06 cap ReAct at 7 (HotpotQA) or 5 (FEVER)</td><td>long: an ALFWorld task can have more than 50 locations and take an expert policy more than 50 steps</td></tr>
+      </table>
+      <div class="callout"><b>The design lesson.</b> "Think before every action" is the knowledge-task setting, not the method. For long action sequences the study deliberately let thoughts be sparse and asynchronous — and §09 shows that forcing a narrower, more regular kind of thought there does worse.</div>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="kt-setup" data-nav="QA & fact-checking setup">
+      <h3><span class="idx">04</span> Knowledge-intensive tasks: the setup</h3>
+      <p class="lede">Two benchmarks that reward finding facts, an action space of three text commands over Wikipedia, and a frozen PaLM-540B prompted with six or three examples.</p>
+
+      <ul class="notes">
+        <li><b>HotpotQA</b> — multi-hop <a href="../../nlp/question-answering.html#open-domain">question answering</a> that needs reasoning over two or more Wikipedia passages. Scored by exact match (EM).</li>
+        <li><b>FEVER</b> — fact verification: each claim is labelled SUPPORTS, REFUTES or NOT ENOUGH INFO according to whether a Wikipedia passage verifies it. Scored by accuracy.</li>
+        <li><b>Question-only setup.</b> The model receives only the question or claim — <i>not</i> the supporting paragraphs. Everything beyond its parameters must come through the actions below. This is what makes the tasks a test of acting, and what makes it a cousin of <a href="../../nlp/retrieval-augmented-generation.html">retrieval-augmented generation</a> with the model itself writing the queries.</li>
+      </ul>
+
+      <table class="grid2">
+        <tr><th style="width:170px">action</th><th>what the environment returns</th></tr>
+        <tr><td><code>search[entity]</code></td><td>the first 5 sentences of the entity's Wikipedia page if it exists; otherwise the top-5 similar entity names from the Wikipedia search engine</td></tr>
+        <tr><td><code>lookup[string]</code></td><td>the next sentence in the current page containing <code>string</code> — a simulated Ctrl+F</td></tr>
+        <tr><td><code>finish[answer]</code></td><td>ends the episode with <code>answer</code></td></tr>
+      </table>
+      <p>The interface is deliberately weak — far weaker than a modern retriever — so the model has to retrieve the way a person browses: by name, then by keyword inside a page. The point was to study reasoning-guided retrieval, not to win on retrieval quality.</p>
+
+      <h4>Prompts and baselines</h4>
+      <ul class="notes">
+        <li><b>Exemplars:</b> 6 HotpotQA and 3 FEVER cases drawn at random from the training set, each hand-written as a ReAct trajectory. The study reports that more examples did not improve performance.</li>
+        <li><b>Standard</b>, <b>CoT</b> and <b>Act</b> prompts are the same trajectories with parts deleted (§02's table).</li>
+        <li><b>CoT-SC</b> — <a href="../../llm/reasoning-in-llms.html#self-consistency">self-consistency</a>: sample 21 CoT trajectories at temperature 0.7 and take the majority answer.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="trajectories" data-nav="Four trajectories, side by side">
+      <h3><span class="idx">05</span> Four prompting styles on one question</h3>
+      <p class="lede">The original study's opening figure runs the four prompts on one HotpotQA question and shows the characteristic failure of each. The figure below does the same on a question <b>written for this page</b>, over a five-page toy encyclopedia, so that every fact can be checked against the table underneath.</p>
+
+      <div class="viz" id="viz-tr">
+        <div class="vhead">
+          <span class="vtitle">Standard · CoT (reason only) · Act only · ReAct — stepped in parallel</span>
+          <span class="vhint">illustrative, written for this page — not a trajectory from the study; step through and watch where each lane goes wrong</span>
+        </div>
+        <div class="controls">
+          <label>step <input type="range" id="tr-step" min="0" max="17" step="1" value="0" /><span id="tr-stepv" style="min-width:36px;display:inline-block">0 / 17</span></label>
+          <button id="tr-prev" type="button">◂ back</button>
+          <button id="tr-next" type="button">next step ▸</button>
+          <button id="tr-play" type="button">play</button>
+          <button id="tr-reset" type="button">reset</button>
+          <label><input type="checkbox" id="tr-marks" checked /> mark failures and grounding</label>
+        </div>
+        <svg id="tr-svg" width="760" height="724" viewBox="0 0 760 724" role="img" aria-label="Four side-by-side columns, one per prompting style, answering the same toy multi-hop question: how long is the river that flows through the birthplace of the composer of the opera Glass Harbour. The step control reveals one more line in every column at a time. The Standard column gives a single wrong answer, 340 km, with no visible steps. The chain-of-thought column correctly recalls the composer but then states a hallucinated birthplace, the valley name Tessel instead of the town Merrow, and reasons on to a wrong answer of 90 km; those lines are marked in red. The act-only column issues the right first searches and even retrieves the birthplace sentence, but with no thought to extract the town it searches the valley instead, gets a useless result and finishes with a place name rather than a length; the drift is marked in amber. The ReAct column writes a plan, recovers from a failed first search by reformulating it, uses a thought to pick the town out of the birthplace observation, follows the town to its river, and finishes with the correct 212 km; the grounding thoughts are marked in green. The readout reports, for the current step, the newest line in each column, how many tool calls each column has made, and what the marked line shows."></svg>
+        <div class="readout" aria-live="polite" id="tr-readout"></div>
+      </div>
+
+      <table class="grid2">
+        <tr><th style="width:200px">toy encyclopedia page</th><th>first sentences (what <code>search</code> returns)</th></tr>
+        <tr><td><code>Glass Harbour (opera)</code></td><td>Glass Harbour is a 1931 opera in three acts with music by Ilse Varn.</td></tr>
+        <tr><td><code>Ilse Varn</code></td><td>Ilse Varn (1894–1962) was a composer born in Merrow, a market town in the Tessel valley.</td></tr>
+        <tr><td><code>Merrow</code></td><td>Merrow is a market town on the river Asker.</td></tr>
+        <tr><td><code>Asker</code></td><td>The Asker is a river 212 km long.</td></tr>
+        <tr><td><code>Tessel</code></td><td>The Tessel is a valley whose towns include Merrow and Hale.</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">All names are fictional. There is no page titled exactly <code>Glass Harbour</code>, so a search for it returns the similar titles <code>Glass Harbour (opera)</code> and <code>Glass Harbour (film)</code>, mimicking the study's <code>search</code> behaviour.</p>
+
+      <ul class="notes">
+        <li><b>CoT's error is unfalsifiable from inside.</b> The wrong birthplace is fluent and plausible, and every later step is valid reasoning <i>from</i> it. This is the failure the study's error analysis finds dominant for CoT (§07).</li>
+        <li><b>Act-only had the answer in its context and lost it.</b> The observation naming Merrow was in the transcript; what was missing was a step that said "this is the birthplace; the town, not the valley, is what I follow". That is the "extract from observations" thought of §03.</li>
+        <li><b>ReAct is slower</b> — more steps, more tokens — and only as good as its searches. If the <code>Merrow</code> page had not named its river, the trajectory would have needed more lookups or would have failed: the search-result failure of §07.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="kt-results" data-nav="QA results & the hybrids">
+      <h3><span class="idx">06</span> Results on HotpotQA and FEVER — and why the best rows are hybrids</h3>
+      <p class="lede"><b>ReAct beats Act on both tasks and beats CoT on FEVER — but on HotpotQA it is slightly <i>worse</i> than CoT.</b> The two methods fail in different ways (§07), so the study combines them, and the combinations are the best prompting results.</p>
+
+      <table class="grid2">
+        <tr><th>PaLM-540B, prompting</th><th>HotpotQA (EM)</th><th>FEVER (accuracy)</th></tr>
+        <tr><td>Standard</td><td class="num">28.7</td><td class="num">57.1</td></tr>
+        <tr><td>CoT (reason only)</td><td class="num">29.4</td><td class="num">56.3</td></tr>
+        <tr><td>CoT-SC (21 samples)</td><td class="num">33.4</td><td class="num">60.4</td></tr>
+        <tr><td>Act (act only)</td><td class="num">25.7</td><td class="num">58.9</td></tr>
+        <tr><td><b>ReAct</b></td><td class="num">27.4</td><td class="num">60.9</td></tr>
+        <tr class="hl"><td><b>CoT-SC → ReAct</b></td><td class="num">34.2</td><td class="num">64.6</td></tr>
+        <tr class="hl"><td><b>ReAct → CoT-SC</b></td><td class="num">35.1</td><td class="num">62.0</td></tr>
+        <tr><td>supervised state of the art (reference)</td><td class="num">67.5</td><td class="num">89.5</td></tr>
+      </table>
+
+      <h4>The two hybrids</h4>
+      <div class="formula"><span class="lbl">two back-off rules between internal and external knowledge</span><span class="eq">ReAct → CoT-SC     run ReAct; if it has not called finish[·] within S steps,
+                   answer with CoT-SC instead
+                   S = 7 (HotpotQA),  S = 5 (FEVER)     — more steps did not help ReAct
+
+CoT-SC → ReAct     draw n CoT-SC samples; let m = count of the majority answer
+                   if  m &lt; n / 2   the model's internal knowledge is not confident:
+                                  run ReAct instead</span></div>
+      <ul class="notes">
+        <li><b>Read the rules as confidence routing.</b> One trusts retrieval first and falls back to memory when retrieval stalls; the other trusts memory first and falls back to retrieval when the samples disagree. Each wins on one task: ReAct → CoT-SC on HotpotQA, CoT-SC → ReAct on FEVER.</li>
+        <li><b>Sample efficiency.</b> The study plots accuracy against the number of CoT-SC samples: both hybrids stay above plain CoT-SC at every sample count, and reach CoT-SC's 21-sample accuracy with only 3–5 samples. (The curves are in a figure; only those two statements are taken from it here.)</li>
+        <li><b>The absolute level is modest.</b> The best prompted HotpotQA number is 32.4 EM below the supervised reference (67.5 − 35.1; our arithmetic). The reference systems are trained on the task; the prompted model sees six examples and a deliberately weak search tool.</li>
+      </ul>
+
+      <div class="viz" id="viz-rs">
+        <div class="vhead">
+          <span class="vtitle">Reported results by benchmark and method</span>
+          <span class="vhint">pick a benchmark; differences in the readout are our arithmetic on the reported numbers</span>
+        </div>
+        <div class="controls">
+          <label>benchmark <select id="rs-b">
+            <option value="hotpot" selected>HotpotQA (EM)</option>
+            <option value="fever">FEVER (accuracy)</option>
+            <option value="alf">ALFWorld (success %)</option>
+            <option value="web">WebShop</option>
+          </select></label>
+          <label>slice <select id="rs-s"></select></label>
+          <label><input type="checkbox" id="rs-ref" checked /> show reference line</label>
+        </div>
+        <svg id="rs-svg" width="760" height="340" viewBox="0 0 760 340" role="img" aria-label="Horizontal bar chart of the study's reported numbers for the chosen benchmark, one bar per method, with ReAct bars in teal, hybrid bars in violet, the reason-only and act-only prompting baselines in grey and the learned baselines in amber. For HotpotQA the hybrids are the longest bars, near 35, CoT-SC follows at 33.4, and ReAct at 27.4 sits slightly below plain CoT at 29.4. For FEVER ReAct at 60.9 beats CoT at 56.3 and CoT-SC to ReAct is longest at 64.6. An optional dashed line marks the supervised state of the art, far to the right of every prompted method. For ALFWorld the slice control selects a task type; on the all-tasks slice the best ReAct prompt reaches 71 percent against 45 for the best act-only prompt and 37 for the imitation-learning agent, and even the average ReAct prompt, 57, beats both. For WebShop the slice selects score or success rate, and ReAct leads every automatic method while an optional dashed line marks the human expert at 82.1 score and 59.6 percent success. The readout states the leader and the gaps between key methods."></svg>
+        <div class="readout" aria-live="polite" id="rs-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="errors" data-nav="Error analysis: ReAct vs CoT">
+      <h3><span class="idx">07</span> Error analysis: hallucination versus search and reasoning failures</h3>
+      <p class="lede">To understand §06, the study hand-labelled HotpotQA trajectories: from each of ReAct and CoT, 50 with a correct answer and 50 with a wrong one (by EM), 200 in total. <b>CoT's dominant failure is hallucination; ReAct essentially does not hallucinate, but gets stuck.</b></p>
+
+      <table class="grid2">
+        <tr><th></th><th>category</th><th>definition used</th><th>ReAct</th><th>CoT</th></tr>
+        <tr><td rowspan="2"><b>success</b></td><td>true positive</td><td>correct reasoning trace and facts</td><td class="num">94%</td><td class="num">86%</td></tr>
+        <tr><td>false positive</td><td>right answer, but hallucinated reasoning or facts</td><td class="num">6%</td><td class="num">14%</td></tr>
+        <tr><td rowspan="4"><b>failure</b></td><td>reasoning error</td><td>wrong reasoning trace, including failing to recover from repetitive steps</td><td class="num">47%</td><td class="num">16%</td></tr>
+        <tr><td>search result error</td><td>search returns empty or does not contain useful information</td><td class="num">23%</td><td class="num">–</td></tr>
+        <tr class="hl"><td>hallucination</td><td>hallucinated reasoning or facts</td><td class="num">0%</td><td class="num">56%</td></tr>
+        <tr><td>label ambiguity</td><td>right prediction, but it does not match the label precisely</td><td class="num">29%</td><td class="num">28%</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">CoT has no search, so it has no search-result row. ReAct's failure column sums to 99%, presumably rounding (our arithmetic).</p>
+
+      <div class="viz" id="viz-er">
+        <div class="vhead">
+          <span class="vtitle">Where the trajectories went right and wrong, ReAct vs CoT (HotpotQA, hand-labelled)</span>
+          <span class="vhint">highlight one category to compare the two methods directly</span>
+        </div>
+        <div class="controls">
+          <label>highlight <select id="er-c">
+            <option value="all" selected>all categories</option>
+            <option value="tp">true positive</option>
+            <option value="fp">false positive</option>
+            <option value="re">reasoning error</option>
+            <option value="se">search result error</option>
+            <option value="ha">hallucination</option>
+            <option value="la">label ambiguity</option>
+          </select></label>
+          <label>show <select id="er-g">
+            <option value="both" selected>successes and failures</option>
+            <option value="succ">successes only</option>
+            <option value="fail">failures only</option>
+          </select></label>
+        </div>
+        <svg id="er-svg" width="760" height="300" viewBox="0 0 760 300" role="img" aria-label="Stacked horizontal bars, each spanning one hundred percent of a labelled sample. Two bars for correctly answered trajectories, ReAct and chain-of-thought, split into true positives and false positives: ReAct 94 and 6 percent, chain-of-thought 86 and 14 percent, so a correct chain-of-thought answer is more than twice as likely to rest on hallucinated facts. Two bars for wrong answers, split into reasoning error, search result error, hallucination and label ambiguity: ReAct 47, 23, 0 and 29 percent; chain-of-thought 16, none, 56 and 28 percent. Hallucination, in red, fills more than half of the chain-of-thought failure bar and is absent from ReAct's, whose failures are mostly reasoning errors, including repetitive loops, and uninformative searches. Label ambiguity is a similar share for both. Selecting a category dims the others; the readout gives its definition and the two percentages."></svg>
+        <div class="readout" aria-live="polite" id="er-readout"></div>
+      </div>
+
+      <h4>The study's reading of the table</h4>
+      <ul class="notes">
+        <li><b>Hallucination is a serious problem for CoT.</b> It is 56% of CoT's failures, and it also contaminates CoT's <i>successes</i>: 14% of correct CoT answers rest on hallucinated reasoning or facts, against 6% for ReAct. ReAct's trajectory is more grounded, fact-driven and trustworthy because it can consult an external source. The broader taxonomy of this failure is on the <a href="../../llm/hallucination-factuality.html">hallucination &amp; factuality</a> page.</li>
+        <li><b>The structural constraint costs flexibility.</b> Interleaving forces every reasoning step to sit between actions, and ReAct's reasoning-error rate is higher than CoT's. One frequent ReAct-specific pattern: the model <b>repeats its previous thoughts and actions</b> and cannot break out of the loop. The study suspects greedy decoding contributes.</li>
+        <li><b>Search quality is the ceiling.</b> Non-informative searches are 23% of ReAct's failures; a bad observation derails the reasoning that follows and the model struggles to recover and reformulate. This is the same "retrieval recall bounds accuracy" story as in <a href="../../nlp/question-answering.html#open-domain">open-domain QA</a>.</li>
+        <li><b>About 3 in 10 "failures" are not failures.</b> Label ambiguity is 29% / 28%: the prediction is right but does not exactly match the gold string. EM undercounts both methods by a similar amount.</li>
+      </ul>
+      <div class="callout"><b>The one-line synthesis.</b> CoT is flexible but ungrounded; ReAct is grounded but brittle. That is precisely the complementarity the hybrids of §06 exploit — and it explains how ReAct can be the <i>more trustworthy</i> method while scoring lower EM on HotpotQA.</div>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="finetune" data-nav="Fine-tuning on trajectories">
+      <h3><span class="idx">08</span> Fine-tuning smaller models on ReAct trajectories</h3>
+      <p class="lede"><b>Prompted, ReAct is the worst of the four methods on the smaller PaLM models; fine-tuned on 3,000 trajectories, it becomes the best.</b> A fine-tuned 8B ReAct model beats every prompting method at 62B, and a fine-tuned 62B one beats every prompting method at 540B.</p>
+
+      <ul class="notes">
+        <li><b>Data by bootstrapping.</b> Run the prompted 540B model, keep 3,000 trajectories that reached the correct answer, and fine-tune on them — the same self-generated-rationale bootstrapping idea used for reasoning traces. Each method (Standard, CoT, Act, ReAct) gets its own data generated the same way.</li>
+        <li><b>The target is the whole trajectory.</b> The model is fine-tuned to decode entire trajectories — all thoughts, actions and observations — conditioned on the input question or claim.</li>
+        <li><b>Training details reported:</b> batch size 64; ReAct and Act trained for 4,000 steps on both PaLM-8B and PaLM-62B; Standard and CoT for 2,000 steps (8B) and 1,000 steps (62B).</li>
+      </ul>
+
+      <div class="formula"><span class="lbl">the scaling result, as stated (HotpotQA)</span><span class="eq">prompting,   PaLM-8B / 62B:   ReAct is the WORST of Standard, CoT, Act, ReAct
+fine-tuned,  3,000 examples:  ReAct is the BEST of the four
+
+fine-tuned ReAct  @  8B    &gt;   every prompting method  @  62B
+fine-tuned ReAct  @  62B   &gt;   every prompting method  @  540B
+
+fine-tuning Standard or CoT  ≪  fine-tuning ReAct or Act       (both sizes)</span></div>
+
+      <p><b>Why the gap is plausible.</b> The study's explanation: fine-tuning Standard or CoT teaches the model to <i>memorise</i> — potentially hallucinated — knowledge facts, whereas fine-tuning ReAct or Act teaches a generalisable skill: how to reason and act to <i>fetch</i> information from Wikipedia. Prompted small models, conversely, struggle to learn the ReAct format and its reasoning from a few in-context examples at all.</p>
+      <div class="callout"><b>A caveat on numbers.</b> The scaling result is reported as a figure; this page states only the orderings the study writes out in its text and does not read values off the plot. How this line of work developed — training the agent loop itself with reinforcement learning — is on the <a href="../agentic-rl.html">agentic RL</a> page.</div>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="decision" data-nav="ALFWorld & WebShop">
+      <h3><span class="idx">09</span> Decision making: a text game and a shopping site</h3>
+      <p class="lede"><b>Here the comparison is not with chain-of-thought but with agents trained on many demonstrations.</b> With one or two in-context examples, ReAct beats an imitation-learning agent by 34 points of absolute success on ALFWorld and the best learned web agent by about 10 points on WebShop.</p>
+
+      <h4>ALFWorld</h4>
+      <ul class="notes">
+        <li>A text-only game aligned with an embodied household benchmark: the agent navigates and manipulates objects through text commands ("go to cabinet 1", "take pan 1"). Six task types; evaluation on 134 unseen games, in a task-specific setup.</li>
+        <li><b>Prompts.</b> For each task type, 3 training trajectories were annotated with sparse thoughts that decompose the goal, track sub-goal completion, decide the next sub-goal, and use commonsense about where objects are. Every ordered pair of 2 of the 3 makes one prompt — 6 prompts per task type, 2 exemplars each. Act prompts are the same trajectories with the thoughts deleted.</li>
+        <li><b>Baseline.</b> BUTLER, an imitation-learning agent trained on 10⁵ expert trajectories per task type.</li>
+      </ul>
+
+      <table class="grid2">
+        <tr><th>ALFWorld success (%)</th><th>Pick</th><th>Clean</th><th>Heat</th><th>Cool</th><th>Look</th><th>Pick 2</th><th>All</th></tr>
+        <tr><td>Act (best of 6 prompts)</td><td class="num">88</td><td class="num">42</td><td class="num">74</td><td class="num">67</td><td class="num">72</td><td class="num">41</td><td class="num">45</td></tr>
+        <tr><td><b>ReAct</b> (average of 6)</td><td class="num">65</td><td class="num">39</td><td class="num">83</td><td class="num">76</td><td class="num">55</td><td class="num">24</td><td class="num">57</td></tr>
+        <tr class="hl"><td><b>ReAct</b> (best of 6)</td><td class="num">92</td><td class="num">58</td><td class="num">96</td><td class="num">86</td><td class="num">78</td><td class="num">41</td><td class="num">71</td></tr>
+        <tr><td>ReAct-IM (average of 6)</td><td class="num">55</td><td class="num">59</td><td class="num">60</td><td class="num">55</td><td class="num">23</td><td class="num">24</td><td class="num">48</td></tr>
+        <tr><td>ReAct-IM (best of 6)</td><td class="num">62</td><td class="num">68</td><td class="num">87</td><td class="num">57</td><td class="num">39</td><td class="num">33</td><td class="num">53</td></tr>
+        <tr><td>BUTLERg (best of 8)</td><td class="num">33</td><td class="num">26</td><td class="num">70</td><td class="num">76</td><td class="num">17</td><td class="num">12</td><td class="num">22</td></tr>
+        <tr><td>BUTLER (best of 8)</td><td class="num">46</td><td class="num">39</td><td class="num">74</td><td class="num">100</td><td class="num">22</td><td class="num">24</td><td class="num">37</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>71 vs 45 vs 37 overall.</b> The best ReAct prompt beats the best Act prompt by 26 points and BUTLER by 34 (our arithmetic; the 34 is the study's headline). Even the <i>average</i> ReAct prompt (57) beats the <i>best</i> Act prompt.</li>
+        <li><b>Not uniform.</b> Act's best prompt wins on Look (72 vs ReAct's average 55), BUTLER is perfect on Cool, and Pick 2 is hard for everyone. The aggregate hides task types where thoughts add little.</li>
+        <li><b>Prompt sensitivity is large.</b> On Pick, ReAct's average and best prompts differ by 27 points (our arithmetic). Report both, as the study does.</li>
+      </ul>
+
+      <h4>Which thoughts? ReAct versus an Inner-Monologue-style variant</h4>
+      <p>To test whether the content of the thoughts matters — not just the presence of feedback in the context — the study ran <b>ReAct-IM</b>: the same setup, but with thoughts restricted to the dense, feedback-style pattern of earlier inner-monologue agents, i.e. only (1) decomposing the current goal and (2) naming the current sub-goal to complete.</p>
+      <ul class="notes">
+        <li><b>ReAct 71 vs ReAct-IM 53</b> overall (best of 6), with ReAct ahead on five of the six task types — Clean is the exception.</li>
+        <li><b>Why IM loses</b>, by the study's inspection: without high-level goal decomposition it often misjudges when a sub-goal is finished or what the next one should be; and without commonsense reasoning it struggles to work out where an item is likely to be.</li>
+        <li><b>The lesson:</b> flexible, sparse, model-chosen thoughts — planning, commonsense, progress tracking — beat a fixed vocabulary of status updates. External feedback alone is not the active ingredient.</li>
+      </ul>
+
+      <h4>WebShop</h4>
+      <ul class="notes">
+        <li>An online shopping environment with 1.18M real products and 12k human instructions; the agent must buy a product matching an instruction (for flavour, an invented one: "a nightstand with drawers, nickel finish, under 140 dollars"). Evaluation on 500 test instructions.</li>
+        <li><b>Actions:</b> search, choose a product, choose options, buy. Act is prompted one-shot; ReAct adds reasoning to decide what to explore, when to buy, and which product options are relevant.</li>
+        <li><b>Metrics:</b> score — the percentage of desired attributes the chosen product covers, averaged over episodes; success rate (SR) — the percentage of episodes in which the product meets every requirement.</li>
+        <li><b>Baselines:</b> IL, trained on 1,012 human-annotated trajectories; IL+RL, which additionally uses reinforcement learning on 10,587 training instructions.</li>
+      </ul>
+      <table class="grid2">
+        <tr><th>WebShop</th><th>score</th><th>success rate (%)</th></tr>
+        <tr><td>Act (one-shot prompt)</td><td class="num">62.3</td><td class="num">30.1</td></tr>
+        <tr class="hl"><td><b>ReAct</b> (one-shot prompt)</td><td class="num">66.6</td><td class="num">40.0</td></tr>
+        <tr><td>IL</td><td class="num">59.9</td><td class="num">29.1</td></tr>
+        <tr><td>IL+RL</td><td class="num">62.4</td><td class="num">28.7</td></tr>
+        <tr><td>human expert</td><td class="num">82.1</td><td class="num">59.6</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>One-shot Act is already on par with IL and IL+RL</b>; ReAct adds about 10 points of success over the previous best (40.0 vs 30.1 for Act, 29.1 for IL; differences ours). The study attributes it to ReAct being more likely to identify instruction-relevant products and options.</li>
+        <li><b>Humans are still far ahead</b> (59.6% SR). The study notes that experts explore more products and reformulate queries more — exactly the behaviour no method here reliably shows.</li>
+      </ul>
+      <p>Web navigation and GUI agents descend directly from this setting; the modern version of the problem is on the <a href="../computer-control.html">computer control</a> page.</p>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="hitl" data-nav="Editing a thought; another model">
+      <h3><span class="idx">10</span> Editing a thought to fix behaviour — and a second model family</h3>
+      <p class="lede">Because the policy conditions on its own thoughts, a human can steer the agent by editing a thought instead of taking over the actions.</p>
+
+      <ul class="notes">
+        <li><b>The example (ALFWorld).</b> A ReAct trajectory fails because of a hallucinating thought at step 17. A human edits two thoughts — at steps 17 and 23 — removing the hallucinated sentence and adding hints. The agent's subsequent reasoning and actions change accordingly, and the task succeeds.</li>
+        <li><b>Why this is new.</b> Correcting an Act agent would mean typing many actions; an RL policy offers no editable intermediate state at all. A thought is a compact, human-readable control point — one sentence of edit replaces many steps of intervention.</li>
+        <li><b>The general principle</b> — make the agent's plan inspectable and put a human checkpoint where an edit is cheapest — reappears in practice as plan approval and in the <a href="../agentic-design-patterns.html#tool">tool-use pattern</a>'s emphasis on traces you can read.</li>
+      </ul>
+
+      <h4>It is not a PaLM artefact</h4>
+      <table class="grid2">
+        <tr><th>ReAct prompting</th><th>PaLM-540B</th><th>GPT-3 (text-davinci-002, greedy)</th></tr>
+        <tr><td>HotpotQA EM (random 500 validation questions)</td><td class="num">29.4</td><td class="num">30.8</td></tr>
+        <tr><td>ALFWorld success % (all 134 unseen games, best PaLM prompt set)</td><td class="num">70.9</td><td class="num">78.4</td></tr>
+      </table>
+      <p>ReAct prompting carries over to a second model family, which does as well or better. Note that the HotpotQA row is a 500-question subset, so its 29.4 is not comparable with §06's 27.4; the ALFWorld 70.9 is the unrounded form of §09's 71.</p>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="limits" data-nav="Limitations">
+      <h3><span class="idx">11</span> Limitations the original study states — and ones its own results show</h3>
+      <div class="cards">
+        <div class="box bad"><div class="n">context</div><div class="t">Demonstrations do not fit</div><div class="g">Complex tasks with large action spaces need more demonstrations to learn well, which can exceed the input-length limit of in-context learning.</div></div>
+        <div class="box warn"><div class="n">data</div><div class="t">Fine-tuning needs trajectories</div><div class="g">Fine-tuning on HotpotQA looked promising (§08), but the study expects that more high-quality human annotations are needed to improve further.</div></div>
+        <div class="box warn"><div class="n">future work</div><div class="t">Multi-task and RL</div><div class="g">Scaling ReAct with multi-task training and combining it with complementary paradigms such as reinforcement learning are left open.</div></div>
+        <div class="box bad"><div class="n">from §07</div><div class="t">Loops and bad searches</div><div class="g">Repetitive thought–action loops and uninformative retrievals account for most ReAct failures; prompted ReAct cannot recover reliably from either.</div></div>
+        <div class="box bad"><div class="n">from §06</div><div class="t">Rigid interleaving</div><div class="g">Alone, ReAct is behind CoT on HotpotQA EM: the structural constraint reduces reasoning flexibility. The best numbers needed a hybrid.</div></div>
+        <div class="box warn"><div class="n">from §09</div><div class="t">Prompt sensitivity</div><div class="g">Average and best-of-6 prompt results differ by up to 27 points on one ALFWorld task type (our arithmetic on Table 3).</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="practice" data-nav="In practice (beyond the study)">
+      <h3><span class="idx">12</span> In practice: what happened to the loop after the original study</h3>
+      <p class="lede">Everything above is the original method and its reported evidence. This section is <b>general practice since the study</b>, as of late 2026 — fast-moving, implementation-dependent, and not among the study's claims.</p>
+
+      <table class="grid2">
+        <tr><th style="width:180px">then (the study)</th><th>now (common practice)</th><th>what carried over</th></tr>
+        <tr><td><b>action as text</b> — <code>Action: search[X]</code> parsed out of the completion</td><td><b>native tool calling</b>: the model API takes typed tool schemas and returns structured calls (name + JSON arguments); results go back as tool-result messages</td><td>the loop itself: call, execute, append the observation, repeat until a final answer</td></tr>
+        <tr><td><b>thought as a text line</b> in the prompt</td><td>visible reasoning text before a call, or a model's trained internal reasoning interleaved between tool calls</td><td>a thought still changes only the context (§02); it now often comes from training rather than exemplars</td></tr>
+        <tr><td><b>few-shot exemplar trajectories</b></td><td>a system prompt plus tool descriptions; no worked trajectories needed for capable models</td><td>tool descriptions do the selection work the exemplars used to do — see the hub's <a href="../agents.html#tools">tool-use section</a></td></tr>
+        <tr><td><b>fixed step cap</b> as the ReAct → CoT-SC trigger</td><td>step, token, time and cost budgets with a graceful partial-result exit; duplicate-call detection</td><td>§07's repetition loop is still the canonical failure — see <a href="../agents.html#challenges">failure modes</a></td></tr>
+        <tr><td><b>3 Wikipedia commands</b></td><td>search engines, code execution, file systems, browsers, whole desktops</td><td>observation quality still bounds accuracy (§07's search-result errors)</td></tr>
+      </table>
+
+      <ul class="notes">
+        <li><b>The default agent loop.</b> The "Thought / Action / Observation" format became the template for tool-using agents generally; most agent frameworks' basic loop is a ReAct loop with structured calls. The design trade-offs — schemas, parallel calls, observation bloat — are on the <a href="../agentic-design-patterns.html#tool">agentic design patterns</a> page.</li>
+        <li><b>Reflection as a successor.</b> Reflexion-style agents add an outer loop: after a failed trial, write a verbal self-critique and carry it into the next attempt — <a href="../agent-learning.html#reflexion">agent learning</a>.</li>
+        <li><b>Evaluating the trajectory, not just the answer.</b> The study's hand-labelled error taxonomy is an early instance of trajectory-level evaluation; the systematic version is on <a href="../agent-evaluation.html">agent evaluation</a>.</li>
+        <li><b>Observations are untrusted input.</b> Feeding retrieved text straight into the context — the mechanism that removes hallucination in §07 — is also the channel for prompt injection. The study did not address this; any deployed ReAct loop must (<a href="../agents.html#challenges">failure modes and safety</a>).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">13</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"ReAct beats chain-of-thought."</span> <span class="fix">Not uniformly.</span> On HotpotQA alone, ReAct scores 27.4 EM to CoT's 29.4; it wins on FEVER. Its clearer advantage is in grounding (0% hallucination in sampled failures) and the best QA numbers come from combining it with CoT-SC (§06–§07).</div>
+      <div class="wrong"><span class="say">"ReAct means a thought before every action."</span> <span class="fix">Only for the knowledge tasks.</span> In ALFWorld and WebShop thoughts are sparse and the model decides when to have one (§03); a denser, more regular thought pattern (ReAct-IM) did worse (§09).</div>
+      <div class="wrong"><span class="say">"ReAct is a training method."</span> <span class="fix">It is a prompting format first.</span> The main results use a frozen model and one to six exemplars. Fine-tuning on bootstrapped trajectories is a secondary experiment that helps small models (§08).</div>
+      <div class="wrong"><span class="say">"Grounding in tools eliminates errors."</span> <span class="fix">It trades one failure for others.</span> ReAct's failures shift to reasoning loops (47%) and uninformative searches (23%). Grounding is only as good as the observations, and bad observations derail the trace (§07).</div>
+      <div class="wrong"><span class="say">"The thoughts are a faithful explanation of the agent's decisions."</span> <span class="fix">They are context the policy conditions on, not a guarantee.</span> Editing a thought changes behaviour (§10), so thoughts are causally used — but the study's own false positives (6% of ReAct's correct answers rest on wrong reasoning or facts) show a trace can look justified and still be wrong.</div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">14</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Augment the action space</b> to <code>Â = A ∪ L</code>: a thought is an action with no environment effect that only extends the context, <code>cₜ₊₁ = (cₜ, âₜ)</code>.</li>
+        <li><b>Useful thoughts manage the interaction</b> — decompose, inject commonsense, extract from observations, track progress, handle exceptions.</li>
+        <li><b>Dense for reasoning tasks, sparse for long action sequences</b>, with the model choosing when to think.</li>
+        <li><b>HotpotQA / FEVER:</b> ReAct 27.4 / 60.9 vs CoT 29.4 / 56.3 vs Act 25.7 / 58.9; the hybrids reach 35.1 (ReAct → CoT-SC) and 64.6 (CoT-SC → ReAct), and match 21-sample CoT-SC with 3–5 samples.</li>
+        <li><b>Error analysis:</b> CoT fails by hallucinating (56% of failures); ReAct by loops and reasoning errors (47%) and bad searches (23%), with 0% hallucination.</li>
+        <li><b>Fine-tuning</b> on 3,000 bootstrapped trajectories makes ReAct the best method at 8B and 62B, beating prompting at the next size up.</li>
+        <li><b>Decision tasks:</b> ALFWorld 71% vs Act 45% and BUTLER 37%; WebShop 40.0% SR vs 28.7–30.1% for the learned and act-only baselines — from one or two exemplars.</li>
+        <li><b>Thoughts are a control surface:</b> editing one sentence can turn a failed trajectory into a success.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Agents" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../agents.html">← Agents</a>
+      <a href="../agents.html" style="color:var(--muted)">Agents · overview</a>
+      <a href="../agentic-design-patterns.html">Agentic Design Patterns →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="react.viz.js"></script>
+</body>
+</html>

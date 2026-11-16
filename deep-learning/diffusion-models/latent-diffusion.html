@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Latent Diffusion Models</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .src{font-size:12.5px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../diffusion-models.html">Diffusion Models</a> · deep dive</p>
+      <h1>Latent Diffusion Models</h1>
+      <p>Train an autoencoder once, then run the whole diffusion process in its small latent space and decode a single time at the end. The <a href="../diffusion-models.html#latent">hub's §10</a> gives the four-line summary; this page goes through the original study: why it separates <i>perceptual</i> from <i>semantic</i> compression, what the KL- and VQ-regularised autoencoders look like, the downsampling-factor ablation that lands on <code>f = 4–8</code>, why the latent has to be rescaled, how a domain encoder <code>τ<sub>θ</sub></code> enters through cross-attention, and what the results and the compute bill actually were.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Deep Learning</span>
+        <span class="pill">Generative</span>
+        <span class="pill">perceptual vs semantic compression · ℰ / 𝒟 · KL-reg / VQ-reg · f ablation · latent SNR · τθ cross-attention · results · V100-days · limits</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="motivation" data-nav="Why leave pixel space">
+      <h3><span class="idx">01</span> Why leave pixel space: the bill, and where the bits go</h3>
+      <p class="lede"><b>A pixel-space diffusion model spends its compute on every pixel at every step, even though most of an image's bits encode detail no viewer can perceive.</b> The original study's fix is to remove that detail once, with a separately trained autoencoder, and let the diffusion model work only on what is left.</p>
+
+      <ul class="notes">
+        <li><b>The bill.</b> The paper puts the strongest pixel-space diffusion models of the time at <b>150–1000 V100-days</b> of training, and producing 50 000 samples at about <b>5 days on a single A100</b>. Sampling typically takes 25–1000 sequential network evaluations, each over the full-resolution tensor (the step-count side of this is on the <a href="../diffusion-models.html#sampling">hub's sampling section</a>).</li>
+        <li><b>The loss can ignore detail; the compute cannot.</b> A diffusion model's training objective can down-weight imperceptible detail, but gradients and every forward pass still run over all pixels. The cost is paid whether or not the model ends up caring.</li>
+        <li><b>Two kinds of compression.</b> The paper reads the rate–distortion trade-off of a trained pixel model in two regimes: a <b>perceptual compression</b> stage that discards high-frequency detail but learns little semantics, and a <b>semantic compression</b> stage where the generative model actually learns the conceptual composition of the data. Most bits of a digital image fall in the first regime.</li>
+      </ul>
+
+      <div class="formula"><span class="lbl">the division of labour</span><span class="eq">stage 1  perceptual compression    autoencoder  ℰ, 𝒟        removes imperceptible detail
+                                     trained ONCE, reused across many diffusion models and tasks
+
+stage 2  semantic compression      diffusion model  ε<sub>θ</sub>     learns the data distribution
+                                     on z = ℰ(x), a perceptually equivalent but smaller space</span></div>
+
+      <div class="callout"><b>The point of the split.</b> Earlier two-stage generators had to pick one compression rate that served both reconstruction and generation. Because the second stage here is a convolutional diffusion model that handles a 2-D latent well, the first stage can be <b>mild</b> — remove only what is imperceptible — and reconstructions stay very good (§03).</div>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="pipeline" data-nav="Shape of the computation">
+      <h3><span class="idx">02</span> The shape of the computation</h3>
+      <p class="lede">An image <code>x ∈ ℝ^(H×W×3)</code> is encoded to a latent <code>z = ℰ(x) ∈ ℝ^(h×w×c)</code> with a spatial downsampling factor <code>f</code>. The diffusion model is trained on <code>z</code>, not <code>x</code>, and at sampling time its output is decoded once.</p>
+
+      <div class="formula"><span class="lbl">tensors, training and sampling</span><span class="eq">downsampling factor    f  =  H / h  =  W / w  =  2ᵐ ,   m ∈ ℕ
+
+training    x  ──ℰ──▶  z₀ ∈ ℝ^(h×w×c)  ──q(zₜ | z₀)──▶  zₜ  ──ε<sub>θ</sub>(zₜ, t)──▶  ε̂       (ℰ frozen)
+sampling    z_T ~ 𝒩(0, I)  ──T′ reverse steps on h×w×c──▶  z₀  ──𝒟──▶  x̃ ∈ ℝ^(H×W×3)    (𝒟 runs ONCE)
+
+example (own arithmetic, Table 8 shapes):  256×256×3 = 196 608 numbers
+     f = 4, c = 3   →   64×64×3  = 12 288    (16× fewer)
+     f = 8, c = 4   →   32×32×4  =  4 096    (48× fewer)</span></div>
+
+      <ul class="notes">
+        <li><b>The latent keeps its 2-D layout.</b> Earlier two-stage approaches that modelled a learned latent autoregressively relied on an arbitrary 1-D ordering of it, which forced aggressive compression to keep sequences short. A latent diffusion model keeps <code>z</code> as a small image and uses a time-conditional U-Net built mainly from 2-D convolutions, so it inherits the spatial inductive biases that make convolutions good at images (the backbone itself is on the <a href="../diffusion-models.html#network">hub's network section</a>).</li>
+        <li><b>The encoder is cheap at training time.</b> The forward process is fixed, so <code>zₜ</code> is obtained from <code>ℰ(x)</code> in closed form — one encoder call per example, exactly as the pixel-space recipe on the <a href="ddpm.html">DDPM page</a> obtains <code>xₜ</code> from <code>x₀</code>.</li>
+        <li><b>Everything sequential happens small.</b> All <code>T′</code> reverse steps run on <code>h×w×c</code>; the decoder is paid once per sample, not once per step.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="autoencoder" data-nav="The first-stage autoencoder">
+      <h3><span class="idx">03</span> Stage one: a perceptual autoencoder, KL- or VQ-regularised</h3>
+      <p class="lede"><b>A plain pixel-MSE <a href="../autoencoders-vaes.html">autoencoder</a> blurs; a perceptual loss plus a patch-based adversarial loss keeps reconstructions on the image manifold.</b> A light regulariser then stops the latent from taking arbitrarily high variance.</p>
+
+      <ul class="notes">
+        <li><b>Reconstruction objective.</b> The autoencoder is trained with a <b>perceptual loss</b> and a <b>patch-based adversarial objective</b>: a discriminator that scores local patches rather than whole images, which enforces local realism and avoids the blur that pixel-space L2 or L1 losses alone produce. That discriminator is the PatchGAN idea covered on the <a href="../generative-adversarial-networks.html#pix2pix">GAN page's Pix2Pix section</a>.</li>
+        <li><b>KL-reg.</b> A slight KL penalty pulls the latent toward a standard normal, as in a VAE but with a very small weight — enough to bound the latent's scale, far too little to make it a good sampling prior on its own. The rate/distortion knob it sets is the <code>β</code> trade-off on the <a href="../autoencoders-vaes/beta-collapse-vqvae.html#tradeoff">β-VAE page</a>.</li>
+        <li><b>VQ-reg.</b> A vector-quantisation layer with a learned codebook of size <code>|𝒵|</code>, as in <a href="../autoencoders-vaes/beta-collapse-vqvae.html#vqvae">VQ-VAE</a> — but <b>absorbed into the decoder</b>. The diffusion model works on the continuous pre-quantisation latent; snapping to the codebook is part of decoding.</li>
+      </ul>
+
+      <div class="formula"><span class="lbl">the two regularisers (schematic)</span><span class="eq">KL-reg:   ℰ(x) = (μ, σ) ,   z = μ + σ ⊙ ε₀ ,   penalty  w · KL( 𝒩(μ, σ²) ‖ 𝒩(0, I) ) ,  w small
+VQ-reg:   z = ℰ(x) continuous ;   𝒟(z) = 𝒟′( quantise(z) )      quantise: nearest of |𝒵| codes per position</span></div>
+
+      <h4>What reconstruction quality each factor buys</h4>
+      <p>The paper trains a family of autoencoders on OpenImages and evaluates reconstructions on ImageNet validation. Selected rows of its first-stage table (Table 8):</p>
+      <table class="grid2">
+        <tr><th>f</th><th>regulariser</th><th>c</th><th>latent for 256² (own arithmetic)</th><th>R-FID ↓</th><th>PSNR ↑</th></tr>
+        <tr><td class="num">2</td><td>KL</td><td class="num">2</td><td class="num">128×128×2</td><td class="num">0.086</td><td class="num">32.47</td></tr>
+        <tr><td class="num">2</td><td>VQ, |𝒵| = 2048</td><td class="num">2</td><td class="num">128×128×2</td><td class="num">0.16</td><td class="num">30.85</td></tr>
+        <tr class="hl"><td class="num">4</td><td>KL</td><td class="num">3</td><td class="num">64×64×3</td><td class="num">0.27</td><td class="num">27.53</td></tr>
+        <tr class="hl"><td class="num">4</td><td>VQ, |𝒵| = 8192</td><td class="num">3</td><td class="num">64×64×3</td><td class="num">0.58</td><td class="num">27.43</td></tr>
+        <tr class="hl"><td class="num">8</td><td>KL</td><td class="num">4</td><td class="num">32×32×4</td><td class="num">0.90</td><td class="num">24.19</td></tr>
+        <tr class="hl"><td class="num">8</td><td>VQ, |𝒵| = 16384</td><td class="num">4</td><td class="num">32×32×4</td><td class="num">1.14</td><td class="num">23.07</td></tr>
+        <tr><td class="num">16</td><td>KL</td><td class="num">16</td><td class="num">16×16×16</td><td class="num">0.87</td><td class="num">24.08</td></tr>
+        <tr><td class="num">16</td><td>VQ, |𝒵| = 16384</td><td class="num">8</td><td class="num">16×16×8</td><td class="num">5.15</td><td class="num">20.83</td></tr>
+        <tr><td class="num">32</td><td>KL</td><td class="num">64</td><td class="num">8×8×64</td><td class="num">2.04</td><td class="num">22.27</td></tr>
+        <tr><td class="num">32</td><td>VQ, |𝒵| = 16384</td><td class="num">16</td><td class="num">8×8×16</td><td class="num">31.83</td><td class="num">17.45</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Reconstruction degrades smoothly with f</b> — for the KL models, PSNR falls from 32.47 dB at <code>f = 2</code> to 22.27 dB at <code>f = 32</code>, and R-FID rises from 0.086 to 2.04. VQ-reg degrades faster at large <code>f</code> with these channel counts (R-FID 31.83 at <code>f = 32</code>, <code>c = 16</code>).</li>
+        <li><b>Channels matter as much as f.</b> The <code>f = 16</code> KL autoencoder with <code>c = 16</code> reconstructs about as well as <code>f = 8</code> with <code>c = 4</code> (R-FID 0.87 vs 0.90). Both have exactly 4 096 latent numbers per 256² image (own arithmetic). Reconstruction alone therefore does not pick <code>f</code>; what the <i>diffusion model</i> can learn on that latent does — §06.</li>
+        <li><b>For comparison</b> the same table lists earlier quantised autoencoders: a 16× VQ model with a 16384-entry codebook at R-FID 4.98, and an 8× discrete VAE at R-FID 32.01. The diffusion-friendly autoencoders are much milder.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="objective" data-nav="The latent objective">
+      <h3><span class="idx">04</span> Stage two: the same denoising loss, on <code>z</code></h3>
+      <p class="lede">Nothing about the diffusion objective changes. Replace <code>x</code> by <code>z = ℰ(x)</code> and the simplified ε-prediction loss of the <a href="../diffusion-models.html#training">hub's §05</a> becomes the latent diffusion loss.</p>
+
+      <div class="formula"><span class="lbl">pixel loss → latent loss</span><span class="eq">L<sub>DM</sub>   =  𝔼<sub>x, ε~𝒩(0,1), t</sub>  ‖ ε − ε<sub>θ</sub>(xₜ, t) ‖²₂
+
+L<sub>LDM</sub>  =  𝔼<sub>ℰ(x), ε~𝒩(0,1), t</sub>  ‖ ε − ε<sub>θ</sub>(zₜ, t) ‖²₂            zₜ = √ᾱₜ · ℰ(x) + √(1 − ᾱₜ) · ε</span>
+<span class="lbl">conditional version (§07)</span><span class="eq">L<sub>LDM</sub>  =  𝔼<sub>ℰ(x), y, ε~𝒩(0,1), t</sub>  ‖ ε − ε<sub>θ</sub>(zₜ, t, τ<sub>θ</sub>(y)) ‖²₂       ε<sub>θ</sub> and τ<sub>θ</sub> optimised jointly</span></div>
+
+      <ul class="notes">
+        <li><b>ℰ and 𝒟 are frozen during stage two.</b> No gradient flows into the autoencoder, so one first stage can serve every diffusion model trained on top of it.</li>
+        <li><b>The schedule is the pixel one.</b> The training-hyperparameter tables list 1000 diffusion steps with a linear schedule for the reported models; the main result tables sample with DDIM, mostly 100–500 steps depending on the experiment.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="scale" data-nav="Latent scale &amp; SNR">
+      <h3><span class="idx">05</span> The latent's scale sets the signal-to-noise ratio</h3>
+      <p class="lede"><b>The forward process assumes data of roughly unit variance.</b> A KL-regularised latent can have a much larger scale, and then the same noise schedule leaves far more signal at every step than intended.</p>
+
+      <div class="formula"><span class="lbl">why scale matters, and the fix (Appendix D.1 and G)</span><span class="eq">zₜ = √ᾱₜ · z₀ + √(1 − ᾱₜ) · ε        effective SNR(t)  ∝  Var(z₀) · ᾱₜ / (1 − ᾱₜ)
+
+large Var(z₀)  ⇒  high SNR at every t  ⇒  semantic content is still readable late into the chain
+
+rescale once:   σ̂² = mean over batch, channel, height, width of (z − μ̂)²     — from the FIRST batch
+                z  ←  z / σ̂                                                    → unit variance
+VQ-reg latents:  already close to unit variance, not rescaled</span></div>
+
+      <ul class="notes">
+        <li>The paper reports that this signal-to-noise ratio, induced by the latent's scale, <b>significantly affects results</b>: it compares the raw <code>f = 4</code> KL latent with a version rescaled by its component-wise standard deviation, in the convolutional-sampling experiments of §09.</li>
+        <li>This is the same lesson as the hub's schedule discussion (<a href="../diffusion-models.html#schedules">§03</a>): what matters is SNR over time, and the data's own scale is part of that.</li>
+        <li><b>Later, not from this paper:</b> the public text-to-image release built on this work hard-codes a single scalar, <code>0.18215</code>, multiplied into its <code>f = 8</code> KL latents. It is this same "divide by the latent's standard deviation" step, estimated once and frozen.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="factor" data-nav="Choosing f">
+      <h3><span class="idx">06</span> Choosing <code>f</code>: the downsampling-factor ablation</h3>
+      <p class="lede">The study trains class-conditional ImageNet models with <code>f ∈ {1, 2, 4, 8, 16, 32}</code> — written LDM-<code>f</code>, with LDM-1 the pixel-space baseline — on a single A100 with the same number of training steps and the same parameter count. <b>Too little compression trains slowly; too much caps quality.</b></p>
+
+      <ul class="notes">
+        <li><b>Small f (LDM-1, LDM-2) trains slowly.</b> Most of the network's work is still perceptual; after 2M training steps there is an FID gap of <b>38</b> between pixel-space LDM-1 and LDM-8 (Fig. 6, 100 DDIM steps).</li>
+        <li><b>Large f stagnates.</b> At <code>f = 32</code> too much information is gone in the first stage, and sample quality stops improving early — the autoencoder's ceiling, not the diffusion model, is binding.</li>
+        <li><b>The middle wins.</b> LDM-4 to LDM-16 strike a good balance between efficiency and perceptually faithful results; on sample throughput vs FID (Fig. 7, CelebA-HQ and ImageNet, 10–200 DDIM steps) LDM-4 to LDM-8 reach much lower FID than LDM-1 while also sampling much faster. Complex data such as ImageNet needs less compression than faces. The paper's conclusion: <b>LDM-4 and LDM-8 offer the best conditions</b> for high-quality synthesis.</li>
+      </ul>
+
+      <div class="viz" id="viz-f">
+        <div class="vhead">
+          <span class="vtitle">Downsampling-factor explorer: latent shape, size, attention cost and reconstruction quality</span>
+          <span class="vhint">slide f from pixel space to 32×; watch the element count and the attention cost collapse while reconstruction error rises</span>
+        </div>
+        <div class="controls">
+          <label>downsampling factor f <input type="range" id="f-i" min="0" max="5" step="1" value="2" /><span id="f-iv" style="min-width:26px;display:inline-block">4</span></label>
+          <label>input resolution <select id="f-res">
+            <option value="256" selected>256 × 256</option>
+            <option value="512">512 × 512</option>
+            <option value="1024">1024 × 1024</option>
+          </select></label>
+          <label>regulariser <select id="f-reg">
+            <option value="kl" selected>KL-reg</option>
+            <option value="vq">VQ-reg</option>
+          </select></label>
+        </div>
+        <svg id="f-svg" width="760" height="440" viewBox="0 0 760 440" role="img" aria-label="Top left: the input image drawn as a square overlaid with a faint grid of one cell per latent position, and, after an arrow labelled with the encoder, the latent at the selected factor f drawn to the same spatial scale as a smaller square with a stack of channel slabs behind it, up to twelve drawn, labelled with its height, width and channel count. Top right: a column of the selected factor's numbers — latent shape, numbers per sample and reduction, spatial positions, relative cost of one full-grid self-attention layer, reconstruction FID and PSNR — and the ablation verdict in colour. Bottom: two bar charts over the six factors 1, 2, 4, 8, 16 and 32 on logarithmic axes. The left chart shows the number of latent elements relative to the image; for the KL autoencoders it falls from 1 at f equals 1 to a floor of one forty-eighth from f equals 8 upward, because the channel count grows as the grid shrinks, while the VQ autoencoders keep falling to one hundred ninety-second at f equals 32. The right chart shows the reconstruction FID of the first-stage autoencoder from the paper's Table 8, which rises with f; f equals 1 has no autoencoder and no bar. A shaded band marks f equals 4 to 8, the range the paper's ablation found best, and the selected factor is outlined. The readout gives the latent shape, the element count and reduction factor, the number of spatial positions, the relative cost of one self-attention layer over the whole latent grid, which scales with the square of the number of positions, the Table 8 reconstruction FID and PSNR, and the ablation's verdict for that factor."></svg>
+        <div class="readout" aria-live="polite" id="f-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Element count is not the whole story.</b> For the KL autoencoders, <code>f = 8</code>, <code>16</code> and <code>32</code> all give 4 096 numbers per 256² image — the channel count grows as fast as the grid shrinks. What changes is how many <i>spatial positions</i> the U-Net sees (1 024, 256, 64) and how much each position has to encode. The attention-cost bar is own arithmetic for a single self-attention layer over the whole latent grid, proportional to <code>(h·w)²</code>; the paper's U-Nets only place attention at a few low resolutions, so treat it as the trend, not a measured cost.</li>
+        <li><b>The reconstruction column is a floor, not a forecast.</b> It is how well the frozen autoencoder can redraw a real image; samples cannot be better than the decoder allows, but they can be much worse if the diffusion model struggles on that latent (the <code>f = 32</code> case).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="conditioning" data-nav="Conditioning through τθ">
+      <h3><span class="idx">07</span> Conditioning: a domain encoder <code>τ<sub>θ</sub></code> and cross-attention</h3>
+      <p class="lede">The study's general conditioning mechanism: encode the condition <code>y</code> — text, a class label, a layout — with a domain-specific encoder <code>τ<sub>θ</sub></code> into a sequence of <code>M</code> tokens, and let the U-Net read it with <b>cross-attention</b> at several resolutions. The general picture of cross-attention and guidance is on the <a href="../diffusion-models.html#guidance">hub's §09</a> and the <a href="../attention.html">attention page</a>; this is the paper's exact form.</p>
+
+      <div class="formula"><span class="lbl">cross-attention inside the U-Net</span><span class="eq">τ<sub>θ</sub>(y) ∈ ℝ^(M × d<sub>τ</sub>)                 condition as M tokens
+φᵢ(zₜ)  ∈ ℝ^(N × dᵢ)                  flattened U-Net features at block i, N = hᵢ·wᵢ positions
+
+Q = W_Q⁽ⁱ⁾ · φᵢ(zₜ)       K = W_K⁽ⁱ⁾ · τ<sub>θ</sub>(y)       V = W_V⁽ⁱ⁾ · τ<sub>θ</sub>(y)
+
+Attention(Q, K, V) = softmax( QKᵀ / √d ) · V              (N × M) weights, output N × d</span></div>
+
+      <ul class="notes">
+        <li><b>Queries come from the image, keys and values from the condition.</b> Every latent position asks "which condition tokens are relevant here?" The weight matrix is <code>N × M</code>, so its cost is linear in the number of latent positions — another place where a smaller latent pays off.</li>
+        <li><b><code>τ<sub>θ</sub></code> is trained jointly</b> with the denoiser from scratch for the reported text model; it is not a frozen pretrained encoder (contrast §12).</li>
+        <li><b>Not everything goes through attention.</b> Spatially aligned conditions — a low-resolution image for super-resolution, a masked image for inpainting, a semantic map — are simply <b>concatenated</b> with <code>zₜ</code> as extra input channels.</li>
+      </ul>
+
+      <h4>The text-to-image configuration</h4>
+      <table class="grid2">
+        <tr><th>component</th><th>setting (training-hyperparameter tables)</th></tr>
+        <tr><td><b>autoencoder</b></td><td>KL-reg, <code>f = 8</code>, latent 32×32×4 at 256²</td></tr>
+        <tr><td><b>τ<sub>θ</sub> text encoder</b></td><td>transformer, 32 layers, width 1280, BERT tokenizer, sequence length 77</td></tr>
+        <tr><td><b>denoiser</b></td><td>U-Net, 320 base channels, multipliers 1, 2, 4, 4, 8 heads, cross-attention at latent resolutions 32, 16, 8; 1.45B parameters in total</td></tr>
+        <tr><td><b>training</b></td><td>LAION-400M, batch 680, 390K iterations, learning rate 1.0e−4, 1000 diffusion steps, linear schedule</td></tr>
+        <tr><td><b>sampling</b></td><td>250 DDIM steps for the benchmark; classifier-free guidance scale <code>s = 1.5</code> for the guided row of §08, <code>s = 10</code> for the showcase samples</td></tr>
+      </table>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="results" data-nav="Generation results">
+      <h3><span class="idx">08</span> Generation results: unconditional, class-conditional, text-to-image</h3>
+      <p class="lede">At 256² the latent models are competitive with or ahead of pixel-space diffusion and GANs, at a fraction of the parameters and compute — the first strong evidence that a frozen autoencoder does not have to be a quality tax.</p>
+
+      <h4>Unconditional (Table 1)</h4>
+      <table class="grid2">
+        <tr><th>dataset (256²)</th><th>model</th><th>FID ↓</th><th>precision / recall</th><th>reference points from the table</th></tr>
+        <tr class="hl"><td>CelebA-HQ</td><td>LDM-4, 500 DDIM steps</td><td class="num">5.11</td><td class="num">0.72 / 0.49</td><td>LSGM 7.22 — reported as a new state of the art</td></tr>
+        <tr><td>FFHQ</td><td>LDM-4, 200 steps</td><td class="num">4.98</td><td class="num">0.73 / 0.50</td><td>StyleGAN 4.16, ProjectedGAN 3.08</td></tr>
+        <tr><td>LSUN-Churches</td><td>LDM-8 (KL), 100 steps</td><td class="num">4.02</td><td class="num">0.64 / 0.52</td><td>DDPM 7.89, StyleGAN2 3.86</td></tr>
+        <tr><td>LSUN-Bedrooms</td><td>LDM-4, 200 steps</td><td class="num">2.95</td><td class="num">0.66 / 0.48</td><td>ADM 1.90, DDPM 4.9</td></tr>
+      </table>
+      <p>The latent models beat earlier diffusion models everywhere except LSUN-Bedrooms, where they come close to ADM with about half its parameters (274M vs 552M) and roughly four times less training compute (§10). Against GANs they trade a little FID for <b>higher recall</b>, which the paper attributes to the mode-covering likelihood-based objective.</p>
+
+      <h4>Class-conditional ImageNet 256² (Table 3)</h4>
+      <table class="grid2">
+        <tr><th>model</th><th>FID ↓</th><th>IS ↑</th><th>precision / recall</th><th>params</th></tr>
+        <tr><td>BigGAN-deep</td><td class="num">6.95</td><td class="num">203.6</td><td class="num">0.87 / 0.28</td><td class="num">340M</td></tr>
+        <tr><td>ADM (pixel diffusion)</td><td class="num">10.94</td><td class="num">100.98</td><td class="num">0.69 / 0.63</td><td class="num">554M</td></tr>
+        <tr><td>ADM-G (classifier guidance)</td><td class="num">4.59</td><td class="num">186.7</td><td class="num">0.82 / 0.52</td><td class="num">608M</td></tr>
+        <tr><td>LDM-4</td><td class="num">10.56</td><td class="num">103.49</td><td class="num">0.71 / 0.62</td><td class="num">400M</td></tr>
+        <tr class="hl"><td><b>LDM-4-G</b> (classifier-free, <code>s = 1.5</code>)</td><td class="num">3.60</td><td class="num">247.67</td><td class="num">0.87 / 0.48</td><td class="num">400M</td></tr>
+      </table>
+      <p>The model behind these rows: <code>f = 4</code> VQ autoencoder (<code>|𝒵| = 8192</code>, latent 64×64×3), 192 base channels, the class label entering through cross-attention, batch 1200 for 178K iterations, 250 DDIM steps. Guidance behaves as the hub describes — FID and IS improve, recall drops (0.62 → 0.48). The compute table also reports <code>s = 1.25</code> at FID 3.95, IS 178.22.</p>
+
+      <h4>Text-to-image, MS-COCO 256² (Table 2)</h4>
+      <table class="grid2">
+        <tr><th>model</th><th>FID ↓</th><th>IS ↑</th><th>params</th></tr>
+        <tr><td>CogView</td><td class="num">27.10</td><td class="num">18.20</td><td class="num">4B</td></tr>
+        <tr><td>LAFITE</td><td class="num">26.94</td><td class="num">26.02</td><td class="num">75M</td></tr>
+        <tr><td>GLIDE</td><td class="num">12.24</td><td class="num">–</td><td class="num">6B</td></tr>
+        <tr><td>Make-A-Scene</td><td class="num">11.84</td><td class="num">–</td><td class="num">4B</td></tr>
+        <tr><td>LDM-KL-8</td><td class="num">23.31</td><td class="num">20.03</td><td class="num">1.45B</td></tr>
+        <tr class="hl"><td><b>LDM-KL-8-G</b> (<code>s = 1.5</code>)</td><td class="num">12.63</td><td class="num">30.29</td><td class="num">1.45B</td></tr>
+      </table>
+      <p>With classifier-free guidance the 1.45B latent model lands next to 4B and 6B pixel-space or token-based systems. Guidance roughly halves FID here (23.31 → 12.63), a much bigger effect than for the class-conditional model.</p>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="tasks" data-nav="Image-to-image tasks">
+      <h3><span class="idx">09</span> Image-to-image tasks: super-resolution, inpainting, layouts, semantic maps</h3>
+      <p class="lede">Concatenation conditioning turns the same latent model into a family of image-to-image translators — the problem space the <a href="../generative-adversarial-networks.html#translation">GAN translation sections</a> describe from the adversarial side.</p>
+
+      <h4>Super-resolution, ImageNet 64² → 256² (Table 5)</h4>
+      <p>Bicubic ×4 degradation, the <code>f = 4</code> VQ autoencoder pretrained on OpenImages, low-resolution image concatenated with the U-Net input.</p>
+      <table class="grid2">
+        <tr><th>model</th><th>FID ↓ (val / train feats)</th><th>IS ↑</th><th>PSNR ↑</th><th>SSIM ↑</th><th>params</th></tr>
+        <tr><td>image regression</td><td class="num">15.2</td><td class="num">121.1</td><td class="num">27.9</td><td class="num">0.801</td><td class="num">625M</td></tr>
+        <tr><td>SR3 (pixel diffusion)</td><td class="num">5.2</td><td class="num">180.1</td><td class="num">26.4</td><td class="num">0.762</td><td class="num">625M</td></tr>
+        <tr class="hl"><td>LDM-4, 100 steps</td><td class="num">2.8 / 4.8</td><td class="num">166.3</td><td class="num">24.4</td><td class="num">0.69</td><td class="num">169M</td></tr>
+        <tr><td>LDM-4 big, 100 steps</td><td class="num">2.4 / 4.3</td><td class="num">174.9</td><td class="num">24.7</td><td class="num">0.71</td><td class="num">552M</td></tr>
+      </table>
+      <p>Better FID, <b>worse PSNR and SSIM</b> than both baselines. The paper reads this as the <code>f = 4</code> autoencoder's reconstruction limit showing up in pixel-accurate metrics (§11). In a user study (Table 4) the latent model was preferred over a pixel-space diffusion baseline <b>70.6% vs 29.4%</b>.</p>
+
+      <h4>Inpainting on Places (Tables 6 and 7)</h4>
+      <table class="grid2">
+        <tr><th>model</th><th>train samples/s</th><th>hours / epoch</th><th>FID@2k, epoch 6</th></tr>
+        <tr><td>LDM-1 (pixel space)</td><td class="num">0.11</td><td class="num">20.66</td><td class="num">24.74</td></tr>
+        <tr><td>LDM-4, KL, with attention</td><td class="num">0.32</td><td class="num">7.66</td><td class="num">15.21</td></tr>
+        <tr class="hl"><td>LDM-4, VQ, with attention</td><td class="num">0.33</td><td class="num">7.04</td><td class="num">14.99</td></tr>
+        <tr><td>LDM-4, VQ, no attention</td><td class="num">0.35</td><td class="num">6.66</td><td class="num">15.95</td></tr>
+      </table>
+      <p>The paper summarises this as a speed-up of <b>at least 2.7×</b> between pixel- and latent-based diffusion while improving FID by <b>at least 1.6×</b> (own check: 20.66 / 7.66 ≈ 2.70 and 24.74 / 15.21 ≈ 1.63 for the KL row). After scaling up and fine-tuning, the big LDM-4 reaches FID <b>1.50</b> on all test samples vs LaMa 2.21 and CoModGAN 1.82, and 9.39 on 40–50% masked images vs 12.0 and 10.4 (Table 7); LPIPS is about level with LaMa. Users preferred it over LaMa <b>68.1% vs 31.9%</b> (Table 4).</p>
+
+      <h4>Layouts, semantic maps and sampling beyond the training size</h4>
+      <ul class="notes">
+        <li><b>Layout-to-image (Table 9).</b> Bounding-box layouts encoded by <code>τ<sub>θ</sub></code> and read through cross-attention: LDM-4 reaches FID 32.02 on OpenImages 256² (VQGAN+transformer 45.33) and 40.91 on COCO when fine-tuned from OpenImages.</li>
+        <li><b>Convolutional sampling.</b> Because the denoiser is convolutional and the condition is spatial, a semantic-synthesis model trained on 256² crops generates coherent <b>512 × 1024</b> landscapes; super-resolution and inpainting models likewise produce 512²–1024² outputs. This is where the latent SNR of §05 matters most.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="compute" data-nav="The compute bill">
+      <h3><span class="idx">10</span> The compute bill, side by side</h3>
+      <p class="lede">The compute table (Table 18) puts training cost in V100-days next to quality and sampling throughput. <b>The headline is not a better FID; it is the same FID region for several times less training and one to two orders of magnitude more samples per second.</b></p>
+
+      <div class="viz" id="viz-cmp">
+        <div class="vhead">
+          <span class="vtitle">Reported training compute against quality or throughput (Table 18)</span>
+          <span class="vhint">pick a benchmark; switch the vertical axis between FID and sampling throughput</span>
+        </div>
+        <div class="controls">
+          <label>benchmark <select id="cmp-d">
+            <option value="imagenet" selected>ImageNet 256², class-conditional</option>
+            <option value="bedrooms">LSUN-Bedrooms 256²</option>
+            <option value="churches">LSUN-Churches 256²</option>
+            <option value="ffhq">FFHQ 256²</option>
+          </select></label>
+          <label>vertical axis <select id="cmp-y">
+            <option value="fid" selected>FID (lower is better)</option>
+            <option value="thr">samples / s (higher is better)</option>
+          </select></label>
+        </div>
+        <svg id="cmp-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Scatter plot of the models in the paper's compute table for the chosen benchmark. The horizontal axis is overall training compute in V100-days on a logarithmic scale. The vertical axis is either FID, lower is better, or sampling throughput in samples per second on a logarithmic scale, higher is better. Latent diffusion models are drawn in teal and baselines in amber, each labelled. On ImageNet the latent models sit at 79 to 271 V100-days, to the left of the pixel-space ADM models at 916 to 962, and the guided LDM-4 has the lowest FID of the set. On LSUN-Bedrooms the latent model uses about a quarter of ADM's compute for a somewhat higher FID while sampling about thirty times faster. Points without a reported throughput are omitted in the throughput view and listed in the readout. Hovering a point shows its numbers."></svg>
+        <div class="readout" aria-live="polite" id="cmp-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>ImageNet:</b> LDM-4-G cost 271 V100-days against 962 for ADM-G (916 for the diffusion model plus 46 for its noise-robust classifier) — about 3.5× less (own arithmetic) — for a lower FID (3.60 vs 4.59) and higher throughput (0.4 vs 0.07 samples/s at 250 steps).</li>
+        <li><b>LSUN-Bedrooms:</b> about 55 V100-days and 1.07 samples/s for LDM-4 against 232 V100-days and 0.03 samples/s for ADM at 1000 steps. (The table lists 60 in the generator column and 55 overall for this row; the text's "four times less compute" fits either.)</li>
+        <li><b>Throughput</b> is measured on a single A100 and mixes step counts (100–1000) — part of the speed-up is fewer DDIM steps, part is the smaller tensor per step.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="limits" data-nav="Limitations &amp; impact">
+      <h3><span class="idx">11</span> Limitations and societal impact the original study states</h3>
+      <div class="cards">
+        <div class="box bad"><div class="n">speed</div><div class="t">Still sequential</div><div class="g">Latent diffusion cuts the cost per step, not the number of steps. Sampling remains slower than a one-pass GAN.</div></div>
+        <div class="box bad"><div class="n">precision</div><div class="t">The autoencoder is a ceiling</div><div class="g">Where fine pixel-level accuracy is required, reconstruction quality becomes the bottleneck. The super-resolution models are already somewhat limited by it — the low PSNR / SSIM of §09.</div></div>
+        <div class="box warn"><div class="n">misuse</div><div class="t">Cheaper means more accessible</div><div class="g">Lower training and inference cost makes the technology broadly available, and with it the creation and spread of manipulated imagery and disinformation.</div></div>
+        <div class="box warn"><div class="n">data</div><div class="t">Leakage and bias</div><div class="g">Generative models can reveal training data, and can reproduce or amplify biases already in the data — important when it is sensitive or was collected without consent.</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="after" data-nav="After the paper">
+      <h3><span class="idx">12</span> After the paper: the public release and what changed</h3>
+      <p class="lede">Everything above is the original study. This section is <b>later work and public-release practice</b>, not the paper's claims.</p>
+      <table class="grid2">
+        <tr><th style="width:190px">aspect</th><th>in the paper</th><th>in the widely used later release</th></tr>
+        <tr><td><b>resolution / latent</b></td><td>256² images; <code>f = 4</code> 64×64×3 or <code>f = 8</code> 32×32×4</td><td>512² images into <code>f = 8</code>, 4-channel KL latents, i.e. 64×64×4</td></tr>
+        <tr><td><b>text encoder</b></td><td><code>τ<sub>θ</sub></code>: a 32-layer transformer trained jointly from scratch</td><td>a frozen pretrained <a href="../../models/clip.html">CLIP</a> text encoder; the U-Net is trained against its token embeddings</td></tr>
+        <tr><td><b>latent scale</b></td><td><code>σ̂</code> estimated from the first batch (§05)</td><td>a fixed constant <code>0.18215</code></td></tr>
+        <tr><td><b>backbone</b></td><td>convolutional U-Net with attention at low resolutions</td><td>later latent models replace the U-Net with a transformer over latent patches, patchified as in a <a href="../../vision/vision-transformers.html">vision transformer</a> (the hub's DiT notes in <a href="../diffusion-models.html#network">§08</a>)</td></tr>
+        <tr><td><b>autoencoder</b></td><td>4 channels at <code>f = 8</code></td><td>later systems moved to more latent channels at the same <code>f</code> to raise the reconstruction ceiling of §11</td></tr>
+      </table>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">13</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"The latent is a VAE latent, so you could just sample it from 𝒩(0, I)."</span> <span class="fix">No — the KL weight is tiny.</span> The regulariser only bounds the scale. The latent's distribution is complicated, which is exactly why a diffusion model is trained on it.</div>
+      <div class="wrong"><span class="say">"More compression is always faster and therefore better."</span> <span class="fix">Not past <code>f ≈ 16</code>.</span> At <code>f = 32</code> quality stagnates early because the first stage throws away information the generator would need (§06).</div>
+      <div class="wrong"><span class="say">"Latent diffusion uses a pretrained CLIP text encoder."</span> <span class="fix">Not in the original study.</span> Its text encoder <code>τ<sub>θ</sub></code> is trained jointly with the U-Net; the frozen-CLIP setup is a later public-release choice (§12).</div>
+      <div class="wrong"><span class="say">"The decoder runs at every denoising step."</span> <span class="fix">Once per sample.</span> All reverse steps stay in latent space; <code>𝒟</code> is applied to the final <code>z₀</code> only (§02).</div>
+      <div class="wrong"><span class="say">"VQ-reg means the diffusion model works on discrete codes."</span> <span class="fix">It works on continuous latents.</span> The quantisation layer is absorbed into the decoder (§03).</div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">14</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Split the work:</b> a once-trained perceptual autoencoder removes imperceptible detail; the diffusion model only learns semantics, on <code>z = ℰ(x)</code>.</li>
+        <li><b>Mild compression suffices</b> because the latent stays 2-D and the denoiser is convolutional; perceptual + patch-adversarial losses keep reconstructions sharp; KL- or VQ-reg keeps the latent tame.</li>
+        <li><b>The loss is unchanged:</b> <code>‖ε − ε<sub>θ</sub>(zₜ, t, τ<sub>θ</sub>(y))‖²</code>, with conditions entering through cross-attention or concatenation.</li>
+        <li><b><code>f = 4–8</code></b> is the sweet spot: smaller trains slowly, <code>f = 32</code> caps quality.</li>
+        <li><b>Rescale the latent</b> to unit variance, or the noise schedule's SNR is wrong.</li>
+        <li><b>The payoff:</b> FID 3.60 on class-conditional ImageNet for 271 V100-days, against 4.59 for 962; the price is a reconstruction ceiling visible in pixel-accurate metrics.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Diffusion models" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="ddpm.html">← DDPM</a>
+      <a href="../diffusion-models.html" style="color:var(--muted)">Diffusion Models · overview</a>
+      <a href="../generative-adversarial-networks.html">GANs →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="latent-diffusion.viz.js"></script>
+</body>
+</html>

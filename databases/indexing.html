@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Indexing</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Indexing</h1>
+      <p>An index is a second, redundant copy of some of your data, kept in a shape that answers one kind of question quickly. Every index buys read speed with write cost, disk space and planner complexity. This page covers the main structures (B⁺-tree, hash, LSM-tree, bitmap), how composite and covering indexes behave, and how a query planner decides whether to use any of them.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Systems</span>
+        <span class="pill">Storage Engines</span>
+        <span class="pill">Query Planning</span>
+        <span class="pill">B-trees · LSM</span>
+      </div>
+    </header>
+
+    <section class="topic" id="why">
+      <h3><span class="idx">01</span> Why indexes exist: the cost of a full scan</h3>
+      <p class="lede">Without an index, <code>WHERE email = 'a@b.c'</code> has to read every page of the table. The cost is counted in <b>page I/Os</b>, not rows, because storage moves data in fixed-size pages (usually 4–16 KB).</p>
+      <ul class="notes">
+        <li><b>Full scan:</b> cost ∝ P, the number of table pages. That's fine for a 10 MB table and hopeless for a 2 TB one when you only want one row.</li>
+        <li><b>Index lookup:</b> descend a small structure to find where the matching rows live, then fetch only those pages. Cost ∝ index height + matching rows.</li>
+        <li><b>What you pay for it:</b> each <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code> has to maintain <i>every</i> index on the table. Indexes also take disk, buffer-cache memory and backup time, and every extra one gives the planner more ways to pick a bad plan.</li>
+      </ul>
+      <div class="formula"><span class="lbl">Rough I/O cost of one equality lookup</span><span class="eq">full scan ≈ P pages</span>        <span class="eq">B⁺-tree ≈ h + k   (h = tree height, k = pages holding the k matches)</span></div>
+      <div class="callout"><b>One line:</b> an index turns "read everything and filter" into "seek, then read a little". The work moves from read time to write time.</div>
+    </section>
+
+    <section class="topic" id="btree">
+      <h3><span class="idx">02</span> The B⁺-tree: the default index</h3>
+      <p class="lede">A B⁺-tree is a balanced multiway search tree with one node per disk page. Inner nodes hold only separator keys and child pointers, so a single page fans out to hundreds of children. Leaves hold the keys plus row pointers (or the rows themselves) and are chained left to right, which makes range scans cheap. The structure itself is covered in <a href="../dsa/data-structures/balanced-trees/b-trees.html">B-Trees &amp; B⁺-Trees</a>.</p>
+      <div class="formula"><span class="lbl">Fan-out and height</span><span class="eq">f ≈ ⌊ page_size / (key_bytes + pointer_bytes) ⌋ · fill</span>        <span class="eq">h ≈ ⌈ log_f (N / leaf_entries) ⌉ + 1</span></div>
+      <ul class="notes">
+        <li>Because f is in the hundreds, h grows extremely slowly. A billion rows fit in <b>3–4 levels</b>. The inner levels are small enough to stay in the buffer cache, so a point lookup costs about <b>one or two real disk reads</b>.</li>
+        <li><b>Fill factor:</b> after random inserts nodes settle at about 69% full (≈ ln 2). Bulk-loading sorted data can pack them to about 90–100%.</li>
+        <li><b>Supports:</b> equality, ranges (<code>&lt;</code>, <code>BETWEEN</code>), prefix <code>LIKE 'abc%'</code>, <code>ORDER BY</code> without a sort step, and <code>MIN/MAX</code>. It does not help with <code>LIKE '%abc'</code> or with functions of the column unless you build an expression index.</li>
+      </ul>
+      <div class="viz" id="viz-bt">
+        <div class="vhead">
+          <span class="vtitle">B⁺-tree height calculator</span>
+          <span class="vhint">bigger pages or smaller keys → more fan-out → fewer levels</span>
+        </div>
+        <div class="controls">
+          <label>page size <select id="bt-page"><option value="4096">4 KB</option><option value="8192" selected>8 KB</option><option value="16384">16 KB</option></select></label>
+          <label>key bytes <input type="range" id="bt-key" min="4" max="256" step="4" value="16"></label>
+          <label>rows (10ˣ) <input type="range" id="bt-n" min="3" max="11" step="0.25" value="9"></label>
+          <label>fill <input type="range" id="bt-fill" min="0.5" max="1" step="0.01" value="0.69"></label>
+        </div>
+        <svg id="bt-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Interactive diagram: B-plus-tree levels, node counts per level and the lookup path"></svg>
+        <div class="readout" aria-live="polite" id="bt-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="hash">
+      <h3><span class="idx">03</span> Hash indexes: O(1) equality, nothing else</h3>
+      <p class="lede">A hash index maps <code>h(key) → bucket → row pointers</code>. Equality lookups take expected O(1) probes regardless of table size. The hashing details are in <a href="../dsa/data-structures/hash-tables.html">Hash Tables</a>.</p>
+      <ul class="notes">
+        <li><b>No order, so no ranges.</b> <code>WHERE ts &gt; …</code>, <code>ORDER BY</code> and prefix matches cannot use a hash index (see <a href="../dsa/data-structures/hash-tables/modern-hashing-bloom.html">what hashing cannot do</a>).</li>
+        <li><b>Growth:</b> on-disk hash indexes have to grow without rehashing everything at once. Linear hashing splits one bucket at a time. Extendible hashing doubles a directory of bucket pointers.</li>
+        <li><b>In practice</b> a B⁺-tree is usually within a level of a hash index on equality and handles everything else as well, so relational engines default to B-trees. Hash indexing earns its place in in-memory key-value stores, hash joins and the in-memory key directory of log-structured stores.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="lsm">
+      <h3><span class="idx">04</span> LSM-trees: turn random writes into sequential ones</h3>
+      <p class="lede">A log-structured merge tree buffers writes in memory and flushes them as immutable sorted files. Writes are fast and sequential. Reads may have to check several files.</p>
+      <ol class="notes">
+        <li><b>Write:</b> append to the <b>WAL</b> for durability, then insert into the in-memory <b>memtable</b> (a sorted skip list or tree).</li>
+        <li><b>Flush:</b> when the memtable fills up, write it out as an immutable sorted <b>SSTable</b> in level 0.</li>
+        <li><b>Compaction:</b> background jobs merge-sort SSTables into larger ones at deeper levels and drop overwritten values and <b>tombstones</b> (delete markers).</li>
+        <li><b>Read:</b> check the memtable, then each level from newest to oldest. A per-file <b>Bloom filter</b> skips files that definitely don't contain the key, and sparse block indexes locate the block inside a file.</li>
+      </ol>
+      <table class="cmp">
+        <tr><th>Compaction</th><th>Write amp</th><th>Point-read amp (no Bloom)</th><th>Space amp</th><th>Good for</th></tr>
+        <tr><td><b>Leveled</b> (one sorted run per level)</td><td>High, ≈ T per level · L levels</td><td>≈ L runs</td><td>Low, ≈ 1 + 1/T</td><td>Read-heavy and space-sensitive workloads</td></tr>
+        <tr><td><b>Tiered / size-tiered</b> (up to T runs per level)</td><td>Low, ≈ 1 per level · L</td><td>≈ T · L runs</td><td>High, often ≥ 2× while compacting</td><td>Write-heavy ingest</td></tr>
+      </table>
+      <p>T is the size ratio between adjacent levels (often 10) and L is the number of levels. Treat the figures as orders of magnitude. Real engines mix strategies, for example tiered at level 0 and leveled below it.</p>
+    </section>
+
+    <section class="topic" id="amp">
+      <h3><span class="idx">05</span> Read, write and space amplification</h3>
+      <p class="lede">Storage engines are compared by how many bytes they physically move per logical byte. It is generally accepted that no structure minimises all three amplifications at once: improving any two costs you the third.</p>
+      <div class="formula"><span class="lbl">Definitions</span><span class="eq">write amp = bytes written to storage / bytes written by the application</span>
+<span class="eq">read amp = bytes (or pages) read per logical lookup</span>
+<span class="eq">space amp = bytes on disk / bytes of live data</span></div>
+      <ul class="notes">
+        <li><b>B⁺-tree write amp:</b> changing a 100-byte row dirties a whole 8 KB page, which works out to about 80× at the page level, plus the WAL record and possibly a full-page image after a checkpoint. Writes are in-place and random.</li>
+        <li><b>LSM write amp:</b> each byte is rewritten once per compaction it passes through. Leveled compaction with T = 10 and 4–5 levels commonly measures 10–30×, but those writes are large and sequential, which SSDs and HDDs handle much better than random 8 KB writes.</li>
+        <li><b>Secondary indexes multiply write amp.</b> A table with 6 indexes does roughly 7 structure updates per insert. Under write-heavy load, the number of indexes is the first knob to check.</li>
+        <li><b>SSD wear:</b> write amp is also a hardware cost, because flash endurance is rated in total bytes written.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="bitmap">
+      <h3><span class="idx">06</span> Bitmap indexes: low-cardinality analytics</h3>
+      <p class="lede">A bitmap index stores one bit-vector per distinct value. Bit i is 1 if row i has that value. A predicate becomes a bitwise operation.</p>
+      <div class="formula"><span class="eq">rows(status='open' ∧ region∈{EU,US}) = B_open AND (B_EU OR B_US)</span>        <span class="eq">size ≈ distinct_values · N bits (before compression)</span></div>
+      <ul class="notes">
+        <li>Bitmaps suit columns with few distinct values (status, country, boolean flags), where a B-tree would point at huge, unselective lists of rows. Run-length or roaring-style compression keeps sparse bitmaps small, and AND/OR/COUNT run with SIMD over whole machine words.</li>
+        <li><b>Poor for OLTP:</b> one update can touch a compressed run that covers many rows, so locking and rewrite costs are high under concurrent writes. They belong in warehouses and columnar engines (see <a href="../data-engineering/data-warehousing.html">Data Warehousing</a>).</li>
+        <li>Some row stores build bitmaps <i>at query time</i> instead. A "bitmap index scan" collects matching row locations from one or more B-trees into a bitmap, combines them with AND/OR, then visits the heap pages in physical order.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="composite">
+      <h3><span class="idx">07</span> Composite indexes and the leftmost-prefix rule</h3>
+      <p class="lede">An index on <code>(country, city, signup_date)</code> sorts entries lexicographically: first by country, then by city within each country, then by date. A seek can only use a <b>leading run of equality columns, optionally followed by one range column</b>. That is the leftmost-prefix rule. Toggle the predicates and watch which entries the scan has to touch.</p>
+      <div class="viz" id="viz-lp">
+        <div class="vhead">
+          <span class="vtitle">Leftmost-prefix: which part of the index is a contiguous range?</span>
+          <span class="vhint">green = returned · amber = scanned then filtered · dim = skipped</span>
+        </div>
+        <div class="controls">
+          <label>country <select id="lp-c"><option value="any">(no predicate)</option><option value="DE">= 'DE'</option><option value="US" selected>= 'US'</option></select></label>
+          <label>city <select id="lp-t"><option value="any" selected>(no predicate)</option><option value="Paris">= 'Paris'</option><option value="Austin">= 'Austin'</option></select></label>
+          <label>signup_date <select id="lp-d"><option value="any">(no predicate)</option><option value="ge" selected>≥ '2024-07'</option><option value="eq">= '2024-03'</option></select></label>
+          <label><input type="checkbox" id="lp-cov"> SELECT only indexed columns</label>
+        </div>
+        <svg id="lp-svg" width="640" height="320" viewBox="0 0 640 320" role="img" aria-label="Interactive diagram: sorted composite index entries highlighted by seek range and filter"></svg>
+        <div class="readout" aria-live="polite" id="lp-read"></div>
+      </div>
+      <ul class="notes">
+        <li><b>Column order rule of thumb:</b> equality columns first, then the column used for a range or <code>ORDER BY</code>. Among the equality columns, the order matters less than which column sets are actually queried together.</li>
+        <li>An index on <code>(a, b)</code> also serves queries on <code>a</code> alone, so a separate index on <code>a</code> is usually redundant write cost.</li>
+        <li><b>Skip scan:</b> some engines can use an index whose leading column has no predicate by jumping between its distinct values. This only pays off when that leading column has very few distinct values.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="covering">
+      <h3><span class="idx">08</span> Clustered, secondary and covering indexes</h3>
+      <table class="cmp">
+        <tr><th>Kind</th><th>What the leaf holds</th><th>Consequence</th></tr>
+        <tr><td><b>Clustered</b> (index-organised table)</td><td>The full row, ordered by the key</td><td>Range scans on the key read contiguous pages. Only one per table. A random primary key such as UUIDv4 scatters inserts and causes page splits.</td></tr>
+        <tr><td><b>Secondary over a heap</b></td><td>Key + physical row location</td><td>Each match costs an extra heap fetch, which is a random I/O if rows are not physically ordered by this key.</td></tr>
+        <tr><td><b>Secondary over a clustered table</b></td><td>Key + primary key</td><td>Each match does a second B-tree descent through the clustered index. Wide primary keys bloat every secondary index.</td></tr>
+        <tr><td><b>Covering</b> (extra <code>INCLUDE</code>d columns)</td><td>Key + payload columns the query needs</td><td>An <b>index-only scan</b> never touches the table. Multi-version engines still need a visibility check, often served by a per-page "all-visible" map.</td></tr>
+        <tr><td><b>Partial / filtered</b></td><td>Only rows matching a predicate (<code>WHERE deleted = false</code>)</td><td>Smaller and cheaper to maintain. Used only when the query implies the index's predicate.</td></tr>
+      </table>
+      <div class="callout"><b>Correlation matters:</b> the same index can be cheap or ruinous depending on how closely the table's physical row order follows the index order. With high correlation, k matches cost about k/rows_per_page sequential pages. With none, they cost about k random pages.</div>
+    </section>
+
+    <section class="topic" id="planner">
+      <h3><span class="idx">09</span> Selectivity and how the planner chooses</h3>
+      <p class="lede">A cost-based planner estimates the <b>selectivity</b> s of each predicate (the fraction of rows that pass), converts each candidate plan to an abstract cost, and picks the cheapest. Indexes win only when s is small.</p>
+      <div class="formula"><span class="lbl">Simplified cost model (units of one sequential page read)</span><span class="eq">cost_seq ≈ P · c_seq + N · c_cpu</span>
+<span class="eq">cost_index ≈ h · c_rand + s·N · c_rand   (uncorrelated: one random page per match)</span>
+<span class="eq">cost_bitmap ≈ P · (1 − e^(−sN/P)) · c_page + s·N · c_cpu   (each heap page visited once, in order)</span></div>
+      <ul class="notes">
+        <li><b>Where selectivity comes from:</b> per-column statistics, namely most-common-value lists, equi-depth histograms and distinct counts, refreshed by <code>ANALYZE</code>. Predicates on different columns are multiplied together under an <b>independence assumption</b>.</li>
+        <li><b>Correlated columns break that assumption.</b> <code>city='Paris' AND country='FR'</code> is estimated at s_city·s_country, which can be orders of magnitude too low. The planner then picks a nested loop that runs a million times. Multi-column (extended) statistics fix this.</li>
+        <li><b>c_rand / c_seq</b> encodes the storage. A ratio of about 4 is the classic spinning-disk default, and about 1.1 suits SSDs. On SSDs the index stays the better plan up to much larger selectivities.</li>
+      </ul>
+      <div class="viz" id="viz-pl">
+        <div class="vhead">
+          <span class="vtitle">Seq scan vs index scan vs bitmap scan</span>
+          <span class="vhint">drag selectivity; the cheapest plan is highlighted</span>
+        </div>
+        <div class="controls">
+          <label>selectivity (10ˣ) <input type="range" id="pl-s" min="-6" max="0" step="0.05" value="-3"></label>
+          <label>random/seq cost <input type="range" id="pl-r" min="1" max="8" step="0.1" value="4"></label>
+          <label><input type="checkbox" id="pl-corr"> table physically ordered by the key</label>
+        </div>
+        <svg id="pl-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Interactive chart: estimated plan cost versus predicate selectivity for three access paths"></svg>
+        <div class="readout" aria-live="polite" id="pl-read"></div>
+      </div>
+      <p>Use <code>EXPLAIN ANALYZE</code> to compare <b>estimated</b> and <b>actual</b> rows at each node. A gap of 10× or more is the usual root cause of a bad plan, more often than a missing index.</p>
+    </section>
+
+    <section class="topic" id="practice">
+      <h3><span class="idx">10</span> Operational practice</h3>
+      <ul class="notes">
+        <li><b>Index for the workload, not the schema.</b> Start from the slowest frequent queries (from query-stats views or slow logs) and design composite or covering indexes for them. Don't index every foreign key and filter column reflexively.</li>
+        <li><b>Find unused indexes.</b> Usage counters show indexes that are never scanned. They are pure write and space cost. Check replicas too, because a read replica may depend on an index the primary never uses.</li>
+        <li><b>Build online.</b> Creating an index on a large live table can block writes. Use the engine's concurrent or online build, and expect it to take longer and possibly fail halfway, leaving an invalid index to drop.</li>
+        <li><b>Bloat and fragmentation:</b> MVCC updates leave dead entries behind, and random-key inserts split pages. Watch index size compared with live rows, and rebuild or repack when the ratio drifts.</li>
+        <li><b>Monitor the plan, not just latency.</b> Plans flip when statistics change, for example after a bulk load. Treat a plan regression like a model regression: alert on it and diff it (compare <a href="../mlops/monitoring-and-drift.html">Monitoring &amp; Drift</a>).</li>
+        <li><b>Vector search is indexing too:</b> approximate-nearest-neighbour indexes trade recall for speed. See <a href="vector-databases.html">Vector Databases</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">11</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>B⁺-tree</b> is the general-purpose default: equality, ranges and ordering in about 3–4 levels for a billion rows, with inner levels cached in memory.</li>
+        <li><b>Hash</b> handles equality only. <b>LSM</b> gives fast sequential writes and pays for them with compaction and multi-file reads. <b>Bitmap</b> suits low-cardinality analytics and is poor for OLTP.</li>
+        <li><b>Composite indexes</b> follow the leftmost-prefix rule: equality columns first, then at most one range column. <b>Covering</b> indexes avoid table lookups altogether.</li>
+        <li>Every index adds <b>write amplification</b>, and the planner only uses an index when the estimated <b>selectivity</b> is low enough. Bad estimates do more damage than missing indexes.</li>
+        <li>Related pages: <a href="transactions-acid.html">Transactions (ACID)</a> (the WAL and MVCC that indexes must respect), <a href="nosql.html">NoSQL</a> (LSM-based stores), <a href="../programming/sql.html">SQL</a>.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="indexing.viz.js"></script>
+</body>
+</html>

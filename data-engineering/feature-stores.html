@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Feature Stores</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Feature Stores</h1>
+      <p>A model needs the same feature computed twice: in bulk over history to build a <b>training set</b>, and one row at a time in milliseconds to <b>serve</b> a prediction. A feature store is the system that keeps those two paths consistent — one definition, an offline store for time-travel queries, an online store for low-latency lookups, and a registry so features are found and reused instead of re-invented. Its central technical problem is <b>time</b>: every training row must see features exactly as they were at prediction time, not as they are now.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Engineering</span>
+        <span class="pill">MLOps</span>
+        <span class="pill">Point-in-time joins</span>
+        <span class="pill">Training/serving skew</span>
+        <span class="pill">Online serving</span>
+      </div>
+    </header>
+
+    <section class="topic" id="problem" data-nav="The problem">
+      <h3><span class="idx">01</span> The problem: every feature lives twice</h3>
+      <ul class="notes">
+        <li><b>Training</b> needs features for millions of historical (entity, timestamp, label) rows, computed in batch with <a href="../programming/apache-spark.html">Spark</a> or warehouse <a href="../programming/sql.html">SQL</a>.</li>
+        <li><b>Serving</b> needs the same features for one entity <i>now</i>, within a latency budget of a few milliseconds, from a service written in a different language by a different team.</li>
+        <li>Without shared infrastructure, the two implementations drift: a different null fill, a timezone boundary, a 7-day window computed as 7×24 hours in one and calendar days in the other. The model then sees inputs at serving time it was never trained on — <b>training/serving skew</b> — and degrades silently.</li>
+        <li>Meanwhile five teams each build their own "customer 30-day spend" with five slightly different definitions.</li>
+      </ul>
+      <div class="callout"><b>One line:</b> a feature store turns features from ad-hoc pipeline code into managed, versioned data products with two access paths — historical (point-in-time) and live (low latency) — fed from one definition.</div>
+    </section>
+
+    <section class="topic" id="architecture" data-nav="Architecture">
+      <h3><span class="idx">02</span> Architecture: offline store, online store, registry</h3>
+      <table class="cmp">
+        <tr><th>Component</th><th>Stores / does</th><th>Typical backing</th><th>Optimised for</th></tr>
+        <tr><td><b>Offline store</b></td><td>Full history of feature values with timestamps</td><td>Lakehouse tables or a warehouse (<a href="data-warehousing.html">Data Warehousing</a>)</td><td>Large scans; point-in-time joins for training and batch scoring</td></tr>
+        <tr><td><b>Online store</b></td><td>Latest value per entity key</td><td>Low-latency key-value store (in-memory or SSD-backed; see <a href="../databases/nosql.html">NoSQL</a>, <a href="../databases/caching.html">Caching</a>)</td><td>Single-digit-ms point reads at high QPS</td></tr>
+        <tr><td><b>Registry</b></td><td>Feature definitions, entities, owners, versions, lineage, schemas</td><td>Metadata database + code repository</td><td>Discovery, governance, consistency</td></tr>
+        <tr><td><b>Materialisation</b></td><td>Jobs that compute features and write them to one or both stores</td><td>Batch (scheduled), streaming, or on-demand</td><td>Freshness vs cost</td></tr>
+        <tr><td><b>Serving API</b></td><td><code>get_online_features(entity_keys, features)</code> and <code>get_historical_features(entity_df, features)</code></td><td>SDK + low-latency service</td><td>One interface for both paths</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">the two read paths</span><span class="eq">training:  entity_df(entity, t, label)  ⋈ₚᵢₜ  offline_store   →  training set</span>
+<span class="eq">serving:   request(entity)  →  online_store[entity]  →  feature vector  →  model</span></div>
+      <ul class="notes">
+        <li>Some feature stores <b>transform</b> (they own the computation from raw data); others are <b>virtual</b> — they register features computed by your existing pipelines and only manage storage, joins, and serving. Both need the same time semantics.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="concepts" data-nav="Entities &amp; timestamps">
+      <h3><span class="idx">03</span> Entities, feature views, and timestamps</h3>
+      <ul class="notes">
+        <li><b>Entity</b>: the thing features describe, with a join key — <code>customer_id</code>, <code>merchant_id</code>, (<code>customer_id</code>, <code>merchant_id</code>) for pair features.</li>
+        <li><b>Feature view / group</b>: a set of features for one entity sharing a source and a schedule, e.g. <code>customer_spend_stats</code> with <code>spend_7d</code>, <code>spend_30d</code>, <code>txn_count_24h</code>.</li>
+        <li><b>Event timestamp</b>: the time at which the value became true in the world (end of the aggregation window). This is what point-in-time joins use.</li>
+        <li><b>Created / ingestion timestamp</b>: when the row was written to the store. It differs from event time when data arrives late or is backfilled, and it matters for reproducing what was <i>actually knowable</i> at serving time (§05).</li>
+        <li><b>TTL</b>: how far back a value may be used. A <code>spend_7d</code> computed 40 days ago should not be joined to today's label; with TTL = 2 days the join returns null instead, mirroring what the online store would return for a stale entity.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="pit" data-nav="Point-in-time joins">
+      <h3><span class="idx">04</span> Point-in-time-correct joins</h3>
+      <p class="lede">For every training row (entity e, prediction time t), join the feature value that was the latest one known at t — never a later one. This is an <b>as-of join</b>, not an equality join.</p>
+      <div class="formula"><span class="lbl">as-of join with ingestion delay <span class="keep">δ</span> and time-to-live TTL</span><span class="eq">x(e, t) = v(e, τ*)</span>      <span class="eq">τ* = max { τ : τ + δ ≤ t  and  τ ≥ t − TTL }</span>      <span class="eq">(null if the set is empty)</span>
+<span class="lbl">what a naive join does instead</span><span class="eq">x<sub>naive</sub>(e, t) = v(e, latest τ)</span>      <span class="eq">— uses values from after t: label leakage</span></div>
+      <p>Drag the label (prediction) times and compare the naive "latest value" join with the as-of join. Raise the ingestion delay to model a nightly batch that only lands features hours after the window closes.</p>
+
+      <div class="viz" id="viz-pit">
+        <div class="vhead">
+          <span class="vtitle">As-of join vs naive join on a feature timeline</span>
+          <span class="vhint">drag the label markers · set ingestion delay and TTL · switch join type</span>
+        </div>
+        <div class="controls">
+          <label>join <select id="pit-mode"><option value="asof">point-in-time (as-of)</option><option value="naive">naive: latest value</option></select></label>
+          <label>ingestion delay δ <input type="range" id="pit-delay" min="0" max="3" step="0.5" value="0"> <b id="pit-delayv">0 d</b></label>
+          <label>TTL <input type="range" id="pit-ttl" min="1" max="10" step="1" value="10"> <b id="pit-ttlv">10 d</b></label>
+        </div>
+        <svg id="pit-svg" class="dragpt" width="640" height="270" viewBox="0 0 640 270" role="img" aria-label="Interactive timeline: feature value updates and draggable label times, showing which feature value each join picks and where leakage occurs"></svg>
+        <div class="readout" aria-live="polite" id="pit-read"></div>
+      </div>
+      <ul class="notes">
+        <li>Implementation: sort both sides by (entity, time) and merge (<code>merge_asof</code> in <a href="../programming/pandas.html">pandas</a>; <code>ASOF JOIN</code> or a window/<code>QUALIFY ROW_NUMBER()</code> pattern in SQL; range join + rank in Spark). At scale, bucket by entity and time to avoid a cross join.</li>
+        <li><b>Leakage looks like success.</b> A churn model trained with naive joins sees "days since last login" computed <i>after</i> the customer churned. Offline AUC soars; production performance collapses. The gap between offline and online metrics is often the first symptom (see <a href="../machine-learning/model-evaluation.html">Model Evaluation</a>).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="leakage" data-nav="Leakage pitfalls">
+      <h3><span class="idx">05</span> Label leakage and time-travel pitfalls</h3>
+      <table class="cmp">
+        <tr><th>Pitfall</th><th>How it leaks</th><th>Guard</th></tr>
+        <tr><td><b>Latest-value join</b></td><td>Uses the current snapshot for historical rows</td><td>As-of join on event timestamp</td></tr>
+        <tr><td><b>Ignoring ingestion delay</b></td><td>Value with event time 23:59 joined to a 00:30 prediction, but the nightly job only lands it at 03:00</td><td>Join on <code>τ + δ ≤ t</code> or on created timestamp; δ from the real pipeline SLA</td></tr>
+        <tr><td><b>Backfilled features</b></td><td>A new feature computed today over history uses corrected or late-arriving data that wasn't available then</td><td>Accept as known optimism, or rebuild from raw data as-of each date; flag backfilled ranges</td></tr>
+        <tr><td><b>Window boundary inclusive of t</b></td><td>"Transactions in the last 24 h" includes the transaction being scored (whose label is fraud)</td><td>Windows end strictly before t; exclude the current event</td></tr>
+        <tr><td><b>Target-derived features</b></td><td>Target encoding or aggregates computed over the full dataset, including the row's own label</td><td>Compute from strictly earlier data, or out-of-fold (see <a href="data-preprocessing.html">Data Preprocessing</a>)</td></tr>
+        <tr><td><b>Random train/test split on time-series data</b></td><td>Future rows train the model scored on the past</td><td>Split by time; validate on a later period</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="skew" data-nav="Training/serving skew">
+      <h3><span class="idx">06</span> Training/serving skew</h3>
+      <table class="cmp">
+        <tr><th>Kind</th><th>Cause</th><th>Detection / fix</th></tr>
+        <tr><td><b>Logic skew</b></td><td>Two implementations of a feature (SQL offline, Java online)</td><td>Single definition compiled to both paths; on-demand transforms shared as one function</td></tr>
+        <tr><td><b>Data skew</b></td><td>Online path reads a different source (cache vs warehouse), different null handling, unit or timezone differences</td><td>Compare distributions of logged serving features to training features</td></tr>
+        <tr><td><b>Freshness skew</b></td><td>Training used values available within minutes; serving sees values a day old (or vice versa)</td><td>Model δ in the as-of join to match production freshness</td></tr>
+        <tr><td><b>Version skew</b></td><td>Model trained on feature v2, serving still materialises v1 (or an embedding from a different model)</td><td>Pin feature versions in the model artifact; registry checks at deploy</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Log-and-wait</b> is the most robust fix: log the exact feature vector served with each prediction, join it to the label when it arrives, and train on <i>that</i>. Training data then matches serving by construction — at the cost of waiting to accumulate it, and of only having features that were served.</li>
+        <li><b>Skew metric:</b> for a sample of entities, recompute features offline for the same timestamps they were served and compare. Track mismatch rate per feature; alert above a threshold. Distribution-level checks (PSI, KS) are covered in <a href="../mlops/monitoring-and-drift.html">Monitoring &amp; Drift</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="materialisation" data-nav="Materialisation">
+      <h3><span class="idx">07</span> Materialisation: batch, streaming, on-demand</h3>
+      <table class="cmp">
+        <tr><th>Mode</th><th>Computation</th><th>Freshness</th><th>Cost &amp; complexity</th><th>Example</th></tr>
+        <tr><td><b>Batch</b></td><td>Scheduled job over the warehouse/lake, writes offline + pushes latest to online</td><td>Hours</td><td>Cheapest, simplest</td><td>Customer lifetime value, 90-day aggregates</td></tr>
+        <tr><td><b>Streaming</b></td><td>Stream job updates windowed aggregates from an event log (<a href="stream-processing.html">Stream Processing</a>)</td><td>Seconds</td><td>Always-on cluster, state management, exactly-once concerns</td><td>Transactions in last 10 min, session click count</td></tr>
+        <tr><td><b>On-demand</b></td><td>Computed at request time from request data (+ stored features)</td><td>Instant</td><td>Adds serving latency; must be identical offline</td><td>Distance between user and merchant; amount ÷ user's average amount</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Online writes are upserts of the latest value;</b> offline writes are appends with timestamps. A materialisation job that only updates the online store leaves the offline history incomplete — and the next training set can't be point-in-time correct.</li>
+        <li><b>Streaming backfills.</b> A new streaming feature has no history. Either compute history with a batch job using the same logic (risking logic skew), or replay the event log through the stream job (kappa-style).</li>
+        <li><b>Idempotent materialisation</b> by (entity, event timestamp) makes reruns safe — the same discipline as <a href="etl-pipelines.html#idempotency">ETL idempotency</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="freshness" data-nav="Freshness &amp; latency">
+      <h3><span class="idx">08</span> Freshness and latency budgets</h3>
+      <div class="formula"><span class="lbl">staleness of a served feature</span><span class="eq">staleness(t) = t − event_time(latest value in online store)</span>
+<span class="lbl">batch every Δ with pipeline latency L (staleness is a sawtooth)</span><span class="eq">min = L</span>      <span class="eq">max = L + Δ</span>      <span class="eq">mean ≈ L + Δ / 2</span></div>
+
+      <div class="viz" id="viz-fresh">
+        <div class="vhead">
+          <span class="vtitle">Feature staleness: batch interval vs streaming</span>
+          <span class="vhint">change the schedule and pipeline latency</span>
+        </div>
+        <div class="controls">
+          <label>batch interval Δ <input type="range" id="fr-int" min="1" max="24" step="1" value="6"> <b id="fr-intv">6 h</b></label>
+          <label>pipeline latency L <input type="range" id="fr-lat" min="0" max="4" step="0.25" value="1"> <b id="fr-latv">1 h</b></label>
+          <label>SLA <input type="range" id="fr-sla" min="1" max="24" step="1" value="4"> <b id="fr-slav">4 h</b></label>
+        </div>
+        <svg id="fr-svg" width="640" height="220" viewBox="0 0 640 220" role="img" aria-label="Interactive chart: staleness sawtooth for batch materialisation compared with a near-flat streaming line and a freshness SLA"></svg>
+        <div class="readout" aria-live="polite" id="fr-read"></div>
+      </div>
+      <ul class="notes">
+        <li><b>Value of freshness is feature-specific.</b> "Transactions in the last 5 minutes" is meaningless a day late; "country of residence" can be a week old. Set freshness SLAs per feature view and alert on violations.</li>
+        <li><b>Online latency budget:</b> a recommendation request might allow 50 ms end to end; feature retrieval for a few hundred candidates must fit in a fraction of that. Batch the lookups (one multi-get per request), co-locate the store with the model server, and cap the number of feature views per request.</li>
+        <li>Online store sizing: memory ≈ entities × features × bytes per value × replication. 100 M users × 200 float features × 4 B ≈ 80 GB before overhead and replicas.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="registry" data-nav="Registry &amp; governance">
+      <h3><span class="idx">09</span> Feature registry and governance</h3>
+      <ul class="notes">
+        <li><b>Definitions as code</b>, reviewed and versioned: entity, source, transformation, schedule, TTL, owner, description, tags. The registry is built from the repository, not edited by hand.</li>
+        <li><b>Discovery and reuse:</b> searchable catalog with descriptions, statistics, freshness, and which models consume each feature. Reuse is where most of the organisational value comes from — the fifth team gets <code>spend_30d</code> for free and consistent.</li>
+        <li><b>Versioning:</b> changing a feature's logic creates a new version; models pin versions. Breaking changes follow the same rules as <a href="etl-pipelines.html#contracts">data contracts</a>.</li>
+        <li><b>Lineage:</b> feature → source tables → upstream pipelines, and feature → models. Needed to answer "which models break if this source is late?" and to propagate deletions.</li>
+        <li><b>Access control and privacy:</b> tag PII-derived features, restrict who can read them, and support deletion requests in both stores. For aggregate features with privacy guarantees, see <a href="differential-privacy.html">Differential Privacy</a>; for quality checks, see <a href="data-quality-governance.html">Data Quality &amp; Governance</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="embeddings" data-nav="Embeddings as features">
+      <h3><span class="idx">10</span> Embeddings as features</h3>
+      <ul class="notes">
+        <li><a href="../nlp/embeddings.html">Embeddings</a> of users, items, or text are increasingly the most important features. They behave like features in a store — keyed by entity, materialised in batch or streaming, served online — with extra constraints.</li>
+        <li><b>Version coupling.</b> An embedding is only meaningful relative to the model that produced it; vectors from encoder v3 and v4 live in different spaces. Store the producing model's version with every vector and never mix versions in one training set or one index.</li>
+        <li><b>Re-embedding is a backfill.</b> Upgrading the encoder means recomputing every entity's vector, retraining downstream models, and rebuilding ANN indexes — plan it like a migration, with dual-writing during cut-over.</li>
+        <li><b>Storage and serving.</b> 768 float32 dimensions = 3 KB per entity; 100 M entities ≈ 300 GB. Lower precision (float16, int8) or reduced dimensions cut this substantially. Key-based lookup ("this user's vector") fits the online store; similarity search ("items near this vector") needs a vector index (see <a href="../databases/vector-databases.html">Vector Databases</a>).</li>
+        <li><b>Point-in-time still applies:</b> a user embedding trained on data including future interactions leaks just like a scalar aggregate.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="when" data-nav="When you need one">
+      <h3><span class="idx">11</span> When you need one, and failure modes</h3>
+      <table class="cmp">
+        <tr><th>Situation</th><th>Recommendation</th></tr>
+        <tr><td>Batch scoring only, a few models</td><td>Well-tested SQL feature tables with as-of joins are enough; a full feature store is overhead</td></tr>
+        <tr><td>Real-time inference with features from history</td><td>You need an online store and consistent offline history — this is the core use case</td></tr>
+        <tr><td>Many teams, overlapping features</td><td>Registry and reuse justify the platform even for batch</td></tr>
+        <tr><td>Strict latency + streaming freshness</td><td>Streaming materialisation and careful online-store capacity planning</td></tr>
+      </table>
+      <table class="cmp">
+        <tr><th>Failure mode</th><th>Symptom</th></tr>
+        <tr><td>Online store not updated (job failed silently)</td><td>Stale features served; predictions drift without a code change</td></tr>
+        <tr><td>Missing entity in online store</td><td>Default values served; cold-start handled differently from training</td></tr>
+        <tr><td>Offline history gaps</td><td>Training sets with nulls where production never had them</td></tr>
+        <tr><td>Hot entity keys</td><td>Online store latency spikes for a few very active users</td></tr>
+        <tr><td>Unbounded feature proliferation</td><td>Thousands of unused features, rising materialisation cost; prune by consumer count</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">12</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>One definition, two stores:</b> offline (history, point-in-time joins) and online (latest value, ms reads), plus a registry for discovery and versions.</li>
+        <li><b>Point-in-time correctness</b> is non-negotiable: τ* = max τ with τ + δ ≤ t, within TTL. Naive latest-value joins leak labels and inflate offline metrics.</li>
+        <li><b>Skew</b> comes from logic, data, freshness, and version differences; log served features and measure mismatch.</li>
+        <li><b>Choose materialisation by freshness need:</b> batch (hours, cheap), streaming (seconds), on-demand (request-time).</li>
+        <li><b>Embeddings are features with a model version attached;</b> re-embedding is a coordinated backfill.</li>
+        <li>Upstream: <a href="etl-pipelines.html">ETL Pipelines</a>, <a href="stream-processing.html">Stream Processing</a>, <a href="data-warehousing.html">Data Warehousing</a>. Downstream: <a href="../mlops/model-deployment.html">Model Deployment</a>, <a href="../mlops/monitoring-and-drift.html">Monitoring &amp; Drift</a>, <a href="../mlops/experiment-tracking.html">Experiment Tracking</a>.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="feature-stores.viz.js"></script>
+</body>
+</html>

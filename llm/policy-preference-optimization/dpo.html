@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · DPO: Direct Preference Optimization</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../policy-preference-optimization.html">Policy / Preference Optimization</a> · deep dive</p>
+      <h1>DPO: Direct Preference Optimization</h1>
+      <p>RLHF fits a reward model and then runs reinforcement learning against it. The original study keeps the same objective and the same preference model, but changes variables: it writes the reward in terms of the policy that would be optimal for it, so the whole problem becomes one classification loss on the policy. This page works through the full derivation of that optimum, why the partition function cancels for pairs and for rankings, the equivalence-class argument behind "your language model is secretly a reward model", the gradient and the ablation that shows why its weighting matters, the study's argument about actor-critic instability, and the four experiments, including the human check on the automatic judge.</p>
+      <div style="margin-top:10px">
+        <span class="pill">LLMs &amp; Generative AI</span>
+        <span class="pill">Alignment</span>
+        <span class="pill">closed-form optimum · Bradley–Terry · Plackett–Luce · equivalence classes · gradient · reward–KL frontier · win rates · judge validation</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="problem" data-nav="The problem being solved">
+      <h3><span class="idx">01</span> The problem: RLHF's objective, and what it costs to optimise</h3>
+      <p class="lede"><b>DPO does not propose a new objective.</b> It takes the standard three-phase RLHF setup (supervised fine-tuning, then a reward model, then RL), keeps phase 3's objective and phase 2's preference model as they are, and asks whether the objective can be optimised without fitting a separate reward model or sampling from the policy during training.</p>
+
+      <div class="formula"><span class="lbl">the setup the study starts from (its equations 1 to 3)</span><span class="eq">preference model (Bradley–Terry), with a latent reward r* we cannot observe:
+    p*(y₁ ≻ y₂ | x)  =  exp r*(x, y₁) / ( exp r*(x, y₁) + exp r*(x, y₂) )  =  σ( r*(x, y₁) − r*(x, y₂) )
+
+reward modelling, on a fixed dataset D = { (x, y_w, y_l) } of comparisons:
+    L_R(r_φ, D)  =  − E_(x, y_w, y_l)~D [ log σ( r_φ(x, y_w) − r_φ(x, y_l) ) ]
+
+RL fine-tuning, the KL-regularised objective:
+    max over π_θ of   E_x~D, y~π_θ(·|x) [ r_φ(x, y) ]  −  β · KL( π_θ(·|x) ‖ π_ref(·|x) )
+
+with  π_ref = π_SFT,  and  π_θ  initialised to  π_SFT.</span></div>
+
+      <ul class="notes">
+        <li><b>Why the KL term is there.</b> The study gives three reasons. It keeps the policy close to the distribution where the reward model is accurate, it keeps generation diverse, and it stops the policy collapsing onto a single high-reward answer. <code>β</code> sets how strong that pull is. The hub's <a href="../policy-preference-optimization.html#ppo">§04</a> covers the per-token form PPO actually optimises, <code>r_φ(x, y) − β(log π_θ(y|x) − log π_ref(y|x))</code>.</li>
+        <li><b>Why it is usually solved with RL.</b> Responses are sampled as discrete tokens, so you cannot backpropagate through the sampling step. The standard solution is policy-gradient RL, normally PPO. That pipeline trains several language models and has to sample from the policy inside the training loop, which is where its cost and fragility come from (<a href="../policy-preference-optimization.html#pipeline">hub §02</a>).</li>
+        <li><b>A detail that matters later.</b> Earlier work normalised the learned reward so that <code>E_x,y [ r(x, y) ] = 0</code> for every prompt, to lower its variance. That is a per-prompt shift of the reward, and §04 and §07 show why such shifts are harmless for the optimum but not for the variance of the gradient.</li>
+      </ul>
+      <div class="callout"><b>The one idea.</b> There is an exact mapping from any reward function to the policy that is optimal for it. Invert that mapping, and a loss over reward functions becomes a loss over policies. The study calls this a change of variables, and the policy network ends up playing both roles: it is the language model, and it is the (implicit) reward model.</div>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="optimum" data-nav="The closed-form optimum">
+      <h3><span class="idx">02</span> The closed-form optimum, derived step by step</h3>
+      <p class="lede">The hub (<a href="../policy-preference-optimization.html#dpo">§05</a>) gives the optimum as one line. Here is the appendix derivation behind it. It needs only algebra and one fact about KL divergence. Fix a prompt <code>x</code>, allow any distribution over responses (a <i>non-parametric</i> policy class), and take <code>β &gt; 0</code>.</p>
+
+      <div class="formula"><span class="lbl">from the regularised objective to a single KL (appendix A.1)</span><span class="eq">  max over π of  E_x E_y~π [ r(x, y) − β log( π(y|x) / π_ref(y|x) ) ]
+
+=  min over π of  E_x E_y~π [ log( π(y|x) / π_ref(y|x) ) − r(x, y) / β ]          divide by −β; max ↔ min
+
+=  min over π of  E_x E_y~π [ log( π(y|x) / ( (1/Z(x)) · π_ref(y|x) · exp( r(x, y)/β ) ) ) − log Z(x) ]
+                                                    multiply and divide inside the log by Z(x)
+
+where  Z(x)  =  ∑_y π_ref(y|x) · exp( r(x, y) / β )          the partition function</span>
+<span class="lbl">name the denominator, and notice it is a distribution</span><span class="eq">π*(y|x)  =  (1/Z(x)) · π_ref(y|x) · exp( r(x, y) / β )       π* ≥ 0  and  ∑_y π* = 1
+
+=  min over π of  E_x [ KL( π(·|x) ‖ π*(·|x) )  −  log Z(x) ]</span>
+<span class="lbl">finish with Gibbs' inequality</span><span class="eq">Z(x) does not depend on π, so only the KL term is being minimised.
+KL ≥ 0, with equality if and only if the two distributions are identical (Gibbs' inequality):
+
+    π(y|x)  =  π*(y|x)  =  (1/Z(x)) · π_ref(y|x) · exp( r(x, y) / β )         for every x</span></div>
+
+      <ul class="notes">
+        <li><b>The reference is reweighted, not replaced.</b> <code>π*</code> is <code>π_ref</code> tilted by <code>exp(r/β)</code>. A response the reference gives zero probability stays at zero whatever its reward. Small <code>β</code> sharpens the tilt toward the highest-reward response, and large <code>β</code> leaves <code>π_ref</code> almost unchanged. The background on KL and Gibbs' inequality is on the <a href="../../machine-learning/variational-inference.html#kl-elbo">variational inference</a> page. The step "turn the objective into a KL to a tilted distribution" is the same move used to derive the ELBO.</li>
+        <li><b>What the optimum is worth</b> (our step, not in the study). Substitute <code>π*</code> back in. Since <code>log(π*/π_ref) = r/β − log Z</code>, the objective at the optimum is <code>E_π*[r] − β·E_π*[r/β − log Z] = β·log Z(x)</code>. So <code>β log Z(x)</code> is the best achievable value of "reward minus β·KL" for prompt <code>x</code>. §07 uses this quantity again, as the "soft value" of the reference.</li>
+        <li><b>Why this alone is not an algorithm.</b> <code>Z(x)</code> sums over every possible response, which is exponentially many sequences. The study notes that even with a maximum-likelihood estimate of the reward, estimating <code>Z(x)</code> is expensive, so <code>π*</code> cannot be computed or sampled directly. The next step removes <code>Z</code> instead of estimating it.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="reparam" data-nav="Change of variables; Z cancels">
+      <h3><span class="idx">03</span> The change of variables: why <code>Z(x)</code> cancels, for pairs and for rankings</h3>
+      <p class="lede">Take logs of the optimum and solve for the reward. Every reward can then be written through its own optimal policy, plus a term that depends only on the prompt. Both preference models the study uses compare responses <i>to the same prompt</i>, so that prompt-only term drops out.</p>
+
+      <div class="formula"><span class="lbl">invert the optimum (equation 5)</span><span class="eq">log π*(y|x)  =  log π_ref(y|x)  +  r(x, y)/β  −  log Z(x)
+
+⇒   r(x, y)  =  β · log( π*(y|x) / π_ref(y|x) )  +  β · log Z(x)</span>
+<span class="lbl">substitute into Bradley–Terry (appendix A.2)</span><span class="eq">write  h(y) = β · log( π*(y|x) / π_ref(y|x) )  and  c = β · log Z(x)
+
+p*(y₁ ≻ y₂ | x)  =  exp( h(y₁) + c ) / ( exp( h(y₁) + c ) + exp( h(y₂) + c ) )
+                 =  exp(c) · exp h(y₁) / ( exp(c) · [ exp h(y₁) + exp h(y₂) ] )        exp(c) cancels
+                 =  1 / ( 1 + exp( h(y₂) − h(y₁) ) )
+                 =  σ( β log( π*(y₁|x) / π_ref(y₁|x) )  −  β log( π*(y₂|x) / π_ref(y₂|x) ) )   (equation 6)</span>
+<span class="lbl">maximum likelihood for a parametric policy (equation 7)</span><span class="eq">L_DPO(π_θ; π_ref)  =  − E_(x, y_w, y_l)~D [ log σ( β log( π_θ(y_w|x) / π_ref(y_w|x) )  −  β log( π_θ(y_l|x) / π_ref(y_l|x) ) ) ]</span></div>
+
+      <p>Equation 7 is the reward-model loss of §01 with <code>r_φ</code> replaced by <code>β log(π_θ/π_ref)</code>, and nothing else changed. The hub's <a href="../policy-preference-optimization.html#dpo">equation decoder</a> works through each symbol, the tensor shapes and a small numerical example, so they are not repeated here. Because the procedure is exactly fitting a reparameterised Bradley–Terry model, the study notes that it inherits that model's statistical guarantees, such as consistency of the estimator under suitable assumptions on the preference data.</p>
+
+      <h4>Rankings of K responses: the Plackett–Luce form (appendix A.3)</h4>
+      <p>If annotators rank <code>K</code> answers instead of comparing two, the natural model is Plackett–Luce. Choose the top answer with softmax probability over all <code>K</code>, then the next over the <code>K − 1</code> that remain, and so on. For <code>K = 2</code> it is exactly Bradley–Terry.</p>
+      <div class="formula"><span class="lbl">plackett–luce over a ranking <span class="keep">τ</span> of y_1 … y_K (equations 18 to 20)</span><span class="eq">p*(τ | y₁, …, y_K, x)  =  ∏_(k=1..K)  exp r*(x, y_τ(k))  /  ∑_(j=k..K) exp r*(x, y_τ(j))
+
+substitute r = h + c:  every factor gains exp(c) in its numerator AND in every denominator term,
+so c cancels factor by factor, exactly as for a pair.
+
+L_DPO(π_θ; π_ref)  =  − E_(τ, y₁…y_K, x)~D [ log ∏_(k=1..K)  exp( β log( π_θ(y_τ(k)|x) / π_ref(y_τ(k)|x) ) )
+                                                         / ∑_(j=k..K) exp( β log( π_θ(y_τ(j)|x) / π_ref(y_τ(j)|x) ) ) ]</span>
+<span class="lbl">a three-way ranking, with rewards (1, 0, −1) for a ≻ b ≻ c (our arithmetic)</span><span class="eq">factor 1:  e¹ / (e¹ + e⁰ + e⁻¹)  =  2.718 / 4.086  =  0.6652        a beats {a, b, c}
+factor 2:  e⁰ / (e⁰ + e⁻¹)       =  1 / 1.368     =  0.7311        b beats {b, c}
+factor 3:  e⁻¹ / e⁻¹             =  1                               c is all that is left
+p(a ≻ b ≻ c)  =  0.6652 × 0.7311  =  0.4863
+
+add any constant c to all three rewards: every ratio is unchanged.</span></div>
+      <p>Every experiment in the study uses pairwise data. The sentiment task, for example, turns four completions per prompt into six pairs instead of one 4-way ranking (§08). The ranking form is derived but not evaluated.</p>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="theory" data-nav="Equivalence classes: no generality lost">
+      <h3><span class="idx">04</span> Equivalence classes: why the reparameterisation loses no generality</h3>
+      <p class="lede">A natural worry is that restricting rewards to the form <code>β log(π/π_ref)</code> also restricts which preferences can be modelled. The study's answer is no. Rewards that differ by a function of the prompt alone are indistinguishable both to the preference model and to the RL objective, and every such family contains exactly one member of the DPO form.</p>
+
+      <div class="formula"><span class="lbl">definition 1 · equivalent rewards</span><span class="eq">r ~ r'   if and only if   r(x, y) − r'(x, y)  =  f(x)   for some function f of the prompt alone</span>
+<span class="lbl">lemma 1 · same class, same preferences (proof, appendix A.5)</span><span class="eq">each Plackett–Luce factor with r' = r + f:
+    exp( r(x, y_τ(k)) + f(x) ) / ∑_(j≥k) exp( r(x, y_τ(j)) + f(x) )
+ =  exp f(x) · exp r(x, y_τ(k)) / ( exp f(x) · ∑_(j≥k) exp r(x, y_τ(j)) )   =   the factor under r
+⇒  p_r'(τ | …)  =  p_r(τ | …)              Bradley–Terry is the case K = 2</span>
+<span class="lbl">lemma 2 · same class, same optimal policy</span><span class="eq">π_r'(y|x)  =  π_ref(y|x) · exp( (r(x, y) + f(x))/β ) / ∑_y π_ref(y|x) · exp( (r(x, y) + f(x))/β )
+           =  exp( f(x)/β ) · π_ref · exp(r/β) / ( exp( f(x)/β ) · ∑_y π_ref · exp(r/β) )   =   π_r(y|x)</span></div>
+
+      <p>Lemma 1 is the familiar under-specification of Plackett–Luce and Bradley–Terry models: the data cannot pin down a per-prompt offset, which is why reward-model training normally needs an extra identifiability constraint before maximum-likelihood guarantees apply (the hub notes the same thing in <a href="../policy-preference-optimization.html#reward">§03</a>). Lemma 2 says that for the RL objective the offset does not matter either. So it is enough to recover <i>any</i> member of the right class.</p>
+
+      <div class="formula"><span class="lbl">theorem 1 · every class has a member of the DPO form (appendix A.6)</span><span class="eq">assume π_ref(y|x) &gt; 0 for every (x, y), and β &gt; 0. Then every equivalence class of rewards
+contains a reward that can be written   r(x, y) = β · log( π(y|x) / π_ref(y|x) )   for some model π.
+
+proof: the projection
+    f(r; π_ref, β)(x, y)  =  r(x, y)  −  β · log ∑_y π_ref(y|x) · exp( r(x, y)/β )      (equation 8)
+subtracts only a function of x, so it stays in r's class. Using equation 5,
+    r(x, y) − β log Z(x)  =  β · log( π_r(y|x) / π_ref(y|x) )                  which has the DPO form.</span>
+<span class="lbl">proposition 1 · and that member is unique</span><span class="eq">suppose  r = β log(π/π_ref)  and  r' = r + f(x) = β log(π'/π_ref).
+then  π(y|x) · exp( f(x)/β )  =  π'(y|x)   for every y.
+sum over y, both sides are distributions:  exp( f(x)/β ) = 1   ⇒   f(x) = 0   ⇒   r' = r.</span>
+<span class="lbl">which member DPO picks (equation 9)</span><span class="eq">∑_y π_ref(y|x) · exp( r(x, y)/β )  =  1         i.e.  the representative whose partition function is 1</span></div>
+
+      <ul class="notes">
+        <li><b>What "secretly a reward model" means.</b> Minimising <code>L_DPO</code> is maximum-likelihood fitting of a Bradley–Terry reward model, restricted to the class <code>r_θ = β log(π_θ/π_ref)</code>. Every reward in that class has <code>Z(x) = 1</code>, so its optimal policy is simply <code>π_θ</code>. Fitting the reward and solving the RL problem become the same act. The study's own description is that DPO constrains an under-specified preference model just enough to make the optimal policy analytically tractable for every prompt, without shrinking the set of representable rewards.</li>
+        <li><b>What it does <i>not</i> say</b> (our reading). The theorem is about what can be represented. It does not say that a finite network trained on finite, off-policy data will reach the right member, and the "mild assumptions" include full support of <code>π_ref</code>. A softmax language model satisfies that in principle, though its tail probabilities are tiny. Optimisation and generalisation are empirical questions, which §09 to §11 address.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="gradient" data-nav="The gradient and its weight">
+      <h3><span class="idx">05</span> The gradient in full, and why its weight matters</h3>
+      <p class="lede">Differentiate the loss and you get a simple update: raise the log-likelihood of the preferred response, lower that of the dispreferred one. Each pair's step is scaled by how wrong the implicit reward currently is. The study's ablation shows that dropping that scale makes the model degenerate.</p>
+
+      <div class="formula"><span class="lbl">derivation (appendix A.4)</span><span class="eq">implicit reward:   r̂_θ(x, y)  =  β · log( π_θ(y|x) / π_ref(y|x) )
+margin:            m  =  r̂_θ(x, y_w) − r̂_θ(x, y_l)              per-pair loss  ℓ = − log σ(m)
+
+dℓ/dm  =  − σ'(m)/σ(m)  =  − σ(m)(1 − σ(m))/σ(m)  =  − (1 − σ(m))  =  − σ(−m)
+∇_θ m  =  β · ( ∇_θ log π_θ(y_w|x) − ∇_θ log π_θ(y_l|x) )          π_ref is frozen
+
+∇_θ L_DPO  =  − β · E_(x, y_w, y_l)~D [ σ( r̂_θ(x, y_l) − r̂_θ(x, y_w) ) · ( ∇_θ log π_θ(y_w|x) − ∇_θ log π_θ(y_l|x) ) ]
+                                        └── higher when the       └── raise y_w        └── lower y_l
+                                            ordering is wrong</span></div>
+
+      <ul class="notes">
+        <li><b>The weight is a correction signal, scaled by <code>β</code>.</b> <code>σ(r̂_l − r̂_w)</code> is the probability that the implicit reward model ranks the pair the <i>wrong</i> way. It is near 1 for confidently mis-ranked pairs and goes to 0 as the pair becomes confidently correct. That is how the study describes it: examples are weighted by how much higher the implicit reward rates the dispreferred completion, accounting for the strength of the KL constraint. The hub's <a href="../policy-preference-optimization.html#dpo">§05</a> shows what this means for already-correct pairs.</li>
+        <li><b>The ablation.</b> The study compares against an <b>unlikelihood</b> baseline: maximise <code>log π(y_w|x)</code> and minimise <code>log π(y_l|x)</code>, with an optional coefficient <code>α ∈ [0, 1]</code> on the second term. This is the update with the weight removed. On the sentiment task it gets a frontier (§09). On summarisation, samples at temperature 1.0 collapse into repeated tokens ("when when when …", appendix Table 3). The study leaves it out of the summarisation and dialogue comparisons because it "produces generally meaningless responses", which it attributes to unconstrained likelihood minimisation. <code>log π(y_l|x)</code> has no lower bound, so pushing it down never stops.</li>
+        <li><b>The same function as reward-model training.</b> With <code>r̂_θ</code> in place of <code>r_φ</code>, this is the gradient of logistic regression on the reward margin. The <a href="../../machine-learning/logistic-regression.html#training">logistic regression page</a> derives the <code>(label − σ(score))</code> form, and the DPO weight is that residual for a label of 1.</li>
+      </ul>
+
+      <div class="formula"><span class="lbl">a categorical policy makes this exact (our derivation, used by the toy in §06)</span><span class="eq">one prompt, K responses, logits θ ∈ ℝᴷ,  π_θ = softmax(θ)
+∇_θ log π_θ(y)  =  e_y − π_θ                          (e_y the one-hot vector for y)
+
+∇_θ log π_θ(y_w) − ∇_θ log π_θ(y_l)  =  (e_w − π_θ) − (e_l − π_θ)  =  e_w − e_l      π_θ cancels
+
+so in the coordinates  u = β · (θ − log π_ref)  the DPO loss is exactly Bradley–Terry logistic regression on
+per-response scores u, and its population minimiser is u = r* + const, i.e. π_θ = π* of §02.</span></div>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="toy" data-nav="A toy where everything is computable">
+      <h3><span class="idx">06</span> A toy where everything is computable: one prompt, six responses</h3>
+      <p class="lede">In a real model you cannot compute <code>π*</code>, the true reward, or the exact KL. In this toy you can compute all three. There is one prompt with six candidate responses, a fixed reference policy <code>π_ref</code>, and a hidden "true" reward <code>r*</code>. Preferences come from Bradley–Terry on <code>r*</code>, with both responses of a pair drawn from <code>π_ref</code> as in the study's pipeline. DPO then trains a categorical policy on them. Everything here is <b>simulated</b>: it is not from the study.</p>
+
+      <div class="viz" id="viz-dp">
+        <div class="vhead">
+          <span class="vtitle">Simulated: DPO on a six-response toy, against the closed-form RLHF optimum π* ∝ π_ref · exp(r*/β)</span>
+          <span class="vhint">train once, change β, train again. Each run lands on a different point of the same reward–KL frontier. Switch to the unweighted update to see the ablation.</span>
+        </div>
+        <div class="controls">
+          <label>β <input type="range" id="dp-b" min="0" max="9" step="1" value="5" aria-describedby="dp-bv" /><span id="dp-bv" style="min-width:34px;display:inline-block">1</span></label>
+          <label>preference data <select id="dp-d">
+            <option value="pop" selected>population: every pair, exact Bradley–Terry probabilities</option>
+            <option value="fin">finite: N sampled pairs</option>
+          </select></label>
+          <label>N pairs <input type="range" id="dp-n" min="10" max="500" step="10" value="60" /><span id="dp-nv" style="min-width:30px;display:inline-block">60</span></label>
+          <label>update <select id="dp-g">
+            <option value="dpo" selected>DPO (σ-weighted)</option>
+            <option value="naive">unweighted (weight removed)</option>
+          </select></label>
+          <button id="dp-play" type="button">train</button>
+          <button id="dp-reset" type="button">reset policy</button>
+          <button id="dp-sweep" type="button">sweep 5 values of β</button>
+          <button id="dp-resample" type="button">resample pairs</button>
+          <button id="dp-new" type="button">new toy</button>
+        </div>
+        <svg id="dp-svg" width="760" height="520" viewBox="0 0 760 520" role="img" aria-label="Simulated toy with one prompt and six responses. Top left: for each response, an outline bar for the reference policy, a dashed amber tick for the closed-form optimal policy at the chosen beta, and a filled teal bar for the policy being trained. Each response is labelled with its true reward. Before training the filled bars equal the reference outlines. Under DPO they move until they sit on the amber ticks, so mass moves toward high-reward responses the reference rarely produced, more strongly the smaller beta is. Top right: a scatter of each response's implicit reward, beta times the log of policy over reference, against its true reward, with a dashed line of slope one offset by minus beta log Z. During training the points move from a flat line at zero onto the dashed line, showing that implicit and true rewards end up equal up to a constant. Bottom left: expected true reward against KL divergence from the reference. The exact optimal frontier is drawn as a curve, the current run's trajectory climbs from the reference point to the frontier point for its beta, and earlier runs or a beta sweep remain as faint trajectories ending at different points along the same curve. Bottom right: expected true reward and KL plotted against training step, with dashed lines at the optimum's values. With the unweighted update the policy does not stop: it collapses onto one response, which is not even the highest-reward one, and ends below the frontier. The readout reports the step, loss, distance to the optimum, KL, expected reward, and how close the implicit rewards are to the true rewards up to a constant."></svg>
+        <div class="readout" aria-live="polite" id="dp-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>What to look for.</b> With population data and the DPO update, the policy converges to <code>π*</code>, and the spread of <code>r̂ − r*</code> across responses goes to zero. The implicit reward recovers the true reward up to a constant, and that constant is exactly <code>−β log Z</code>, the representative of equation 9. Sweeping <code>β</code> traces out the frontier, a toy analogue of the sentiment experiment in §09. Smaller <code>β</code> buys more reward and costs more KL.</li>
+        <li><b>The unweighted update shows the §05 ablation in miniature.</b> Its gradient is the same for every pair no matter how well the pair is already ranked. The logits therefore grow without bound, and the policy collapses onto the response with the largest "net win" score under <code>π_ref</code>-weighted pairs. In the preset that is <code>y₄</code>, not the best response <code>y₆</code>, which the reference rarely samples. That point lies well below the frontier. <code>β</code> has no effect on this objective, which is part of the problem.</li>
+        <li><b>Finite data is where the toy goes beyond the study.</b> With few pairs, rarely sampled responses are compared only a few times, and a response that wins every one of its comparisons has a maximum-likelihood score of <code>+∞</code>. Its probability keeps growing past <code>π*</code>, so the run ends away from the frontier. Later work raised this overfitting problem (§13). The study itself only ever uses large fixed datasets.</li>
+        <li><b>Conventions.</b> Gradient descent on the logits, with the step scaled by <code>1/β²</code> so that every <code>β</code> converges in about the same number of steps (in the <code>u</code> coordinates of §05 the dynamics do not depend on <code>β</code>). The unweighted update uses a fixed step. These are conveniences for the toy, not part of the method.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="actor-critic" data-nav="Why actor-critic is unstable">
+      <h3><span class="idx">07</span> Why actor-critic RLHF is unstable, as the study argues it</h3>
+      <p class="lede">The study uses the same framework to explain why PPO-style RLHF can be unstable. Its argument is about a per-prompt normalising term that drops out of the <i>optimum</i> but still affects the <i>variance</i> of the gradient. DPO's parameterisation has that term built in, so no baseline is needed.</p>
+
+      <div class="formula"><span class="lbl">rl fine-tuning written as projection onto the optimum (equation 10)</span><span class="eq">minimise  KL( π_θ(y|x) ‖ π*(y|x) )      (the control-as-inference view of the constrained RL problem)
+
+⇔  max over π_θ of  E_y~π_θ(y|x) [  r(x, y)  −  β · log ∑_y π_ref(y|x) · exp( r(x, y)/β )   −   β · log( π_θ(y|x) / π_ref(y|x) )  ]
+                                    └──────────── f(r, π_ref, β): the DPO-equivalent reward ───────┘   └──────── KL term ────────┘</span>
+<span class="lbl">the normaliser, read as a value (our gloss on the study's statement)</span><span class="eq">β · log Z(x)  =  β · log E_y~π_ref [ exp( r(x, y)/β ) ]        a soft maximum of r under π_ref:
+    the soft value function of the reference policy, and the value of the optimum (§02)</span></div>
+
+      <ul class="notes">
+        <li><b>The argument, as stated.</b> This is the same objective earlier RLHF work optimised, with the reward replaced by the DPO-equivalent reward of its class. The normalising term <code>β log Z(x)</code> can be read as the soft value function of <code>π_ref</code>. It does not change the optimal solution, because it depends only on <code>x</code> (Lemma 2). Without it, though, the policy gradient can have high variance, and learning becomes unstable.</li>
+        <li><b>The existing remedies, as the study describes them.</b> Learn a value function to account for the term (a critic, which can itself be hard to optimise), or normalise rewards with a human-completion baseline, which amounts to a single-sample Monte-Carlo estimate of the normaliser. The DPO reparameterisation gives a reward that needs no baseline at all.</li>
+        <li><b>How strong a claim this is</b> (our reading). It is a diagnosis of a variance source, not a proof that PPO fails. The PPO baselines in the study were not straw men: the study's own implementation normalises rewards and tunes hyperparameters, and on the sentiment task it is compared with an off-the-shelf implementation. Where PPO falls short in §09 and §10 is in optimisation efficiency, since both methods target the same objective. The RL background (baselines, advantages, critics) is on the <a href="../../machine-learning/reinforcement-learning.html#policy-gradient">reinforcement learning</a> page.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="pipeline" data-nav="Pipeline, reference, setup">
+      <h3><span class="idx">08</span> The pipeline in practice: choosing <code>π_ref</code>, hyperparameters, and the three tasks</h3>
+      <p class="lede">The recipe has two steps. First, sample pairs <code>y₁, y₂ ~ π_ref(·|x)</code> for each prompt, have them labelled, and fix the dataset. Second, minimise <code>L_DPO</code> for that <code>π_ref</code>, that dataset and a chosen <code>β</code>. In practice the dataset is usually someone else's, and that is what decides how to pick <code>π_ref</code>.</p>
+
+      <ul class="notes">
+        <li><b>If the SFT model that generated the data is available,</b> set <code>π_ref = π_SFT</code>, because the preference data was sampled from it.</li>
+        <li><b>If it is not,</b> fit one: <code>π_ref = argmax over π of E_(x, y_w)~D [ log π(y_w|x) ]</code>, i.e. supervised fine-tuning on the <i>preferred</i> completions only ("Preferred-FT"). The study says this helps reduce the distribution shift between the true reference distribution, which is unavailable, and the <code>π_ref</code> that DPO uses. The equations of §02 and §03 assume the pairs came from <code>π_ref</code>.</li>
+        <li><b>Hyperparameters</b> (appendix B): <code>β = 0.1</code> by default, <code>β = 0.5</code> for summarisation; batch size 64; RMSprop at learning rate 1e-6, warmed up linearly from 0 over 150 steps. The study says it did not meaningfully tune <code>β</code>. Its reference implementation also returns the detached implicit rewards <code>β(log π_θ − log π_ref)</code> next to the loss, for monitoring.</li>
+      </ul>
+
+      <table class="grid2">
+        <tr><th>task</th><th>prompt x</th><th>model and π_ref</th><th>where preferences come from</th><th>how it is scored</th></tr>
+        <tr><td><b>controlled sentiment</b></td><td>an IMDb movie-review prefix of 2–8 tokens; the policy must continue it positively</td><td>GPT-2-large, supervised fine-tuned on IMDb training reviews (the appendix gives one epoch on a subset)</td><td>4 completions for each of 25 000 prefixes, turned into 6 pairs per prefix by a pre-trained sentiment classifier: <code>p(positive | x, y_w) &gt; p(positive | x, y_l)</code></td><td>the same classifier is the <b>ground-truth reward</b>, so the reward–KL frontier can be measured exactly</td></tr>
+        <tr><td><b>summarisation</b></td><td>a Reddit forum post (TL;DR dataset)</td><td>a publicly available GPT-J SFT model trained on human-written summaries; DPO, PPO and Preferred-FT all start from it</td><td>human preferences collected by earlier work, on samples from a <i>different but similarly trained</i> SFT model</td><td>GPT-4 win rate against the test set's reference summaries, at sampling temperatures 0.0–1.0</td></tr>
+        <tr><td><b>single-turn dialogue</b></td><td>a user query from the helpful-and-harmless (HH) dialogue dataset: 170k human–assistant dialogues, each ending in two responses from a large, unnamed model plus a preference label</td><td>Pythia-2.8B, with <code>π_ref</code> from Preferred-FT, since no SFT model exists for this data</td><td>the dataset's own human labels</td><td>GPT-4 win rate against the test set's <i>preferred</i> response</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">Our arithmetic: C(4, 2) = 6 pairs per prefix × 25 000 prefixes = 150 000 sentiment pairs. The study reports the counts, not the product.</p>
+
+      <h4>The baselines</h4>
+      <ul class="notes">
+        <li><b>Prompting:</b> zero-shot GPT-J for summarisation, 2-shot Pythia-2.8B for dialogue. <b>SFT</b> alone. <b>Preferred-FT</b>: supervised fine-tuning on <code>y_w</code> only. <b>Unlikelihood</b> (sentiment only, §05).</li>
+        <li><b>PPO</b> with a reward model learned from the preferences (for sentiment, a GPT-2-large reward model trained for 3 epochs, keeping the checkpoint with the best validation accuracy), and <b>PPO-GT</b>, an oracle that gets the ground-truth reward. PPO-GT is only possible in the sentiment task, and is run in two versions there: an off-the-shelf implementation, and the study's own, which normalises rewards, tunes hyperparameters and uses 1024 samples per PPO step.</li>
+        <li><b>Best-of-N</b>: sample <code>N</code> responses from the SFT model (Preferred-FT for dialogue) and return the one the learned reward model scores highest. It is strong, but impractical: it costs <code>N</code> samples per query at test time.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="sentiment" data-nav="Sentiment: the reward–KL frontier">
+      <h3><span class="idx">09</span> Experiment 1: controlled sentiment, and the reward–KL frontier</h3>
+      <p class="lede"><b>When the true reward is known, the fair way to compare optimisers is by the frontier they trace in (KL, reward), not by reward alone.</b> Slightly higher reward at much higher KL is not a win. On that frontier, DPO dominates PPO, and also beats PPO that is given the ground-truth reward.</p>
+
+      <ul class="notes">
+        <li><b>The sweep.</b> Each method was run several times with a different conservativeness setting: PPO with target KL ∈ {3, 6, 9, 12}, DPO with <code>β</code> ∈ {0.05, 0.1, 1, 5}, unlikelihood with <code>α</code> ∈ {0.05, 0.1, 0.5, 1}, and Preferred-FT with different random seeds. That is 22 runs in total. Every 100 training steps until convergence, each policy was evaluated on test prompts for its average ground-truth reward and its average <b>sequence-level</b> KL to the reference, meaning the sum of the per-timestep KL divergences.</li>
+        <li><b>The result</b> (the study's Figure 2, left). DPO "produces by far the most efficient frontier", with the highest reward at low KL. Its reward/KL trade-off strictly dominates PPO's, and it is better than PPO-GT's even though PPO-GT optimises the true reward and not a learned one.</li>
+        <li><b>Why that second point is notable.</b> DPO and PPO target the same objective. So a gap between their frontiers measures how well each <i>optimises</i> it, not which objective is better. PPO-GT also has no reward-model error, so its remaining gap to DPO is optimisation error alone.</li>
+      </ul>
+      <div class="callout"><b>No point values here, deliberately.</b> The frontier is published only as a scatter plot, with no table, so this page does not quote numbers read off it. The <a href="#toy">toy in §06</a> shows the same picture in a setting where every quantity is exact: the frontier curve, and runs at different <code>β</code> landing on it. The hub's <a href="../policy-preference-optimization.html#evaluation">§08</a> explains why any alignment method should be compared along such a curve.</div>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="summarisation" data-nav="Summarisation, dialogue, shift">
+      <h3><span class="idx">10</span> Experiments 2–4: summarisation, dialogue, and a distribution shift</h3>
+      <p class="lede">With no ground-truth reward, the study measures win rate against a fixed baseline, judged by GPT-4. Section 11 checks that judge against humans. All models here are 6B parameters or smaller.</p>
+
+      <h4>TL;DR summarisation (GPT-J)</h4>
+      <div class="cards">
+        <div class="box good"><div class="n">best-case win rate vs reference summaries</div><div class="t">DPO ≈ 61% vs PPO 57%</div><div class="g">DPO at temperature 0.0, compared with PPO at <i>its</i> best temperature, which is also 0.0. DPO's best win rate is also higher than the Best-of-N baseline's.</div></div>
+        <div class="box good"><div class="n">robustness to temperature</div><div class="t">DPO holds up; PPO degrades</div><div class="g">Across temperatures 0.0–1.0, PPO's win rate can drop to the base GPT-J model's level at high temperature. DPO is much more robust. Preferred-FT does not improve significantly over SFT.</div></div>
+        <div class="box good"><div class="n">human head-to-head</div><div class="t">58%</div><div class="g">DPO samples at temperature 0.25 were preferred by humans over PPO samples at temperature 0 in 58% of comparisons (§11).</div></div>
+      </div>
+      <p>The full curves of win rate against temperature (Figure 2, right) appear only as a plot, so only the values the text states are quoted above. The study adds that it did not meaningfully tune DPO's <code>β</code>, so these results may understate DPO.</p>
+
+      <h4>Single-turn dialogue (Pythia-2.8B)</h4>
+      <ul class="notes">
+        <li><b>The baseline is hard: the human-preferred response itself.</b> A win rate above 50% means the policy's answers beat the answer people actually chose.</li>
+        <li><b>Results.</b> DPO does as well as or better than Best-of-128 Preferred-FT and 2-shot Pythia-2.8B, each at its best temperature. Best-of-N plateaus at about 64–128 samples (appendix Figure 4, N ∈ {1, 4, 16, 64, 128}). DPO is <b>the only computationally efficient method that improves over the preferred completions</b>, and it matches or beats the computationally demanding Best-of-128.</li>
+        <li><b>Where PPO is.</b> A publicly released PPO model for this dataset could not be made to beat base Pythia-2.8B with any prompt or temperature the study tried. Given the summarisation results and the fact that the two optimise the same reward, the study treats Best-of-128 as a rough proxy for PPO-level performance. This is an indirect comparison, and the study says so.</li>
+        <li><b>Training dynamics.</b> DPO reaches its best performance relatively quickly, and its improvement over the dataset labels stays fairly stable through training at temperatures 0.7 and 1.0 (Figure 3, right). The limitations section asks whether the slight late decline there is reward over-optimisation (§12).</li>
+      </ul>
+
+      <h4>Out of distribution: TL;DR policies on CNN/DailyMail news</h4>
+      <table class="grid2">
+        <tr><th>GPT-4 win rate vs ground-truth summaries</th><th>temperature 0</th><th>temperature 0.25</th></tr>
+        <tr class="hl"><td><b>DPO</b></td><td class="num">0.36</td><td class="num">0.31</td></tr>
+        <tr><td>PPO</td><td class="num">0.26</td><td class="num">0.23</td></tr>
+      </table>
+      <p>These are the summarisation policies, applied unchanged to news articles, at the two best temperatures from TL;DR. They are judged with the same concise-summary prompt, with "forum post" changed to "news article" (study Table 1). DPO still leads by a clear margin. The study treats this as <i>initial</i> evidence that DPO policies generalise about as well as PPO policies. That is notable because PPO also trains on extra unlabelled Reddit prompts, which DPO does not use.</p>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="judge" data-nav="Validating the GPT-4 judge">
+      <h3><span class="idx">11</span> Is GPT-4 a fair judge? The human study behind the win rates</h3>
+      <p class="lede">Every number in §10 comes from a model judge, so the study checks that judge against people. GPT-4 agrees with humans about as often as humans agree with each other. The <i>wording</i> of the judge prompt changes the win rates, though, and one wording favours longer summaries more than humans do.</p>
+
+      <ul class="notes">
+        <li><b>Two prompts.</b> <b>GPT-4 (S)</b> ("simple") asks which summary better captures the most important points of the post. <b>GPT-4 (C)</b> ("concise") adds "without including unimportant or irrelevant details. A good summary is both precise and concise". The concise version exists because the study found that, under (S), GPT-4 preferred longer, more repetitive summaries than humans did. Both prompts ask for a one-sentence comparison first, then a single letter. The order of the two summaries is randomised on every call, using one fixed judge snapshot.</li>
+        <li><b>Design.</b> Three methods, chosen to span the quality range: DPO (temperature 0.25, the best), SFT (temperature 0.25, middle) and PPO (temperature 1.0, the worst), each against greedy PPO, which is PPO's best temperature. 25 volunteer raters each did 25 comparisons. DPO and PPO-1 comparisons had two raters each, which gives human–human agreement; SFT comparisons had one. Ties, about 1% of judgments, were dropped.</li>
+      </ul>
+
+      <table class="grid2">
+        <tr><th>vs PPO at temperature 0</th><th>DPO (temp 0.25)</th><th>SFT (temp 0.25)</th><th>PPO-1 (temp 1.0)</th></tr>
+        <tr><td>N respondents</td><td class="num">272</td><td class="num">122</td><td class="num">199</td></tr>
+        <tr><td>GPT-4 (S) win %</td><td class="num">47</td><td class="num">27</td><td class="num">13</td></tr>
+        <tr><td>GPT-4 (C) win %</td><td class="num">54</td><td class="num">32</td><td class="num">12</td></tr>
+        <tr class="hl"><td><b>Human win %</b></td><td class="num">58</td><td class="num">43</td><td class="num">17</td></tr>
+        <tr><td>GPT-4 (S) – human agreement %</td><td class="num">70</td><td class="num">77</td><td class="num">86</td></tr>
+        <tr><td>GPT-4 (C) – human agreement %</td><td class="num">67</td><td class="num">79</td><td class="num">85</td></tr>
+        <tr class="hl"><td><b>human – human agreement %</b></td><td class="num">65</td><td class="num">—</td><td class="num">87</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">Study Table 2. "—": only one rater per SFT comparison, so no human–human figure.</p>
+
+      <div class="viz" id="viz-jg">
+        <div class="vhead">
+          <span class="vtitle">Reported: judge win rates and agreement against humans, TL;DR human study</span>
+          <span class="vhint">compare each judge's bar with the human bar. The concise prompt is closer on average, and both judges under-rate the two better methods relative to humans.</span>
+        </div>
+        <div class="controls">
+          <label>view <select id="jg-v">
+            <option value="win" selected>win rate vs greedy PPO</option>
+            <option value="agree">per-judgment agreement</option>
+          </select></label>
+        </div>
+        <svg id="jg-svg" width="760" height="320" viewBox="0 0 760 320" role="img" aria-label="Grouped bar chart of the study's human-validation table. Win-rate view: three groups, DPO at temperature 0.25, SFT at temperature 0.25 and PPO at temperature 1.0, each compared with greedy PPO. Each group has three bars, the GPT-4 simple-prompt win rate, the GPT-4 concise-prompt win rate and the human win rate, with a dashed line at 50 percent. Humans give DPO 58, SFT 43 and PPO 17 percent. The concise prompt gives 54, 32 and 12, and the simple prompt 47, 27 and 13, so the concise prompt is closer to humans for DPO and SFT. Agreement view: the same groups with GPT-4 simple-human, GPT-4 concise-human and human-human agreement percentages. Agreement is 65 to 87 percent throughout, and judge-human agreement is similar to or above human-human agreement wherever the latter was measured. The SFT human-human bar is marked as not collected. The readout gives the judge-to-human gaps."></svg>
+        <div class="readout" aria-live="polite" id="jg-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>The conclusion the study draws.</b> With either prompt, GPT-4 agrees with humans about as often as humans agree with each other, so it is a reasonable proxy. The (C) prompt generally gives win rates closer to the human ones, and it is the prompt used for all the main summarisation results.</li>
+        <li><b>What to carry over</b> (our reading). Both judges give the two stronger methods lower win rates than humans do. Compared with humans, the absolute win-rate gap averages 10.3 points for (S) and 6.7 for (C) (our arithmetic, from the table). That is the length bias the study itself identified, and a reason to report the judge prompt alongside any win rate. The general picture of judge biases and agreement measurement is on the <a href="../llm-as-a-judge.html#biases">LLM-as-a-Judge</a> page (<a href="../llm-as-a-judge.html#agreement">agreement with humans</a>).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="limits" data-nav="Limitations">
+      <h3><span class="idx">12</span> Limitations the original study states</h3>
+      <div class="cards">
+        <div class="box warn"><div class="n">generalisation</div><div class="t">Out of distribution, versus an explicit reward</div><div class="g">The CNN/DailyMail result is initial evidence only. An open question is whether DPO can make use of unlabelled prompts the way PPO does, for example by self-labelling with the DPO policy.</div></div>
+        <div class="box bad"><div class="n">over-optimisation</div><div class="t">Does reward hacking happen without a reward model?</div><div class="g">How reward over-optimisation shows up in direct preference optimisation is left open. The study asks whether the slight late decline in dialogue win rate is an instance of it.</div></div>
+        <div class="box warn"><div class="n">scale</div><div class="t">Up to 6B parameters</div><div class="g">Scaling to state-of-the-art models orders of magnitude larger is named as future work.</div></div>
+        <div class="box warn"><div class="n">evaluation</div><div class="t">The judge prompt matters</div><div class="g">GPT-4 win rates change with the prompt (§11). How best to get high-quality judgments from automated evaluators is left open.</div></div>
+        <div class="box good"><div class="n">scope</div><div class="t">Beyond language preferences</div><div class="g">The study also names training generative models in other modalities as a possible application.</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="practice" data-nav="In practice (beyond the study)">
+      <h3><span class="idx">13</span> In practice: what changed after the original study</h3>
+      <p class="lede">Everything above is the original method and its reported evidence. This section is <b>observations and common practice from the years after the study (roughly 2023–2026)</b>. It moves fast, varies between tools, and is not part of the original study's claims.</p>
+
+      <table class="grid2">
+        <tr><th style="width:180px">topic</th><th>what is commonly observed or done</th><th>link to the theory above</th></tr>
+        <tr><td><b>β</b></td><td>0.1, the study's own default, is still the most common starting value; values from about 0.01 to 0.5 are routinely reported. Smaller <code>β</code> moves further from the reference.</td><td><code>β</code> picks the point on the frontier (§06, §09). It is the KL coefficient of the target objective, not just a loss scale.</td></tr>
+        <tr><td><b>likelihood displacement</b></td><td>The log-probability of the chosen response often falls during training, just more slowly than the rejected one's. A common patch is to add an SFT term on <code>y_w</code>. See the <a href="../policy-preference-optimization.html#dpo">hub's §05</a>.</td><td>The gradient (§05) constrains only the <i>difference</i>. Nothing in it pins the absolute level.</td></tr>
+        <tr><td><b>on-policy / iterative DPO</b></td><td>Regenerate pairs from the current policy, relabel them with humans, a reward model or a judge, and repeat. This closes much of the gap to online RL. See the hub's <a href="../policy-preference-optimization.html#dpo">§05</a> and <a href="../policy-preference-optimization.html#rlhf-vs-dpo">§09</a>.</td><td>§02 and §03 assume the pairs come from <code>π_ref</code>. Fresh pairs from the current policy restore that assumption step by step. Its open question about unlabelled prompts (§12) points the same way.</td></tr>
+        <tr><td><b>length</b></td><td>DPO-trained models tend to get longer, and length-controlled evaluation has become standard.</td><td>The same bias the judge study found (§11), now in the training labels as well.</td></tr>
+        <tr><td><b>memory and compute</b></td><td>The reference log-probabilities of a fixed dataset can be computed once in advance, so training needs only the policy in memory. It is commonly combined with <a href="../parameter-efficient-fine-tuning.html">LoRA-style adapters</a>, where the frozen base can serve as <code>π_ref</code> if the adapter is switched off.</td><td>Only <code>π_θ</code> receives gradients (§05).</td></tr>
+        <tr><td><b>agents</b></td><td>Preference losses of this shape are also applied to whole agent trajectories (good versus bad tool-use runs). See <a href="../../agentic/agent-learning.html#parametric">agent learning</a>.</td><td>The derivation does not care what <code>y</code> is, as long as <code>log π(y|x)</code> can be computed.</td></tr>
+      </table>
+
+      <h4>Well-known successors, one line each</h4>
+      <ul class="notes">
+        <li><b>IPO</b> replaces the log-sigmoid with a squared loss toward a target margin. It argues that when preferences are close to deterministic, DPO's optimum drives the margin to infinity and the KL term stops regularising, which is the finite-data effect in the §06 toy. See the <a href="../policy-preference-optimization.html#variants">hub's zoo</a>.</li>
+        <li><b>KTO</b> learns from unpaired good/bad labels, so it needs a separate reference point because there is no pair for <code>Z(x)</code> to cancel in (<a href="../policy-preference-optimization.html#variants">zoo</a>).</li>
+        <li><b>ORPO</b> adds an odds-ratio penalty to the SFT loss and drops the reference model (<a href="../policy-preference-optimization.html#variants">zoo</a>).</li>
+        <li><b>SimPO</b> drops the reference too, using the length-normalised average log-probability as the implicit reward plus a target margin. It gives up §04's link to the KL-regularised objective in exchange for simplicity and length control.</li>
+      </ul>
+      <p>For where these methods sit alongside PPO, GRPO and verifier rewards, see the hub's <a href="../policy-preference-optimization.html#variants">zoo</a> and <a href="../policy-preference-optimization.html#rlhf-vs-dpo">RLHF vs DPO</a>. For the three-stage pipeline DPO simplifies, as it was first applied to a production chat model, see <a href="../../models/gpt/decoding-successors.html#instructgpt">InstructGPT</a>.</p>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">14</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"DPO is a heuristic that roughly approximates RLHF."</span> <span class="fix">It targets the same KL-regularised objective exactly,</span> under the stated assumptions: a Bradley–Terry (or Plackett–Luce) preference model, a policy class rich enough to contain the optimum, and <code>π_ref</code> with full support (§02 to §04). What it changes is how that objective is optimised: no reward network, and no sampling during training.</div>
+      <div class="wrong"><span class="say">"DPO has no reward model."</span> <span class="fix">It has one implicitly: <code>r̂ = β log(π_θ/π_ref)</code>.</span> The study's reference code returns those rewards alongside the loss. You can read them off for any response, and in the toy (§06) they recover the true reward up to a constant.</div>
+      <div class="wrong"><span class="say">"The implicit reward tells you how good a response is."</span> <span class="fix">Only relative to other responses to the same prompt.</span> Rewards are identified only up to a function of the prompt <code>f(x)</code> (Lemma 1), so comparing <code>r̂</code> values across different prompts means nothing.</div>
+      <div class="wrong"><span class="say">"Removing the σ weight gives a simpler loss that does the same thing."</span> <span class="fix">It degenerates.</span> The unweighted, unlikelihood-style update never stops pushing <code>log π(y_l)</code> down, and on summarisation it produces repeated-token gibberish (§05). In the toy it collapses onto a response that is not even the best one.</div>
+      <div class="wrong"><span class="say">"DPO was shown to beat PPO at scale."</span> <span class="fix">Not in the original study.</span> Its models were 6B parameters or smaller, the real-data comparisons were judged by GPT-4, and the dialogue comparison used Best-of-128 as a stand-in for PPO. The sentiment frontier is the controlled, ground-truth result (§09 to §11).</div>
+      <div class="wrong"><span class="say">"<code>Z(x)</code> cancels, so normalisation never matters."</span> <span class="fix">It cancels because both responses share the same prompt.</span> With single-response feedback there is nothing for it to cancel against, which is why unpaired methods need another device (§13). In RL it does not cancel either, and the study argues it is a source of gradient variance (§07).</div>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">15</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Same objective, new variables.</b> <code>max E[r] − β·KL(π‖π_ref)</code> has the optimum <code>π* = π_ref·exp(r/β)/Z(x)</code>. The proof rewrites the objective as <code>KL(π‖π*) − log Z</code> and applies Gibbs' inequality.</li>
+        <li><b>Invert it:</b> <code>r = β log(π*/π_ref) + β log Z(x)</code>. Bradley–Terry and Plackett–Luce only compare responses to the same prompt, so <code>β log Z(x)</code> cancels, and preference likelihood becomes a loss on the policy.</li>
+        <li><b>No generality lost.</b> Rewards that differ by <code>f(x)</code> give the same preferences and the same optimal policy, and each such class has exactly one member of the form <code>β log(π/π_ref)</code>, the one with <code>Z = 1</code>.</li>
+        <li><b>The gradient</b> is <code>−β E[σ(r̂_l − r̂_w)(∇log π(y_w) − ∇log π(y_l))]</code>. The weight is the probability of a mis-ranking, and removing it makes the model degenerate.</li>
+        <li><b>The study's diagnosis of PPO:</b> the normaliser <code>β log Z(x)</code> is a soft value of the reference. It leaves the optimum unchanged but adds gradient variance, which critics or baselines then have to absorb. DPO's reward needs no baseline.</li>
+        <li><b>Evidence, at ≤ 6B:</b> the best reward–KL frontier on sentiment, ahead even of PPO with the true reward; ≈ 61% vs 57% best-case TL;DR win rate and more robust to temperature; the only cheap method to beat the preferred HH responses; 0.36 vs 0.26 out of distribution; and a judge validated against humans, with prompt sensitivity stated.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Policy and preference optimization" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../policy-preference-optimization.html">← Policy / Preference Optimization</a>
+      <a href="../policy-preference-optimization.html#dpo" style="color:var(--muted)">hub · DPO overview</a>
+      <a href="../llm-as-a-judge.html">LLM-as-a-Judge →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="dpo.viz.js"></script>
+</body>
+</html>

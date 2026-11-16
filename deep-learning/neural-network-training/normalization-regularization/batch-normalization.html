@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Batch Normalization</title>
+<script src="../../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .cards .box.plain{border-left:3px solid var(--muted)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(91,156,255,.07)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../normalization-regularization.html">Normalization Layers &amp; Training Regularization</a> · deep dive</p>
+      <h1>Batch Normalization</h1>
+      <p>The hub page has the layer itself: its formulas, the two variances, and the train/eval asymmetry that causes most of its bugs (<a href="../normalization-regularization.html#norm">§29</a>). This page is about the original study. It covers the problem it named, internal covariate shift. It explains why normalising <i>outside</i> the gradient step fails and why full whitening was ruled out. It then walks through the two algorithms, the full backward pass through the batch mean and variance, the convolutional version, the scale-invariance argument for higher learning rates, and the MNIST and ImageNet evidence with every reported number. A final, clearly separated section covers what later work found, which was not kind to the original explanation.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Deep Learning</span>
+        <span class="pill">Neural Network Training</span>
+        <span class="pill">internal covariate shift · Algorithm 1 &amp; 2 · backprop through μ, σ² · conv BN · scale invariance · BN-Inception · 14× fewer steps</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ics" data-nav="Internal covariate shift">
+      <h3><span class="idx">01</span> The problem as the study framed it: internal covariate shift</h3>
+      <p class="lede"><b>Covariate shift</b> is the classical name for a learning system whose input distribution changes between training and use. The study's move was to apply the idea <i>inside</i> a network. Every layer is a learner whose inputs are produced by the layers below, so whenever those layers update, the layer's input distribution changes under it.</p>
+
+      <div class="formula"><span class="lbl">the sub-network view</span><span class="eq">ℓ  =  F₂( F₁(u, Θ₁), Θ₂ )
+
+learning Θ₂ is exactly learning a stand-alone network  ℓ = F₂(x, Θ₂)
+fed with inputs  x = F₁(u, Θ₁).  One SGD step with batch size m and rate α:
+
+    Θ₂  ←  Θ₂ − (α/m) ∑ᵢ ∂F₂(xᵢ, Θ₂)/∂Θ₂
+
+⇒ whatever makes training efficient for a stand-alone network — e.g. a FIXED
+  input distribution — helps the sub-network too.  But x moves whenever Θ₁ does.</span>
+<span class="lbl">the definition used throughout the study</span><span class="eq">Internal Covariate Shift  =  the change in the distribution of network activations
+                             due to the change in network parameters during training.</span></div>
+
+      <h4>Why it was thought to matter: saturation</h4>
+      <p>Take a sigmoid layer <code>z = g(Wu + b)</code> with <code>g(x) = 1/(1 + exp(−x))</code>. As <code>|x|</code> grows, <code>g′(x) → 0</code>, so every dimension of <code>x = Wu + b</code> except the small ones sends almost no gradient down to <code>u</code>. Because <code>x</code> depends on <code>W</code>, <code>b</code> and every layer below, parameter updates keep pushing dimensions into the saturated regime, and the effect compounds with depth. The usual fixes at the time were ReLUs, careful initialisation and small learning rates (the mechanics are on <a href="../gradient-flow-init.html#vanishing">gradient flow &amp; initialisation</a>). The study's claim was that if the distribution of nonlinearity inputs stayed stable, the optimiser would be less likely to get stuck in saturation and training would accelerate.</p>
+      <div class="callout"><b>Hold this loosely.</b> Internal covariate shift is the study's <i>motivation</i>, not something it proved to be the mechanism. Its own experiments show the method works. Whether it works <i>because</i> it reduces internal covariate shift was later contested (§13).</div>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="whitening" data-nav="Why not whiten outside the step">
+      <h3><span class="idx">02</span> Two ways to fix the distribution that do not work</h3>
+      <p class="lede">Whitening the inputs (zero mean, unit variance, decorrelated) was long known to speed up convergence, so the natural idea is to whiten every layer's inputs. The study rules out two versions of this before proposing its own: normalising <b>outside</b> the gradient step, and normalising with <b>full whitening</b>.</p>
+
+      <h4>Failure 1 — normalisation the optimiser does not know about</h4>
+      <p>Suppose a layer adds a learned bias and then centres the result using the mean over the training set, and the gradient step ignores the fact that the mean depends on <code>b</code>:</p>
+      <div class="formula"><span class="lbl">the bias blow-up</span><span class="eq">x  =  u + b          x̂  =  x − E[x]          E[x] = (1/N) ∑ᵢ xᵢ over the training set
+
+gradient step that treats E[x] as a constant:
+    b  ←  b + Δb,       Δb ∝ −∂ℓ/∂x̂
+
+after re-computing the normalisation:
+    u + (b + Δb) − E[u + (b + Δb)]   =   u + b − E[u + b]
+
+⇒ the layer's output is UNCHANGED, so the loss is unchanged and the gradient
+  points the same way next step.  b grows without bound while ℓ stays fixed.</span></div>
+      <p>The update and the re-normalisation cancel exactly. The study reports that the effect is worse when the normalisation also <i>scales</i>, and that in its initial experiments the model blew up whenever the normalisation parameters were computed outside the gradient step. The lesson is that the normalisation has to be part of the function being differentiated. Written generally, <code>x̂ = Norm(x, 𝒳)</code> depends on the example <i>and</i> on the whole set <code>𝒳</code>, so backpropagation needs both Jacobians <code>∂Norm/∂x</code> and <code>∂Norm/∂𝒳</code>. Dropping the second one is what causes the explosion above.</p>
+
+      <h4>Failure 2 — full whitening, done properly, is too expensive</h4>
+      <div class="formula"><span class="lbl">what proper whitening would need, every step</span><span class="eq">Cov[x]  =  E[xxᵀ] − E[x]E[x]ᵀ                (d × d, over the training set)
+x̂       =  Cov[x]^(−1/2) · (x − E[x])          an inverse matrix square root
++ the derivatives of both through backprop.</span></div>
+      <ul class="notes">
+        <li><b>Cost and differentiability.</b> An inverse square root of a <code>d × d</code> covariance, plus its backward pass, at every layer and every step. It is also not differentiable everywhere.</li>
+        <li><b>Mini-batches cannot estimate it.</b> The batch size is usually smaller than the number of activations being whitened, so a mini-batch covariance is <b>singular</b> and would need regularising. Per-dimension variances have no such problem, and that is what makes mini-batch statistics usable at all.</li>
+        <li><b>Per-example statistics are not the answer either.</b> Normalising over a single example, or over feature maps at one location, discards the absolute scale of the activations and so changes what the network can represent. The study wanted each example normalised relative to the statistics of the training data.</li>
+      </ul>
+      <p>This leads to two simplifications: <b>(1)</b> normalise each scalar feature independently instead of whitening jointly, and <b>(2)</b> estimate the statistics from the current mini-batch instead of the whole training set, so they "fully participate in the gradient backpropagation".</p>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="transform" data-nav="Algorithm 1: the transform">
+      <h3><span class="idx">03</span> Algorithm 1: the Batch Normalizing Transform</h3>
+      <p class="lede">For one activation <code>x</code> (the index <code>k</code> is dropped) over a mini-batch <code>ℬ = {x₁…ₘ}</code>, the transform <code>BN_γ,β : x₁…ₘ → y₁…ₘ</code> is four lines. The ε is a constant added to the variance for numerical stability.</p>
+
+      <div class="formula"><span class="lbl">Algorithm 1 — applied to activation <span class="keep">x</span> over a mini-batch</span><span class="eq">input:   values of x over a mini-batch  ℬ = {x₁ … xₘ};   learned parameters γ, β
+output:  { yᵢ = BN_γ,β(xᵢ) }
+
+μ_ℬ   ←  (1/m) ∑ᵢ₌₁ᵐ xᵢ                         mini-batch mean
+σ²_ℬ  ←  (1/m) ∑ᵢ₌₁ᵐ (xᵢ − μ_ℬ)²                mini-batch variance
+x̂ᵢ    ←  (xᵢ − μ_ℬ) / √(σ²_ℬ + ε)               normalise
+yᵢ    ←  γ x̂ᵢ + β   ≡  BN_γ,β(xᵢ)               scale and shift</span>
+<span class="lbl">why <span class="keep">γ</span> and <span class="keep">β</span>: the transform can represent the identity</span><span class="eq">choose   γ⁽ᵏ⁾ = √Var[x⁽ᵏ⁾]   and   β⁽ᵏ⁾ = E[x⁽ᵏ⁾]      ⇒   y⁽ᵏ⁾ = x⁽ᵏ⁾
+(exactly, with full-data statistics and ε neglected)</span></div>
+
+      <ul class="notes">
+        <li><b>Why the affine step is not optional.</b> Normalising alone changes what a layer can represent. The study's example: normalising the inputs of a sigmoid to zero mean and unit variance would confine them to its <i>linear</i> regime. With <code>γ</code> and <code>β</code> learned, the network can restore any scale and offset it needs, so the change is to the parameterisation, not the function class. The study adds <b>two parameters per activation</b>.</li>
+        <li><b>What <code>x̂</code> guarantees.</b> Neglecting ε, <code>∑ᵢ x̂ᵢ = 0</code> and <code>(1/m)∑ᵢ x̂ᵢ² = 1</code> within every batch. So if the batch elements are drawn from the same distribution, each <code>x̂</code> has expected value 0 and variance 1. Each <code>x̂⁽ᵏ⁾</code> is then the input to a sub-network (the affine step and everything after it) whose inputs have fixed first and second moments, although their <i>joint</i> distribution can still change.</li>
+        <li><b>Not per-example.</b> <code>BN_γ,β(xᵢ)</code> depends on <code>xᵢ</code> <i>and on the other examples in the batch</i>. That has consequences for the backward pass (§04), for inference (§05) and for regularisation (§08).</li>
+      </ul>
+      <p>The biased <code>1/m</code> variance in the normalising step, and the unit-variance property it buys, are worked through numerically on the hub's <a href="../normalization-regularization.html#norm">§29</a>, so they are not repeated here.</p>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="backprop" data-nav="Backprop through μ and σ²">
+      <h3><span class="idx">04</span> The backward pass, through the batch statistics</h3>
+      <p class="lede">Because <code>μ_ℬ</code> and <code>σ²_ℬ</code> are functions of every <code>xᵢ</code> in the batch, the gradient with respect to one input has three paths: directly through <code>x̂ᵢ</code>, through the variance, and through the mean. The study writes the chain rule out before simplification. This is exactly what makes failure 1 of §02 impossible.</p>
+
+      <div class="formula"><span class="lbl">the study's chain rule (<span class="keep">gᵢ ≡ ∂ℓ/∂yᵢ</span> arriving from above)</span><span class="eq">∂ℓ/∂x̂ᵢ    =  ∂ℓ/∂yᵢ · γ
+
+∂ℓ/∂σ²_ℬ   =  ∑ᵢ₌₁ᵐ  ∂ℓ/∂x̂ᵢ · (xᵢ − μ_ℬ) · (−½)(σ²_ℬ + ε)^(−3/2)
+
+∂ℓ/∂μ_ℬ    =  ( ∑ᵢ₌₁ᵐ ∂ℓ/∂x̂ᵢ · (−1/√(σ²_ℬ + ε)) )  +  ∂ℓ/∂σ²_ℬ · ( ∑ᵢ₌₁ᵐ −2(xᵢ − μ_ℬ) ) / m
+
+∂ℓ/∂xᵢ     =  ∂ℓ/∂x̂ᵢ · 1/√(σ²_ℬ + ε)  +  ∂ℓ/∂σ²_ℬ · 2(xᵢ − μ_ℬ)/m  +  ∂ℓ/∂μ_ℬ · 1/m
+               └── direct path ──────┘    └── via the variance ──┘     └── via the mean ┘
+
+∂ℓ/∂γ      =  ∑ᵢ₌₁ᵐ ∂ℓ/∂yᵢ · x̂ᵢ              ∂ℓ/∂β  =  ∑ᵢ₌₁ᵐ ∂ℓ/∂yᵢ</span></div>
+
+      <h4>What the three paths do together (this page's simplification)</h4>
+      <p>The study stops at the expressions above. Collapsing them is a short exercise. Note that <code>∑ᵢ (xᵢ − μ_ℬ) = 0</code>, so the second term of <code>∂ℓ/∂μ_ℬ</code> vanishes. Write <code>s = √(σ²_ℬ + ε)</code>:</p>
+      <div class="formula"><span class="lbl">collapsed form — derived on this page, not in the study</span><span class="eq">∂ℓ/∂xᵢ  =  (γ / (m·s)) · (  m·gᵢ  −  ∑ⱼ gⱼ  −  x̂ᵢ · ∑ⱼ gⱼ x̂ⱼ  )
+
+consequences (ε neglected, so (1/m)∑ x̂ⱼ² = 1):
+    ∑ᵢ ∂ℓ/∂xᵢ        =  0        the gradient has no component along "shift the whole batch"
+    ∑ᵢ x̂ᵢ · ∂ℓ/∂xᵢ   =  0        … nor along "scale the batch about its mean"</span></div>
+      <p>This says the incoming gradient is projected away from the two directions the normalisation cancels. Shifting every <code>xᵢ</code> by a constant, or scaling them about their mean, cannot change <code>x̂</code>, so the loss cannot depend on them, and the gradient carries no signal along them. That is the formal version of "the optimiser now knows the normalisation is there". The training simulation in §09 uses exactly these formulas, term by term, and the scale-invariance figure in §07 was checked against finite differences to six significant figures. The general mechanics of backpropagation are on <a href="../loss-backprop.html#backprop">loss &amp; backprop</a>.</p>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="inference" data-nav="Algorithm 2: train, then infer">
+      <h3><span class="idx">05</span> Algorithm 2: training a BN network, then freezing it for inference</h3>
+      <p class="lede">Mini-batch dependence helps training but is "neither necessary nor desirable during inference". The output should depend on the input alone, deterministically. So after training, the study replaces the batch statistics with <b>population</b> statistics, and the layer becomes a fixed linear map.</p>
+
+      <div class="formula"><span class="lbl">Algorithm 2 — training a batch-normalised network</span><span class="eq">input:  network N with parameters Θ; a subset of activations {x⁽ᵏ⁾}ₖ₌₁ᴷ
+output: batch-normalised network for inference, N_BN^inf
+
+ 1  N_BN^tr ← N
+ 2  for k = 1 … K:
+ 3      add  y⁽ᵏ⁾ = BN_γ⁽ᵏ⁾,β⁽ᵏ⁾(x⁽ᵏ⁾)  to N_BN^tr                   (Algorithm 1)
+ 4      every layer that took x⁽ᵏ⁾ as input now takes y⁽ᵏ⁾
+ 6  train N_BN^tr to optimise  Θ ∪ {γ⁽ᵏ⁾, β⁽ᵏ⁾}ₖ₌₁ᴷ
+ 7  N_BN^inf ← N_BN^tr          inference network, parameters frozen
+ 8  for k = 1 … K:
+10      process multiple training mini-batches ℬ of size m and average:
+            E[x]    ←  E_ℬ[μ_ℬ]
+            Var[x]  ←  (m / (m − 1)) · E_ℬ[σ²_ℬ]          unbiased
+11      in N_BN^inf replace  y = BN_γ,β(x)  with
+            y  =  (γ / √(Var[x] + ε)) · x  +  ( β − γ·E[x] / √(Var[x] + ε) )</span></div>
+
+      <ul class="notes">
+        <li><b>The <code>m/(m − 1)</code> factor.</b> Each <code>σ²_ℬ</code> is a biased within-batch variance, so their average under-reports the population variance by <code>(m − 1)/m</code>. The factor undoes that. Neglecting ε, the inference-time <code>x̂</code> then has the same mean 0 and variance 1 as during training.</li>
+        <li><b>Inference BN is one affine map per activation</b>, <code>y = a·x + c</code> with <code>a = γ/√(Var[x] + ε)</code> and <code>c = β − a·E[x]</code>. The study notes that the normalisation "may further be composed with the scaling by γ and shift by β, to yield a single linear transform that replaces BN(x)". The step the hub makes explicit, absorbing it into the preceding weight matrix, follows directly (<a href="../normalization-regularization.html#norm">§29, "fold it away"</a>).</li>
+        <li><b>Moving averages instead of a post-hoc pass.</b> Algorithm 2 averages over training batches after training. The study notes that moving averages can be used instead, which lets you track a model's accuracy <i>as it trains</i>. The simulation in §09 does this. The hub covers the running-average mechanics and the train/eval bugs.</li>
+      </ul>
+      <p>Step 5 of the original listing is just <code>end for</code>. The step numbers above follow the original, so 5, 9 and 12 are missing: they are loop closings and a notational comment.</p>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="conv" data-nav="BN in convolutional nets">
+      <h3><span class="idx">06</span> Where BN goes, and how it works in a convolutional layer</h3>
+      <p class="lede">The study targets layers of the form <code>z = g(Wu + b)</code>, which covers fully connected and convolutional layers. It places BN <b>between the affine map and the nonlinearity</b>, drops the bias, and in convolutional layers shares the statistics and the <code>(γ, β)</code> pair across every spatial location of a feature map.</p>
+
+      <div class="formula"><span class="lbl">placement, and the vanished bias</span><span class="eq">z  =  g(Wu + b)        becomes        z  =  g( BN(Wu) )
+
+b is dropped: BN subtracts the batch mean, which cancels any constant b exactly.
+Its role is taken over by β (Algorithm 1).</span>
+<span class="lbl">convolutional BN — the effective mini-batch</span><span class="eq">ℬ  =  all values of ONE feature map, over every batch element AND every location
+
+batch size m, feature map p × q   ⇒   m′ = |ℬ| = m · p · q
+one (γ, β) pair per feature map, not per activation
+
+example (this page's arithmetic):  m = 32, a 28 × 28 map   ⇒   m′ = 32 · 784 = 25 088</span></div>
+
+      <ul class="notes">
+        <li><b>Why normalise <code>Wu</code> and not the layer input <code>u</code>.</b> <code>u</code> is usually the output of another nonlinearity, so the <i>shape</i> of its distribution is likely to change during training, and fixing its first two moments would not remove the shift. <code>Wu + b</code> is more likely to be symmetric, non-sparse and "more Gaussian", so normalising it is more likely to produce a stable distribution. (The same argument is used in the conclusion to contrast BN with an earlier standardisation layer applied <i>after</i> the nonlinearity.)</li>
+        <li><b>Why share across locations.</b> The convolutional property: elements of the same feature map at different locations should be normalised the same way. The inference transform of Algorithm 2 is modified the same way, so it is one affine map per feature map.</li>
+        <li><b>A side effect worth noticing.</b> <code>m′</code> is large even when <code>m</code> is small, so convolutional BN gets far better statistics than a fully connected BN at the same batch size. It does not fix the small-batch problem, though: the <code>m · p · q</code> values come from only <code>m</code> images and are strongly correlated (§13). For convolutions themselves, see <a href="../../convolutional-networks.html">convolutional networks</a>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="lr" data-nav="Why higher learning rates">
+      <h3><span class="idx">07</span> Why BN permits higher learning rates: scale invariance</h3>
+      <p class="lede">In an ordinary deep network, a learning rate that is too high can make gradients explode or vanish, or leave training stuck in poor minima. It can also grow the weights, which then amplify the gradients and lead to model explosion. With BN, <b>backpropagation through a layer is unaffected by the scale of its weights</b>.</p>
+
+      <div class="formula"><span class="lbl">the study's three identities, for a scalar a</span><span class="eq">BN(Wu)  =  BN((aW)u)
+
+∂BN((aW)u) / ∂u      =   ∂BN(Wu) / ∂u                the layer Jacobian is unchanged
+∂BN((aW)u) / ∂(aW)   =   (1/a) · ∂BN(Wu) / ∂W         larger weights ⇒ smaller gradients</span>
+<span class="lbl">consequence for an SGD step — this page's one-line corollary</span><span class="eq">‖Δ(aW)‖ / ‖aW‖   =   η · (1/a)‖∂ℓ/∂W‖ / (a‖W‖)   ∝   1/a²
+
+If a large step inflates the weights, the next steps become relatively smaller.
+The study's phrasing: BN will "stabilize the parameter growth".</span></div>
+      <p>The first identity holds because <code>a</code> scales <code>xᵢ − μ_ℬ</code> and <code>σ_ℬ</code> alike and cancels in <code>x̂</code>. The other two follow by differentiating it. Strictly, the cancellation is exact only when ε is neglected: once <code>a²σ²</code> is comparable to ε, the invariance breaks. The figure below shows this.</p>
+
+      <div class="viz" id="viz-sc">
+        <div class="vhead">
+          <span class="vtitle">Scale the weights by a: what changes and what does not, measured</span>
+          <span class="vhint">with BN on, output and input-gradient stay flat while the weight gradient falls as 1/a; turn BN off to compare</span>
+        </div>
+        <div class="controls">
+          <label>weight scale a <input type="range" id="sc-a" min="-2" max="2" step="0.01" value="0.7" /><span id="sc-av" style="min-width:42px;display:inline-block">5.01</span></label>
+          <label><input type="checkbox" id="sc-bn" checked /> BN on</label>
+          <label>ε <select id="sc-eps">
+            <option value="0.00001" selected>1e-5</option><option value="0.001">1e-3</option><option value="0.1">0.1</option>
+          </select></label>
+        </div>
+        <svg id="sc-svg" width="760" height="330" viewBox="0 0 760 330" role="img" aria-label="Left: a log-log chart of four measured quantities against the weight scale a, from 0.01 to 100, each divided by its value at a equal to 1. The quantities are the norm of the layer's output, the norm of the loss gradient with respect to the layer input u, the norm of the loss gradient with respect to the scaled weights, and the relative size of one gradient step compared with the weight norm. With batch normalisation on, the output and input-gradient curves are flat at 1, the weight-gradient curve falls with slope minus one, along a dotted reference line labelled 1 over a, and the relative-step curve falls with slope minus two, along a line labelled 1 over a squared. At small a, left of a dashed red rule marking where a times the activation standard deviation equals the square root of epsilon, the curves bend away from these lines because epsilon stops being negligible. With batch normalisation off, the output grows in proportion to a and the gradients follow no common law. A vertical dashed marker and four dots show the current a. Right: a bar chart of one unit's output for each of the 32 batch items, as an outline at a equal to 1 and filled bars at the current a; with batch normalisation on the filled bars sit exactly inside the outlines. The readout gives the maximum output difference and the four ratios beside 1 over a and 1 over a squared."></svg>
+        <div class="readout" aria-live="polite" id="sc-readout"></div>
+      </div>
+      <p style="font-size:12.5px;color:var(--muted)">Simulated: one layer, 32 random inputs of width 8, 6 output units, <code>γ = 1</code>, <code>β = 0</code>, loss <code>½∑(y − t)²</code> against a fixed random target. Every point is a real forward and backward pass through the study's chain rule (§04). The analytic gradients agree with finite differences.</p>
+
+      <h4>The conjecture about Jacobians</h4>
+      <div class="formula"><span class="lbl">the study's heuristic, explicitly offered as a conjecture</span><span class="eq">two consecutive normalised layers,  z = F(x),  with F(x) ≈ Jx  (linear for fixed parameters)
+assume x and z Gaussian, uncorrelated  ⇒  Cov[x] = Cov[z] = I
+
+I  =  Cov[z]  =  J Cov[x] Jᵀ  =  J Jᵀ       ⇒   every singular value of J equals 1
+                                             ⇒   gradient magnitudes preserved in backprop</span></div>
+      <p>The study is explicit that reality violates every assumption: the map is not linear, and the normalised values are neither Gaussian nor independent. It still "expects" better-behaved gradient propagation, and calls the precise effect an area of further study. Singular values near 1 are the dynamical-isometry picture of <a href="../gradient-flow-init.html#init">initialisation</a>. The broader link between curvature and the largest usable step size is on <a href="../optimizers.html#landscape">optimisers</a>.</p>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="regularise" data-nav="BN as a regulariser">
+      <h3><span class="idx">08</span> BN as a regulariser</h3>
+      <p class="lede">A training example is seen together with the other examples in its mini-batch, so the training network "no longer produc[es] deterministic values for a given training example". The study found this noise helped generalisation, enough that <b>dropout could be removed or reduced</b>.</p>
+      <ul class="notes">
+        <li><b>The noise is in the statistics.</b> <code>μ_ℬ</code> and <code>σ_ℬ</code> change with batch composition, so the same example gets a slightly different <code>x̂</code> each time it is seen. The hub measures this directly: the same input, three batches, three outputs (<a href="../normalization-regularization.html#norm">§29</a>).</li>
+        <li><b>Indirect evidence from ImageNet (§10).</b> Shuffling the training data more thoroughly, so the same examples do not keep landing in a batch together, gave about 1% better validation accuracy. The study reads this as consistent with the regulariser view: the randomisation helps most if it hits an example differently each time.</li>
+        <li><b>No separate analysis.</b> The study offers this observation and no theory of the regularising effect. How it compares to dropout's own noise model is on the sibling page, <a href="dropout.html">Dropout</a>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="mnist" data-nav="MNIST: activations over time">
+      <h3><span class="idx">09</span> Experiment 1: activations over time on MNIST</h3>
+      <p class="lede">To look at internal covariate shift directly, the study trained a deliberately simple network and compared the baseline with its BN version. The goal was the comparison, not state-of-the-art MNIST accuracy, which this architecture does not reach.</p>
+
+      <table class="grid2">
+        <tr><th style="width:220px">setting</th><th>as reported</th></tr>
+        <tr><td>input</td><td>28×28 binary image</td></tr>
+        <tr><td>network</td><td>3 fully connected hidden layers, 100 activations each, <code>y = g(Wu + b)</code> with sigmoid <code>g</code>; then a fully connected 10-way layer and cross-entropy loss</td></tr>
+        <tr><td>initialisation</td><td><code>W</code> from small random Gaussian values</td></tr>
+        <tr><td>training</td><td>50 000 steps, 60 examples per mini-batch</td></tr>
+        <tr class="hl"><td><b>BN variant</b></td><td>BN added to each hidden layer, as in Algorithm 2</td></tr>
+        <tr><td>what was plotted</td><td>(a) held-out test accuracy against step; (b, c) for one typical activation from the <b>last hidden layer</b>, the 15th, 50th and 85th percentiles of its sigmoid input over training, without and with BN</td></tr>
+      </table>
+      <p>The reported finding: the BN network reaches higher test accuracy and trains faster. Without BN, the sigmoid-input distribution changes significantly over time in both mean and variance. With BN it is "much more stable". The study offers no numbers beyond the figure, so this page does not quote readings off its axes.</p>
+
+      <div class="viz" id="viz-ics">
+        <div class="vhead">
+          <span class="vtitle">A simulation in the spirit of the MNIST experiment — two sigmoid nets, with and without BN</span>
+          <span class="vhint">press train; watch the amber band (without BN) drift and widen while the blue one (with BN) stays put</span>
+        </div>
+        <div class="controls">
+          <button id="ics-play" type="button">train</button>
+          <button id="ics-reset" type="button">reset</button>
+          <label>learning rate <select id="ics-lr">
+            <option value="0.25">0.25</option><option value="0.5">0.5</option><option value="1" selected>1.0</option><option value="2">2.0</option>
+          </select></label>
+          <label>initial weight std <select id="ics-std">
+            <option value="0.03">0.03</option><option value="0.1" selected>0.1</option><option value="0.3">0.3</option>
+          </select></label>
+          <label>watch hidden layer <select id="ics-layer">
+            <option value="0">1</option><option value="1">2</option><option value="2" selected>3 (last)</option>
+          </select></label>
+        </div>
+        <svg id="ics-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Three panels sharing a horizontal axis of training steps from 0 to 1500. Panel a: held-out accuracy of the two networks, amber without batch normalisation and blue with it. The blue curve rises to about 0.94 within the first few hundred steps, while the amber curve stays near chance, 0.1, for a while before climbing. Panel b, without batch normalisation: for one sigmoid input in the chosen hidden layer, a shaded band from the 15th to the 85th percentile over 200 held-out inputs, with the median as a line. The band starts narrow near zero, then drifts down to about minus 2 and changes width as training proceeds. Panel c, with batch normalisation: the same quantity, which spreads to roughly minus 1.6 to plus 1.4 early on and then stays at about that position and width. Both vertical axes run from minus 4 to plus 4. The readout gives the step, both accuracies, the three percentiles for each network and how far each median has drifted."></svg>
+        <div class="readout" aria-live="polite" id="ics-readout"></div>
+      </div>
+      <p style="font-size:12.5px;color:var(--muted)"><b>What is simulated, honestly:</b> the architecture is the study's (3 × 100 sigmoid hidden units, 10-way softmax, cross-entropy, batch 60, small Gaussian init, plain SGD), and it runs live in your browser. The data is <i>not</i> MNIST: there are ten random 7×7 binary prototypes, and each pixel is flipped with probability 0.25. Training runs 1 500 steps, not 50 000. Both nets start from identical weights and see identical batches. Percentiles are measured on 200 fixed held-out inputs, and the BN net is evaluated in inference mode, with running population estimates (momentum 0.1, unbiased <code>m/(m−1)</code> variance). Because this task tops out near 95% accuracy, the baseline eventually catches up. The point is the <i>path</i>, not the endpoint.</p>
+      <ul class="notes">
+        <li><b>Why the baseline starts slowly here.</b> With small weights every sigmoid sits near 0.5 and the backward signal is attenuated layer by layer. The pre-activations then drift as the lower layers learn, so each layer keeps re-adapting. With BN, every pre-activation is immediately rescaled to a useful range, whatever the weight scale (§07).</li>
+        <li><b>The BN band is stable but not frozen.</b> <code>γ</code> and <code>β</code> are learned, so the distribution can move. It moves only when the loss asks it to, not as a by-product of updates in other layers. Try learning rate 2.0 to see <code>β</code> shift the band deliberately.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="imagenet" data-nav="ImageNet: the setup">
+      <h3><span class="idx">10</span> Experiment 2: ImageNet — the network, and what had to change</h3>
+      <p class="lede">The main test was a new variant of the Inception network on 1000-class ImageNet classification. BN was applied to the input of every nonlinearity, in the convolutional way of §06, and the rest of the architecture was left unchanged. The important finding is that <b>adding BN alone does not take full advantage of it</b>. The training recipe has to change too.</p>
+
+      <table class="grid2">
+        <tr><th style="width:220px">the "Inception" baseline of the study</th><th>as reported</th></tr>
+        <tr><td>architecture</td><td>many convolutional and pooling layers, softmax over 1000 classes, ReLU in convolutional layers; no fully connected layers other than the top softmax</td></tr>
+        <tr><td>main change vs the earlier Inception</td><td>each 5×5 convolution replaced by two consecutive 3×3 convolutions with up to 128 filters</td></tr>
+        <tr><td>size</td><td class="num">13.6 × 10⁶ parameters</td></tr>
+        <tr><td>appendix details</td><td>the 3×3 pairs add 9 weight layers to the maximum depth, about 25% more parameters and about 30% more compute; the number of 28×28 Inception modules goes from 2 to 3; a mix of average and max pooling inside modules; stride-2 layers before filter concatenation in modules 3c and 4e instead of pooling between modules; a separable first convolution with depth multiplier 8</td></tr>
+        <tr><td>optimiser</td><td>SGD with momentum, mini-batch 32, large-scale distributed training</td></tr>
+        <tr><td>metric</td><td>validation accuracy @1 (top-1 of 1000), single crop, evaluated during training</td></tr>
+      </table>
+
+      <h4>"Accelerating BN networks": the seven changes</h4>
+      <div class="cards">
+        <div class="box good"><div class="n">1</div><div class="t">Increase the learning rate</div><div class="g">A training speed-up "with no ill side effects" (§07). By 5× and 30× in the variants of §11.</div></div>
+        <div class="box good"><div class="n">2</div><div class="t">Remove dropout</div><div class="g">BN serves some of the same goals (§08). Removing it sped up training without increasing overfitting.</div></div>
+        <div class="box good"><div class="n">3</div><div class="t">Reduce L2 weight regularisation by 5×</div><div class="g">The weight of the L2 loss on the parameters was divided by 5, which improved held-out validation accuracy. Weight decay itself is on the <a href="../normalization-regularization.html#weight-decay">hub</a>.</div></div>
+        <div class="box good"><div class="n">4</div><div class="t">Decay the learning rate 6× faster</div><div class="g">Inception's rate was decayed exponentially. Since the BN network trains faster, it was lowered 6 times faster.</div></div>
+        <div class="box good"><div class="n">5</div><div class="t">Remove local response normalisation</div><div class="g">Inception and others benefit from it, but with BN it was found unnecessary.</div></div>
+        <div class="box good"><div class="n">6</div><div class="t">Shuffle more thoroughly</div><div class="g">Within-shard shuffling, so the same examples do not always share a batch: about 1% better validation accuracy (§08).</div></div>
+        <div class="box good"><div class="n">7</div><div class="t">Reduce photometric distortions</div><div class="g">BN networks train faster and see each example fewer times, so the trainer was allowed to focus on more "real" images by distorting them less.</div></div>
+      </div>
+      <p>Notice how many of the seven <i>remove regularisation</i>: dropout, most of the L2 penalty, augmentation strength. That is what you would do if the layer were itself a regulariser and the network now saw each example fewer times. The other three are about speed: a higher rate, faster decay, and dropping a normalisation that is now redundant.</p>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="single" data-nav="Single-network results">
+      <h3><span class="idx">11</span> Single-network results: 14× fewer steps</h3>
+      <p class="lede">Five networks were trained on the 2012 challenge training data and tested on its validation data. The yardstick is Inception's own best accuracy, <b>72.2%</b>, which it reached after 31 × 10⁶ steps. The question is how many steps each BN variant needs to get there, and how far beyond it each one goes.</p>
+
+      <table class="grid2">
+        <tr><th>network</th><th>what it is</th><th>initial LR</th><th>steps to 72.2%</th><th>max accuracy</th></tr>
+        <tr><td><b>Inception</b></td><td>the baseline of §10</td><td class="num">0.0015</td><td class="num">31.0 × 10⁶</td><td class="num">72.2%</td></tr>
+        <tr><td><b>BN-Baseline</b></td><td>Inception + BN before each nonlinearity; nothing else changed</td><td class="num">0.0015</td><td class="num">13.3 × 10⁶</td><td class="num">72.7%</td></tr>
+        <tr class="hl"><td><b>BN-x5</b></td><td>BN + the seven changes of §10; LR × 5</td><td class="num">0.0075</td><td class="num">2.1 × 10⁶</td><td class="num">73.0%</td></tr>
+        <tr class="hl"><td><b>BN-x30</b></td><td>as BN-x5, LR × 30</td><td class="num">0.045</td><td class="num">2.7 × 10⁶</td><td class="num">74.8%</td></tr>
+        <tr><td><b>BN-x5-Sigmoid</b></td><td>as BN-x5, sigmoid instead of ReLU</td><td class="num">0.0075</td><td class="num">— (not reached)</td><td class="num">69.8%</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">From the study's Figure 3 and the variant descriptions in its single-network section. "BN-Baseline" uses Inception's rate (it is "same as Inception" plus BN).</p>
+
+      <div class="viz" id="viz-res">
+        <div class="vhead">
+          <span class="vtitle">The reported single-network numbers, three ways</span>
+          <span class="vhint">switch views; the speed-up factors in the steps view are this page's divisions of the reported step counts</span>
+        </div>
+        <div class="controls">
+          <label>view <select id="res-v">
+            <option value="steps" selected>steps to reach 72.2%</option>
+            <option value="acc">maximum accuracy</option>
+            <option value="lr">initial learning rate</option>
+          </select></label>
+        </div>
+        <svg id="res-svg" width="760" height="270" viewBox="0 0 760 270" role="img" aria-label="Horizontal bar chart of the five ImageNet networks: Inception, BN-Baseline, BN-x5, BN-x30 and BN-x5-Sigmoid. In the steps view the bars give training steps in millions to reach 72.2 percent top-1 accuracy: 31.0, 13.3, 2.1 and 2.7, with BN-x5-Sigmoid drawn as an empty dashed outline because it never reaches that accuracy; each BN bar is labelled with how many times fewer steps it needs than Inception. In the accuracy view the bars give maximum validation accuracy on an axis starting at 68 percent: 72.2, 72.7, 73.0, 74.8 and 69.8, with a dashed line at Inception's 72.2. In the learning-rate view the bars give initial learning rates on a log axis: 0.0015, 0.0015, 0.0075, 0.045 and 0.0075."></svg>
+        <div class="readout" aria-live="polite" id="res-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>BN alone halves the steps.</b> BN-Baseline matches Inception "in less than half the number of training steps" (this page's arithmetic: 31.0 / 13.3 ≈ 2.3×), at the same learning rate and recipe.</li>
+        <li><b>The recipe does the rest.</b> BN-x5 needs <b>14 times fewer steps</b> than Inception to reach 72.2% (the division 31.0 / 2.1 is about 14.8; the study says 14×). The introduction puts the same fact as matching the baseline with "only 7% of the training steps" (2.1 / 31.0 ≈ 6.8%). This is the headline of the abstract.</li>
+        <li><b>Higher still: slower start, better finish.</b> BN-x30 trains "somewhat slower initially" (2.7 × 10⁶ steps to 72.2%) but reaches <b>74.8%</b> after 6 × 10⁶ steps. The study calls that 5 times fewer steps than Inception needed for 72.2% (31 / 6 ≈ 5.2).</li>
+        <li><b>The control that matters.</b> The same 5× learning-rate increase applied to Inception <i>without</i> BN "caused the model parameters to reach machine infinity". So the higher rate is something BN makes possible, not just a better hyperparameter.</li>
+        <li><b>Sigmoids become trainable.</b> BN-x5-Sigmoid reaches 69.8%. The original Inception with sigmoid stayed at chance and "never achieves better than 1/1000 accuracy". The study offers this as verification that removing internal covariate shift lets deep networks train with saturating nonlinearities.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ensemble" data-nav="Ensemble: 4.9% top-5">
+      <h3><span class="idx">12</span> The ensemble: 4.9% top-5 validation, 4.82% test</h3>
+      <p class="lede">Six BN networks, averaged, beat the best published ImageNet results at the time. The test-server error of <b>4.82%</b> top-5 also beat the estimated accuracy of human raters on the benchmark.</p>
+
+      <table class="grid2">
+        <tr><th>model</th><th>resolution</th><th>crops</th><th>models</th><th>top-1 error</th><th>top-5 error</th></tr>
+        <tr><td>original Inception ensemble (2014 challenge entry)</td><td class="num">224</td><td class="num">144</td><td class="num">7</td><td class="num">—</td><td class="num">6.67%</td></tr>
+        <tr><td>a prior large-scale system, low-res</td><td class="num">256</td><td class="num">—</td><td class="num">1</td><td class="num">—</td><td class="num">7.96%</td></tr>
+        <tr><td>same system, high-res</td><td class="num">512</td><td class="num">—</td><td class="num">1</td><td class="num">24.88</td><td class="num">7.42%</td></tr>
+        <tr><td>same system, ensemble</td><td class="num">variable</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">5.98%</td></tr>
+        <tr><td>BN-Inception, single crop</td><td class="num">224</td><td class="num">1</td><td class="num">1</td><td class="num">25.2%</td><td class="num">7.82%</td></tr>
+        <tr><td>BN-Inception, multicrop</td><td class="num">224</td><td class="num">144</td><td class="num">1</td><td class="num">21.99%</td><td class="num">5.82%</td></tr>
+        <tr class="hl"><td><b>BN-Inception ensemble</b></td><td class="num">224</td><td class="num">144</td><td class="num">6</td><td class="num">20.1%</td><td class="num">4.9%*</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">The study's Figure 4, on the 50 000-image validation set. *The ensemble reached <b>4.82%</b> top-5 error on the 100 000-image test set, as reported by the test server. The abstract rounds this to 4.8%. The prior systems are given by description here, not by name.</p>
+
+      <ul class="notes">
+        <li><b>The ensemble members.</b> 6 networks, each based on BN-x30 and modified by some of the following: larger initial weights in the convolutional layers; dropout at 5% or 10% (against 40% in the original Inception); and non-convolutional, per-activation BN in the last hidden layers. Each reached its best accuracy after about 6 × 10⁶ steps. Predictions were the arithmetic average of the members' class probabilities. Ensemble and multicrop inference followed the earlier Inception work.</li>
+        <li><b>Against the prior best.</b> The strongest concurrent result the study cites is a rectifier-based ensemble reporting 4.94% top-5 on the test server, so 4.82% is a 0.12-point improvement (this page's subtraction). Against the original 7-model Inception ensemble's 6.67% on validation, the gap is 1.77 points.</li>
+        <li><b>Even one BN network with multicrop</b> (5.82%) beats that 7-model ensemble (6.67%).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="later" data-nav="What later work found">
+      <h3><span class="idx">13</span> What later work found (beyond the original study)</h3>
+      <p class="lede">Everything above is the original method and its evidence. This section is <b>general knowledge from later work</b>. It is not part of the study's claims, it is summarised without its numbers, and parts of it are still debated.</p>
+
+      <div class="cards">
+        <div class="box bad"><div class="n">the explanation</div><div class="t">Internal covariate shift was challenged</div><div class="g">A 2018 analysis trained BN networks and then deliberately injected time-varying, non-zero-mean, non-unit-variance noise <i>after</i> each BN layer, re-creating a severe distribution shift. The networks still trained about as well as ordinary BN networks and far better than the unnormalised ones. By a gradient-based measure of internal covariate shift, BN did not reliably reduce it either.</div></div>
+        <div class="box good"><div class="n">the replacement account</div><div class="t">BN smooths the loss landscape</div><div class="g">The same line of work argued that BN makes the loss and its gradients more Lipschitz, so gradients are more predictive and larger steps are safe. That fits §07's scale-invariance and §11's learning-rate results without needing internal covariate shift. The hub's <a href="../normalization-regularization.html#norm">§29</a> gives this account in the context of the layer's mechanics.</div></div>
+        <div class="box warn"><div class="n">scale invariance, revisited</div><div class="t">Weight decay becomes a learning-rate knob</div><div class="g">Because <code>BN((aW)u) = BN(Wu)</code>, an L2 penalty on <code>W</code> cannot change what a BN layer computes. It only shrinks <code>‖W‖</code>, which by §07 <i>raises</i> the effective step (<code>∝ 1/‖W‖²</code>). Later analyses treat weight decay on BN networks as controlling an effective learning rate, not as capacity control.</div></div>
+        <div class="box bad"><div class="n">the batch</div><div class="t">Small batches break it</div><div class="g">The statistics are estimated from <code>m</code> samples (or <code>m</code> images in a conv net), so at very small batches they become noisy and the layer hurts. Detection, segmentation and other memory-bound tasks run into this. Batch renormalisation corrects mini-batch statistics toward the running ones. Synchronised BN pools statistics across devices.</div></div>
+        <div class="box good"><div class="n">the alternatives</div><div class="t">Normalise over another axis</div><div class="g"><b>LayerNorm</b> normalises over the features of one example, so there is no batch dependence and no train/eval gap. It is the default in sequence models and transformers. <b>GroupNorm</b> normalises over groups of channels per example and is the small-batch choice for vision. <b>RMSNorm</b> drops the mean. See the hub's <a href="../normalization-regularization.html#layernorm">§30</a> and <a href="../../transformers/residual-norms-ffn.html#norms">LayerNorm against RMSNorm</a> in the transformer block.</div></div>
+        <div class="box plain"><div class="n">and without it</div><div class="t">Normaliser-free deep networks</div><div class="g">Very deep residual networks were later trained without BN at all, using careful residual initialisation (scaling or zero-initialising each branch) and, at scale, adaptive gradient clipping. This suggests much of BN's value lies in keeping signal propagation healthy at initialisation. A related BN trick is zero-initialising the last <code>γ</code> in each residual block (<a href="../../residual-skip-connections.html#init">residual initialisation tricks</a>).</div></div>
+      </div>
+      <p>The original study's practical claims have held up well: faster training, higher usable learning rates, trainable saturating nonlinearities, and less need for dropout. Its proposed <i>reason</i> has not. The same pattern of a result outliving its first explanation shows up in the <a href="../../residual-skip-connections.html#landscape">loss-landscape account of residual connections</a>. BN and residual connections arrived in the same year and are usually used together.</p>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">14</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"BN is just standardising the inputs at every layer — you could precompute the statistics."</span> <span class="fix">That is exactly the version the study shows failing.</span> If the statistics sit outside the gradient step, the optimiser keeps pushing in directions the normalisation cancels, and parameters such as <code>b</code> grow without bound (§02). BN works because the batch statistics are inside the differentiated function and gradients flow through <code>μ_ℬ</code> and <code>σ²_ℬ</code> (§04).</div>
+      <div class="wrong"><span class="say">"BN forces every layer's inputs to be zero-mean, unit-variance."</span> <span class="fix">Only <code>x̂</code> is; the layer outputs <code>γx̂ + β</code>.</span> With <code>γ = √Var[x]</code> and <code>β = E[x]</code> it can recover the identity (§03). What it removes is the <i>accidental</i> coupling between a layer's input moments and the parameters below.</div>
+      <div class="wrong"><span class="say">"Keep the bias in the layer before BN."</span> <span class="fix">It does nothing.</span> The batch mean subtraction cancels any constant exactly, and <code>β</code> takes over its role (§06). It is a wasted parameter. Its gradient through BN is exactly zero (§04's <code>∑ ∂ℓ/∂xᵢ = 0</code>).</div>
+      <div class="wrong"><span class="say">"The study showed BN works by reducing internal covariate shift."</span> <span class="fix">It assumed that and showed the method works.</span> The MNIST figure shows more stable distributions <i>alongside</i> faster training. It does not show one causes the other, and later experiments that re-injected the shift found the benefit survived (§13).</div>
+      <div class="wrong"><span class="say">"Adding BN to a network gives the 14× speed-up."</span> <span class="fix">Adding BN alone gave about 2.3×.</span> The 14× needed the full recipe of §10: 5× the learning rate, no dropout, a fifth of the L2 penalty, 6× faster decay, no LRN, better shuffling and lighter distortions (§11).</div>
+      <div class="wrong"><span class="say">"Convolutional BN has one <code>γ, β</code> per activation."</span> <span class="fix">One pair per feature map.</span> Statistics are pooled over the batch <i>and</i> all <code>p × q</code> locations, for an effective batch of <code>m · p · q</code> (§06).</div>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">15</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Motivation:</b> internal covariate shift, the change in a layer's input distribution as earlier layers train, which pushes saturating units into flat regions.</li>
+        <li><b>Normalisation must be inside the gradient.</b> Normalising outside the step lets the bias grow without bound. Full whitening is too costly and singular at mini-batch size. So: per-feature, per-mini-batch, differentiated through.</li>
+        <li><b>Algorithm 1:</b> <code>x̂ = (x − μ_ℬ)/√(σ²_ℬ + ε)</code>, <code>y = γx̂ + β</code>. <code>γ, β</code> can recover the identity, at two extra parameters per activation.</li>
+        <li><b>Backprop</b> has three paths: direct, via <code>σ²_ℬ</code> and via <code>μ_ℬ</code>. Together they remove the gradient's shift and scale components.</li>
+        <li><b>Algorithm 2:</b> train with batch statistics, then infer with <code>E[x] = E_ℬ[μ_ℬ]</code> and <code>Var[x] = m/(m−1)·E_ℬ[σ²_ℬ]</code>. Inference BN is one affine map and can be folded.</li>
+        <li><b>Conv nets:</b> <code>z = g(BN(Wu))</code> with the bias dropped. Statistics per feature map over <code>m′ = m·p·q</code> values.</li>
+        <li><b>Higher learning rates:</b> <code>BN((aW)u) = BN(Wu)</code>. The input Jacobian is unchanged and the weight gradient scales as <code>1/a</code>, so weight growth self-limits.</li>
+        <li><b>Evidence:</b> 72.2% in 2.1 × 10⁶ steps instead of 31.0 × 10⁶ (14×), 74.8% best single network, trainable sigmoids (69.8%), and a 6-network ensemble at 4.9% top-5 validation and 4.82% test.</li>
+        <li><b>Later:</b> the results held up. The internal-covariate-shift explanation largely did not, and loss-landscape smoothing replaced it. Batch dependence pushed sequence models to LayerNorm and small-batch vision to GroupNorm.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Normalization layers and training regularization" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../normalization-regularization.html">← Normalization Layers &amp; Training Regularization</a>
+      <a href="../normalization-regularization.html" style="color:var(--muted)">Normalization &amp; Regularization · overview</a>
+      <a href="dropout.html">Dropout →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../../data.js"></script>
+<script src="../../../notes.js"></script>
+<script src="batch-normalization.viz.js"></script>
+</body>
+</html>

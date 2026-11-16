@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · InstructGPT &amp; RLHF</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover,.controls button.on{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../gpt.html">GPT</a> · deep dive</p>
+      <h1>InstructGPT &amp; RLHF</h1>
+      <p>The paper that turned GPT-3 from a text continuer into an instruction follower using human feedback. The short version — three stages, two formulas, the headline results — is <a href="decoding-successors.html#instructgpt">§26 of the GPT card</a>, and the general machinery of reward models, PPO and their DPO-style alternatives is on <a href="../../llm/policy-preference-optimization.html">Policy / Preference Optimization</a>. This page reads the paper itself: where the prompts came from, who labelled them and how often they agreed, the exact settings of each stage, how the evaluation was built, every family of result, what alignment cost, and the paper's own account of whose preferences it encoded.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Model Architectures</span>
+        <span class="pill">GPT</span>
+        <span class="pill">API prompts · labellers · SFT · 6B reward model · PPO-ptx · KL · win rates · FLAN/T0 · TruthfulQA · toxicity · alignment tax</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="problem" data-nav="The objective mismatch">
+      <h3><span class="idx">01</span> The problem: the pretraining objective is not the task</h3>
+      <p class="lede"><b>Predicting the next token of web text is not the same objective as "follow the user's instructions helpfully and safely".</b> The paper calls a model trained only on the first <i>misaligned</i> with the second: it can make up facts, produce toxic or biased text, or simply ignore the instruction and continue the prompt.</p>
+      <ul class="notes">
+        <li><b>The target behaviour</b> is stated in three words: <b>helpful</b> (do the task the user intends), <b>honest</b> (do not fabricate; measured as truthfulness), and <b>harmless</b> (avoid causing physical, psychological or social harm).</li>
+        <li><b>The approach</b> is to use human preferences as the reward signal: collect demonstrations and rankings from people, fit a model to them, and optimise the language model against that model. The objective-level view of why next-token likelihood and preference are different targets is on <a href="autoregressive-objective.html">GPT: Autoregressive Objective &amp; Causal Masking</a>.</li>
+        <li><b>The starting point</b> is GPT-3 at three sizes — 1.3B, 6B and 175B parameters (the architecture and its training are on <a href="gpt1-to-gpt3.html">GPT-1 to GPT-3</a>).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="prompts" data-nav="The prompt dataset">
+      <h3><span class="idx">02</span> The prompt dataset: what people actually asked</h3>
+      <p class="lede">Most prompts came from <b>real use of an API</b>, not from academic benchmarks. That single choice explains much of the evaluation (§07) and why models fine-tuned on public NLP datasets did poorly on it (§08).</p>
+      <ul class="notes">
+        <li><b>Sources.</b> Prompts submitted to the API's playground by customers using an early instruction-tuned model, plus prompts written by labellers to bootstrap the process — plain arbitrary tasks, few-shot instruction/response sets, and prompts modelled on use cases from API waitlist applications.</li>
+        <li><b>Filtering.</b> Heuristic de-duplication by long common prefix; at most <b>200 prompts per user ID</b>; train, validation and test split <b>by user ID</b> so no user appears in two splits; personally identifiable information filtered out of the training prompts. The data is over 96% English.</li>
+      </ul>
+
+      <table class="grid2">
+        <tr><th>stage</th><th>train prompts (labeller / customer)</th><th>validation prompts (labeller / customer)</th></tr>
+        <tr><td><b>SFT</b> — demonstrations</td><td class="num">11 295 / 1 430</td><td class="num">1 550 / 103</td></tr>
+        <tr><td><b>RM</b> — rankings</td><td class="num">6 623 / 26 584</td><td class="num">3 488 / 14 399</td></tr>
+        <tr><td><b>PPO</b> — RL prompts (no labels)</td><td class="num">— / 31 144</td><td class="num">— / 16 185</td></tr>
+      </table>
+      <p>Hence the "about 13k, 33k and 31k" usually quoted. Mean prompt lengths differ by stage — about 408 tokens for SFT training prompts, 199 for RM and 166 for PPO — because labeller-written few-shot prompts are long.</p>
+
+      <div class="viz" id="viz-ds">
+        <div class="vhead">
+          <span class="vtitle">What the prompts were for, and who wrote them</span>
+          <span class="vhint">toggle the view · hover a bar</span>
+        </div>
+        <div class="controls">
+          <button type="button" id="ds-cat" class="on">use-case categories (API prompts)</button>
+          <button type="button" id="ds-src">labeller vs customer, per stage</button>
+        </div>
+        <svg id="ds-svg" width="640" height="270" viewBox="0 0 640 270" role="img" aria-label="Bar chart of the prompt dataset: use-case category shares, or labeller versus customer prompt counts for each training stage"></svg>
+        <div class="readout" aria-live="polite" id="ds-read"></div>
+      </div>
+      <p>Open-ended <b>generation</b> alone is 45.6% of the API prompts and brainstorming another 11.2%; classification, extraction and closed QA — the bread and butter of public benchmarks — together are 8.0% (sums are our arithmetic).</p>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="labellers" data-nav="Labellers and agreement">
+      <h3><span class="idx">03</span> The labellers, and how often they agreed</h3>
+      <ul class="notes">
+        <li><b>About 40 contractors</b>, hired through two contracting platforms and chosen by a <b>screening test</b> that measured agreement with the researchers on flagging sensitive content and on ranking outputs, plus the quality of their written demonstrations.</li>
+        <li><b>What to optimise.</b> During training data collection labellers were told to prioritise <b>helpfulness</b> to the user; in the final evaluations, to prioritise <b>truthfulness and harmlessness</b>. The paper notes the tension: a request for something harmful puts the two in conflict.</li>
+        <li><b>Agreement.</b> Training labellers agreed with each other <b>72.6 ± 1.5%</b> of the time; a separate group of <b>held-out labellers</b>, who produced no training data, agreed <b>77.3 ± 1.3%</b>. For comparison, an earlier summarisation study measured researcher–researcher agreement of 73 ± 4%.</li>
+        <li><b>Who they were.</b> In a voluntary survey of 19 labellers, about half identified as male and 44% as female; most were 18–34; the largest nationality groups were Filipino and Bangladeshi (22% each), then American (17%).</li>
+      </ul>
+      <div class="callout"><b>Why the agreement numbers matter.</b> If people agree only about three times in four, no reward model can predict "the" preference much better than that — the label noise is a ceiling on reward-model accuracy, and the reward model's 72% (§05) is close to it.</div>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="sft" data-nav="Stage 1: SFT">
+      <h3><span class="idx">04</span> Stage 1 — supervised fine-tuning on demonstrations</h3>
+      <table class="grid2">
+        <tr><th>setting</th><th>1.3B and 6B</th><th>175B</th></tr>
+        <tr><td>epochs</td><td class="num" colspan="2">16, cosine learning-rate decay, residual dropout 0.2</td></tr>
+        <tr><td>learning rate</td><td class="num">9.65 × 10⁻⁶</td><td class="num">5.03 × 10⁻⁶</td></tr>
+        <tr><td>batch size</td><td class="num">32</td><td class="num">8</td></tr>
+        <tr><td>model selection</td><td class="num" colspan="2">by reward-model score on the validation set</td></tr>
+      </table>
+      <p>The SFT models <b>overfit on validation loss after one epoch</b>, yet training longer kept improving both reward-model score and human preference ratings. Validation likelihood is therefore not the quantity to early-stop on when the goal is preference — one of the paper's quieter, practically important findings.</p>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="rm" data-nav="Stage 2: the reward model">
+      <h3><span class="idx">05</span> Stage 2 — the reward model, and the ranking batch</h3>
+      <p class="lede">The reward model is the SFT model with its unembedding layer removed and a scalar head added: prompt and response in, one number out. It is trained to give the human-preferred response the higher score.</p>
+      <ul class="notes">
+        <li><b>Size: 6B for every policy size.</b> 175B reward models were tried; training "could be unstable", and a 175B model would be much more expensive to use as the value function in RL.</li>
+        <li><b>Rankings, not pairs.</b> Labellers ranked K = 4 to 9 responses per prompt, giving <code>C(K, 2)</code> comparisons.</li>
+        <li><b>Training:</b> a single epoch, learning rate 9 × 10⁻⁶, a batch of 64 prompts — up to 2 304 comparisons per batch (<code>64 · C(9, 2) = 64 · 36</code>, our check).</li>
+        <li><b>Normalisation.</b> Before RL a bias is added so that the labeller demonstrations score 0 on average; only reward differences are learned, so the offset is free.</li>
+      </ul>
+
+      <div class="formula"><span class="lbl">the pairwise loss, and why all C(K,2) pairs of a prompt go in one batch element</span><span class="eq">loss(θ)  =  − 1 / C(K,2) · E_(x, y_w, y_l) [ log σ( r_θ(x, y_w) − r_θ(x, y_l) ) ]
+
+naive:     shuffle every pair into the dataset independently
+           → each completion is seen in K − 1 different pairs within one epoch
+           → the model overfits after a single epoch
+paper:     all pairs of one prompt form ONE batch element
+           → K forward passes instead of 2 · C(K,2)          K = 9:   9  vs  72   (our arithmetic)
+           → no overfitting, and it trains faster</span></div>
+
+      <ul class="notes">
+        <li><b>Does it generalise to other people?</b> Five reward models were trained by cross-validation over five groups of labellers. On the held-out group they predicted preferences with <b>69.6 ± 0.9%</b> accuracy, against <b>72.4 ± 0.4%</b> on the labellers they were trained on — a small drop.</li>
+        <li>A worked example of this loss for a chosen reward gap is the lower panel of the figure in <a href="decoding-successors.html#instructgpt">§26</a>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ppo" data-nav="Stage 3: PPO and the KL">
+      <h3><span class="idx">06</span> Stage 3 — PPO against the reward model, held near SFT</h3>
+      <p class="lede">The RL environment is a <b>bandit</b>: a random prompt arrives, the policy writes a response, the reward model scores it, the episode ends. A per-token KL penalty to the SFT model keeps the policy from drifting into text the reward model scores well but people would not. PPO itself is on <a href="../../machine-learning/reinforcement-learning/ppo.html">PPO</a>.</p>
+      <table class="grid2">
+        <tr><th>setting</th><th>value</th></tr>
+        <tr><td>policy initialisation</td><td>the SFT model, trained two further epochs with a 10% pretraining-data mix</td></tr>
+        <tr><td>value function</td><td>initialised from the reward model</td></tr>
+        <tr class="hl"><td><b>KL coefficient β</b></td><td class="num">0.02</td></tr>
+        <tr class="hl"><td><b>pretraining-loss coefficient γ</b> (PPO-ptx)</td><td class="num">27.8   (γ = 0 for "PPO")</td></tr>
+        <tr><td>episodes</td><td class="num">256k, over about 31k unique prompts</td></tr>
+        <tr><td>batch / minibatch</td><td class="num">512 / 64</td></tr>
+        <tr><td>PPO clip, sampling temperature</td><td class="num">0.2, 1</td></tr>
+        <tr><td>context</td><td>2k tokens; prompts over 1k tokens dropped; responses capped at 1k</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">the objective, as published (also on the GPT card)</span><span class="eq">objective(φ) = E_(x,y)~π_φ [ r_θ(x, y) − β · log( π_φ(y | x) / π_SFT(y | x) ) ]  +  γ · E_x~D_pretrain [ log π_φ(x) ]</span>
+<span class="lbl">a standard identity (general knowledge, not from the paper): the best policy for the first term alone</span><span class="eq">π*(y | x)  ∝  π_SFT(y | x) · exp( r_θ(x, y) / β )
+β → ∞ : π* = π_SFT                       β → 0 : π* puts all mass on the reward model's argmax</span></div>
+
+      <div class="viz" id="viz-kl">
+        <div class="vhead">
+          <span class="vtitle">A toy: what the KL coefficient protects against</span>
+          <span class="vhint">drag β · eight candidate responses · two are "reward hacks" the reward model over-scores · per-response, not per-token, for clarity</span>
+        </div>
+        <div class="controls">
+          <label>KL coefficient β <input type="range" id="kl-b" min="-2.3" max="1" step="0.05" value="-0.7" /><span id="kl-bv" style="min-width:44px;display:inline-block">0.20</span></label>
+        </div>
+        <svg id="kl-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Toy model of KL-regularised policy optimisation: SFT and optimised probabilities over eight responses, with reward-model score, true quality and KL as the coefficient changes"></svg>
+        <div class="readout" aria-live="polite" id="kl-read"></div>
+      </div>
+      <p>The toy's numbers are invented; its shape is the point. As β falls the policy concentrates on whatever the reward model rates highest. While the reward model is right, true quality rises with it; once the policy reaches responses the reward model over-scores, reward keeps climbing while true quality falls — reward over-optimisation, the reason a KL anchor exists at all. The paper reports its useful range of β as roughly 0.01–0.02.</p>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="evaluation" data-nav="How it was evaluated">
+      <h3><span class="idx">07</span> How the models were compared</h3>
+      <table class="grid2">
+        <tr><th>model</th><th>what it is</th></tr>
+        <tr><td><b>GPT-3</b></td><td>the pretrained model, given the prompt as is</td></tr>
+        <tr><td><b>GPT-3 (prompted)</b></td><td>the same, with a few-shot prefix chosen to make it follow instructions</td></tr>
+        <tr><td><b>SFT</b></td><td>stage 1 only</td></tr>
+        <tr><td><b>PPO</b></td><td>stages 1–3, γ = 0</td></tr>
+        <tr class="hl"><td><b>PPO-ptx</b> = "InstructGPT"</td><td>stages 1–3 with the pretraining mix; the default model of the paper</td></tr>
+        <tr><td><b>FLAN, T0 baselines</b></td><td>175B GPT-3 fine-tuned on the FLAN and T0 collections of public NLP tasks (about 1M examples each, 896k seen by the selected checkpoints)</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>The main metric is a win rate:</b> how often labellers prefer a model's output to the <b>175B SFT model's</b> on held-out API prompts from customers not in the training set. The SFT model was chosen as the baseline because it sits in the middle of the pack.</li>
+        <li>Labellers also gave a <b>1–7 Likert score</b> and binary <b>metadata</b> judgements: did it fail to follow the instruction, violate an explicit constraint, hallucinate, use language inappropriate for a customer assistant?</li>
+        <li>Public benchmarks measured truthfulness, toxicity, bias and the capability regressions (§09, §10). Judging outputs with models instead of people is the subject of <a href="../../llm/llm-as-a-judge.html">LLM-as-a-Judge</a> (beyond this paper).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="preference" data-nav="Preference results">
+      <h3><span class="idx">08</span> The preference results</h3>
+      <div class="cards">
+        <div class="box good"><div class="n">size vs alignment</div><div class="t">1.3B InstructGPT beat 175B GPT-3</div><div class="g">Labellers preferred the 1.3B PPO-ptx model's outputs to those of 175B GPT-3, despite more than 100× fewer parameters.</div></div>
+        <div class="box good"><div class="n">same size</div><div class="t">85 ± 3% and 71 ± 4%</div><div class="g">175B InstructGPT was preferred to 175B GPT-3 85 ± 3% of the time, and to few-shot-prompted 175B GPT-3 71 ± 4%.</div></div>
+        <div class="box good"><div class="n">held-out labellers</div><div class="t">The preference was not just the trainers'</div><div class="g">Labellers who wrote no training data preferred InstructGPT to GPT-3 at about the same rate as the training labellers.</div></div>
+        <div class="box warn"><div class="n">public-task fine-tuning</div><div class="t">FLAN and T0 fell short of plain SFT</div><div class="g">Win rate against the 175B SFT baseline: InstructGPT 73.4 ± 2%, the FLAN model 29.8 ± 2%, the T0 model 26.8 ± 2%. Head to head, 175B InstructGPT was preferred to FLAN 78 ± 4% and to T0 79 ± 4%.</div></div>
+      </div>
+      <ul class="notes">
+        <li><b>Metadata.</b> Compared with GPT-3, InstructGPT outputs were rated more appropriate for a customer assistant, followed explicit constraints more often, failed to attempt the correct instruction less often, and hallucinated less in closed-domain tasks.</li>
+        <li><b>Why FLAN and T0 lost.</b> The paper's explanation is the prompt distribution of §02: public NLP datasets are mostly classification, QA and similar tasks with automatic metrics, while over half of real API use is open-ended generation and brainstorming. And public datasets lack diversity of inputs. Fine-tuning on them builds a different skill.</li>
+        <li><b>The ordering.</b> GPT-3 outputs did worst; a well-crafted few-shot prompt gave a clear step up, training on demonstrations (SFT) another, and RL (PPO) another. Adding the pretraining mix (PPO-ptx) did not change labeller preference much. The paper presents the per-size win rates in figures rather than a table, so no per-size numbers are quoted here.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="safety" data-nav="Truthfulness, toxicity, bias">
+      <h3><span class="idx">09</span> Truthfulness, toxicity and bias</h3>
+      <table class="grid2">
+        <tr><th>175B models (appendix table)</th><th>GPT-3</th><th>SFT</th><th>PPO</th><th>PPO-ptx</th></tr>
+        <tr><td>TruthfulQA, fraction true — QA prompt</td><td class="num">0.284</td><td class="num">0.515</td><td class="num">0.755</td><td class="num">0.712</td></tr>
+        <tr><td>TruthfulQA, fraction true — with an instruction to say "I have no comment" when unsure</td><td class="num">0.570</td><td class="num">0.665</td><td class="num">0.879</td><td class="num">0.815</td></tr>
+        <tr><td>RealToxicityPrompts, toxicity — basic prompt</td><td class="num">0.231</td><td class="num">0.211</td><td class="num">0.228</td><td class="num">0.234</td></tr>
+        <tr class="hl"><td>RealToxicityPrompts, toxicity — <b>prompted to be toxic</b></td><td class="num">0.285</td><td class="num">0.256</td><td class="num">0.427</td><td class="num">0.400</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Truthfulness.</b> On TruthfulQA InstructGPT gave truthful and informative answers about twice as often as GPT-3. On closed-domain API tasks (summarise, answer from given text) it made up information <b>21%</b> of the time against GPT-3's <b>41%</b> — a measure of honesty to the input, which is what <a href="../../llm/hallucination-factuality.html">Hallucination &amp; Factuality</a> calls faithfulness.</li>
+        <li><b>Toxicity cuts both ways.</b> Told to be respectful, InstructGPT produced about <b>25% fewer</b> toxic outputs than GPT-3; with no such instruction the advantage disappeared; told to be toxic, it was <b>more</b> toxic than GPT-3 (highlighted row). It follows instructions — including bad ones.</li>
+        <li><b>Bias: no significant improvement</b> on Winogender or CrowS-Pairs.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="tax" data-nav="The alignment tax">
+      <h3><span class="idx">10</span> The alignment tax, and what pays it down</h3>
+      <ul class="notes">
+        <li><b>The regressions.</b> RL fine-tuning without the pretraining mix (PPO) lost performance against GPT-3 on several public datasets: SQuAD, DROP, HellaSwag and WMT 2015 French→English translation.</li>
+        <li><b>The fix.</b> Mixing pretraining gradients into PPO (PPO-ptx, γ = 27.8) greatly reduced the regressions and even surpassed GPT-3 on HellaSwag, but still lagged it on DROP, SQuADv2 and translation. The paper reports that mixing in pretraining updates works better than the simpler alternative of raising the KL coefficient, and costs little in labeller preference.</li>
+        <li><b>The compute.</b> Training the 175B SFT model took 4.9 petaflop/s-days and the 175B PPO-ptx model 60, against 3 640 for GPT-3's pretraining — the alignment stage is about 1.8% of the pretraining bill (our arithmetic: 64.9 / 3 640).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="generalisation" data-nav="Generalisation and mistakes">
+      <h3><span class="idx">11</span> What generalised, and the mistakes it still made</h3>
+      <div class="cards">
+        <div class="box good"><div class="n">generalised (qualitatively)</div><div class="t">Non-English instructions and code</div><div class="g">Although almost all training data was English and contained little code, InstructGPT could follow instructions in other languages and answer questions about code — though it often answered in English when asked in another language.</div></div>
+        <div class="box bad"><div class="n">mistake 1</div><div class="t">Accepts false premises</div><div class="g">Asked a question that assumes something false, it may go along with the premise.</div></div>
+        <div class="box bad"><div class="n">mistake 2</div><div class="t">Over-hedges</div><div class="g">It can give several possible answers when one is clear, or hedge a simple question — the paper suggests labellers rewarded epistemic humility.</div></div>
+        <div class="box bad"><div class="n">mistake 3</div><div class="t">Several constraints at once</div><div class="g">Performance degrades when an instruction carries multiple explicit constraints, such as "list 10 movies made in the 1930's set in France".</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="whose" data-nav="Whose preferences">
+      <h3><span class="idx">12</span> Whose preferences, and the stated limits</h3>
+      <p class="lede">The paper is explicit that "aligned" here means aligned to a particular group, not to people in general.</p>
+      <ul class="notes">
+        <li>The behaviour reflects <b>the labellers</b> (a few dozen people, mostly English-speaking, based largely in the US or Southeast Asia), <b>the researchers</b> who wrote their instructions and resolved ambiguous cases, and <b>the API customers</b> whose prompts defined the tasks — a population drawn from a waitlist.</li>
+        <li>It states that aligning to everyone's preferences at once is impossible; there is no single set of values the method could target, and conditioning on the preferences of particular groups is left as future work.</li>
+        <li>The models remain neither fully aligned nor fully safe: they still produce toxic or biased outputs, make up facts, and generate harmful content when explicitly asked. Many of these concerns became the agenda of later preference-optimisation work (<a href="../../llm/policy-preference-optimization.html">Policy / Preference Optimization</a>, beyond this paper).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">13</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"RLHF made the model know more."</span> <span class="fix">It changed behaviour, not knowledge.</span> The alignment stage is under 2% of pretraining compute, and capability benchmarks regressed slightly without the pretraining mix (§10).</div>
+      <div class="wrong"><span class="say">"InstructGPT is PPO on the reward model."</span> <span class="fix">The released recipe is PPO-ptx</span>: the KL penalty to SFT <i>and</i> a pretraining-likelihood term with γ = 27.8.</div>
+      <div class="wrong"><span class="say">"A bigger reward model is always better."</span> <span class="fix">The paper used 6B for every policy size</span>; 175B reward-model training could be unstable and is expensive as a value function.</div>
+      <div class="wrong"><span class="say">"Instruction tuning on many public NLP tasks gives the same result."</span> <span class="fix">On real API prompts it did not</span>: FLAN- and T0-tuned 175B models lost to plain SFT (§08).</div>
+      <div class="wrong"><span class="say">"Aligned means safe."</span> <span class="fix">It means following the instruction.</span> Asked to be toxic, InstructGPT was more toxic than GPT-3; bias did not improve (§09).</div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">14</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Data:</b> real API prompts (filtered, split by user) — ~13k SFT, ~33k RM, ~31k PPO — written and ranked by ~40 screened labellers who agree with one another about 73–77% of the time.</li>
+        <li><b>Recipe:</b> SFT for 16 epochs (selected by RM score, not validation loss) → a 6B reward model trained one epoch on whole rankings per batch element → PPO with β = 0.02 and a pretraining mix γ = 27.8.</li>
+        <li><b>Result:</b> a 1.3B aligned model is preferred to 175B GPT-3; 175B InstructGPT wins 85 ± 3% against GPT-3 and beats FLAN/T0-style tuning on real prompts.</li>
+        <li><b>Safety:</b> truthfulness roughly doubles and closed-domain hallucination halves (41% → 21%); toxicity improves only when asked to be respectful; bias does not improve.</li>
+        <li><b>Cost:</b> about 2% of pretraining compute, plus an alignment tax on public benchmarks that the pretraining mix mostly removes.</li>
+        <li><b>Scope:</b> aligned to a specific group of labellers, researchers and customers — by the paper's own account.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="GPT series" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="decoding-successors.html">← GPT: Decoding, InstructGPT &amp; GPT-4</a>
+      <a href="../gpt.html" style="color:var(--muted)">GPT · overview</a>
+      <a href="../../llm/policy-preference-optimization.html">Policy / Preference Optimization →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="instructgpt.viz.js"></script>
+</body>
+</html>

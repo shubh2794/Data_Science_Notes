@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Learning to Align &amp; Translate (2014)</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover,.controls button.on{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../machine-translation.html">Machine Translation</a> · the source paper</p>
+      <h1>Learning to Align &amp; Translate (2014)</h1>
+      <p>The paper that introduced attention for translation. Instead of squeezing the source into one vector, the encoder keeps one <b>annotation</b> per source word, and at every output step the decoder computes a fresh weighted average of them, the weights coming from a small learned <b>alignment model</b>. The general mechanism and the score-function comparison are on <a href="../../deep-learning/attention/scores-scaling.html">Alignment, Scores &amp; Scaling</a>; this page reads the paper <i>as a paper</i>. It covers the hypothesis it set out to test, the exact encoder, alignment model and decoder, the training setup, the BLEU table against the fixed-vector baseline and a phrase-based system, the sentence-length result, and the alignments it learned without supervision.</p>
+      <div style="margin-top:10px">
+        <span class="pill">NLP</span>
+        <span class="pill">Machine translation</span>
+        <span class="pill">fixed-length hypothesis · RNNencdec vs RNNsearch · bidirectional annotations · additive alignment · maxout readout · BLEU vs length · soft alignment</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="hypothesis" data-nav="The fixed-length hypothesis">
+      <h3><span class="idx">01</span> The hypothesis: the fixed-length vector is the bottleneck</h3>
+      <p class="lede"><b>The paper starts from a conjecture, stated in its abstract:</b> "the use of a fixed-length vector is a bottleneck in improving the performance of this basic encoder–decoder architecture". An encoder that must compress every sentence into one vector of the same size will find this hardest on long sentences, especially ones longer than those in the training corpus.</p>
+      <ul class="notes">
+        <li><b>The proposal.</b> Let the model "(soft-)search" the source for the parts relevant to the next target word, without any hard segmentation. The source becomes a <i>sequence</i> of vectors, and the decoder picks a different mixture of them for each word it writes. In the paper's words this relieves the encoder "from the burden of having to encode all information in the source sentence into a fixed-length vector".</li>
+        <li><b>The experiment is built to test the hypothesis.</b> Two models are trained on the same data with the same sizes: <b>RNNencdec</b>, the fixed-vector encoder–decoder, and <b>RNNsearch</b>, the proposed model. Each is trained twice, once on sentences of up to 30 words and once on sentences of up to 50 (the <code>-30</code> and <code>-50</code> suffixes). If the bottleneck matters, the gap between them should grow with sentence length (§07).</li>
+        <li><b>Context.</b> The fixed-vector design being argued against is the one on <a href="seq2seq-lstm.html">Seq2seq: Deep LSTM Translation</a>. The paper's own baseline is a smaller gated-unit version of it, not the deep LSTM system. The general version of the bottleneck argument, as a rank bound, is on <a href="../../deep-learning/rnns-lstms/architectures-seq2seq.html#bottleneck">the fixed-context bottleneck section</a>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="encoder" data-nav="Bidirectional annotations">
+      <h3><span class="idx">02</span> The encoder: one annotation per word, from both directions</h3>
+      <p class="lede">A left-to-right RNN's state at word <code>j</code> summarises only the words up to <code>j</code>. The paper wants each annotation to summarise the words <i>around</i> <code>j</code>, both before and after it. So it uses a <b>bidirectional RNN</b> and concatenates the two states at each position.</p>
+      <div class="formula"><span class="lbl">the annotations, as the paper defines them</span><span class="eq">forward     →hⱼ  =  f( →hⱼ₋₁ , xⱼ )        j = 1 → T_x
+backward    ←hⱼ  =  f( ←hⱼ₊₁ , xⱼ )        j = T_x → 1
+
+annotation  hⱼ   =  [ →hⱼ ; ←hⱼ ]          concatenation:  1000 + 1000 = 2000 numbers per word</span></div>
+      <ul class="notes">
+        <li><b>Why the annotation is local.</b> The paper relies on "the tendency of RNNs to better represent recent inputs". So <code>hⱼ</code> concentrates on the words around <code>xⱼ</code> while still carrying some of the whole sentence. That is what makes it usable as the representation <i>of word j</i>.</li>
+        <li><b>Sizes.</b> Each direction has 1000 hidden units, so the annotations are 2000-dimensional (our arithmetic from the two 1000-unit directions). Word embeddings are 620-dimensional.</li>
+        <li><b>The memory now grows with the sentence.</b> A 50-word source is represented by 50 × 2000 = 100 000 numbers instead of one fixed vector (our arithmetic). That is the whole point. When bidirectional encoders are legitimate, and when they leak the future, is covered on <a href="../../deep-learning/rnns-lstms/architectures-seq2seq.html#bidir">the bidirectional-RNN section</a>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="alignment" data-nav="The alignment model">
+      <h3><span class="idx">03</span> The alignment model: score, normalise, blend, once per output word</h3>
+      <p class="lede">At output step <code>i</code> the decoder has its previous state <code>sᵢ₋₁</code>. A small feed-forward network scores how well each annotation <code>hⱼ</code> matches it. A softmax turns the scores into weights, and the weighted sum of annotations becomes the <b>context vector</b> <code>cᵢ</code> for this word only. The alignment model is trained <b>jointly</b> with everything else, from the translation loss alone.</p>
+      <div class="formula"><span class="lbl">as published</span><span class="eq">score       eᵢⱼ  =  a( sᵢ₋₁ , hⱼ )  =  vₐᵀ tanh( Wₐ sᵢ₋₁  +  Uₐ hⱼ )
+
+normalise   αᵢⱼ  =  exp( eᵢⱼ ) / ∑ₖ₌₁…T_x exp( eᵢₖ )
+
+blend       cᵢ   =  ∑ⱼ₌₁…T_x  αᵢⱼ hⱼ</span>
+<span class="lbl">shapes in the paper's appendix</span><span class="eq">Wₐ ∈ ℝ^(n′ × n)     Uₐ ∈ ℝ^(n′ × 2n)     vₐ ∈ ℝ^(n′)        n = 1000 hidden units,  n′ = 1000
+
+Uₐ hⱼ does not depend on i, so it is computed once per sentence and reused at every output step.</span>
+<span class="lbl">the cost, for one sentence pair (our arithmetic)</span><span class="eq">T_x · T_y scores, each a 1000-wide tanh and a dot product with vₐ
+a 30-word source and a 30-word target:  900 scores per sentence</span></div>
+      <ul class="notes">
+        <li><b>Two readings of the weights.</b> The paper reads <code>αᵢⱼ</code> as the probability that target word <code>yᵢ</code> is "aligned to, or translated from" source word <code>xⱼ</code>. It reads <code>cᵢ</code> as the <i>expected</i> annotation under that distribution. It also calls this a mechanism of <b>attention</b>: the decoder decides which parts of the source to pay attention to.</li>
+        <li><b>Not a latent variable.</b> Classical alignment models treat alignment as a hidden variable to be marginalised. Here it is computed directly and is differentiable, so the gradient of the translation loss trains the alignment model by plain backpropagation. Why this "soft" choice is the trainable one is on <a href="../../deep-learning/attention/scores-scaling.html#soft">What "soft" alignment means</a>.</li>
+        <li><b>Why additive, and what came after.</b> The score is a one-hidden-layer network, now called <b>additive attention</b>. How it compares with dot-product scoring, the odd-function property of the bias-free form, and why the dot product later won on speed are all covered on <a href="../../deep-learning/attention/scores-scaling.html#score">Score functions</a> and not repeated here.</li>
+      </ul>
+
+      <div class="viz" id="viz-att">
+        <div class="vhead">
+          <span class="vtitle">Soft alignment for one sentence pair: hover a target word to see its weights over the annotations</span>
+          <span class="vhint">illustrative weights, built to resemble the kind of alignment the paper plots; not values read from its figure · sharpness scales the scores before the softmax</span>
+        </div>
+        <div class="controls">
+          <label>target word i <input type="range" id="att-i" min="1" max="15" step="1" value="5" /><span id="att-iv" style="min-width:90px;display:inline-block">5</span></label>
+          <label>sharpness <input type="range" id="att-b" min="0.2" max="3" step="0.1" value="1.4" /><span id="att-bv" style="min-width:28px;display:inline-block">1.4</span></label>
+          <label>alignment <select id="att-m">
+            <option value="soft" selected>soft (softmax weights)</option>
+            <option value="hard">hard (argmax, one source word)</option>
+          </select></label>
+        </div>
+        <svg id="att-svg" width="640" height="440" viewBox="0 0 640 440" role="img" aria-label="Heat map of attention weights with one row per French target word and one column per English source annotation, mostly diagonal with a reversed block where the English adjective-noun phrase is reordered in French, and below it a bar chart of the weights for the selected target word"></svg>
+        <div class="readout" aria-live="polite" id="att-read"></div>
+      </div>
+      <p>The pair follows the paper's first alignment example, where "European Economic Area" becomes "zone économique européenne". The bright cells step <i>backwards</i> through that block because French puts the noun first. Raise the sharpness and every row tends to one-hot. Switch to <i>hard</i> to see what is lost. "la" and "européenne" can no longer look at the noun that fixes their gender (§09).</p>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="decoder" data-nav="Gated decoder and maxout readout">
+      <h3><span class="idx">04</span> The decoder: gated units, a context in every gate, and a maxout readout</h3>
+      <p class="lede">The decoder is a recurrent network built from <b>gated hidden units</b>, with an update gate and a reset gate (the unit is on <a href="../../deep-learning/rnns-lstms/lstm-gru.html">LSTM &amp; GRU Cells</a>). The context <code>cᵢ</code> enters the candidate state and <b>both gates</b>, and it enters the output layer again.</p>
+      <div class="formula"><span class="lbl">the decoder state, from the paper's appendix</span><span class="eq">sᵢ   =  (1 − zᵢ) ∘ sᵢ₋₁  +  zᵢ ∘ s̃ᵢ
+s̃ᵢ   =  tanh( W E yᵢ₋₁  +  U [ rᵢ ∘ sᵢ₋₁ ]  +  C cᵢ )
+zᵢ   =  σ( W_z E yᵢ₋₁  +  U_z sᵢ₋₁  +  C_z cᵢ )          update gate
+rᵢ   =  σ( W_r E yᵢ₋₁  +  U_r sᵢ₋₁  +  C_r cᵢ )          reset gate
+
+s₀   =  tanh( W_s ←h₁ )                                  started from the backward state at the first word
+
+E yᵢ₋₁ is the 620-d embedding of the previous target word.</span>
+<span class="lbl">the readout: a deep output with one maxout layer</span><span class="eq">t̃ᵢ   =  U_o sᵢ₋₁  +  V_o E yᵢ₋₁  +  C_o cᵢ                  2l = 1000 values
+tᵢ   =  [ max( t̃ᵢ,₂ₖ₋₁ , t̃ᵢ,₂ₖ ) ]  for k = 1 … l           l = 500 maxout units
+p( yᵢ | sᵢ, yᵢ₋₁, cᵢ )  ∝  exp( yᵢᵀ W_o tᵢ )                 softmax over the 30 000-word shortlist</span></div>
+      <ul class="notes">
+        <li><b>The baseline is the same model with attention switched off.</b> The appendix notes that fixing <code>cᵢ</code> to the forward encoder's last state <code>→h_T_x</code> turns this into the fixed-vector encoder–decoder. That is why the RNNencdec vs RNNsearch comparison isolates attention so cleanly.</li>
+        <li><b>Maxout</b> takes the larger of each pair of values, a learned piecewise-linear activation. The readout sees the previous word, the decoder state and the current context, so it can draw on the source directly when choosing the word.</li>
+        <li><b>Sizes</b> as given in the paper: <code>n = 1000</code> hidden units for encoder directions, decoder and alignment model; embeddings <code>m = 620</code>; maxout <code>l = 500</code>. The paper does not print a total parameter count.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="training" data-nav="Training setup">
+      <h3><span class="idx">05</span> The training setup</h3>
+      <h4>Data</h4>
+      <ul class="notes">
+        <li><b>WMT'14 English→French</b> parallel corpora: Europarl (61M words), news commentary (5.5M), UN (421M) and two crawled corpora (90M and 272.5M), <b>850M words</b> in total. A data-selection method reduced this to <b>348M words</b>. No monolingual data was used.</li>
+        <li><b>Development set:</b> news-test-2012 and news-test-2013 concatenated. <b>Test set:</b> news-test-2014, <b>3003 sentences</b>, not seen in training.</li>
+        <li><b>Vocabulary:</b> a shortlist of the <b>30 000 most frequent words</b> in each language. Every other word is mapped to <code>[UNK]</code>. Tokenised with a standard script; no lowercasing or stemming.</li>
+      </ul>
+      <h4>Optimisation</h4>
+      <div class="formula"><span class="lbl">as published</span><span class="eq">optimiser        minibatch SGD with Adadelta,   ε = 10⁻⁶,   ρ = 0.95
+minibatch        80 sentences;  1600 pairs at a time are retrieved, sorted by length and split into 20 minibatches
+clipping         gradient L2 norm limited to a threshold of 1
+initialisation   recurrent matrices random orthogonal;  Wₐ, Uₐ ~ Gaussian(0, 0.001²);  vₐ and biases 0;
+                 all other weights ~ Gaussian(0, 0.01²)
+training         about 5 days per model
+decoding         beam search, approximately maximising p( y | x )</span></div>
+
+      <table class="grid2">
+        <tr><th>Table 2 · learning statistics</th><th>updates (× 10⁵)</th><th>epochs</th><th>hours</th><th>train NLL</th><th>dev NLL</th></tr>
+        <tr><td>RNNencdec-30</td><td class="num">8.46</td><td class="num">6.4</td><td class="num">109</td><td class="num">28.1</td><td class="num">53.0</td></tr>
+        <tr><td>RNNencdec-50</td><td class="num">6.00</td><td class="num">4.5</td><td class="num">108</td><td class="num">44.0</td><td class="num">43.6</td></tr>
+        <tr><td>RNNsearch-30</td><td class="num">4.71</td><td class="num">3.6</td><td class="num">113</td><td class="num">26.7</td><td class="num">47.2</td></tr>
+        <tr><td>RNNsearch-50</td><td class="num">2.88</td><td class="num">2.2</td><td class="num">111</td><td class="num">40.7</td><td class="num">38.1</td></tr>
+        <tr class="hl"><td><b>RNNsearch-50*</b></td><td class="num">6.67</td><td class="num">5.0</td><td class="num">252</td><td class="num">36.7</td><td class="num">35.2</td></tr>
+      </table>
+      <p>Table 2 lists one GPU model per run, two different cards of the period. Under the same time budget (about 110 hours) the attention models made fewer updates, because each step does more work. RNNsearch-50 saw only 2.2 epochs against RNNencdec-50's 4.5 and still reached a lower development NLL. RNNsearch-50* is RNNsearch-50 trained "much longer", until development performance stopped improving.</p>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="results" data-nav="Results: Table 1">
+      <h3><span class="idx">06</span> The results: attention against the fixed vector and a phrase-based system (Table 1)</h3>
+      <p class="lede">BLEU on news-test-2014, reported twice: on <b>all</b> sentences, and on the subset of sentences with <b>no unknown words</b>. In the second column the models were not allowed to emit <code>[UNK]</code>.</p>
+      <table class="grid2">
+        <tr><th>model</th><th>All</th><th>No UNK</th></tr>
+        <tr><td>RNNencdec-30</td><td class="num">13.93</td><td class="num">24.19</td></tr>
+        <tr><td>RNNsearch-30</td><td class="num">21.50</td><td class="num">31.44</td></tr>
+        <tr><td>RNNencdec-50</td><td class="num">17.82</td><td class="num">26.71</td></tr>
+        <tr><td>RNNsearch-50</td><td class="num">26.75</td><td class="num">34.16</td></tr>
+        <tr class="hl"><td><b>RNNsearch-50*</b> (trained longer)</td><td class="num">28.45</td><td class="num">36.15</td></tr>
+        <tr><td><b>phrase-based statistical system</b></td><td class="num">33.30</td><td class="num">35.63</td></tr>
+      </table>
+
+      <div class="viz" id="viz-tab">
+        <div class="vhead">
+          <span class="vtitle">Table 1, as printed: fixed vector against attention</span>
+          <span class="vhint">toggle the evaluation subset · paired bars are the same training length · the dashed line is the phrase-based system · hover or focus a bar</span>
+        </div>
+        <div class="controls">
+          <button id="tb-all" class="on" type="button">all sentences</button>
+          <button id="tb-unk" type="button">sentences with no unknown words</button>
+        </div>
+        <svg id="tb-svg" width="640" height="280" viewBox="0 0 640 280" role="img" aria-label="Grouped bar chart of test BLEU for the fixed-vector and attention models trained on sentences up to 30 and up to 50 words, plus the longer-trained attention model, with a dashed line for the phrase-based system"></svg>
+        <div class="readout" aria-live="polite" id="tb-read"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Attention wins at both training lengths:</b> +7.57 BLEU at 30 words and +8.93 at 50 on all sentences (our differences). In the paper's words, "the RNNsearch-30 even outperforms RNNencdec-50".</li>
+        <li><b>Against the phrase-based system.</b> On all sentences the longest-trained model is still 4.85 BLEU behind (28.45 vs 33.30). On sentences with no unknown words it is <b>0.52 ahead</b> (36.15 vs 35.63). The paper's claim is that RNNsearch is "as high as" the conventional system "when only the sentences consisting of known words are considered", and it calls this "a striking result".</li>
+        <li><b>The comparison favours the statistical system.</b> It also used a separate 418M-word monolingual corpus, which the neural models did not.</li>
+        <li><b>The gap between the columns is the UNK problem.</b> A shortlist of 30 000 words means many test sentences contain at least one <code>[UNK]</code>. The neural models lose far more BLEU on those sentences than the phrase-based system, whose two scores differ by only 2.3 (§10).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="length" data-nav="BLEU against sentence length">
+      <h3><span class="idx">07</span> BLEU against sentence length: the test of the hypothesis (Figure 2)</h3>
+      <p class="lede">Figure 2 plots each model's test BLEU against sentence length. Its shape is the paper's main evidence for the hypothesis in §01. <b>Both fixed-vector models fall sharply as sentences get longer.</b> RNNsearch-30 falls much less. <b>RNNsearch-50</b>, in the paper's words, "shows no performance deterioration even with sentences of length 50 or more".</p>
+      <ul class="notes">
+        <li><b>What the figure does not give.</b> The paper prints no per-length numbers, so this page does not attach any. The claim to take away is qualitative. The fixed-vector models degrade with length; the attention model trained on 50-word sentences does not.</li>
+        <li><b>The examples behind it.</b> The appendix shows long test sentences translated by both models. In one, the fixed-vector model translates correctly up to a certain phrase and then drifts away from the meaning of the source. In another, it starts to drift after about 30 words. RNNsearch-50 keeps the whole meaning in both.</li>
+        <li><b>Training length is part of the result.</b> The <code>-30</code> models never saw a sentence longer than 30 words. So the right-hand end of the figure measures generalisation to lengths the model was not trained on, as well as capacity.</li>
+      </ul>
+      <div class="callout"><b>Reconciling this with the deep-LSTM result.</b> <a href="seq2seq-lstm.html">Seq2seq: Deep LSTM Translation</a> reported little degradation with length from a fixed vector. Its model, though, had four 1000-cell layers, an 8000-number state, a reversed source and a five-model ensemble. The baselines here are much smaller. Read together (our interpretation), the bottleneck is real and grows with sentence length, a large enough model can hide much of it, and attention removes the constraint rather than working around it.</div>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="qualitative" data-nav="What the alignments look like">
+      <h3><span class="idx">08</span> What the learned alignments look like (Figure 3)</h3>
+      <p class="lede">Figure 3 plots the weights <code>αᵢⱼ</code> from RNNsearch-50 as grey-scale matrices. One is an arbitrary sentence. The other three were sampled at random from test sentences of 10 to 20 words with no unknown words. No alignment supervision was given at any point.</p>
+      <ul class="notes">
+        <li><b>Mostly monotonic.</b> The strongest weights lie along the diagonal, as expected between two languages with largely the same word order.</li>
+        <li><b>Non-trivial reorderings where the languages differ.</b> French and English usually order adjectives and nouns differently. The paper's example: the model translates "European Economic Area" as "zone économique européenne". It aligns "zone" with "Area" first, then jumps back two words to finish the phrase, which is the reversed block in the figure in §03.</li>
+        <li><b>Diagnostic, not explanation.</b> These are four chosen matrices, illustrations rather than measurements. How much attention maps can tell us about what a model relied on was debated later (beyond this paper; see <a href="../../deep-learning/attention/cost-limits.html">Attention Cost &amp; Limits</a>).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="soft-hard" data-nav="Soft vs hard alignment">
+      <h3><span class="idx">09</span> Why soft alignment, in the paper's own argument</h3>
+      <p class="lede">The paper argues for soft alignment on linguistic grounds as well as for its trainability. Its example is "the man" translated as "l' homme".</p>
+      <div class="cards">
+        <div class="box bad"><div class="n">hard alignment</div><div class="t">[the] → [l'], [man] → [homme]</div><div class="g">Any hard alignment pairs the words one-to-one. That does not help translation, because the article depends on the word after it: "the" can become le, la, les or l', and which one is right depends on the noun.</div></div>
+        <div class="box good"><div class="n">soft alignment</div><div class="t">[l'] attends to both [the] and [man]</div><div class="g">The decoder can look at both source words when writing the article, and so can pick the elided form that "homme" requires.</div></div>
+        <div class="box good"><div class="n">a second benefit</div><div class="t">Phrases of different lengths</div><div class="g">Source and target phrases need not have the same length, and nothing has to be mapped "to or from nowhere", the NULL token that classical word-alignment models need.</div></div>
+      </div>
+      <p>The mathematical side of the same choice, that an argmax has no useful gradient so a hard version would need sampling-based estimators, is worked through on <a href="../../deep-learning/attention/scores-scaling.html#soft">Alignment, Scores &amp; Scaling</a>.</p>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="limits" data-nav="Limitations">
+      <h3><span class="idx">10</span> Limitations the paper states, and what followed</h3>
+      <ul class="notes">
+        <li><b>Unknown and rare words.</b> The conclusion names this as the main challenge left: "One of challenges left for the future is to better handle unknown, or rare words." Table 1 shows its cost: on all sentences the best model trails the phrase-based system by 4.85 BLEU, and on known-word sentences it leads by 0.52.</li>
+        <li><b>Quadratic scoring cost.</b> Every target word scores every source word. The paper accepts this because "most of input and output sentences are only 15–40 words" in translation, and notes it could limit use on other tasks.</li>
+        <li><b>A comparison under unequal conditions.</b> The phrase-based system had extra monolingual data. The neural models were trained on a fixed 30 000-word shortlist for about 110 hours each (252 for the longest run).</li>
+        <li><b>Later developments (beyond this paper).</b> Sub-word vocabularies largely solved the <code>[UNK]</code> problem (<a href="../tokenization.html">Tokenization</a>). Dot-product and multi-head attention replaced the additive scorer, and self-attention replaced the recurrent encoder and decoder (<a href="../../deep-learning/transformers/original-transformer.html">The Original Transformer</a>). The decoder-to-encoder attention introduced here survives as cross-attention.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">11</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"Attention beat phrase-based translation."</span> <span class="fix">It matched it on sentences without unknown words.</span> On all sentences the best model was 4.85 BLEU behind, and the phrase-based system also used extra monolingual data.</div>
+      <div class="wrong"><span class="say">"The context vector is computed from the current decoder state."</span> <span class="fix">From the previous one, sᵢ₋₁.</span> The context then feeds the gates, the candidate state and the readout for step <code>i</code>. Variants that score against <code>sᵢ</code> came later (beyond this paper).</div>
+      <div class="wrong"><span class="say">"Each annotation is the encoder state at word j."</span> <span class="fix">It is two states concatenated</span>, forward and backward, so each annotation summarises both sides of the word.</div>
+      <div class="wrong"><span class="say">"The alignments were supervised."</span> <span class="fix">They were learned only from the translation loss.</span> That the matrices look like word alignments is a finding, not a training target.</div>
+      <div class="wrong"><span class="say">"The fixed-vector baseline was the deep LSTM system."</span> <span class="fix">It was a same-size gated-unit encoder–decoder</span>, which is what makes the RNNencdec vs RNNsearch comparison a controlled one.</div>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">12</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Hypothesis:</b> a fixed-length vector is a bottleneck, worst on long sentences. The test is RNNencdec vs RNNsearch, trained on sentences of up to 30 and up to 50 words.</li>
+        <li><b>Encoder:</b> a bidirectional RNN with 1000 units per direction. Each annotation is <code>hⱼ = [→hⱼ ; ←hⱼ]</code>.</li>
+        <li><b>Alignment:</b> <code>eᵢⱼ = vₐᵀ tanh(Wₐ sᵢ₋₁ + Uₐ hⱼ)</code>, softmax to <code>αᵢⱼ</code>, <code>cᵢ = ∑ⱼ αᵢⱼ hⱼ</code>, all learned jointly.</li>
+        <li><b>Decoder:</b> gated units with <code>cᵢ</code> in every gate, and a maxout readout (<code>l = 500</code>) over a 30 000-word shortlist.</li>
+        <li><b>Setup:</b> 348M words after data selection, minibatch 80, Adadelta (ε = 10⁻⁶, ρ = 0.95), clipping at 1, about 5 days per model, beam search.</li>
+        <li><b>Results:</b> RNNsearch-50* scores 28.45 / 36.15 BLEU (all / no UNK) against 33.30 / 35.63 for the phrase-based system. RNNsearch shows no deterioration with length where RNNencdec collapses.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Machine translation papers" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="seq2seq-lstm.html">← Seq2seq: Deep LSTM Translation</a>
+      <a href="../machine-translation.html" style="color:var(--muted)">Machine Translation · overview</a>
+      <a href="../../deep-learning/transformers/original-transformer.html">The Original Transformer →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="align-and-translate.viz.js"></script>
+</body>
+</html>

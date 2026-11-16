@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · ETL Pipelines</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>ETL Pipelines</h1>
+      <p>Every model, dashboard, and feature table sits at the end of a pipeline that <b>extracts</b> data from source systems, <b>transforms</b> it into a usable shape, and <b>loads</b> it somewhere queryable. The code is rarely hard. What makes pipelines hard is that they run <b>forever, on a schedule, against sources that change</b> — so the properties that matter are operational: idempotency, incrementality, recoverability, and the ability to tell when the output is wrong.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Engineering</span>
+        <span class="pill">Orchestration</span>
+        <span class="pill">Idempotency</span>
+        <span class="pill">CDC</span>
+        <span class="pill">Data contracts</span>
+      </div>
+    </header>
+
+    <section class="topic" id="etl-elt" data-nav="ETL vs ELT">
+      <h3><span class="idx">01</span> ETL vs ELT</h3>
+      <p class="lede">The letters are the same; the order decides where the compute lives and whether raw data is kept.</p>
+      <table class="cmp">
+        <tr><th></th><th>ETL (transform, then load)</th><th>ELT (load raw, transform in place)</th></tr>
+        <tr><td>Where transforms run</td><td>A separate engine (Spark job, custom service) before the target</td><td>Inside the warehouse/lakehouse, usually as SQL models</td></tr>
+        <tr><td>Raw data kept?</td><td>Often not — only the transformed result lands</td><td>Yes — a raw/bronze layer is the replayable source of truth</td></tr>
+        <tr><td>Reprocessing after a logic bug</td><td>Re-extract from sources (which may have changed or expired)</td><td>Re-run the SQL over the retained raw layer</td></tr>
+        <tr><td>Good fit</td><td>PII must be masked before landing; heavy non-SQL transforms (parsing, ML scoring); constrained targets</td><td>Cheap elastic warehouse compute; analysts own the transforms; frequent logic changes</td></tr>
+        <tr><td>Risk</td><td>Lost history; transform engine is a bottleneck</td><td>Raw layer becomes a swamp; warehouse bill grows with every re-run</td></tr>
+      </table>
+      <ul class="notes">
+        <li>Most modern stacks are <b>layered ELT</b>: <b>raw</b> (exact copy of source, append-only) → <b>staged/cleaned</b> (typed, deduplicated, conformed) → <b>marts</b> (business-level facts and dimensions, see <a href="data-warehousing.html">Data Warehousing</a>). The same idea is often called bronze/silver/gold.</li>
+        <li>Keep the raw layer. Storage is cheap; the ability to rebuild every downstream table after a bug is priceless.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="orchestration" data-nav="Orchestration &amp; DAGs">
+      <h3><span class="idx">02</span> Batch orchestration: DAGs and schedulers</h3>
+      <p class="lede">A scheduler runs a <b>directed acyclic graph</b> of tasks: each task starts only when its upstreams succeed. The scheduler — not your code — owns retries, timeouts, concurrency, and history.</p>
+      <table class="cmp">
+        <tr><th>Concept</th><th>What it means</th><th>Why it matters</th></tr>
+        <tr><td><b>Task / operator</b></td><td>One unit of work: run a query, call an extract, trigger a Spark job</td><td>The unit of retry and of logging</td></tr>
+        <tr><td><b>Dependency</b></td><td>Edge A → B: B waits for A</td><td>Encodes data dependencies explicitly, not by timing</td></tr>
+        <tr><td><b>Logical date / data interval</b></td><td>The slice of data a run is responsible for (e.g. 2026-11-16 00:00 → 2026-11-17 00:00), distinct from when it actually executes</td><td>Makes runs reproducible and backfills possible</td></tr>
+        <tr><td><b>Retries with backoff</b></td><td>Re-attempt a failed task N times, waiting longer each time</td><td>Absorbs transient failures (timeouts, throttling) — <b>only safe if the task is idempotent</b></td></tr>
+        <tr><td><b>Sensor / data-aware trigger</b></td><td>Wait for an upstream file, partition, or table update rather than a clock time</td><td>Stops "ran at 2 a.m. on yesterday's half-written data"</td></tr>
+        <tr><td><b>SLA / timeout</b></td><td>Alert if a task or the whole DAG hasn't finished by a deadline</td><td>Late data is a failure mode even when nothing errors</td></tr>
+      </table>
+      <ul class="notes">
+        <li>Schedulers in this family (Airflow-style DAG-as-code, asset-oriented orchestrators, and managed cloud equivalents) differ in emphasis — task-centric vs <b>data-asset-centric</b> — but share this vocabulary. Asset-centric tools model "table X depends on table Y" directly and trigger when Y's partition materialises.</li>
+        <li><b>Keep the orchestrator thin.</b> It should call compute (warehouse SQL, Spark, containers), not perform heavy processing inside its own workers.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="idempotency" data-nav="Idempotency">
+      <h3><span class="idx">03</span> Idempotency: the property everything else depends on</h3>
+      <p class="lede">A pipeline task is idempotent if running it once or many times for the same input interval leaves the target in the same state. Retries, reruns, and backfills are all safe exactly when this holds.</p>
+      <div class="formula"><span class="lbl">idempotent load for a data interval p</span><span class="eq">run(p) ∘ run(p) = run(p)</span>      <span class="eq">target state after k ≥ 1 runs  =  target state after 1 run</span>
+<span class="lbl">three standard ways to achieve it</span><span class="eq">overwrite partition:   DELETE WHERE dt = p;  INSERT … WHERE dt = p</span>   <span class="eq">(atomically)</span>
+<span class="eq">merge / upsert:        MERGE INTO t USING s ON t.key = s.key  WHEN MATCHED UPDATE  WHEN NOT MATCHED INSERT</span>
+<span class="eq">write-then-swap:       write to t__staging, validate, atomically rename/swap into t</span></div>
+      <ul class="notes">
+        <li><b>The classic bug:</b> <code>INSERT INTO t SELECT … WHERE dt = '{{ logical_date }}'</code>. It works on the first run. On a retry after a partial failure, or a rerun to fix upstream data, it appends a second copy and every downstream sum doubles.</li>
+        <li><b>Parametrise by the data interval, never by <code>now()</code>.</b> A task that reads "the last 24 hours" relative to wall-clock gives different answers on retry and cannot be backfilled.</li>
+        <li><b>Atomic publication.</b> Readers should see either the old partition or the new one, never a half-written mix. Lakehouse table formats and warehouse transactions give you this; raw file writes to object storage do not (see <a href="../databases/transactions-acid.html">Transactions (ACID)</a>).</li>
+        <li>Side effects (sending emails, calling a payment API) are not idempotent by default. Guard them with an idempotency key recorded in a table, or move them out of the pipeline.</li>
+      </ul>
+
+      <div class="viz" id="viz-etl">
+        <div class="vhead">
+          <span class="vtitle">A scheduled DAG run: retries, reruns, and duplicate rows</span>
+          <span class="vhint">pick a failure · choose the load mode · run, then rerun</span>
+        </div>
+        <div class="controls">
+          <label>failure <select id="etl-fail">
+            <option value="none">none</option>
+            <option value="transient" selected>load fails once mid-write</option>
+            <option value="persistent">extract_orders always fails</option>
+          </select></label>
+          <label>retries <input type="range" id="etl-ret" min="0" max="3" step="1" value="1"> <b id="etl-retv">1</b></label>
+          <label>load mode <select id="etl-mode">
+            <option value="append">append (INSERT INTO)</option>
+            <option value="overwrite">overwrite partition</option>
+          </select></label>
+          <button type="button" class="btn" id="etl-run">▶ run 2026-11-16</button>
+          <button type="button" class="btn ghost" id="etl-reset">⟲ reset target</button>
+        </div>
+        <svg id="etl-svg" width="640" height="270" viewBox="0 0 640 270" role="img" aria-label="Interactive diagram: an ETL DAG run with task retries, showing how append versus overwrite loads affect row counts"></svg>
+        <div class="readout" aria-live="polite" id="etl-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="backfill" data-nav="Backfills">
+      <h3><span class="idx">04</span> Backfills and reruns</h3>
+      <ul class="notes">
+        <li>A <b>backfill</b> runs the pipeline for past intervals: a new table needs two years of history, or a logic fix must be applied retroactively. If tasks are interval-parametrised and idempotent, a backfill is just "run for each p in [start, end]".</li>
+        <li><b>Partition-at-a-time</b> design makes backfills parallel and resumable — 730 independent daily runs, any of which can fail and retry alone — instead of one monolithic job that must restart from scratch.</li>
+        <li><b>Dependencies across time.</b> Tasks that read their own previous output (running totals, SCD Type 2, sessionisation) must run in order; mark them as depending on the previous interval so the scheduler serialises them.</li>
+        <li><b>Throttle.</b> A backfill can launch hundreds of concurrent queries against a production source database. Cap concurrency, read from replicas or the raw layer, and schedule outside peak hours.</li>
+        <li><b>Downstream propagation.</b> Fixing a staging table doesn't fix the marts built from it. Lineage (§10) tells you everything that must be re-run, in topological order.</li>
+      </ul>
+      <div class="callout"><b>Operational rule:</b> if you can't confidently answer "what happens if I run yesterday's job again right now?", the pipeline isn't production-ready.</div>
+    </section>
+
+    <section class="topic" id="incremental" data-nav="Incremental loads">
+      <h3><span class="idx">05</span> Incremental loads</h3>
+      <p class="lede">Re-copying an entire source every night stops scaling at some point. Incremental strategies move only what changed — and each one has a characteristic way of missing data.</p>
+      <table class="cmp">
+        <tr><th>Strategy</th><th>How</th><th>Catches deletes?</th><th>Failure mode</th></tr>
+        <tr><td><b>Full refresh</b></td><td>Copy everything, replace target</td><td>Yes</td><td>Cost and source load grow with table size; fine for small dimensions</td></tr>
+        <tr><td><b>Append-only by key/time</b></td><td>Copy rows with id or created_at beyond the last loaded value</td><td>No</td><td>Misses updates to existing rows</td></tr>
+        <tr><td><b>High-watermark on updated_at</b></td><td>Copy rows where <code>updated_at</code> &gt; last watermark</td><td>No (unless soft-deleted)</td><td>Late-committing transactions, clock skew, and rows updated without touching the column are silently skipped</td></tr>
+        <tr><td><b>Change data capture</b></td><td>Read the database's change log</td><td>Yes</td><td>Operational complexity; log retention limits how long a consumer can be down (§06)</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">high-watermark extraction with a safety overlap</span><span class="eq">extract  { r : wm − δ &lt; r.updated_at ≤ wm′ }</span>      <span class="eq">wm′ = max updated_at observed (or extraction start time)</span>
+<span class="eq">then MERGE on primary key</span>   <span class="eq">— the overlap δ re-reads a little, and MERGE makes the re-read harmless</span></div>
+      <ul class="notes">
+        <li>The overlap δ exists because a transaction can start before the previous extract, commit after it, and carry an <code>updated_at</code> older than the stored watermark. Without overlap + MERGE, that row is lost forever.</li>
+        <li>Periodically reconcile: compare counts or checksums between source and target for a sample of partitions, and schedule an occasional full refresh to repair drift.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="cdc" data-nav="Change data capture">
+      <h3><span class="idx">06</span> Change data capture (CDC)</h3>
+      <p class="lede">Databases already record every change in a write-ahead or binary log for their own replication. Log-based CDC tails that log and turns it into a stream of change events.</p>
+      <table class="cmp">
+        <tr><th>CDC method</th><th>Mechanism</th><th>Trade-off</th></tr>
+        <tr><td><b>Log-based</b></td><td>Read the transaction log (WAL, binlog, redo log) via a replication slot or equivalent</td><td>Captures every insert/update/delete in commit order with low source overhead; needs log access and careful slot management</td></tr>
+        <tr><td><b>Trigger-based</b></td><td>Database triggers write each change into an audit table</td><td>Works anywhere; adds write latency to every transaction</td></tr>
+        <tr><td><b>Query-based</b></td><td>Poll with a high-watermark (§05)</td><td>Simplest; misses deletes and intermediate states</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">shape of a change event</span><span class="eq">{ op: c | u | d,  key: {id: 42},  before: {…} | null,  after: {…} | null,  source: {lsn, txid, ts_ms} }</span></div>
+      <ul class="notes">
+        <li><b>Bootstrap = snapshot + stream.</b> Take a consistent snapshot, note the log position at that instant, then apply changes from exactly that position. Getting this hand-off wrong causes duplicates or gaps.</li>
+        <li><b>Ordering is per key, not global.</b> Changes are usually published to a durable log partitioned by primary key (see <a href="stream-processing.html">Stream Processing</a>), so all events for one row stay in order. Apply them with MERGE using the log sequence number to discard stale replays.</li>
+        <li><b>The retention trap.</b> A stalled consumer holding a replication slot can make the source database retain log segments until its disk fills — a CDC outage that takes down production. Alert on slot lag.</li>
+        <li>Schema changes in the source (a renamed column) flow straight into the change stream. This is where data contracts (§08) earn their keep.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="scd" data-nav="Slowly changing dimensions">
+      <h3><span class="idx">07</span> Slowly changing dimensions</h3>
+      <p class="lede">A customer moves from Lisbon to Berlin. Should last year's sales be reported under Lisbon (where they happened) or Berlin (where the customer is now)? The SCD type is that decision, encoded in the dimension table.</p>
+      <table class="cmp">
+        <tr><th>Type</th><th>On change</th><th>History?</th><th>Use when</th></tr>
+        <tr><td><b>0</b></td><td>Never change (retain original)</td><td>Original only</td><td>Immutable attributes: date of birth, signup channel</td></tr>
+        <tr><td><b>1</b></td><td>Overwrite in place</td><td>None</td><td>Corrections; attributes where only the current value matters</td></tr>
+        <tr><td><b>2</b></td><td>Close the current row, insert a new versioned row</td><td>Full</td><td>Attributes that change facts' meaning over time: region, segment, price tier</td></tr>
+        <tr><td><b>3</b></td><td>Add a <code>previous_value</code> column</td><td>One step back</td><td>"Before vs after a reorganisation" comparisons</td></tr>
+        <tr><td><b>4</b></td><td>Current table + separate history table</td><td>Full, split</td><td>Rapidly changing attributes that would bloat a Type 2 dimension</td></tr>
+        <tr><td><b>6</b> (1+2+3)</td><td>Type 2 rows plus a "current value" column overwritten on every version</td><td>Full + current</td><td>Report by historical <i>or</i> current value from one table</td></tr>
+      </table>
+      <div class="formula"><span class="lbl">SCD Type 2: surrogate keys and validity intervals</span><span class="eq">dim_customer(sk, customer_id, city, valid_from, valid_to, is_current)</span>
+<span class="eq">fact rows store sk, so each fact points at the version valid when it happened</span>
+<span class="eq">as-of lookup: valid_from ≤ t &lt; valid_to</span>      <span class="eq">current row: valid_to = 9999-12-31</span></div>
+
+      <div class="viz" id="viz-scd">
+        <div class="vhead">
+          <span class="vtitle">Type 1 vs Type 2 on the same change stream</span>
+          <span class="vhint">apply changes and compare the dimension tables</span>
+        </div>
+        <div class="controls">
+          <button type="button" class="btn" id="scd-next">apply next change ▶</button>
+          <button type="button" class="btn ghost" id="scd-reset">⟲ reset</button>
+        </div>
+        <svg id="scd-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Interactive tables: a customer dimension under SCD Type 1 overwrite versus Type 2 versioned rows"></svg>
+        <div class="readout" aria-live="polite" id="scd-read"></div>
+      </div>
+      <ul class="notes">
+        <li>Type 2 is not idempotent by accident: re-applying the same change must not create a duplicate version. Compare a hash of the tracked attributes with the current row and only version when it differs.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="contracts" data-nav="Data contracts">
+      <h3><span class="idx">08</span> Data contracts</h3>
+      <p class="lede">Most pipeline breakages start upstream: a product team renames a column, changes units, or starts emitting nulls, with no idea that a model depends on it. A data contract makes that dependency explicit and enforceable.</p>
+      <ul class="notes">
+        <li><b>What a contract specifies:</b> schema (names, types, nullability), semantics (units, enumerations, what a row means), quality expectations (uniqueness, ranges, freshness), delivery SLA, an <b>owner</b>, and a versioning and deprecation policy.</li>
+        <li><b>Where it's enforced:</b> in the producer's CI (a schema change that breaks the contract fails the build), at ingestion (reject or quarantine non-conforming records), and in a schema registry for event streams.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Change</th><th>Compatible?</th><th>Handling</th></tr>
+        <tr><td>Add an optional column</td><td>Backward-compatible</td><td>Ship it; consumers ignore unknown fields</td></tr>
+        <tr><td>Widen a type (int → bigint)</td><td>Usually compatible</td><td>Check downstream casts</td></tr>
+        <tr><td>Rename or drop a column</td><td><b>Breaking</b></td><td>New version; dual-write both during a deprecation window</td></tr>
+        <tr><td>Change units or meaning, same name</td><td><b>Breaking, and invisible to schema checks</b></td><td>The most dangerous kind — needs a semantic contract and a new field name</td></tr>
+        <tr><td>Make a column nullable</td><td>Breaking for consumers that assumed NOT NULL</td><td>Announce; add null-handling tests downstream</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="testing" data-nav="Testing pipelines">
+      <h3><span class="idx">09</span> Testing pipelines</h3>
+      <table class="cmp">
+        <tr><th>Layer</th><th>What it checks</th><th>Example</th></tr>
+        <tr><td><b>Unit tests</b></td><td>Transformation logic on small fixed inputs</td><td>Dedup keeps the latest version; timezone conversion around DST</td></tr>
+        <tr><td><b>Schema tests</b></td><td>Columns, types, nullability match the contract</td><td><code>order_id</code> is NOT NULL and unique</td></tr>
+        <tr><td><b>Data tests</b> (on real output)</td><td>Invariants of the produced table</td><td>Referential integrity, accepted values, <code>amount ≥ 0</code>, row count within ±3σ of trailing average</td></tr>
+        <tr><td><b>Reconciliation</b></td><td>Target agrees with source</td><td>Sum of <code>amount</code> per day matches the source ledger</td></tr>
+        <tr><td><b>Freshness</b></td><td>Data is recent enough</td><td>Max <code>event_time</code> within 2 h of now</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Write–audit–publish.</b> Write the new partition to a staging location or branch, run data tests against it, and only then atomically publish. A failed audit leaves consumers on yesterday's good data instead of today's bad data — fail closed.</li>
+        <li>Distinguish <b>blocking</b> tests (duplicate primary keys, broken joins) from <b>warning</b> tests (a 15% volume dip). Alert fatigue from non-blocking noise is how real failures get ignored.</li>
+        <li>For distribution-level checks on inputs and features, see <a href="data-quality-governance.html">Data Quality &amp; Governance</a> and <a href="../mlops/monitoring-and-drift.html">Monitoring &amp; Drift</a>.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="lineage" data-nav="Lineage &amp; observability">
+      <h3><span class="idx">10</span> Lineage and observability</h3>
+      <ul class="notes">
+        <li><b>Lineage</b> is the graph of which datasets (and which columns) are derived from which. Table-level lineage answers "what breaks if this source is late?"; <b>column-level</b> lineage answers "which dashboards use this PII field?" and "which models consume the column being renamed?".</li>
+        <li><b>Collection:</b> parse SQL to extract input/output tables and columns, emit lineage events from the orchestrator and compute engines on every run, and store them in a catalog. Hand-maintained lineage diagrams are stale within weeks.</li>
+        <li><b>Impact analysis</b> before a change and <b>root-cause analysis</b> after an incident are the two payoffs: walk the graph downstream to notify consumers, upstream to find the first broken node.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Pipeline health signal</th><th>Detects</th></tr>
+        <tr><td><b>Freshness</b> (now − max event time)</td><td>Stalled jobs, upstream delays, silent schedule failures</td></tr>
+        <tr><td><b>Volume</b> (rows per partition)</td><td>Partial loads, duplicated loads, dropped sources</td></tr>
+        <tr><td><b>Schema</b> (columns, types)</td><td>Unannounced upstream changes</td></tr>
+        <tr><td><b>Distribution</b> (null rate, cardinality, mean)</td><td>Semantic breakage that passes schema checks</td></tr>
+        <tr><td><b>Run metadata</b> (duration, retries, cost)</td><td>Creeping inefficiency, flaky dependencies</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">11</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Prefer layered ELT</b> and keep the raw layer — it makes every bug recoverable.</li>
+        <li><b>Idempotency first:</b> parametrise by data interval, overwrite partitions or MERGE, publish atomically. Retries and backfills are only safe on top of it.</li>
+        <li><b>Incremental loads leak at the edges:</b> overlap the watermark and MERGE; use log-based CDC when deletes and every intermediate state matter; watch replication-slot lag.</li>
+        <li><b>Pick the SCD type per attribute</b> by asking which version a historical fact should report under.</li>
+        <li><b>Contracts push breakage left</b> to the producer's CI; <b>write–audit–publish</b> stops bad data at the door; <b>lineage</b> tells you what to re-run.</li>
+        <li>Engines: <a href="../programming/apache-spark.html">Apache Spark</a> or warehouse SQL (<a href="../programming/sql.html">SQL</a>) for transforms; <a href="stream-processing.html">stream processing</a> when batch latency is too high; outputs feed <a href="data-warehousing.html">warehouses</a> and <a href="feature-stores.html">feature stores</a>.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="etl-pipelines.viz.js"></script>
+</body>
+</html>

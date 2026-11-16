@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · PPO: Proximal Policy Optimization</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../reinforcement-learning.html">Reinforcement Learning</a> · deep dive</p>
+      <h1>PPO: Proximal Policy Optimization</h1>
+      <p>Collect a batch with the current policy, then squeeze several epochs of minibatch gradient ascent out of it — without the policy running away from the data that justified the update. The hub page derives the policy gradient, baselines and actor-critic (<a href="../reinforcement-learning.html#policy-gradient">§08 there</a>); this page starts where that leaves off: why reusing a batch breaks the plain estimator, what TRPO's constraint was buying, how the clipped probability ratio replaces it with a first-order objective, which samples actually carry gradient, the adaptive-KL alternative, the joint policy–value–entropy loss, truncated GAE, the data-reuse arithmetic of the algorithm, the surrogate ablation, and what clipping does <i>not</i> guarantee.</p>
+      <div style="margin-top:10px">
+        <span class="pill">Machine Learning</span>
+        <span class="pill">Reinforcement Learning</span>
+        <span class="pill">probability ratio · L^CPI · clipped surrogate · pessimistic bound · adaptive KL · GAE · K epochs · ablation · Atari · limits</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="motivation" data-nav="Why reuse breaks PG">
+      <h3><span class="idx">01</span> The problem: one batch, many gradient steps</h3>
+      <p class="lede"><b>On-policy data is expensive, so you want to take many gradient steps per batch. The plain policy-gradient loss does not survive that.</b> PPO is the answer to a narrow question: what objective can you safely optimise for several epochs on data that a slightly older policy collected?</p>
+
+      <p>The standard estimator (derived on the hub, <a href="../reinforcement-learning.html#policy-gradient">§08</a>) is the gradient of a surrogate loss that automatic differentiation can handle:</p>
+      <div class="formula"><span class="lbl">the policy-gradient estimator and the loss it differentiates</span><span class="eq">ĝ  =  Êₜ[ ∇θ log π_θ(aₜ|sₜ) · Âₜ ]
+
+L^PG(θ)  =  Êₜ[ log π_θ(aₜ|sₜ) · Âₜ ]          ∇θ L^PG  =  ĝ
+
+Êₜ[…]  =  the empirical average over a finite batch of timesteps
+Âₜ     =  an advantage estimate, computed once, under the policy that collected the data</span></div>
+
+      <p><code>ĝ</code> is an unbiased estimate of the true gradient only <i>at the parameters that collected the batch</i>. After the first step, the samples come from a different policy than the one being differentiated, and <code>L^PG</code> has no term that notices. Worse, it has no maximum: with a mean baseline some <code>Âₜ</code> are negative, and pushing <code>log π_θ</code> of those actions towards −∞ increases <code>L^PG</code> without bound. The original study's verdict is that taking multiple optimisation steps on <code>L^PG</code> with the same trajectory is not well-justified and empirically produces <b>destructively large policy updates</b>.</p>
+
+      <div class="cards">
+        <div class="box bad"><div class="n">deep Q-learning</div><div class="t">Fails on many simple problems</div><div class="g">Poorly understood, and (at the time) not demonstrated on continuous-control benchmarks. See the <a href="dqn.html">DQN deep dive</a> for what it does well.</div></div>
+        <div class="box bad"><div class="n">vanilla policy gradient</div><div class="t">Poor data efficiency and robustness</div><div class="g">One gradient step per batch of environment interaction, and fragile step sizes.</div></div>
+        <div class="box warn"><div class="n">TRPO</div><div class="t">Reliable but complicated</div><div class="g">Second-order machinery, and incompatible with architectures that include noise (dropout) or parameter sharing between policy and value or with auxiliary tasks.</div></div>
+        <div class="box good"><div class="n">the goal</div><div class="t">TRPO's reliability, first-order only</div><div class="g">Data efficiency and reliable performance of trust-region methods, using only first-order optimisation — plain minibatch SGD or Adam.</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="trpo" data-nav="TRPO: constraint vs penalty">
+      <h3><span class="idx">02</span> TRPO in one paragraph: a constraint, and why a penalty is hard</h3>
+      <p class="lede">TRPO's move was to change the objective <i>and</i> forbid large changes in the policy, measured as a KL divergence between old and new action distributions — not as a distance in parameter space.</p>
+
+      <div class="formula"><span class="lbl">TRPO: constrained surrogate</span><span class="eq">maximise over θ     Êₜ[ π_θ(aₜ|sₜ) / π_θold(aₜ|sₜ) · Âₜ ]
+
+subject to          Êₜ[ KL[ π_θold(·|sₜ), π_θ(·|sₜ) ] ]  ≤  δ
+
+solved approximately with conjugate gradient, after a LINEAR approximation
+of the objective and a QUADRATIC approximation of the constraint</span>
+<span class="lbl">the penalty form the theory actually suggests</span><span class="eq">maximise over θ     Êₜ[ rₜ(θ)·Âₜ  −  β · KL[ π_θold(·|sₜ), π_θ(·|sₜ) ] ]
+
+(a surrogate using the MAX KL over states, not the mean, lower-bounds
+ the performance of the new policy — so penalising is the principled form)</span></div>
+
+      <p>So why does TRPO use a hard constraint instead of the simpler penalty that first-order SGD could optimise? Because <b>no single fixed <code>β</code> works</b>: the right coefficient differs between problems, and even within one problem the characteristics change as learning proceeds. The study's experiments confirm that simply choosing a fixed <code>β</code> and optimising the penalised objective with SGD is not sufficient (§11's ablation shows the fixed-<code>β</code> rows). PPO keeps the idea — stay close to <code>π_θold</code> — but encodes it directly in the objective's shape. KL divergence itself, and why it is non-negative, is on the <a href="../../math/probability/expectation/concentration.html">concentration &amp; inequalities</a> page.</p>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ratio" data-nav="The ratio and L^CPI">
+      <h3><span class="idx">03</span> The probability ratio and the conservative-policy-iteration surrogate</h3>
+      <p class="lede">Rewrite the objective in terms of the ratio of new to old action probabilities. It is the importance weight that turns data from <code>π_θold</code> into an estimate about <code>π_θ</code>, it equals 1 at the start of every update, and it makes "how far did the policy move on this sample" a single number.</p>
+
+      <div class="formula"><span class="lbl">the ratio and the unclipped surrogate</span><span class="eq">rₜ(θ)  =  π_θ(aₜ|sₜ) / π_θold(aₜ|sₜ)              rₜ(θold) = 1
+
+L^CPI(θ)  =  Êₜ[ π_θ(aₜ|sₜ)/π_θold(aₜ|sₜ) · Âₜ ]  =  Êₜ[ rₜ(θ) · Âₜ ]
+
+CPI = conservative policy iteration, where this surrogate was introduced</span>
+<span class="lbl">why it is an importance-sampling estimate (per state)</span><span class="eq">𝔼_(a ~ π_θ)[ A(s,a) ]  =  ∑ₐ π_θ(a|s)·A(s,a)  =  ∑ₐ π_θold(a|s) · (π_θ(a|s)/π_θold(a|s)) · A(s,a)
+                       =  𝔼_(a ~ π_θold)[ r(θ) · A(s,a) ]</span>
+<span class="lbl">at <span class="keep">θ</span> = <span class="keep">θ</span>old it has the same gradient as L^PG</span><span class="eq">∇θ rₜ(θ)  =  ∇θ π_θ / π_θold  =  rₜ(θ) · ∇θ log π_θ(aₜ|sₜ)
+
+∇θ L^CPI  =  Êₜ[ rₜ(θ) · ∇θ log π_θ(aₜ|sₜ) · Âₜ ]   →   at θ = θold (r = 1):   ĝ</span></div>
+
+      <ul class="notes">
+        <li><b>Same first step, different afterwards.</b> The importance weight <code>rₜ</code> is what <code>L^PG</code> was missing: as the policy moves, each sample's contribution is reweighted by how much more or less likely its action has become. The two objectives agree to first order at <code>θold</code>, and only <code>L^CPI</code> remains a meaningful estimate once <code>θ</code> moves.</li>
+        <li><b>But it is still unconstrained.</b> Without a constraint, maximising <code>L^CPI</code> would lead to an excessively large policy update: it is linear in the new probabilities, so for a positive-advantage action it pays to push <code>rₜ</code> as high as it goes. Importance weights also become high-variance far from 1 — the variance story is on the <a href="../../math/probability/stochastic-processes/monte-carlo.html#variance-reduction">Monte Carlo variance-reduction</a> page.</li>
+        <li><b>A second, hidden approximation</b> (general knowledge, not spelled out in the 2017 study): the ratio corrects for which <i>actions</i> are taken, but the <i>states</i> <code>sₜ</code> still come from <code>π_θold</code>'s state distribution. That mismatch is small only while the policies are close — another reason the surrogate is trustworthy only near <code>θold</code>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="clip" data-nav="The clipped surrogate">
+      <h3><span class="idx">04</span> The clipped surrogate, case by case</h3>
+      <p class="lede"><b>Clip the ratio into <code>[1 − ε, 1 + ε]</code>, then take the minimum of the clipped and unclipped terms.</b> The clip removes the incentive to move <code>rₜ</code> outside the interval; the min makes sure the clip can only ever make the objective <i>smaller</i>, never hide a move that made things worse.</p>
+
+      <div class="formula"><span class="lbl">the main objective, e.g. <span class="keep">ε</span> = 0.2</span><span class="eq">L^CLIP(θ)  =  Êₜ[ min( rₜ(θ)·Âₜ ,  clip(rₜ(θ), 1 − ε, 1 + ε)·Âₜ ) ]</span>
+<span class="lbl">one term, simplified by the sign of the advantage</span><span class="eq">Âₜ &gt; 0:   multiplying by Â keeps order, so
+            min(rÂ, clip(r)Â) = Â · min(r, clip(r)) = Â · min(r, 1 + ε)
+
+Âₜ &lt; 0:   multiplying by Â flips order, so min becomes max
+            min(rÂ, clip(r)Â) = Â · max(r, clip(r)) = Â · max(r, 1 − ε)</span></div>
+
+      <p>(The simplification is this page's own algebra on the definition: for <code>r &lt; 1 − ε</code>, <code>clip(r) = 1 − ε &gt; r</code>; inside the interval they are equal; above it, <code>clip(r) = 1 + ε &lt; r</code>.) So for a good action only the <i>upper</i> clip ever binds, and for a bad action only the <i>lower</i>. That gives five regions, and the gradient of a term is either the full importance-weighted policy gradient or exactly zero:</p>
+
+      <table class="grid2">
+        <tr><th>advantage</th><th>ratio</th><th>what the policy has done to this action</th><th>term</th><th>gradient of the term</th></tr>
+        <tr><td rowspan="2"><b>Â &gt; 0</b> (good action)</td><td><code>r ≤ 1 + ε</code></td><td>not yet made it much more likely (possibly made it less likely)</td><td class="num">r·Â</td><td><b>active</b>: <code>Â·r·∇log π</code> — keep pushing it up</td></tr>
+        <tr class="hl"><td><code>r &gt; 1 + ε</code></td><td>already made it more than <code>1+ε</code> times as likely</td><td class="num">(1+ε)·Â</td><td><b>zero</b> — no further incentive</td></tr>
+        <tr class="hl"><td rowspan="2"><b>Â &lt; 0</b> (bad action)</td><td><code>r &lt; 1 − ε</code></td><td>already made it less than <code>1−ε</code> times as likely</td><td class="num">(1−ε)·Â</td><td><b>zero</b> — no further incentive</td></tr>
+        <tr><td><code>r ≥ 1 − ε</code></td><td>not yet suppressed it enough (possibly made it more likely)</td><td class="num">r·Â</td><td><b>active</b>: <code>Â·r·∇log π</code> — keep pushing it down</td></tr>
+        <tr><td><b>Â = 0</b></td><td>any</td><td>—</td><td class="num">0</td><td>zero</td></tr>
+      </table>
+
+      <p>The two highlighted rows are the only places clipping changes anything. Read the other two carefully: a good action whose probability <i>fell</i> (<code>Â &gt; 0, r &lt; 1 − ε</code>) and a bad action whose probability <i>rose</i> (<code>Â &lt; 0, r &gt; 1 + ε</code>) are <b>not</b> clipped. Those are moves that made the objective worse, and the min keeps their full, unbounded penalty so the gradient can undo them. Drag the ratio below to see each region.</p>
+
+      <div class="viz" id="viz-clip">
+        <div class="vhead">
+          <span class="vtitle">One term of L^CLIP against the ratio r, for a positive and a negative advantage</span>
+          <span class="vhint">drag in either panel to move r; widen ε and watch the flat, zero-gradient region retreat</span>
+        </div>
+        <div class="controls">
+          <label>clip range ε <input type="range" id="cl-eps" min="0.05" max="0.5" step="0.01" value="0.2" /><span id="cl-epsv" style="min-width:34px;display:inline-block">0.20</span></label>
+          <label>ratio r <input type="range" id="cl-r" min="0" max="2" step="0.01" value="1.3" /><span id="cl-rv" style="min-width:34px;display:inline-block">1.30</span></label>
+          <label><input type="checkbox" id="cl-un" checked /> show unclipped r·Â</label>
+          <label><input type="checkbox" id="cl-cc" checked /> show clipped term alone</label>
+        </div>
+        <svg id="cl-svg" width="760" height="350" viewBox="0 0 760 350" role="img" aria-label="Two side-by-side panels plotting one term of the clipped surrogate objective against the probability ratio r from 0 to 2, with an advantage of plus one on the left and minus one on the right. Vertical guides mark 1 minus epsilon, 1 and 1 plus epsilon. A dashed straight line is the unclipped term r times A; a thin amber line is the clipped term alone, flat outside the interval; a thick teal line is their minimum, the actual objective. For the positive advantage the teal line rises with r and goes flat above 1 plus epsilon, and that flat region is shaded red as zero gradient. For the negative advantage the teal line is flat below 1 minus epsilon, shaded as zero gradient, and falls with slope minus one everywhere above it. A draggable marker sits on each teal curve at the current ratio; where the teal line lies below the dashed line the vertical gap is drawn as the penalty. The readout gives, for each sign, the term value, the unclipped value, the penalty, and the derivative with respect to r."></svg>
+        <div class="readout" aria-live="polite" id="cl-readout"></div>
+      </div>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="bound" data-nav="Why a pessimistic bound">
+      <h3><span class="idx">05</span> Why it is a pessimistic lower bound — and a hinge penalty in disguise</h3>
+      <p class="lede">Because <code>min(x, y) ≤ x</code>, every term of <code>L^CLIP</code> is at most the corresponding term of <code>L^CPI</code>. The change in ratio is <b>ignored when it would improve the objective, and included when it makes it worse</b>.</p>
+
+      <div class="formula"><span class="lbl">three facts, each from the definition</span><span class="eq">(1)  L^CLIP(θ)  ≤  L^CPI(θ)                  for every θ          (min ≤ its first argument)
+(2)  L^CLIP(θ)  =  L^CPI(θ)                  while every rₜ ∈ [1 − ε, 1 + ε]
+(3)  ∇L^CLIP(θold)  =  ∇L^CPI(θold)  =  ĝ     at θold every rₜ = 1, strictly inside</span>
+<span class="lbl">rearranged: the clip subtracts a per-sample hinge (this page's rearrangement)</span><span class="eq">L^CLIP  =  L^CPI  −  Êₜ[ penaltyₜ ]
+
+penaltyₜ  =  (rₜ − (1 + ε)) · Âₜ      if Âₜ &gt; 0 and rₜ &gt; 1 + ε        ≥ 0
+          =  (rₜ − (1 − ε)) · Âₜ      if Âₜ &lt; 0 and rₜ &lt; 1 − ε        ≥ 0  (both factors negative)
+          =  0                          otherwise</span></div>
+
+      <ul class="notes">
+        <li><b>Compare with the KL penalty of §02.</b> The theory said: subtract <code>β·KL</code>. Clipping subtracts something with the same job — a penalty for moving too far — but it is zero inside the trust region, grows linearly outside it, applies only on the side that would have helped, and needs no coefficient. The study describes <code>L^CLIP</code> exactly this way: a lower bound on <code>L^CPI</code> with a penalty for having too large a policy update.</li>
+        <li><b>Measured on a real update.</b> Interpolating the parameters along one PPO update direction on the Hopper task, the study plots several surrogates against the interpolation factor. The updated policy ends at a KL of about <b>0.02</b> from the initial one, and that is where <code>L^CLIP</code> attains its maximum — while <code>L^CPI</code> keeps rising past it. The clip turned an objective that recommends going further into one whose optimum sits at a modest step.</li>
+        <li><b>Pessimism is a property of the surrogate, not of performance.</b> "Lower bound" means lower than the <i>unclipped surrogate</i>. It is not a certified lower bound on the true return of the new policy — that is what the max-KL theory of §02 would give, at the price of a very conservative step.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="adaptive-kl" data-nav="Adaptive KL penalty">
+      <h3><span class="idx">06</span> The alternative: a KL penalty with an adaptive coefficient</h3>
+      <p class="lede">If a fixed <code>β</code> fails because no single value fits, adapt it: after each policy update, compare the KL actually achieved with a target, and halve or double <code>β</code>. The study presents this as an alternative (or addition) to clipping; it performed worse than clipping in their experiments, but is an important baseline.</p>
+
+      <div class="formula"><span class="lbl">per policy update</span><span class="eq">1.  optimise   L^KLPEN(θ) = Êₜ[ rₜ(θ)·Âₜ − β · KL[ π_θold(·|sₜ), π_θ(·|sₜ) ] ]
+    with several epochs of minibatch SGD
+
+2.  compute    d = Êₜ[ KL[ π_θold(·|sₜ), π_θ(·|sₜ) ] ]
+
+    if  d &lt; d_targ / 1.5    →   β ← β / 2        (moved too little: loosen)
+    if  d &gt; d_targ × 1.5    →   β ← β × 2        (moved too far: tighten)
+
+the updated β is used for the NEXT policy update</span></div>
+      <ul class="notes">
+        <li><b>A thermostat, not a constraint.</b> Within one update the KL can still overshoot; the controller only corrects the next update. Occasionally a policy update ends with a KL far from <code>d_targ</code>, but <code>β</code> adjusts quickly.</li>
+        <li><b>Robust to its own knobs.</b> The 1.5 and 2 were chosen heuristically and the algorithm is not very sensitive to them; the initial <code>β</code> is unimportant because it adapts (it was initialised at 1 in the ablation).</li>
+        <li><b>The idea survives.</b> The Roboschool runs of §12 adjust the <i>Adam step size</i> based on a target KL — the same feedback loop pointed at a different knob.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="toy" data-nav="Live toy: reuse one batch">
+      <h3><span class="idx">07</span> A live toy: what K epochs on one batch do to each surrogate</h3>
+      <p class="lede">A four-armed bandit with a softmax policy is the smallest setting where the failure of §01 is visible. Everything below is computed in your browser; it is an illustration of the mechanism, not a reproduction of any reported result.</p>
+
+      <div class="formula"><span class="lbl">the toy (a constructed illustration)</span><span class="eq">arms a = 1…4, true mean rewards  μ = (0.3, 0.5, 0.8, 0.4);  reward = μₐ + noise·N(0, 1)
+policy π_θ(a) = softmax(θ)ₐ, starting uniform;   batch of n pulls from π_θold
+Âᵢ = Rᵢ − (batch mean reward);   one "epoch" = one full-batch gradient-ascent step of size η
+
+∇θ log π_θ(a) = e_a − π_θ         (e_a = one-hot of a)
+L^PG    weight per sample:  Âᵢ
+L^CPI   weight per sample:  Âᵢ · rᵢ
+L^CLIP  weight per sample:  Âᵢ · rᵢ  if active (table in §04), else 0
+true return  J(π) = ∑ₐ π(a)·μₐ;     drift  KL[π_θold, π_θ] = ∑ₐ π_θold(a) · log(π_θold(a)/π_θ(a))</span></div>
+
+      <div class="viz" id="viz-toy">
+        <div class="vhead">
+          <span class="vtitle">Reusing one noisy batch for K epochs: unclipped surrogates commit, the clipped one stops</span>
+          <span class="vhint">raise the epochs or the step size; switch to "many iterations" to see what commitment costs over a whole run</span>
+        </div>
+        <div class="controls">
+          <label>view <select id="ty-m">
+            <option value="batch" selected>one batch, K epochs</option>
+            <option value="iter">many iterations, 40 seeds</option>
+          </select></label>
+          <label>epochs K <input type="range" id="ty-k" min="1" max="50" step="1" value="10" /><span id="ty-kv" style="min-width:20px;display:inline-block">10</span></label>
+          <label>step η <input type="range" id="ty-eta" min="0.25" max="8" step="0.25" value="2" /><span id="ty-etav" style="min-width:30px;display:inline-block">2.00</span></label>
+          <label>ε <input type="range" id="ty-eps" min="0.05" max="0.5" step="0.01" value="0.2" /><span id="ty-epsv" style="min-width:30px;display:inline-block">0.20</span></label>
+          <label>batch n <input type="range" id="ty-n" min="4" max="48" step="4" value="16" /><span id="ty-nv" style="min-width:20px;display:inline-block">16</span></label>
+          <label>reward noise <input type="range" id="ty-s" min="0" max="2" step="0.1" value="1" /><span id="ty-sv" style="min-width:24px;display:inline-block">1.0</span></label>
+          <button id="ty-new" type="button">new batch / seeds</button>
+        </div>
+        <svg id="ty-svg" width="760" height="470" viewBox="0 0 760 470" role="img" aria-label="Toy four-armed bandit comparing three surrogate objectives optimised on the same data: plain policy gradient in amber, the unclipped ratio surrogate in violet, and the clipped surrogate in teal. In the one-batch view, the top left plots the KL divergence from the data-collecting policy against epoch on a symmetric-log axis: the two unclipped curves climb steadily and keep climbing, while the clipped curve rises briefly and flattens near a few hundredths. The top right plots the true expected reward of the current policy against epoch, with dashed lines for the starting policy and the best arm; the unclipped curves swing towards whichever arm looked best in this one noisy batch, which may be the wrong one, while the clipped curve moves only a little. The bottom shows, for each arm, the probability ratio of each method's final policy to the starting policy, over a shaded band from 1 minus epsilon to 1 plus epsilon, with each arm labelled by its true mean, its pull count and its mean advantage in the batch. In the many-iterations view the top left plots the true reward averaged over 40 seeds against iteration, with a fresh batch each iteration; the top right plots the per-iteration KL; and the bottom shows, for each method, the share of seeds whose final policy concentrates on each arm, revealing how often the unclipped methods lock on to a wrong arm and never recover."></svg>
+        <div class="readout" aria-live="polite" id="ty-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Start with K = 1.</b> All three methods then produce exactly the same policy: every ratio is 1 at the first step, so the three gradients coincide (§05, fact 3). Every difference you see at larger <code>K</code> comes from reusing the batch.</li>
+        <li><b>Why the unclipped curves run away.</b> On a fixed batch, <code>L^CPI</code> is linear in the new probabilities — <code>∑ₐ π_θ(a) · (sum of Âᵢ on arm a) / (n·π_θold(a))</code> — so its maximum is a deterministic policy on whichever arm has the largest importance-weighted batch advantage. <code>L^PG = ∑ₐ (sum of Âᵢ on arm a) · log π_θ(a)</code> has no maximum at all: any arm with a negative total is pushed towards probability zero forever. Both "fit the batch", including its noise.</li>
+        <li><b>Why that is destructive, not just noisy.</b> Once an arm's probability is near zero it is almost never sampled again, so no future batch can correct the mistake. The many-iterations view shows this as seeds stuck on the wrong arm. Clipping makes each iteration a small step, so a lucky or unlucky batch only nudges the policy and the next batch can disagree.</li>
+        <li><b>Clipping is per sample, not per arm.</b> With noise, one arm has both positive- and negative-advantage pulls. Once that arm's ratio passes <code>1 + ε</code>, its positive samples go silent while its negative samples stay active, so the ratio is held near the boundary rather than frozen — watch the teal bars hover around the band edge. A large <code>η</code> can still jump past the band in one step; §14 returns to that.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="joint-loss" data-nav="Policy + value + entropy">
+      <h3><span class="idx">08</span> The joint objective: policy, value and entropy in one network</h3>
+      <p class="lede">The advantages need a learned value function <code>V(s)</code>. If policy and value share parameters — one network, two heads — the loss must combine the policy surrogate with a value-function error term, and the study adds an entropy bonus to keep exploring. This is the compatibility with parameter sharing that TRPO lacked.</p>
+
+      <div class="formula"><span class="lbl">maximised each iteration (approximately)</span><span class="eq">L^(CLIP+VF+S)ₜ(θ)  =  Êₜ[ L^CLIPₜ(θ)  −  c₁ · L^VFₜ(θ)  +  c₂ · S[π_θ](sₜ) ]
+
+L^VFₜ  =  ( V_θ(sₜ) − Vₜ^targ )²        squared-error value loss (subtracted: we maximise)
+S       =  entropy bonus of the action distribution at sₜ
+c₁, c₂  =  coefficients</span>
+<span class="lbl">entropy, for reference (general knowledge)</span><span class="eq">discrete:      S[π](s) = −∑ₐ π(a|s) · log π(a|s)          largest when uniform
+Gaussian, per action dimension with std σ:   S = ½ · log(2πe·σ²)   grows with log σ</span></div>
+      <ul class="notes">
+        <li><b>When the terms are present.</b> In the MuJoCo surrogate ablation (§11) policy and value had separate networks and there was no entropy bonus, so <code>c₁</code> was irrelevant and <code>c₂ = 0</code>. In the Atari runs (§12) the network was shared, with <code>c₁ = 1</code> and <code>c₂ = 0.01</code>.</li>
+        <li><b>Why the entropy term is there.</b> Policy-gradient updates sharpen the policy; nothing in <code>L^CLIP</code> resists premature collapse to a near-deterministic policy. The entropy bonus is the standard counterweight, covered with the other exploration mechanisms on the hub (<a href="../reinforcement-learning.html#exploration">§09</a>).</li>
+        <li><b>The value target</b> <code>Vₜ^targ</code> is left general in the study's formula. A common choice in implementations (general knowledge) is the bootstrapped return <code>Âₜ + V_θold(sₜ)</code>, computed once with the same advantages.</li>
+        <li><b>Scale matters with sharing.</b> <code>c₁</code> balances two losses on very different scales flowing into the same trunk; a value loss that dominates can drown the policy gradient (general knowledge).</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="gae" data-nav="Truncated GAE">
+      <h3><span class="idx">09</span> Advantages from fixed-length segments: truncated GAE</h3>
+      <p class="lede">PPO collects fixed-length segments of <code>T</code> timesteps — much shorter than an episode — so the advantage estimator may not look past step <code>T</code>. The study uses a truncated form of generalized advantage estimation, with <code>λ</code> as the bias–variance dial.</p>
+
+      <div class="formula"><span class="lbl">T-step bootstrapped advantage</span><span class="eq">Âₜ  =  −V(sₜ) + rₜ + γ·rₜ₊₁ + … + γ^(T−t−1)·r_(T−1) + γ^(T−t)·V(s_T)</span>
+<span class="lbl">truncated GAE</span><span class="eq">δₜ  =  rₜ + γ·V(sₜ₊₁) − V(sₜ)                          (the one-step TD error)
+
+Âₜ  =  δₜ + (γλ)·δₜ₊₁ + … + (γλ)^(T−t−1)·δ_(T−1)
+
+computed backwards:   Â_(T−1) = δ_(T−1),     Âₜ = δₜ + γλ·Âₜ₊₁
+
+λ = 1:  the sum telescopes to the T-step advantage above
+λ = 0:  Âₜ = δₜ, the one-step actor-critic advantage of the hub's §08</span></div>
+
+      <h4>A worked segment (illustrative numbers)</h4>
+      <div class="formula"><span class="lbl">T = 3, <span class="keep">γ</span> = 0.99, <span class="keep">λ</span> = 0.95, so <span class="keep">γλ</span> = 0.9405</span><span class="eq">rewards  r₀, r₁, r₂  =  1, 0, 1          values  V(s₀…s₃)  =  2.0, 1.5, 1.8, 1.0
+
+δ₀ = 1 + 0.99·1.5 − 2.0 = 0.485     δ₁ = 0 + 0.99·1.8 − 1.5 = 0.282     δ₂ = 1 + 0.99·1.0 − 1.8 = 0.190
+
+Â₂ = 0.190
+Â₁ = 0.282 + 0.9405·0.190   = 0.4607
+Â₀ = 0.485 + 0.9405·0.4607  = 0.9183
+
+check λ = 1:  Â₀ = −2.0 + 1 + 0.99·0 + 0.99²·1 + 0.99³·1.0 = 0.9504   (same as δ-sum with γλ = 0.99)
+       λ = 0:  Â₀ = δ₀ = 0.485</span></div>
+      <ul class="notes">
+        <li><b>The dial.</b> <code>λ = 0</code> trusts the critic after one step: low variance, biased if <code>V</code> is wrong. <code>λ = 1</code> uses the actual rewards out to the segment end: unbiased up to the bootstrap at <code>s_T</code>, but the variance of a sum of many random rewards. Every experiment in the study used <code>λ = 0.95</code>. The general principle — trade a little bias for a lot of variance with a control variate — is the subject of the <a href="../../math/probability/stochastic-processes/monte-carlo.html#variance-reduction">variance-reduction</a> page; the baseline argument is on the hub (<a href="../reinforcement-learning.html#policy-gradient">§08</a>).</li>
+        <li><b>Episode boundaries</b> inside a segment (general knowledge): if <code>sₜ₊₁</code> is terminal, the bootstrap <code>γ·V(sₜ₊₁)</code> and the <code>γλ</code> carry are zeroed at that step.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="algorithm" data-nav="The algorithm and data reuse">
+      <h3><span class="idx">10</span> The algorithm, annotated — and how often each sample is reused</h3>
+      <p class="lede">The whole method is an actor-critic loop with one unusual feature: the optimisation phase makes <code>K</code> passes over the batch in minibatches, which is safe only because of the surrogate.</p>
+
+      <div class="formula"><span class="lbl">PPO, actor-critic style</span><span class="eq">for iteration = 1, 2, …
+    for actor = 1 … N                                    (parallel copies of the environment)
+        run π_θold for T timesteps
+        compute advantage estimates Â₁ … Â_T            (truncated GAE, §09)
+    optimise the surrogate L w.r.t. θ,                    (L^CLIP, or L^CLIP+VF+S with sharing)
+        with K epochs and minibatch size M ≤ N·T          (minibatch SGD or, usually better, Adam)
+    θold ← θ                                              (the batch is discarded)</span>
+<span class="lbl">the data-reuse arithmetic (this page's, from the reported hyperparameters)</span><span class="eq">gradient steps per iteration  =  K · N·T / M          each sample used K times
+
+MuJoCo     N·T = 2048 (one 2048-step horizon)    K = 10   M = 64     →   10·2048/64    = 320 steps
+           1M timesteps / 2048 ≈ 488 iterations  →  ≈ 156 000 minibatch steps per run
+Roboschool N·T = 32·512   = 16 384               K = 15   M = 4096   →   15·16384/4096 =  60 steps
+           (flagrun, 128 actors: N·T = 65 536    →   240 steps)
+Atari      N·T = 8·128    = 1 024                K = 3    M = 256    →   3·1024/256    =  12 steps
+           10M timesteps / 1024 ≈ 9 766 iterations</span></div>
+      <ul class="notes">
+        <li><b>That is the data efficiency claim in one line.</b> Vanilla policy gradient takes one step per batch; on MuJoCo, PPO takes 320. The MuJoCo hyperparameter table lists no actor count, so <code>N·T = 2048</code> above assumes the horizon is the whole batch.</li>
+        <li><b>Adam is the default optimiser</b> — the study notes it usually works better than plain SGD here. Its mechanics are on the <a href="../../deep-learning/neural-network-training/optimizers.html#adam">optimizers page</a>.</li>
+        <li><b>"A few lines of code change."</b> Starting from a vanilla policy-gradient implementation, the changes are: replace <code>L^PG</code> with <code>L^CLIP</code>, and run multiple epochs of minibatch updates instead of one step. That simplicity is the study's main selling point against TRPO.</li>
+        <li><b>Still on-policy.</b> Every batch is generated by the current <code>θold</code> and thrown away after <code>K</code> epochs. The ratio corrects only for the drift <i>within</i> one iteration; contrast the replay buffer of <a href="dqn.html">DQN</a>, which reuses transitions from many past policies.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ablation" data-nav="Surrogate ablation">
+      <h3><span class="idx">11</span> Which surrogate? The MuJoCo ablation</h3>
+      <p class="lede">Holding everything else fixed, the study compared no clipping or penalty, clipping at three values of <code>ε</code>, the adaptive KL penalty at three targets, and a fixed KL penalty at four coefficients. <b>Clipping at <code>ε = 0.2</code> was best; no constraint at all was worse than random.</b></p>
+
+      <table class="grid2">
+        <tr><th style="width:190px">setting</th><th>details</th></tr>
+        <tr><td><b>tasks</b></td><td>7 simulated-robotics tasks: HalfCheetah, Hopper, InvertedDoublePendulum, InvertedPendulum, Reacher, Swimmer, Walker2d (all <code>-v1</code>)</td></tr>
+        <tr><td><b>budget</b></td><td>1 million timesteps per run; 3 random seeds per task → 21 runs per setting</td></tr>
+        <tr><td><b>score</b></td><td>average total reward over the last 100 episodes, shifted and scaled per environment so a random policy scores 0 and the best result scores 1, then averaged over the 21 runs</td></tr>
+        <tr><td><b>policy</b></td><td>MLP with two hidden layers of 64 tanh units, outputting the mean of a Gaussian with variable standard deviation; no parameter sharing, no entropy bonus; <code>β</code> initialised at 1</td></tr>
+      </table>
+
+      <div class="viz" id="viz-abl">
+        <div class="vhead">
+          <span class="vtitle">Normalised score of each surrogate objective (random policy = 0, best result = 1)</span>
+          <span class="vhint">hover a bar; sort by score to see the families interleave</span>
+        </div>
+        <div class="controls">
+          <label>order <select id="ab-o">
+            <option value="family" selected>grouped by family, as reported</option>
+            <option value="score">sorted by score</option>
+          </select></label>
+        </div>
+        <svg id="ab-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Horizontal bar chart of eleven surrogate-objective settings and their normalised MuJoCo score, on an axis from minus 0.5 to 1 with a vertical line at zero for the random policy. No clipping or penalty is the only negative bar, at minus 0.39. Clipping bars are teal: epsilon 0.1 scores 0.76, epsilon 0.2 scores 0.82, the longest bar overall, and epsilon 0.3 scores 0.70. Adaptive KL bars are violet: targets 0.003, 0.01 and 0.03 score 0.68, 0.74 and 0.71. Fixed KL bars are amber: beta 0.3, 1, 3 and 10 score 0.62, 0.71, 0.72 and 0.69. A selector re-orders the bars by score. Hovering a bar shows its setting and score in the readout."></svg>
+        <div class="readout" aria-live="polite" id="ab-readout"></div>
+      </div>
+
+      <table class="grid2">
+        <tr><th>algorithm</th><th>avg. normalised score</th></tr>
+        <tr><td>no clipping or penalty</td><td class="num">−0.39</td></tr>
+        <tr><td>clipping, ε = 0.1</td><td class="num">0.76</td></tr>
+        <tr class="hl"><td><b>clipping, ε = 0.2</b></td><td class="num">0.82</td></tr>
+        <tr><td>clipping, ε = 0.3</td><td class="num">0.70</td></tr>
+        <tr><td>adaptive KL, d_targ = 0.003</td><td class="num">0.68</td></tr>
+        <tr><td>adaptive KL, d_targ = 0.01</td><td class="num">0.74</td></tr>
+        <tr><td>adaptive KL, d_targ = 0.03</td><td class="num">0.71</td></tr>
+        <tr><td>fixed KL, β = 0.3</td><td class="num">0.62</td></tr>
+        <tr><td>fixed KL, β = 1</td><td class="num">0.71</td></tr>
+        <tr><td>fixed KL, β = 3</td><td class="num">0.72</td></tr>
+        <tr><td>fixed KL, β = 10</td><td class="num">0.69</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>The negative score is a real collapse.</b> Unconstrained <code>L^CPI</code> with multiple epochs averaged below random because on HalfCheetah it ended up worse than the random policy — the "destructively large update" of §01, measured.</li>
+        <li><b>The ranking within families is mild; between none and anything, enormous.</b> The gap from −0.39 to about 0.7 is what <i>any</i> constraint buys; the gap from 0.74 (best adaptive KL) to 0.82 (best clip) is what clipping buys over its strongest rival. The best fixed <code>β</code> (0.72) is not far behind, but it had to be found by sweeping.</li>
+        <li><b>A variant that did not help:</b> clipping in log space instead of on the ratio was tried and performed no better.</li>
+        <li><b>Caution reading the bars.</b> These are 21 runs per setting with no spread reported; differences of a few hundredths should not be over-read.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="hyperparameters" data-nav="Hyperparameters side by side">
+      <h3><span class="idx">12</span> Hyperparameters across the three settings</h3>
+      <p class="lede">The same algorithm, three regimes: long single-actor segments on cheap simulated robots, very large parallel batches for the humanoid, and short segments with many small minibatches for Atari.</p>
+      <table class="grid2">
+        <tr><th>hyperparameter</th><th>MuJoCo (1M steps)</th><th>Roboschool humanoid</th><th>Atari (40M frames)</th></tr>
+        <tr><td><b>horizon T</b></td><td class="num">2048</td><td class="num">512</td><td class="num">128</td></tr>
+        <tr><td><b>Adam step size</b></td><td class="num">3×10⁻⁴</td><td class="num">adjusted from a target KL</td><td class="num">2.5×10⁻⁴ × α</td></tr>
+        <tr><td><b>epochs K</b></td><td class="num">10</td><td class="num">15</td><td class="num">3</td></tr>
+        <tr><td><b>minibatch M</b></td><td class="num">64</td><td class="num">4096</td><td class="num">32 × 8</td></tr>
+        <tr><td><b>discount γ</b></td><td class="num">0.99</td><td class="num">0.99</td><td class="num">0.99</td></tr>
+        <tr><td><b>GAE λ</b></td><td class="num">0.95</td><td class="num">0.95</td><td class="num">0.95</td></tr>
+        <tr><td><b>actors N</b></td><td class="num">not listed</td><td class="num">32 locomotion / 128 flagrun</td><td class="num">8</td></tr>
+        <tr><td><b>clip ε</b></td><td class="num">0.2 (from §11)</td><td class="num">—</td><td class="num">0.1 × α</td></tr>
+        <tr><td><b>c₁ (value), c₂ (entropy)</b></td><td class="num">separate nets, no bonus</td><td class="num">—</td><td class="num">1, 0.01</td></tr>
+        <tr><td><b>other</b></td><td>—</td><td>log std of the action distribution annealed linearly from −0.7 to −1.6</td><td><code>α</code> annealed linearly from 1 to 0 over learning</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Atari anneals both the step size and <code>ε</code> to zero.</b> The trust region itself shrinks over training, so late updates are tiny on both counts.</li>
+        <li><b>The humanoid shrinks exploration by schedule</b> rather than by an entropy bonus: the policy's log standard deviation is not learned but annealed, from <code>e^(−0.7) ≈ 0.50</code> to <code>e^(−1.6) ≈ 0.20</code> (my conversion).</li>
+        <li><b>γ and λ never changed.</b> 0.99 and 0.95 throughout — the part of PPO's configuration that transferred untouched.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="results" data-nav="Results">
+      <h3><span class="idx">13</span> Results: continuous control, the humanoid, and 49 Atari games</h3>
+
+      <h4>Continuous control against the existing methods</h4>
+      <p>On the same seven MuJoCo tasks at one million timesteps, PPO with clipping at <code>ε = 0.2</code> was compared with a tuned TRPO, the cross-entropy method (CEM), vanilla policy gradient with an adaptive step size, A2C, and A2C with a trust region. A2C is the synchronous version of A3C, which the study found to perform the same as or better than the asynchronous one. PPO <b>outperforms the previous methods on almost all</b> the continuous-control environments.</p>
+
+      <h4>Showcase: 3D humanoid tasks</h4>
+      <div class="cards">
+        <div class="box"><div class="n">RoboschoolHumanoid</div><div class="t">forward locomotion</div><div class="g">Learn to run forward. Curves run to 50M timesteps.</div></div>
+        <div class="box"><div class="n">HumanoidFlagrun</div><div class="t">steer to a moving target</div><div class="g">The target moves every 200 timesteps or whenever it is reached. Curves to 100M timesteps.</div></div>
+        <div class="box"><div class="n">HumanoidFlagrunHarder</div><div class="t">get pelted, get up</div><div class="g">The robot is hit by cubes and must get up off the ground. Curves to 100M timesteps.</div></div>
+      </div>
+
+      <h4>Atari: 49 games against A2C and ACER</h4>
+      <p>Using the same policy network as the A3C work and 40M game frames (10M timesteps), PPO was compared with well-tuned A2C and ACER. Each method's metric was averaged over 3 trials, and the table counts games won under two scoring rules:</p>
+      <table class="grid2">
+        <tr><th>scoring metric</th><th>A2C</th><th>ACER</th><th>PPO</th><th>tie</th></tr>
+        <tr><td><b>(1) average episode reward over all of training</b> — favours fast learning</td><td class="num">1</td><td class="num">18</td><td class="num"><b>30</b></td><td class="num">0</td></tr>
+        <tr><td><b>(2) average episode reward over the last 100 episodes</b> — favours final performance</td><td class="num">1</td><td class="num"><b>28</b></td><td class="num">19</td><td class="num">1</td></tr>
+      </table>
+      <p>Read the two rows together. PPO wins most games on the learning-speed metric, ACER most on final performance. The study's summary: significantly better sample complexity than A2C, and similar to ACER — while being much simpler. ACER is an off-policy actor-critic with a replay buffer and trust-region machinery of its own, so "similar, but much simpler" is the substantive claim.</p>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="limits" data-nav="What clipping does not guarantee">
+      <h3><span class="idx">14</span> What clipping does <i>not</i> guarantee</h3>
+      <p class="lede">This section is <b>general knowledge and later analysis</b>, not claims of the original study. The clip removes an <i>incentive</i>; it is not a constraint, and nothing in the method bounds the KL divergence of the update.</p>
+      <div class="cards">
+        <div class="box bad"><div class="n">no hard bound</div><div class="t">Ratios do leave the band</div><div class="g">Parameters are shared across all states and actions, so gradients from active samples move the ratios of clipped samples too. Several epochs of minibatch steps compound this, and a single large step can jump far outside <code>[1−ε, 1+ε]</code>.</div></div>
+        <div class="box bad"><div class="n">no restoring force</div><div class="t">Flat means flat</div><div class="g">A positive-advantage sample with <code>r &gt; 1+ε</code> has zero gradient: if it was pushed there, nothing in its own term pulls it back. Only samples on the other side of the min (§04) resist.</div></div>
+        <div class="box warn"><div class="n">tuning still matters</div><div class="t">Step size and epochs set the real trust region</div><div class="g">The effective step depends on the learning rate, <code>K</code> and <code>M</code> as much as on <code>ε</code>. Many implementations therefore also monitor the approximate KL and stop the epoch loop early when it exceeds a target.</div></div>
+        <div class="box warn"><div class="n">implementation details</div><div class="t">The clip is not the whole story</div><div class="g">Later careful re-implementations found that code-level choices — advantage normalisation, value-loss clipping, observation and reward normalisation, initialisation, learning-rate annealing — account for a large share of PPO's performance relative to TRPO.</div></div>
+      </div>
+      <p>The bandit in §07 shows the first point live. Even at the default settings the clipped policy's largest ratio ends near 1.3, outside the <code>[0.8, 1.2]</code> band. Set <code>η = 8</code> and <code>K = 1</code>: the first step is unclipped by construction, and it already moves one arm's ratio to about 2.6. In the many-iterations view with the initial seeds, <code>η = 8</code> leaves 5 of 40 clipped runs stuck on a wrong arm (none at <code>η = 2</code>). The clip limits how far an <i>incentive</i> reaches, not how far a step lands. The adaptive-KL idea of §06 and the KL-targeted step size of the humanoid runs (§12) are the ways to put a number on the drift directly.</p>
+    </section>
+
+    <!-- ═══ 15 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="beyond" data-nav="PPO beyond control">
+      <h3><span class="idx">15</span> PPO beyond control: language models and agents</h3>
+      <p class="lede">This is <b>later work beyond the original study</b>, which evaluated only simulated robotics and Atari.</p>
+      <ul class="notes">
+        <li><b>Preference fine-tuning of language models.</b> Generation is treated as a token-level MDP, a learned reward model scores finished responses, and PPO's clipped surrogate updates the policy while a separate KL term to a frozen reference model keeps it from drifting into reward-model exploits. The two leashes do different jobs: the clip limits each <i>update</i>, the reference KL limits the <i>destination</i>. The full pipeline, and the methods that later replaced PPO there, are on <a href="../../llm/policy-preference-optimization.html#ppo">Policy / Preference Optimization</a>.</li>
+        <li><b>Multi-turn agents.</b> Training tool-using agents on long trajectories with sparse, verifiable outcomes reuses the same machinery — ratio, clip, advantages — with new problems in credit assignment over many turns. See <a href="../../agentic/agentic-rl.html#training">Agentic RL</a>.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 16 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">16</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"PPO clips the gradient."</span> <span class="fix">No — it clips the probability ratio inside the objective.</span> The gradient of each term is either the full importance-weighted policy gradient <code>Â·r·∇log π</code> or exactly zero (§04). Gradient-norm clipping is a separate, optional trick.</div>
+      <div class="wrong"><span class="say">"The clip keeps the new policy within ε of the old one."</span> <span class="fix">No — it removes the incentive to go further, per sample.</span> Ratios routinely leave the band through shared parameters and repeated minibatch steps, and the KL of an update is not bounded (§14).</div>
+      <div class="wrong"><span class="say">"The min is redundant; clip(r)·Â alone would do."</span> <span class="fix">Without the min, harmful moves would be clipped too.</span> A bad action made more likely (<code>Â &lt; 0, r &gt; 1+ε</code>) would sit on a flat region with zero gradient and could never be undone. The min keeps the unclipped, worse value precisely there (§05).</div>
+      <div class="wrong"><span class="say">"Reusing the batch for K epochs makes PPO off-policy."</span> <span class="fix">It is on-policy.</span> Each batch comes from the current <code>θold</code> and is discarded after one iteration; the ratio only corrects for the small drift within that iteration (§10).</div>
+      <div class="wrong"><span class="say">"PPO means the KL-penalty version."</span> <span class="fix">The study's main method is the clipped surrogate.</span> The adaptive KL penalty is presented as an alternative and a baseline, and scored lower in the ablation (0.74 at best vs 0.82, §11).</div>
+      <div class="wrong"><span class="say">"ε = 0.2 is the universal setting."</span> <span class="fix">It won the MuJoCo ablation.</span> The Atari runs used <code>ε = 0.1</code>, annealed to 0 over training (§12).</div>
+    </section>
+
+    <!-- ═══ 17 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">17</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>The problem:</b> multiple gradient steps on <code>L^PG</code> with one batch produce destructively large updates; TRPO fixes it with a KL constraint and second-order machinery, and a fixed KL penalty fails because no single <code>β</code> fits.</li>
+        <li><b>The ratio</b> <code>rₜ = π_θ/π_θold</code> makes <code>L^CPI = Êₜ[rₜÂₜ]</code>, which matches the policy gradient at <code>θold</code> but rewards unlimited movement.</li>
+        <li><b>The clip</b>: <code>L^CLIP = Êₜ[min(rÂ, clip(r, 1−ε, 1+ε)Â)]</code>. For <code>Â &gt; 0</code> the term is <code>Â·min(r, 1+ε)</code>; for <code>Â &lt; 0</code>, <code>Â·max(r, 1−ε)</code>. Gradient is zero only where the policy already moved far enough in the helpful direction.</li>
+        <li><b>A pessimistic bound:</b> <code>L^CLIP ≤ L^CPI</code>, equal near <code>θold</code>; the difference is a coefficient-free hinge penalty on moving too far.</li>
+        <li><b>The loop:</b> N actors × T steps, truncated GAE with <code>λ = 0.95</code>, then K epochs of Adam on minibatches — 320 steps per batch on MuJoCo — with a joint value loss and entropy bonus when the network is shared.</li>
+        <li><b>The evidence:</b> no constraint scored −0.39, clipping at 0.2 scored 0.82, the best adaptive KL 0.74; on Atari PPO learned faster than A2C and ACER and matched ACER at the end, with much less machinery.</li>
+        <li><b>The caveat:</b> clipping is an incentive, not a guarantee — learning rate, epochs, minibatch size and implementation details set the real trust region.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Reinforcement learning deep dives" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="dqn.html">← DQN</a>
+      <a href="../reinforcement-learning.html" style="color:var(--muted)">Reinforcement Learning · overview</a>
+      <a href="../../llm/policy-preference-optimization.html">Policy / Preference Optimization →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="ppo.viz.js"></script>
+</body>
+</html>

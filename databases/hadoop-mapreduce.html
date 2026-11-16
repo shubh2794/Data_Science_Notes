@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Hadoop &amp; MapReduce</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Hadoop &amp; MapReduce</h1>
+      <p>The batch paradigm that started "big data": when a dataset no longer fits one machine, <b>ship the computation to the data</b>, express it as two pure functions — <b>map</b> and <b>reduce</b> — and let the framework handle partitioning, sorting, network transfer, and machine failure. Spark replaced the engine, but nearly every idea here (partitioners, shuffles, locality, speculative tasks) survives in it.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Data Systems</span>
+        <span class="pill">Batch processing</span>
+        <span class="pill">Distributed compute</span>
+        <span class="pill">Fault tolerance</span>
+      </div>
+    </header>
+
+    <section class="topic" id="problem" data-nav="Why MapReduce">
+      <h3><span class="idx">01</span> The problem: computation is cheap, moving data is not</h3>
+      <p class="lede">Scanning 10 TB from one disk at ~200 MB/s takes ~14 hours. Spread across 1,000 disks it takes under a minute — if each machine processes the bytes sitting on its own disk.</p>
+      <ul class="notes">
+        <li><b>Scale out, not up.</b> Commodity machines are cheap and fail often. At 1,000 nodes with a 3-year mean time between failures, you lose roughly one machine per day — so failure is a normal operating condition, not an exception.</li>
+        <li><b>Move code, not data.</b> A job's code is kilobytes; its input is terabytes. The scheduler places a task on (or near) the machine holding the input block — <b>data locality</b>.</li>
+        <li><b>Restrict the programming model to make the hard parts automatic.</b> If user code is a pure function over records, the framework can re-run any piece anywhere, any number of times, and get the same answer. That determinism is what makes parallelism and recovery free.</li>
+      </ul>
+      <div class="callout"><b>One line:</b> MapReduce trades expressiveness for automation — you write two side-effect-free functions; the framework owns distribution, the shuffle, retries, and stragglers.</div>
+    </section>
+
+    <section class="topic" id="model" data-nav="Programming model">
+      <h3><span class="idx">02</span> The programming model: map, shuffle, reduce</h3>
+      <p class="lede">Every job is the same three-phase skeleton. Only the two functions at either end are yours.</p>
+      <div class="formula"><span class="lbl">the two user functions, as types</span><span class="eq">map    : (k₁, v₁)         → list(k₂, v₂)</span>
+<span class="eq">reduce : (k₂, list(v₂))   → list(k₃, v₃)</span>
+<span class="lbl">what the framework does between them</span><span class="eq">shuffle : group all (k₂, v₂) by k₂, sort by k₂, deliver each group to exactly one reducer</span></div>
+      <table class="cmp">
+        <tr><th>Phase</th><th>Who runs it</th><th>What happens</th></tr>
+        <tr><td><b>Input split</b></td><td>Framework</td><td>Input files are cut into splits (typically one per storage block); one <b>map task</b> per split.</td></tr>
+        <tr><td><b>Map</b></td><td>User code, M parallel tasks</td><td>Each record → zero or more intermediate key/value pairs. Output is buffered in memory, partitioned, sorted, and <b>spilled to local disk</b>.</td></tr>
+        <tr><td><b>Combine</b> (optional)</td><td>User code, on the map side</td><td>A mini-reduce over one map task's output, to shrink what crosses the network.</td></tr>
+        <tr><td><b>Shuffle &amp; sort</b></td><td>Framework</td><td>Each reducer pulls its partition from every mapper over the network, then merge-sorts so equal keys are adjacent.</td></tr>
+        <tr><td><b>Reduce</b></td><td>User code, R parallel tasks</td><td>Called once per distinct key with an iterator of its values; output written to the distributed file system.</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>M and R are independent knobs.</b> M follows the input size (one task per ~128 MB block); R is chosen by you and sets output-file count and reduce parallelism.</li>
+        <li>The only communication between tasks is the shuffle. Map tasks never talk to each other, reduce tasks never talk to each other — which is why any task can be killed and re-run in isolation.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="wordcount" data-nav="Word count dataflow">
+      <h3><span class="idx">03</span> Word count, step by step</h3>
+      <p class="lede">The canonical first job. <code>map</code> emits <code>(word, 1)</code> for every token; <code>reduce</code> sums the ones. Step through the phases, toggle the combiner, and change the reducer count to see how the partitioner routes keys and how much data crosses the network.</p>
+
+      <div class="viz" id="viz-mr">
+        <div class="vhead">
+          <span class="vtitle">MapReduce word-count dataflow</span>
+          <span class="vhint">step phases · toggle combiner · vary reducers</span>
+        </div>
+        <div class="controls">
+          <button type="button" class="btn ghost" id="mr-prev">◀ prev</button>
+          <button type="button" class="btn" id="mr-next">next phase ▶</button>
+          <label>reducers R <input type="range" id="mr-r" min="1" max="4" step="1" value="2"> <b id="mr-rv">2</b></label>
+          <label><input type="checkbox" id="mr-comb"> combiner</label>
+        </div>
+        <svg id="mr-svg" width="640" height="370" viewBox="0 0 640 370" role="img" aria-label="Interactive diagram: word-count data flowing through map, combine, shuffle and reduce phases"></svg>
+        <div class="readout" aria-live="polite" id="mr-read"></div>
+      </div>
+
+      <div class="formula"><span class="lbl">word count in pseudocode</span><span class="eq">map(offset, line):        for w in line.split(): emit(w, 1)</span>
+<span class="eq">combine(w, counts):       emit(w, sum(counts))</span>      <span class="eq"># same code as reduce here</span>
+<span class="eq">reduce(w, counts):        emit(w, sum(counts))</span></div>
+      <ul class="notes">
+        <li>Notice that <b>the</b> appears in every split and always lands on the same reducer — that is the shuffle's contract. A hot key like this is also the seed of <b>reduce-side skew</b> (§05).</li>
+        <li>With the combiner on, each mapper ships one record per distinct word instead of one per token. On natural-language text, where a few words dominate (Zipf's law), this routinely cuts shuffle volume by an order of magnitude.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="shuffle" data-nav="Shuffle &amp; sort">
+      <h3><span class="idx">04</span> Shuffle &amp; sort: the expensive middle</h3>
+      <p class="lede">Map and reduce are embarrassingly parallel. The shuffle is the all-to-all exchange between them, and it is where most MapReduce jobs spend their time.</p>
+      <ul class="notes">
+        <li><b>Map side.</b> Output goes into a circular in-memory buffer (100 MB by default). When it crosses a threshold (80%), a background thread <b>partitions</b>, <b>sorts by key within each partition</b>, optionally runs the combiner, and spills a file to local disk. Multiple spills are merged into one partitioned, sorted file per map task.</li>
+        <li><b>Reduce side.</b> Each reducer fetches its partition from all M mappers over HTTP — an <b>M × R</b> mesh of transfers — then merge-sorts the runs so it can stream one key's values at a time.</li>
+        <li><b>A reducer cannot start reducing until every mapper has finished</b>, because the last mapper might hold values for any key. That barrier is why a single slow map task stalls the whole job.</li>
+      </ul>
+      <div class="formula"><span class="lbl">default partitioner and shuffle cost</span><span class="eq">partition(k) = hash(k) mod R</span>
+<span class="eq">network transfers = M × R</span>      <span class="eq">bytes shuffled ≈ ∑ⱼ |map-output of task j|</span>      <span class="eq">(after combining, if any)</span></div>
+      <div class="callout"><b>Operational rule:</b> the cheapest shuffle byte is the one never emitted. Filter and project inside <code>map</code>, combine where the algebra allows, and compress intermediate output — CPU is cheaper than the network.</div>
+    </section>
+
+    <section class="topic" id="combine" data-nav="Combiners &amp; partitioners">
+      <h3><span class="idx">05</span> Combiners and partitioners</h3>
+      <h4>Combiner: when is it safe?</h4>
+      <ul class="notes">
+        <li>The framework may run the combiner <b>zero, one, or many times</b> on any subset of a key's values. So the operation must be <b>associative and commutative</b>, and its output type must equal its input type.</li>
+        <li><b>Safe:</b> sum, count, min, max, set union, top-k. <b>Unsafe as-is:</b> mean, median, distinct-count. The fix for mean is to carry a decomposable state: emit <code>(sum, count)</code>, combine component-wise, divide only in the reducer.</li>
+      </ul>
+      <div class="formula"><span class="lbl">why a naive mean combiner is wrong</span><span class="eq">mean(mean(1, 2), mean(3)) = mean(1.5, 3) = 2.25</span>   <span class="eq">≠</span>   <span class="eq">mean(1, 2, 3) = 2</span>
+<span class="lbl">decomposable fix</span><span class="eq">(s₁, n₁) ⊕ (s₂, n₂) = (s₁ + s₂, n₁ + n₂)</span>      <span class="eq">final mean = s / n</span></div>
+      <h4>Partitioner: who gets which key</h4>
+      <ul class="notes">
+        <li><b>Hash partitioner</b> (default) balances well when keys are many and roughly uniform. It cannot split a single hot key — all of its values go to one reducer.</li>
+        <li><b>Total-order partitioner</b> samples the keys to pick R−1 split points so reducer i gets a contiguous key range; concatenating the outputs yields a globally sorted file. This is how the classic sort benchmarks were run.</li>
+        <li><b>Custom partitioner</b> for joins and secondary sort: partition on a prefix of a composite key (e.g. user id) while sorting on the full key (user id, timestamp).</li>
+        <li><b>Skew mitigation:</b> salt hot keys (<code>key#0…key#n</code>), aggregate per salt, then aggregate again; or detect heavy hitters by sampling and route them specially.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="hdfs" data-nav="HDFS &amp; locality">
+      <h3><span class="idx">06</span> HDFS and data locality</h3>
+      <p class="lede">MapReduce's speed came from pairing it with a file system that exposed where every block lived.</p>
+      <table class="cmp">
+        <tr><th>Component</th><th>Role</th></tr>
+        <tr><td><b>NameNode</b></td><td>Holds the namespace and the block → DataNode map in memory. A single logical master; production clusters run an active/standby pair with a shared edit log.</td></tr>
+        <tr><td><b>DataNode</b></td><td>Stores blocks on local disks, heartbeats to the NameNode, serves reads directly to clients.</td></tr>
+        <tr><td><b>Block</b></td><td>Large and fixed-size (128 MB default) so seek time is amortised and the metadata stays small.</td></tr>
+        <tr><td><b>Replication</b></td><td>Factor 3 by default. Rack-aware placement: first replica on the writer's node, second on a node in a different rack, third on another node in that second rack — survives a whole-rack loss with only one cross-rack write.</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Locality levels:</b> node-local (read from local disk) → rack-local (one top-of-rack switch hop) → off-rack (crosses the core network, the scarce resource). Schedulers wait briefly for a local slot before accepting a worse one ("delay scheduling").</li>
+        <li><b>The small-files problem.</b> Every file and block costs NameNode memory (on the order of 150 bytes per object), and every small file becomes its own tiny map task. Ten million 10 KB files are far worse than one 100 GB file — compact them.</li>
+        <li>HDFS is <b>write-once, append-only</b>: no in-place updates. That constraint resurfaces later as the reason data lakes needed table formats to get updates and deletes (see <a href="../data-engineering/data-warehousing.html">Data Warehousing</a>).</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="faults" data-nav="Faults &amp; stragglers">
+      <h3><span class="idx">07</span> Fault tolerance, stragglers, and speculative execution</h3>
+      <ul class="notes">
+        <li><b>Task failure:</b> re-run the task elsewhere (up to a retry limit, 4 by default). Because map/reduce are deterministic and inputs are immutable, a re-run produces identical output.</li>
+        <li><b>Node failure:</b> its <i>completed</i> map tasks are also re-run, because their output lived on that node's local disk, not in HDFS. Completed reduce output is already in HDFS and survives.</li>
+        <li><b>Stragglers.</b> A job finishes when its slowest task finishes. A failing disk, a noisy neighbour, or a bad NIC can make one task 5–10× slower than its peers, and at scale the chance that <i>some</i> task is slow approaches certainty.</li>
+        <li><b>Speculative execution</b> launches a backup copy of a lagging task near the end of a phase and takes whichever copy finishes first. It costs extra slots for a large cut in tail latency — but it is harmful for tasks with side effects (writing to an external database), which is another reason to keep tasks pure.</li>
+      </ul>
+      <div class="formula"><span class="lbl">why stragglers are inevitable at scale</span><span class="eq">T<sub>job</sub> = maxᵢ Tᵢ</span>      <span class="eq">P(at least one slow task) = 1 − (1 − p)ⁿ</span>
+<span class="eq">n = 1000, p = 0.001  ⇒  1 − 0.999¹⁰⁰⁰ ≈ 0.63</span></div>
+
+      <div class="viz" id="viz-spec">
+        <div class="vhead">
+          <span class="vtitle">One slow node vs speculative execution</span>
+          <span class="vhint">drag the slowdown · toggle backup tasks</span>
+        </div>
+        <div class="controls">
+          <label>straggler slowdown <input type="range" id="sp-slow" min="1" max="6" step="0.5" value="4"> <b id="sp-slowv">4×</b></label>
+          <label><input type="checkbox" id="sp-on"> speculative execution</label>
+        </div>
+        <svg id="sp-svg" width="640" height="250" viewBox="0 0 640 250" role="img" aria-label="Interactive Gantt chart: eight map tasks, one on a slow node, with optional speculative backup tasks"></svg>
+        <div class="readout" aria-live="polite" id="sp-read"></div>
+      </div>
+    </section>
+
+    <section class="topic" id="yarn" data-nav="YARN">
+      <h3><span class="idx">08</span> YARN: separating resources from the engine</h3>
+      <p class="lede">The first Hadoop fused job scheduling and resource management into one JobTracker, which capped clusters at a few thousand nodes and supported only MapReduce. YARN split the two.</p>
+      <table class="cmp">
+        <tr><th>Daemon</th><th>Scope</th><th>Responsibility</th></tr>
+        <tr><td><b>ResourceManager</b></td><td>Cluster</td><td>Arbitrates CPU/memory among applications via pluggable schedulers (capacity queues, fair share).</td></tr>
+        <tr><td><b>NodeManager</b></td><td>Per machine</td><td>Launches and monitors <b>containers</b> (a bounded slice of memory and vcores); reports health.</td></tr>
+        <tr><td><b>ApplicationMaster</b></td><td>Per job</td><td>Negotiates containers from the RM, schedules the job's tasks into them, handles task retries and speculation.</td></tr>
+      </table>
+      <ul class="notes">
+        <li>Because the AM is per-application, YARN became a generic cluster OS: MapReduce, Spark, Tez, and Flink all ran as YARN applications on the same hardware.</li>
+        <li>Today Kubernetes fills the same role in many shops; the RM/AM split maps onto the Kubernetes scheduler plus a per-job driver or operator.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="patterns" data-nav="Design patterns">
+      <h3><span class="idx">09</span> Design patterns: joins, sorting, and iteration</h3>
+      <table class="cmp">
+        <tr><th>Pattern</th><th>How it works</th><th>Cost / caveat</th></tr>
+        <tr><td><b>Reduce-side join</b></td><td>Map tags each record with its source table and emits the join key; reducer sees both sides for a key and pairs them.</td><td>Shuffles both tables in full. Works for any sizes; skewed join keys hurt.</td></tr>
+        <tr><td><b>Map-side (broadcast) join</b></td><td>Ship the small table to every mapper (distributed cache), hold it in a hash map, join while streaming the big table.</td><td>No shuffle at all. Requires the small side to fit in memory.</td></tr>
+        <tr><td><b>Secondary sort</b></td><td>Composite key (k, t); partition and group on k, sort on (k, t), so values arrive time-ordered.</td><td>Avoids buffering a key's values in reducer memory.</td></tr>
+        <tr><td><b>Inverted index</b></td><td>map: doc → (term, doc id); reduce: term → posting list.</td><td>The job MapReduce was built for: web-scale indexing.</td></tr>
+        <tr><td><b>Iterative algorithm</b> (PageRank, k-means)</td><td>One MapReduce job per iteration, chained by a driver.</td><td>Every iteration re-reads input and writes output to replicated HDFS — the fatal cost (§10).</td></tr>
+      </table>
+    </section>
+
+    <section class="topic" id="spark" data-nav="Why Spark won">
+      <h3><span class="idx">10</span> Why it gave way to Spark</h3>
+      <p class="lede">MapReduce's rigid two-stage shape and disk-everything durability were the right defaults for 2004 web indexing and the wrong ones for interactive SQL and iterative machine learning.</p>
+      <table class="cmp">
+        <tr><th>Concern</th><th>MapReduce</th><th><a href="../programming/apache-spark.html">Apache Spark</a></th></tr>
+        <tr><td>Between stages</td><td>Materialise to HDFS (3× replicated) between jobs; spill to disk inside a job</td><td>Pipelines narrow operations in memory; shuffle files on local disk only at wide boundaries</td></tr>
+        <tr><td>Job shape</td><td>Exactly map → reduce; multi-step logic = chain of jobs</td><td>Arbitrary DAG of many stages in one job</td></tr>
+        <tr><td>Iteration</td><td>Re-read input from disk each pass</td><td><code>cache()</code> the working set once, iterate in memory</td></tr>
+        <tr><td>Recovery</td><td>Re-run the task from its durable input</td><td>Recompute lost partitions from <b>lineage</b>; checkpoint long lineages</td></tr>
+        <tr><td>API</td><td>Low-level Java classes; SQL bolted on via Hive</td><td>DataFrames/SQL with a cost-based optimiser; Python, Scala, SQL, R</td></tr>
+        <tr><td>Latency floor</td><td>Tens of seconds of JVM/task startup per job</td><td>Long-lived executors; sub-second tasks</td></tr>
+      </table>
+      <ul class="notes">
+        <li>For iterative ML, keeping the working set in memory made Spark one to two orders of magnitude faster on the same hardware — the gap that decided the market.</li>
+        <li>What survived: HDFS-style block storage (now mostly cloud object stores), YARN-style resource managers, columnar file formats born in the Hadoop ecosystem, and the whole <b>map → partition → shuffle → reduce</b> vocabulary, which is exactly how a Spark stage boundary works.</li>
+      </ul>
+    </section>
+
+    <section class="topic" id="takeaways">
+      <h3><span class="idx">11</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Two pure functions, one framework.</b> Determinism is what makes re-execution, speculation, and parallelism automatic.</li>
+        <li><b>The shuffle is the cost centre:</b> M × R transfers, sort, and a global barrier. Filter early, combine where associative and commutative, compress.</li>
+        <li><b>Hash partitioning can't split a hot key</b> — salt it or special-case heavy hitters.</li>
+        <li><b>Locality + replication</b> (128 MB blocks, 3 replicas, rack-aware) let compute run where data sits and survive routine machine loss.</li>
+        <li><b>Stragglers set the job time;</b> speculative backups trim the tail at the price of extra slots.</li>
+        <li>Disk materialisation between every step is why <a href="../programming/apache-spark.html">Spark</a> replaced it — but the vocabulary carries straight over. For the storage side see <a href="../databases/distributed-storage.html">Distributed Storage</a> and <a href="../databases/sharding-replication.html">Sharding &amp; Replication</a>.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="hadoop-mapreduce.viz.js"></script>
+</body>
+</html>

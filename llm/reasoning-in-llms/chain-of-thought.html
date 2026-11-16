@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · Chain-of-Thought Prompting</title>
+<script src="../../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../../notes.css" />
+<style>
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .cards .box{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel-2)}
+  .cards .box .n{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)}
+  .cards .box .t{font-size:14px;font-weight:600;margin:3px 0 5px;color:var(--ink)}
+  .cards .box .g{font-size:12.5px;color:var(--muted);line-height:1.45}
+  .cards .box.bad{border-left:3px solid var(--bad)}
+  .cards .box.good{border-left:3px solid var(--good)}
+  .cards .box.warn{border-left:3px solid var(--accent-2)}
+  .wrong{border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:9px;padding:10px 14px;margin:10px 0;background:var(--panel-2);font-size:13.5px}
+  .wrong .say{color:var(--bad);font-weight:600}
+  .wrong .fix{color:var(--good);font-weight:600}
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.num{font-family:"SF Mono",Menlo,monospace;text-align:right;color:var(--ink)}
+  table.grid2 tr.hl td{background:rgba(45,212,191,.07)}
+  .prompt{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:14px 0}
+  .prompt .col{border:1px solid var(--line);border-radius:9px;padding:10px 13px;background:var(--panel-2);font-size:13px;line-height:1.5}
+  .prompt .col .h{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+  .prompt .q{color:var(--ink)}
+  .prompt .cot{background:rgba(45,212,191,.13);border-radius:3px;padding:0 2px}
+  .prompt .out{border-top:1px dashed var(--line);margin-top:8px;padding-top:6px}
+  .prompt .ok{color:var(--good);font-weight:600}
+  .prompt .no{color:var(--bad);font-weight:600}
+  @media (max-width:720px){.prompt{grid-template-columns:1fr}}
+  .controls button{background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
+        padding:4px 11px;font-size:12.5px;cursor:pointer}
+  .controls button:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <p style="margin:0 0 6px;font-size:13px;color:var(--muted)"><a href="../reasoning-in-llms.html">Reasoning in LLMs</a> · deep dive</p>
+      <h1>Chain-of-Thought Prompting</h1>
+      <p>Put worked intermediate steps into the few-shot exemplars and a large enough model will write its own steps before answering — no fine-tuning, one frozen checkpoint. This page goes past "think step by step": exactly what was in the prompt, how the gain depends on model scale and on problem difficulty, the three ablations that rule out the cheap explanations, how robust the effect was to who wrote the exemplars, what the wrong chains looked like, the commonsense and symbolic results including length generalisation, and what the original study explicitly does <i>not</i> claim.</p>
+      <div style="margin-top:10px">
+        <span class="pill">LLMs &amp; Generative AI</span>
+        <span class="pill">Reasoning · Prompting</span>
+        <span class="pill">⟨input, chain, output⟩ · emergence with scale · ablations · annotator robustness · error analysis · length generalisation · limits</span>
+      </div>
+    </header>
+
+    <!-- ═══ 01 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="idea" data-nav="What the method is">
+      <h3><span class="idx">01</span> What chain-of-thought prompting is</h3>
+      <p class="lede"><b>A chain of thought is a series of intermediate natural-language reasoning steps that lead to the final output.</b> Chain-of-thought prompting is ordinary few-shot prompting in which every exemplar is a triple ⟨input, chain of thought, output⟩ instead of a pair ⟨input, output⟩. Nothing is trained; the model sees the triples in context and imitates the format on the test question.</p>
+
+      <div class="formula"><span class="lbl">standard few-shot prompt vs chain-of-thought prompt</span><span class="eq">standard:   P  =  [x₁, y₁] [x₂, y₂] … [x_k, y_k]  x            model continues with   y
+CoT:        P  =  [x₁, c₁, y₁] … [x_k, c_k, y_k]  x          model continues with   c, y
+
+x = question     c = chain of thought (natural language + inline arithmetic)     y = answer
+k = 8 hand-written exemplars for the math word problems (AQuA: 4, see §02)</span>
+<span class="lbl">what the model is effectively sampling (greedy decoding in the study)</span><span class="eq">p(c, y | P, x)  =  p(c | P, x) · p(y | c, P, x)
+
+the answer token(s) are conditioned on the chain already written, so the
+chain can change the answer — the point the "reasoning after answer" ablation tests (§06)</span></div>
+
+      <p>The study's own illustration (its Figure 1) is a single exemplar followed by a test question. With the plain prompt the model answers directly and gets it wrong; with the chain in the exemplar it writes a chain and gets it right:</p>
+      <div class="prompt" role="group" aria-label="Side-by-side prompts: standard prompting on the left, chain-of-thought prompting on the right, with the same exemplar question and the same test question.">
+        <div class="col">
+          <div class="h">standard prompting</div>
+          <div class="q">Q: Roger has 5 tennis balls. He buys 2 more cans of tennis balls. Each can has 3 tennis balls. How many tennis balls does he have now?</div>
+          <div>A: The answer is 11.</div>
+          <div class="q" style="margin-top:6px">Q: The cafeteria had 23 apples. If they used 20 to make lunch and bought 6 more, how many apples do they have?</div>
+          <div class="out">model: A: The answer is 27. <span class="no">✗</span></div>
+        </div>
+        <div class="col">
+          <div class="h">chain-of-thought prompting</div>
+          <div class="q">Q: Roger has 5 tennis balls. He buys 2 more cans of tennis balls. Each can has 3 tennis balls. How many tennis balls does he have now?</div>
+          <div>A: <span class="cot">Roger started with 5 balls. 2 cans of 3 tennis balls each is 6 tennis balls. 5 + 6 = 11.</span> The answer is 11.</div>
+          <div class="q" style="margin-top:6px">Q: The cafeteria had 23 apples. If they used 20 to make lunch and bought 6 more, how many apples do they have?</div>
+          <div class="out">model: A: <span class="cot">The cafeteria had 23 apples originally. They used 20 to make lunch. So they had 23 - 20 = 3. They bought 6 more apples, so they have 3 + 6 = 9.</span> The answer is 9. <span class="ok">✓</span></div>
+        </div>
+      </div>
+      <p style="font-size:12.5px;color:var(--muted)">Highlighted text is the chain of thought. The figure is illustrative; the prompt actually used for evaluation (§02) has eight exemplars.</p>
+
+      <h4>The four properties the study argues for</h4>
+      <div class="cards">
+        <div class="box good"><div class="n">1 · decomposition</div><div class="t">More computation for harder problems</div><div class="g">A multi-step problem is split into intermediate steps, so problems that need more steps get more generated tokens — "in principle".</div></div>
+        <div class="box good"><div class="n">2 · interpretability</div><div class="t">A window into the behaviour</div><div class="g">The chain suggests how an answer was reached and where it went wrong — with the explicit caveat that fully characterising the computation behind an answer remains open (§11).</div></div>
+        <div class="box good"><div class="n">3 · generality</div><div class="t">Any task solvable via language</div><div class="g">Math word problems, commonsense, symbolic manipulation — and, at least in principle, any task humans solve through language.</div></div>
+        <div class="box good"><div class="n">4 · ease</div><div class="t">Off-the-shelf models, a few exemplars</div><div class="g">Elicited from a sufficiently large frozen model just by writing chains into the few-shot exemplars. No model was fine-tuned for the study.</div></div>
+      </div>
+      <div class="callout"><b>Why "chain of thought" and not "solution".</b> The study notes the chain often reads like a worked solution, but keeps the name to stress that it mimics a step-by-step thought process <i>leading to</i> the answer — whereas explanations in earlier rationale work typically come <i>after</i> the prediction. That ordering is exactly what §06 tests. The in-context learning that makes any of this possible is covered on <a href="../large-language-models.html#incontext">large language models</a>; how few-shot exemplars are chosen and ordered in general is on <a href="../prompt-engineering.html#examples">prompt engineering</a>.</div>
+    </section>
+
+    <!-- ═══ 02 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="setup" data-nav="Setup: prompts, data, models">
+      <h3><span class="idx">02</span> The setup: eight exemplars, five math benchmarks, five model families</h3>
+      <p class="lede">Most of the math datasets have only an evaluation split, so the exemplars were <b>written by hand once</b> and the same set of eight was reused for every free-response benchmark — no per-dataset prompt engineering.</p>
+
+      <h4>The prompt</h4>
+      <ul class="notes">
+        <li><b>Math word problems:</b> one set of eight hand-written ⟨question, chain, answer⟩ exemplars, used for GSM8K, SVAMP, ASDiv and MAWPS. The study states these exemplars "did not undergo prompt engineering". <b>AQuA</b> is multiple choice, so it got four exemplars with solutions taken from its training set instead.</li>
+        <li>The number eight was set by the context budget: the main experiments used a fixed eight exemplars "as constrained by the input length of 1024 tokens".</li>
+        <li><b>Standard prompting</b> (the baseline) uses the same questions with the chains removed: question → "The answer is …".</li>
+      </ul>
+      <p>One of the eight math exemplars exactly as it appears in the full prompt (the Annotator A set; the study calls its author "Annotator A"):</p>
+      <div class="formula"><span class="lbl">exemplar 6 of 8 — math word problem prompt</span><span class="eq">Q: There were nine computers in the server room. Five more computers were installed
+   each day, from monday to thursday. How many computers are now in the server room?
+A: There were originally 9 computers. For each of 4 days, 5 more computers were added.
+   So 5 * 4 = 20 computers were added. 9 + 20 is 29. The answer is 29.</span></div>
+      <p>Note the fixed suffix <code>The answer is N.</code> on every exemplar: it is what makes the final answer parseable from free text, and the model copies it.</p>
+
+      <h4>Benchmarks</h4>
+      <table class="grid2">
+        <tr><th>benchmark</th><th>what it is</th><th>evaluation examples</th></tr>
+        <tr class="hl"><td><b>GSM8K</b></td><td>grade-school multi-step math word problems — the hardest set here</td><td class="num">1 319</td></tr>
+        <tr><td><b>SVAMP</b></td><td>math word problems with varying structures</td><td class="num">1 000</td></tr>
+        <tr><td><b>ASDiv</b></td><td>diverse math word problems</td><td class="num">2 096</td></tr>
+        <tr><td><b>AQuA</b></td><td>algebraic word problems, multiple choice</td><td class="num">254</td></tr>
+        <tr><td><b>MAWPS</b></td><td>four subsets: SingleOp, SingleEq, AddSub, MultiArith</td><td class="num">562 / 508 / 395 / 600</td></tr>
+      </table>
+
+      <h4>Models and decoding</h4>
+      <table class="grid2">
+        <tr><th>family</th><th>sizes evaluated</th><th>note</th></tr>
+        <tr><td><b>GPT-3</b></td><td>350M, 1.3B, 6.7B, 175B</td><td>the API models text-ada-001, text-babbage-001, text-curie-001, text-davinci-002 — which the study says "presumably" correspond to instruction-tuned models of those sizes</td></tr>
+        <tr><td><b>LaMDA</b></td><td>422M, 2B, 8B, 68B, 137B</td><td>results averaged over five random exemplar orders (the appendix tables label the smallest model 420M)</td></tr>
+        <tr><td><b>PaLM</b></td><td>8B, 62B, 540B</td><td>single exemplar order</td></tr>
+        <tr><td><b>UL2</b></td><td>20B</td><td>single size</td></tr>
+        <tr><td><b>Codex</b></td><td>code-davinci-002</td><td>size not stated in the study</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>Greedy decoding</b> throughout — one chain per question. The study itself points out that follow-up work improves on this by sampling many chains and taking the majority answer (<a href="../reasoning-in-llms.html#self-consistency">self-consistency</a>).</li>
+        <li>Only LaMDA was run over five exemplar orders; since those showed little variance across orders, the other models were run with one order to save compute.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 03 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="headline" data-nav="Headline results">
+      <h3><span class="idx">03</span> Headline results: a prompt beats a fine-tuned, verifier-reranked model on GSM8K</h3>
+      <p class="lede"><b>PaLM 540B goes from 17.9% with standard prompting to 56.9% with chain-of-thought prompting on GSM8K</b>, past the prior best of 55% — a fine-tuned GPT-3 175B with a verifier. The fine-tuned GPT-3 alone scored 33%.</p>
+
+      <table class="grid2">
+        <tr><th>model · prompting</th><th>GSM8K</th><th>SVAMP</th><th>ASDiv</th><th>AQuA</th><th>MAWPS</th></tr>
+        <tr><td><b>prior best</b> (task-specific fine-tuning)</td><td class="num">55</td><td class="num">57.4</td><td class="num">75.3</td><td class="num">37.9</td><td class="num">88.4</td></tr>
+        <tr><td>UL2 20B · standard → CoT</td><td class="num">4.1 → 4.4</td><td class="num">10.1 → 12.5</td><td class="num">16.0 → 16.9</td><td class="num">20.5 → 23.6</td><td class="num">16.6 → 19.1</td></tr>
+        <tr><td>LaMDA 137B · standard → CoT</td><td class="num">6.5 → 14.3</td><td class="num">29.5 → 37.5</td><td class="num">40.1 → 46.6</td><td class="num">25.5 → 20.6</td><td class="num">43.2 → 57.9</td></tr>
+        <tr><td>GPT-3 175B · standard → CoT</td><td class="num">15.6 → 46.9</td><td class="num">65.7 → 68.9</td><td class="num">70.3 → 71.3</td><td class="num">24.8 → 35.8</td><td class="num">72.7 → 87.1</td></tr>
+        <tr><td>Codex · standard → CoT</td><td class="num">19.7 → 63.1</td><td class="num">69.9 → 76.4</td><td class="num">74.0 → 80.4</td><td class="num">29.5 → 45.3</td><td class="num">78.7 → 92.6</td></tr>
+        <tr class="hl"><td><b>PaLM 540B · standard → CoT</b></td><td class="num">17.9 → 56.9</td><td class="num">69.4 → 79.0</td><td class="num">72.1 → 73.9</td><td class="num">25.2 → 35.8</td><td class="num">79.2 → 93.3</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">Accuracy (%), greedy decoding. Prior-best figures are from the study's results table and come from different earlier systems per column. The GSM8K "55" and the fine-tuned GPT-3 "33" are the values printed in the study's headline bar chart.</p>
+      <ul class="notes">
+        <li><b>New state of the art on GSM8K, SVAMP and MAWPS</b> for PaLM 540B with CoT — though on SVAMP standard prompting (69.4) already beat the prior best (57.4), so CoT is not what crossed the line there.</li>
+        <li><b>Close but not above on ASDiv and AQuA:</b> 73.9 vs 75.3 and 35.8 vs 37.9. (The study describes both as "within 2%"; by these table values the AQuA gap is 2.1 points — our arithmetic.)</li>
+        <li><b>The largest gains are on GSM8K:</b> +39.0 for PaLM 540B, +31.3 for GPT-3 175B, +43.4 for Codex. That is more than a doubling for the largest GPT and PaLM models — PaLM's 56.9 / 17.9 ≈ 3.2× (our arithmetic).</li>
+        <li><b>Not every cell is positive:</b> LaMDA 137B <i>lost</i> 4.9 points on AQuA with CoT.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 04 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="scale" data-nav="Emergence with scale">
+      <h3><span class="idx">04</span> Emergence with scale: it hurts small models and helps only near 100B</h3>
+      <p class="lede"><b>Chain-of-thought prompting does not positively impact performance for small models and only yields gains with models of ~100B parameters.</b> Below that it is usually <i>worse</i> than standard prompting — the study says it hurts "for most models smaller than 10B parameters". Small models write fluent but illogical chains.</p>
+
+      <p>Every point below is a cell of the study's appendix tables (arithmetic, MAWPS subsets, commonsense, symbolic). Standard prompting is dashed, chain of thought solid; the shaded band between them is the CoT gain (teal) or loss (red) at each size. The x-axis is logarithmic in parameters. Codex is in the tables but has no stated size, so it cannot be placed on this axis.</p>
+
+      <div class="viz" id="viz-sc">
+        <div class="vhead">
+          <span class="vtitle">Solve rate vs model size, standard vs chain-of-thought prompting — the study's reported numbers</span>
+          <span class="vhint">pick GSM8K and PaLM: the curves cross between 8B and 62B; pick MAWPS SingleOp and they barely separate at any size</span>
+        </div>
+        <div class="controls">
+          <label>benchmark <select id="sc-d">
+            <optgroup label="arithmetic">
+              <option value="gsm8k" selected>GSM8K</option>
+              <option value="svamp">SVAMP</option>
+              <option value="asdiv">ASDiv</option>
+              <option value="aqua">AQuA</option>
+              <option value="mawps">MAWPS (all)</option>
+            </optgroup>
+            <optgroup label="MAWPS subsets">
+              <option value="singleop">SingleOp (1 step)</option>
+              <option value="singleeq">SingleEq</option>
+              <option value="addsub">AddSub</option>
+              <option value="multiarith">MultiArith (multi-step)</option>
+            </optgroup>
+            <optgroup label="commonsense">
+              <option value="csqa">CSQA</option>
+              <option value="strategyqa">StrategyQA</option>
+              <option value="date">Date Understanding</option>
+              <option value="sports">Sports Understanding</option>
+              <option value="saycan">SayCan</option>
+            </optgroup>
+            <optgroup label="symbolic">
+              <option value="concat2">Last-letter concat · 2 words (in domain)</option>
+              <option value="concat3">Last-letter concat · 3 words (OOD)</option>
+              <option value="concat4">Last-letter concat · 4 words (OOD)</option>
+              <option value="coin2">Coin flip · 2 (in domain)</option>
+              <option value="coin3">Coin flip · 3 (OOD)</option>
+              <option value="coin4">Coin flip · 4 (OOD)</option>
+            </optgroup>
+          </select></label>
+          <label>model family <select id="sc-f">
+            <option value="all" selected>all three</option>
+            <option value="LaMDA">LaMDA</option>
+            <option value="GPT-3">GPT-3</option>
+            <option value="PaLM">PaLM</option>
+          </select></label>
+          <label><input type="checkbox" id="sc-ul2" checked /> show UL2 20B</label>
+          <label><input type="checkbox" id="sc-zoom" /> zoom y-axis to the data</label>
+        </div>
+        <svg id="sc-svg" width="760" height="380" viewBox="0 0 760 380" role="img" aria-label="Line chart of solve rate in percent against model size in billions of parameters on a logarithmic axis from about 0.3 to 600 billion. For each selected model family, LaMDA, GPT-3 and PaLM, a dashed line shows standard prompting and a solid line chain-of-thought prompting, and the region between them is shaded teal where chain of thought is higher and red where it is lower. On GSM8K all three families sit near zero for small models, where chain of thought is slightly worse; the solid lines then rise steeply at the largest sizes, reaching about 14 percent for LaMDA 137B, 47 for GPT-3 175B and 57 for PaLM 540B, while the dashed lines stay below 18 percent. A horizontal dotted line marks the prior supervised best where the study gives one. An optional single pair of points shows UL2 20B. The readout names, for each family, the smallest size from which chain of thought stays ahead, and the gain at the largest size."></svg>
+        <div class="readout" aria-live="polite" id="sc-readout"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Where the crossover sits</b> (GSM8K, from the tables): LaMDA turns positive at 68B (5.7 → 8.2), PaLM between 8B (4.9 → 4.1, negative) and 62B (9.6 → 29.9), GPT-3 only at 175B (every smaller GPT-3 model loses accuracy with CoT). The "~100B" in the study's summary is a description of these three families, not a sharp threshold.</li>
+        <li><b>Standard prompting is nearly flat on GSM8K</b> across these sizes, so the chain-of-thought curve is not "the same scaling, shifted" — it is a different curve. The study's framing: for tasks where standard prompting has a flat scaling curve, CoT can produce a steeply increasing one, which makes standard prompting "only a lower bound" on what a model can do.</li>
+        <li><b>Why small models fail</b>, per the study's FAQ: they fail even easy symbol mapping (§10 shows small models cannot copy a fixed chain structure onto new names); they have weaker arithmetic; and they often never produce a parseable final answer, through repetition or chains that wander. It calls the scale effect a mix of several emergent abilities (semantic understanding, symbol mapping, staying on topic, arithmetic, faithfulness) and notes that scale is confounded with other factors such as training compute.</li>
+      </ul>
+      <div class="callout"><b>Reading the chart honestly.</b> Each family is a different pretraining recipe, so lines from different families are not one scaling law. LaMDA points are averages of five exemplar orders; GPT-3, PaLM and UL2 are single runs. The y-axis starts at 0 unless you tick "zoom". For a general treatment of what "emergent" does and does not mean, see <a href="../large-language-models.html#scaling">scaling on the LLM page</a>.</div>
+    </section>
+
+    <!-- ═══ 05 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="difficulty" data-nav="Harder problems gain more">
+      <h3><span class="idx">05</span> Harder problems gain more; one-step problems gain nothing</h3>
+      <p class="lede">The gain tracks how many steps a problem needs. GSM8K (lowest baseline) more than doubled for the largest models; on MAWPS's one-step <b>SingleOp</b> subset the change was "either negative or very small".</p>
+
+      <table class="grid2">
+        <tr><th>MAWPS subset</th><th>steps</th><th>GPT-3 175B</th><th>PaLM 62B</th><th>PaLM 540B</th></tr>
+        <tr><td><b>SingleOp</b></td><td>one</td><td class="num">90.9 → 88.8</td><td class="num">87.9 → 85.6</td><td class="num">94.1 → 94.1</td></tr>
+        <tr><td><b>SingleEq</b></td><td>one or two</td><td class="num">82.7 → 86.6</td><td class="num">77.2 → 83.5</td><td class="num">86.5 → 92.3</td></tr>
+        <tr><td><b>AddSub</b></td><td>one or two</td><td class="num">83.3 → 81.3</td><td class="num">74.7 → 78.2</td><td class="num">93.9 → 91.9</td></tr>
+        <tr class="hl"><td><b>MultiArith</b></td><td>multi-step</td><td class="num">33.8 → 91.7</td><td class="num">7.3 → 73.7</td><td class="num">42.2 → 94.7</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">Standard → chain-of-thought accuracy (%), from the study's MAWPS-subset table. The study describes SingleOp as needing a single step and groups SingleOp, SingleEq and AddSub as the easy one- or two-step subsets; "multi-step" for MultiArith is our label from the dataset's name and the pattern in the table.</p>
+
+      <p>The study's answer to "will CoT help my task?" is three conditions that should all hold:</p>
+      <div class="cards">
+        <div class="box good"><div class="n">condition 1</div><div class="t">The task needs multiple steps</div><div class="g">A challenging, multi-step reasoning problem — GSM8K, MultiArith — not a one-step lookup or operation.</div></div>
+        <div class="box good"><div class="n">condition 2</div><div class="t">The model is large</div><div class="g">§04: in these families, ~100B parameters.</div></div>
+        <div class="box good"><div class="n">condition 3</div><div class="t">Standard prompting's scaling curve is flat</div><div class="g">If bigger models already solve it with plain prompting (SingleOp at 90%+), there is little headroom for a chain to add.</div></div>
+      </div>
+    </section>
+
+    <!-- ═══ 06 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="ablations" data-nav="Ablations: what it is not">
+      <h3><span class="idx">06</span> The ablations: three cheaper explanations, each ruled out</h3>
+      <p class="lede">If chain of thought helps, maybe something simpler is doing the work. The study builds a prompt variant that isolates each candidate cause and checks whether it alone recovers the gain. <b>None does on GSM8K.</b></p>
+
+      <div class="formula"><span class="lbl">what goes into each exemplar, per variant</span><span class="eq">standard prompting:        ⟨ x , y ⟩
+chain of thought:          ⟨ x , c , y ⟩
+equation only:             ⟨ x , e , y ⟩          e = the math equation, no words
+variable compute only:     ⟨ x , "…" , y ⟩        a run of dots, as many as the characters in e
+reasoning after answer:    ⟨ x , y , c ⟩          the same chain, but written after the answer</span></div>
+
+      <table class="grid2">
+        <tr><th style="width:170px">variant</th><th>hypothesis it isolates</th><th>result</th><th>what that rules out</th></tr>
+        <tr><td><b>equation only</b></td><td>CoT helps because it makes the model write down the equation to evaluate</td><td>doesn't help much on GSM8K; does help on one- and two-step sets (SVAMP, ASDiv, MAWPS)</td><td>"it's just the equation" — on hard problems the question cannot be translated into an equation directly; the natural-language steps do the translation</td></tr>
+        <tr><td><b>variable compute only</b></td><td>CoT helps because more tokens = more computation, more for harder problems</td><td>about the same as standard prompting</td><td>"it's just extra compute" — the tokens must express intermediate steps in language to help</td></tr>
+        <tr><td><b>reasoning after answer</b></td><td>CoT helps because the chain activates relevant pretrained knowledge</td><td>about the same as standard prompting</td><td>"it's just priming" — the answer must actually depend on the chain, i.e. the chain must come first</td></tr>
+      </table>
+
+      <p>The study reports these ablations on GSM8K for LaMDA 137B and PaLM 540B in a bar chart; the numeric tables give them for LaMDA 137B on four math datasets and, without the equation-only variant, on five commonsense and symbolic tasks (SayCan was run with PaLM). The explorer below uses those tables. Error bars are ±1 standard deviation over five random exemplar orders.</p>
+
+      <div class="viz" id="viz-ab">
+        <div class="vhead">
+          <span class="vtitle">Ablations and robustness — reported means ± std over exemplar orders</span>
+          <span class="vhint">GSM8K: every ablation sits at or below the standard bar; switch to SVAMP or ASDiv and equation-only recovers most of the gap</span>
+        </div>
+        <div class="controls">
+          <label>view <select id="ab-v">
+            <option value="ablation" selected>ablations (what else could explain the gain)</option>
+            <option value="robust">robustness (who wrote the chains, which exemplars)</option>
+          </select></label>
+          <label>task <select id="ab-d">
+            <optgroup label="math (LaMDA 137B)">
+              <option value="gsm8k" selected>GSM8K</option>
+              <option value="svamp">SVAMP</option>
+              <option value="asdiv">ASDiv</option>
+              <option value="mawps">MAWPS</option>
+            </optgroup>
+            <optgroup label="commonsense / symbolic">
+              <option value="date">Date Understanding (LaMDA 137B)</option>
+              <option value="sports">Sports Understanding (LaMDA 137B)</option>
+              <option value="saycan">SayCan (PaLM 540B)</option>
+              <option value="concat">Last-letter concat (LaMDA 137B)</option>
+              <option value="coin">Coin flip (LaMDA 137B)</option>
+            </optgroup>
+          </select></label>
+        </div>
+        <svg id="ab-svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Horizontal bar chart of accuracy in percent for prompt variants on the selected task, each bar with a whisker of plus or minus one standard deviation across five exemplar orders. A dashed vertical line marks standard prompting and a solid vertical line marks chain-of-thought prompting, so the space between them is the chain-of-thought gain. In the ablation view on GSM8K with LaMDA 137B, standard prompting is 6.5, equation only 5.4, variable compute only 6.4, reasoning after answer 6.1, and chain of thought 14.3: every ablation is at or below the baseline. On SVAMP, ASDiv and MAWPS the equation-only bar sits much closer to chain of thought. In the robustness view, bars for chains written by annotators A, B and C, a concise style, and three exemplar sets sampled from the GSM8K training set all sit well to the right of the standard line. The readout gives each variant's share of the chain-of-thought gain that it recovers."></svg>
+        <div class="readout" aria-live="polite" id="ab-readout"></div>
+      </div>
+
+      <h4>Why equation-only fails on GSM8K: the study's example</h4>
+      <div class="formula"><span class="lbl">LaMDA 137B, one GSM8K question, two prompts</span><span class="eq">Q: Mike plays ping pong for 40 minutes. In the first 20 minutes, he scores 4 points.
+   In the second 20 minutes, he scores 25% more points. How many total points did he score?
+
+equation only  (wrong):   (4 + 20 * 0.25) = 6. The answer is 6.
+
+chain of thought (right): … So he scored 25% more in the second 20 minutes.
+                          4 x 1.25 = 5. So he scored 5 points in the second 20 minutes.
+                          So he scored 9 points in total. The answer is 9.</span></div>
+      <p>Writing one equation forces the whole semantic parse into a single step; the chain lets each clause be handled separately. On SVAMP, ASDiv and MAWPS, where one or two steps suffice, the equation is easy to read off the question and equation-only prompting recovers much of the gain — the explorer's readout shows how much.</p>
+      <div class="callout"><b>What the ablations do and do not show.</b> They rule out three specific, cheaper explanations for the <i>size</i> of the gain in these models. They do not show what computation the network performs when it writes a chain — the study is explicit that whether the model is "reasoning" stays open (§11).</div>
+    </section>
+
+    <!-- ═══ 07 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="robustness" data-nav="Robustness to the prompt">
+      <h3><span class="idx">07</span> Robustness: other annotators, other styles, other exemplars</h3>
+      <p class="lede">Few-shot prompting is notoriously sensitive — the study cites exemplar permutations moving GPT-3 on SST-2 from 54.3% to 93.4%. So it re-ran CoT with chains written by different people and with entirely different exemplars. <b>Every variant beat standard prompting by a large margin, with visible variance between them.</b></p>
+
+      <table class="grid2">
+        <tr><th>LaMDA 137B · prompt variant</th><th>GSM8K</th><th>SVAMP</th><th>ASDiv</th><th>MAWPS</th></tr>
+        <tr><td>standard prompting</td><td class="num">6.5 ± 0.4</td><td class="num">29.5 ± 0.6</td><td class="num">40.1 ± 0.6</td><td class="num">43.2 ± 0.9</td></tr>
+        <tr class="hl"><td><b>CoT, Annotator A</b> (the main prompt)</td><td class="num">14.3 ± 0.4</td><td class="num">36.7 ± 0.4</td><td class="num">46.6 ± 0.7</td><td class="num">57.9 ± 1.5</td></tr>
+        <tr><td>CoT, Annotator B</td><td class="num">15.5 ± 0.6</td><td class="num">35.2 ± 0.4</td><td class="num">46.5 ± 0.4</td><td class="num">58.2 ± 1.0</td></tr>
+        <tr><td>CoT, Annotator C</td><td class="num">17.6 ± 1.0</td><td class="num">37.5 ± 2.0</td><td class="num">48.7 ± 0.7</td><td class="num">60.1 ± 2.0</td></tr>
+        <tr><td>CoT, intentionally concise style (A)</td><td class="num">11.1 ± 0.3</td><td class="num">38.7 ± 0.8</td><td class="num">48.0 ± 0.3</td><td class="num">59.6 ± 0.7</td></tr>
+        <tr><td>CoT, exemplars sampled from GSM8K train — set α</td><td class="num">12.6 ± 0.6</td><td class="num">32.8 ± 1.1</td><td class="num">44.1 ± 0.9</td><td class="num">53.9 ± 1.1</td></tr>
+        <tr><td>CoT, GSM8K train — set β</td><td class="num">12.7 ± 0.5</td><td class="num">34.8 ± 1.1</td><td class="num">46.9 ± 0.6</td><td class="num">60.9 ± 0.8</td></tr>
+        <tr><td>CoT, GSM8K train — set γ</td><td class="num">12.6 ± 0.7</td><td class="num">35.6 ± 0.5</td><td class="num">44.4 ± 2.6</td><td class="num">54.2 ± 4.7</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">Mean ± standard deviation over five exemplar orders, from the study's arithmetic ablation/robustness table. This table lists LaMDA 137B CoT on SVAMP as 36.7; the main results table (§03) lists 37.5 for the same configuration — the study does not explain the difference.</p>
+
+      <ul class="notes">
+        <li><b>Annotators B and C</b> (two other co-authors) independently wrote chains for the same eight questions, with no instructions beyond "write the step-by-step reasoning". Their chains differ in style — C, for example, splits "2 toys each from mom and dad" into two additions — and both match or beat A on GSM8K.</li>
+        <li><b>Concise style:</b> A rewrote the chains tersely in the style of the GSM8K reference solutions, e.g. "5 * 4 = 20 new computers were added. So there are 9 + 20 = 29 new computers in the server room now". It was the weakest variant on GSM8K (11.1) but still well above 6.5.</li>
+        <li><b>Exemplars from an independent source:</b> three sets of eight sampled from the GSM8K training set, whose reference solutions were written by crowd workers — restricted to ≤ 60 tokens and ≤ 2 steps for a fair comparison. They performed comparably to the hand-written ones on all four datasets, even though each set was used on datasets it was not drawn from.</li>
+        <li><b>Exemplar order</b>: standard deviations across orders are small almost everywhere — except <b>coin flip</b>, a binary classification task, where several same-label exemplars in a row bias the output (Annotator B ± 7.9, C ± 11.1).</li>
+        <li><b>Number of exemplars</b>: on five LaMDA 137B tasks with flat standard-prompting curves (GSM8K, MultiArith, Sports, Coin Flip, Last-letter concat), the CoT advantage held across exemplar counts from 1 up to 8 (1 to 4 for concat). In preliminary runs, going from 8 to 16 standard exemplars did not let standard prompting catch up.</li>
+        <li><b>Across models</b>: the same prompts improved all three main families on every dataset except CSQA and StrategyQA for GPT-3 (§09).</li>
+      </ul>
+      <div class="callout"><b>"Robust" is not "prompt engineering doesn't matter."</b> The study is explicit: on coin flip, accuracy ranged from 99.6% (Annotator A) to 71.4% (Annotator C), both above the 50.0% baseline. And in a preliminary experiment on reversing a list of five items, two co-authors could not write a chain that solved it while a third wrote one that solved it perfectly. The study suggests generating chains automatically with a large model as future work.</div>
+    </section>
+
+    <!-- ═══ 08 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="errors" data-nav="What the chains got wrong">
+      <h3><span class="idx">08</span> Reading the chains: what was right, what was wrong, what scale fixed</h3>
+      <p class="lede">The study hand-read LaMDA 137B's GSM8K chains: 50 random examples it got right and 50 it got wrong. <b>Right answers almost always came with right chains; about half of the wrong answers were "almost right".</b></p>
+
+      <h4>50 correct answers</h4>
+      <ul class="notes">
+        <li>The detailed appendix count: <b>49 of 50</b> had correct logic and math; <b>1</b> reached the right answer through wrong reasoning ("correct by chance"). Five of the 49 had minor imperfections but stayed coherent — an underspecified statement, an unrelated but true statement, two equations with omitted steps, and one with correct math but inverted semantics.</li>
+        <li>The main text's summary says "except two that coincidentally arrived at the correct answer", and the appendix table caption counts 7 imperfect and 43 human-equivalent chains. The three counts are not fully consistent; the qualitative point — correct free-response answers rarely come from broken chains — holds under any of them.</li>
+        <li>The study's own caveat: free-response arithmetic is hard to hit by accident. On multiple-choice or binary tasks (all the commonsense sets) a wrong chain can much more easily land on the right answer, so this result should not be extrapolated to them.</li>
+      </ul>
+
+      <h4>50 wrong answers, categorised by the smallest fix that would make the chain correct</h4>
+      <table class="grid2">
+        <tr><th>category</th><th>definition</th><th>share</th><th>of 50</th></tr>
+        <tr><td><b>calculator error only</b></td><td>chain completely correct except an arithmetic slip</td><td class="num">8%</td><td class="num">4</td></tr>
+        <tr><td><b>symbol mapping error</b></td><td>correct reasoning, wrong numbers plugged into an equation; fixable by editing only the equations</td><td class="num">16%</td><td class="num">8</td></tr>
+        <tr><td><b>one step missing</b></td><td>correct except for one missing reasoning step</td><td class="num">22%</td><td class="num">11</td></tr>
+        <tr class="hl"><td><b>almost correct, total</b></td><td>the three minor categories above</td><td class="num">46%</td><td class="num">23</td></tr>
+        <tr><td><b>major errors</b></td><td>would need substantial edits; almost all involve a semantic-understanding error, and 8 of these 27 were also incoherent (steps not following from earlier ones, or violating world knowledge)</td><td class="num">54%</td><td class="num">27</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">Percentages as reported; the "of 50" counts for the first four rows are our arithmetic from those percentages (27 is stated). Separately, 34% of the wrong chains contained a calculator error in addition to some other error; the categorisation ignores those.</p>
+
+      <h4>A post-hoc calculator</h4>
+      <p>Because some chains were right except for an arithmetic slip, the study re-evaluated every equation in the generated chains with Python's <code>eval</code>, propagating results into later equations by string matching. This is applied <i>after</i> generation; it does not change what the model writes.</p>
+      <table class="grid2">
+        <tr><th>GSM8K</th><th>standard</th><th>CoT</th><th>CoT + external calculator</th></tr>
+        <tr><td>UL2 20B</td><td class="num">4.1</td><td class="num">4.4</td><td class="num">6.9</td></tr>
+        <tr><td>LaMDA 137B</td><td class="num">6.5</td><td class="num">14.3</td><td class="num">17.8</td></tr>
+        <tr><td>GPT-3 175B</td><td class="num">15.6</td><td class="num">46.9</td><td class="num">49.6</td></tr>
+        <tr><td>Codex</td><td class="num">19.7</td><td class="num">63.1</td><td class="num">65.4</td></tr>
+        <tr class="hl"><td>PaLM 540B</td><td class="num">17.9</td><td class="num">56.9</td><td class="num">58.6</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--muted)">From the study's main results table. Its error-analysis appendix quotes the LaMDA 137B figure as 14.3% → 17.3% rather than 17.8%. The calculator helps more where arithmetic is weak (UL2 on SVAMP: 12.5 → 28.3) and leaves AQuA (multiple choice) unchanged in every row.</p>
+
+      <h4>What scale fixed: PaLM 62B → 540B</h4>
+      <p>A coarser follow-up read <b>45 errors made by PaLM 62B</b>: semantic understanding (20), one step missing (18) and other (7 — hallucinations, repetitive outputs, symbol mapping). Scaling to PaLM 540B fixed "a substantial portion" of errors in all three categories; the main text singles out a large portion of the one-step-missing and semantic-understanding errors. (The per-category fixed counts appear only in a chart and are not reproduced here.) The study reads this as consistent with semantic understanding and logical skills being acquired with scale — with the caveat that scale is confounded with training compute.</p>
+      <p>Broken chains are a special case of unfaithful or ungrounded generation; the general problem and its mitigations are on <a href="../hallucination-factuality.html">hallucination &amp; factuality</a>.</p>
+    </section>
+
+    <!-- ═══ 09 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="commonsense" data-nav="Commonsense reasoning">
+      <h3><span class="idx">09</span> Commonsense reasoning: same method, smaller and less uniform gains</h3>
+      <p class="lede">Because the chain is just language, the method transfers to questions about the physical and social world. Five datasets: <b>CSQA</b> (commonsense multiple choice), <b>StrategyQA</b> (implicit multi-hop yes/no), <b>Date Understanding</b> and <b>Sports Understanding</b> (two evaluation-only tasks from a large collaborative benchmark), and <b>SayCan</b> (map an instruction to a sequence of robot actions).</p>
+      <ul class="notes">
+        <li>Exemplars: for CSQA and StrategyQA, training examples with hand-written chains; Date and Sports have no training set, so exemplars were taken from the start of the evaluation set and excluded from scoring; SayCan used training examples from its source dataset with hand-written chains, the chain being an "Explanation:" line before the "Plan:".</li>
+      </ul>
+      <table class="grid2">
+        <tr><th>PaLM · standard → CoT</th><th>CSQA</th><th>StrategyQA</th><th>Date</th><th>Sports</th><th>SayCan</th></tr>
+        <tr><td>8B</td><td class="num">19.8 → 24.9</td><td class="num">55.6 → 53.5</td><td class="num">12.9 → 13.1</td><td class="num">55.1 → 75.2</td><td class="num">34.2 → 40.0</td></tr>
+        <tr><td>62B</td><td class="num">65.4 → 68.1</td><td class="num">58.4 → 63.4</td><td class="num">29.8 → 44.7</td><td class="num">72.1 → 93.6</td><td class="num">65.8 → 70.0</td></tr>
+        <tr class="hl"><td><b>540B</b></td><td class="num">78.1 → 79.9</td><td class="num">68.6 → 77.8</td><td class="num">49.0 → 65.3</td><td class="num">80.5 → 95.4</td><td class="num">80.8 → 91.7</td></tr>
+        <tr><td>GPT-3 175B (for contrast)</td><td class="num">79.5 → 73.5</td><td class="num">65.9 → 65.4</td><td class="num">43.8 → 52.1</td><td class="num">69.6 → 82.4</td><td class="num">81.7 → 87.5</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>StrategyQA:</b> PaLM 540B with CoT beat the prior single-model state of the art — the main text quotes <b>75.6% vs 69.4%</b>. The appendix table lists 77.8% for the same cell; the study does not reconcile the two.</li>
+        <li><b>Sports Understanding:</b> 95.4% vs <b>84%</b> for an unaided sports enthusiast.</li>
+        <li><b>CSQA gain was minimal</b> (+1.8 for PaLM 540B), and for GPT-3 175B CoT <i>lowered</i> both CSQA and StrategyQA — the one place the same prompts did not transfer across model families. The study lists this non-transfer as a limitation.</li>
+        <li>Scaling helped standard prompting on every commonsense task too; CoT added on top, with the gains looking largest at PaLM 540B. All rows are in the scaling explorer of §04.</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 10 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="symbolic" data-nav="Symbolic reasoning, length">
+      <h3><span class="idx">10</span> Symbolic reasoning and length generalisation</h3>
+      <p class="lede">Two synthetic tasks with known structure let the study test something the math sets cannot: <b>do chains generalise to inputs longer than any exemplar?</b> Exemplars always have 2 items; the out-of-domain (OOD) test sets have 3 or 4.</p>
+      <div class="cards">
+        <div class="box"><div class="n">task 1</div><div class="t">Last-letter concatenation</div><div class="g">"Amy Brown" → "yn". Names built from the top thousand first and last names in census data. (First-letter concatenation was judged too easy — models already do it without a chain.)</div></div>
+        <div class="box"><div class="n">task 2</div><div class="t">Coin flip (state tracking)</div><div class="g">"A coin is heads up. Phoebe flips the coin. Osvaldo does not flip the coin. Is the coin still heads up?" → "no".</div></div>
+      </div>
+      <div class="formula"><span class="lbl">a coin-flip exemplar chain — count flips, then use parity</span><span class="eq">Q: A coin is heads up. Maybelle flips the coin. Shalonda does not flip the coin.
+   Is the coin still heads up?
+A: The coin was flipped by Maybelle. So the coin was flipped 1 time, which is an odd
+   number. The coin started heads up, so after an odd number of flips, it will be
+   tails up. So the answer is no.</span></div>
+
+      <table class="grid2">
+        <tr><th>standard → CoT</th><th>concat · 2</th><th>concat · 3 (OOD)</th><th>concat · 4 (OOD)</th><th>coin · 2</th><th>coin · 3 (OOD)</th><th>coin · 4 (OOD)</th></tr>
+        <tr><td>LaMDA 137B</td><td class="num">5.8 → 77.5</td><td class="num">0.0 → 34.4</td><td class="num">0.0 → 13.5</td><td class="num">49.0 → 99.6</td><td class="num">50.7 → 91.0</td><td class="num">49.1 → 74.5</td></tr>
+        <tr><td>PaLM 62B</td><td class="num">6.8 → 85.0</td><td class="num">0.0 → 59.6</td><td class="num">0.0 → 13.4</td><td class="num">91.4 → 96.8</td><td class="num">43.9 → 91.0</td><td class="num">38.3 → 72.4</td></tr>
+        <tr class="hl"><td><b>PaLM 540B</b></td><td class="num">7.6 → 99.4</td><td class="num">0.2 → 94.8</td><td class="num">0.0 → 63.0</td><td class="num">98.1 → 100.0</td><td class="num">49.3 → 98.6</td><td class="num">54.8 → 90.2</td></tr>
+      </table>
+      <ul class="notes">
+        <li><b>In domain, PaLM 540B with CoT is near 100%.</b> Standard prompting already solves the 2-flip coin task at that size (98.1), but not for LaMDA 137B (49.0, chance).</li>
+        <li><b>These in-domain tasks are "toy tasks"</b>: the exemplar chain already contains the full solution structure, and the model only has to repeat it with new symbols. Small models still fail — the ability to do even that only appears around 100B parameters in these families.</li>
+        <li><b>Out of domain, standard prompting fails</b> on both tasks (concat ≈ 0; coin ≈ chance), while CoT gives upward-sloping scaling curves, though below in-domain accuracy. That is the study's evidence that chains enable length generalisation "for language models of sufficient scale".</li>
+      </ul>
+    </section>
+
+    <!-- ═══ 11 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="limits" data-nav="Limitations">
+      <h3><span class="idx">11</span> Limitations the original study states</h3>
+      <div class="cards">
+        <div class="box bad"><div class="n">interpretation</div><div class="t">Not evidence the network "reasons"</div><div class="g">Chain of thought emulates human reasoners' thought processes; whether the network is actually reasoning is left as an open question.</div></div>
+        <div class="box bad"><div class="n">correctness</div><div class="t">No guarantee of correct reasoning paths</div><div class="g">Wrong chains lead to wrong answers and, especially on multiple-choice or binary tasks, to accidentally right ones. Improving factuality of generations is named as future work.</div></div>
+        <div class="box warn"><div class="n">cost</div><div class="t">Only emerges at large scale</div><div class="g">Which makes it costly to serve; inducing reasoning in smaller models is named as a direction.</div></div>
+        <div class="box warn"><div class="n">annotation</div><div class="t">Cheap for prompting, costly for fine-tuning</div><div class="g">Writing eight chains is trivial; writing enough for fine-tuning could be prohibitive — possibly addressed by synthetic data or zero-shot generalisation.</div></div>
+        <div class="box warn"><div class="n">transfer</div><div class="t">Gains don't transfer perfectly across models</div><div class="g">The same prompts hurt GPT-3 on CSQA and StrategyQA (§09); how pretraining data and architecture affect the gain is left open.</div></div>
+        <div class="box warn"><div class="n">prompting</div><div class="t">Prompt choice still matters</div><div class="g">Large annotator variance on some tasks, and at least one task (list reversal) that only one annotator's chain could solve (§07).</div></div>
+      </div>
+      <p>Also worth stating plainly: most of the large-model results are single greedy runs with one exemplar order, and the ablation and robustness tables are LaMDA 137B only (plus SayCan on PaLM), because further GPT-3 and PaLM queries were described as limited and expensive.</p>
+    </section>
+
+    <!-- ═══ 12 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="practice" data-nav="In practice (beyond the study)">
+      <h3><span class="idx">12</span> In practice: what came after the original study</h3>
+      <p class="lede">Everything above is the original study and its reported evidence (2022–early 2023). This section is <b>later work and common practice</b> — summarised from general knowledge, fast-moving, and not part of the original study's claims. No numbers from later work are quoted.</p>
+
+      <table class="grid2">
+        <tr><th style="width:190px">development</th><th>what it changes</th><th>link to this page</th></tr>
+        <tr><td><b>Zero-shot CoT</b></td><td>A separate later study showed that appending a cue such as "Let's think step by step" — with no exemplars at all — elicits chains from large models, usually with a second prompt to extract the final answer.</td><td>removes the need for hand-written exemplars (§02), though few-shot chains still control style and format</td></tr>
+        <tr><td><b><a href="../reasoning-in-llms.html#self-consistency">Self-consistency</a></b></td><td>Sample several chains at temperature &gt; 0 and majority-vote the final answer instead of trusting one greedy chain.</td><td>the follow-up the study itself mentions in its setup; addresses "no guarantee of correct paths" statistically</td></tr>
+        <tr><td><b>Program-aided reasoning</b></td><td>Have the model write code (or equations) as the chain and run it in an interpreter for the answer.</td><td>the generalisation of §08's post-hoc calculator: the model does the semantic parse, the interpreter does arithmetic</td></tr>
+        <tr><td><b><a href="../reasoning-in-llms.html#structured">Decomposition &amp; search</a></b></td><td>Least-to-most prompting, tree-of-thought search, self-critique — beyond one linear chain.</td><td>targets the one-step-missing and semantic errors of §08</td></tr>
+        <tr><td><b>Reasoning interleaved with actions</b></td><td><a href="../../agentic/agents/react.html">ReAct</a> alternates thoughts with tool calls and observations — the chain is grounded by what the environment returns. This is the bridge to <a href="../../agentic/agents.html">agents</a>.</td><td>extends the chain from internal steps to plan → act → observe</td></tr>
+        <tr><td><b><a href="../reasoning-in-llms.html#trained-reasoning">Reasoning-trained models</a></b></td><td>Models post-trained (often with reinforcement learning on verifiable answers) to produce long reasoning before answering, by default.</td><td>moves CoT from a prompt into the weights; explicit "think step by step" or few-shot chains usually add little for such models — see <a href="../prompt-engineering.html#cot">prompt engineering</a></td></tr>
+        <tr><td><b>Smaller capable models</b></td><td>Better data, instruction tuning and distillation of chains from large models produced much smaller models that benefit from CoT.</td><td>the "~100B" of §04 describes the 2022 families tested, not a fixed law</td></tr>
+      </table>
+
+      <h4>The faithfulness question</h4>
+      <p>The study already hedged that a chain is "an interpretable window" but not a full account of the computation (§01, §11). Later work sharpened this: a written chain need not be the cause of the answer — models can be swayed by features of the prompt that the chain never mentions, and editing or truncating a chain does not always change the answer. Treat a chain as useful for accuracy and debugging, not as an audit trail. The hub covers this under <a href="../reasoning-in-llms.html#limits">limits &amp; caveats</a>; grading chains rather than answers is discussed on <a href="../llm-as-a-judge.html">LLM-as-a-judge</a>.</p>
+    </section>
+
+    <!-- ═══ 13 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="misconceptions" data-nav="Common misconceptions">
+      <h3><span class="idx">13</span> Common misconceptions</h3>
+      <div class="wrong"><span class="say">"Chain-of-thought prompting is the 'Let's think step by step' trick."</span> <span class="fix">Not in the original study.</span> It is <i>few-shot</i>: eight exemplars each containing a hand-written chain. The zero-shot cue came from a separate, later study (§12).</div>
+      <div class="wrong"><span class="say">"Showing your working helps any model."</span> <span class="fix">In the reported results it hurt most models under ~10B parameters.</span> Small models produced fluent but illogical chains and scored below standard prompting; the gain appeared only around 100B in these families (§04).</div>
+      <div class="wrong"><span class="say">"It works because the model gets more tokens to think with."</span> <span class="fix">The variable-compute ablation says no.</span> Replacing the chain with the same number of dots performed about like standard prompting (§06). The tokens have to carry natural-language intermediate steps.</div>
+      <div class="wrong"><span class="say">"It's just making the model write the equation."</span> <span class="fix">Only on easy sets.</span> Equation-only prompting recovered much of the gain on one- and two-step datasets but none on GSM8K, where translating the question into an equation is the hard part (§06).</div>
+      <div class="wrong"><span class="say">"The chain is an explanation of how the model got its answer."</span> <span class="fix">The study explicitly does not claim this.</span> A correct chain usually accompanied a correct free-response answer, but there is no guarantee of correct reasoning paths, and accidentally right answers are more likely on multiple-choice tasks (§08, §11).</div>
+      <div class="wrong"><span class="say">"CoT helps on every reasoning benchmark."</span> <span class="fix">Gains were near zero on MAWPS SingleOp and CSQA, and negative for GPT-3 on CSQA and StrategyQA.</span> The study's own guidance: multi-step task, large model, flat standard-prompting curve (§05).</div>
+    </section>
+
+    <!-- ═══ 14 ═══════════════════════════════════════════════════════════ -->
+    <section class="topic" id="takeaways" data-nav="Takeaways">
+      <h3><span class="idx">14</span> Takeaways</h3>
+      <ul class="notes">
+        <li><b>Method:</b> few-shot exemplars as ⟨input, chain of thought, output⟩; one frozen model; greedy decoding; answer parsed from "The answer is …".</li>
+        <li><b>Headline:</b> PaLM 540B on GSM8K, 17.9% → 56.9%, past a 55% prior best from a fine-tuned GPT-3 with a verifier.</li>
+        <li><b>Scale:</b> the gain is emergent — negative for most models under ~10B, positive around 100B in the families tested.</li>
+        <li><b>Difficulty:</b> large gains on multi-step problems (GSM8K, MultiArith), little or none on one-step ones (SingleOp).</li>
+        <li><b>Ablations:</b> equation-only, dots-for-compute and chain-after-answer do not reproduce the GSM8K gain — the natural-language steps, written before the answer, are what matter.</li>
+        <li><b>Robustness:</b> every annotator, style and exemplar set beat standard prompting by a wide margin, but with real variance — prompt choice still matters.</li>
+        <li><b>Beyond math:</b> commonsense gains were smaller and less uniform; on symbolic tasks chains enabled length generalisation at sufficient scale.</li>
+        <li><b>Limits:</b> no claim the network "reasons", no guarantee of correct chains, expensive scale. Later work — self-consistency, program-aided reasoning, <a href="../../agentic/agents/react.html">ReAct</a>, reasoning-trained models — builds directly on these gaps. Back to the <a href="../reasoning-in-llms.html">Reasoning in LLMs</a> hub.</li>
+      </ul>
+    </section>
+
+    <nav class="pager" aria-label="Reasoning in LLMs" style="display:flex;justify-content:space-between;gap:16px;margin:40px 0 24px;font-size:14px">
+      <a href="../reasoning-in-llms.html">← Reasoning in LLMs</a>
+      <a href="../reasoning-in-llms.html" style="color:var(--muted)">Reasoning · overview</a>
+      <a href="../prompt-engineering.html">Prompt Engineering →</a>
+    </nav>
+  </main>
+</div>
+
+<script src="../../data.js"></script>
+<script src="../../notes.js"></script>
+<script src="chain-of-thought.viz.js"></script>
+</body>
+</html>
