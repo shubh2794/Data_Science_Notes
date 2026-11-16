@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes &middot; Agent Evaluation</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>Agent Evaluation</h1>
+      <p>Standard LLM evaluation asks "is this response correct?" Agent evaluation asks something harder: <b>was the whole trajectory good?</b> Did the agent pick the right tools, call them with the right arguments, follow an efficient plan, and know when to stop? Measuring agents means scoring <i>paths</i>, not just endpoints &mdash; and tracking cost alongside correctness, because a system that burns a hundred steps to do what should take five is not working.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Agentic AI</span>
+        <span class="pill">Evaluation</span>
+        <span class="pill">Benchmarks</span>
+        <span class="pill">Trajectory scoring</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="why-different" data-nav="Why agent eval is different">
+      <h3><span class="idx">01</span> Why agent evaluation is different</h3>
+      <p class="lede">An LLM produces text; an agent produces a <b>trajectory</b> &mdash; a sequence of reasoning steps, tool calls, observations, and state changes. Standard text metrics cannot see most of what matters.</p>
+      <ul class="notes">
+        <li><b>Outputs are actions, not tokens.</b> BLEU, ROUGE, and exact-match score a string; they say nothing about whether the agent called the right tool with the right parameters, or whether a database row was correctly updated.</li>
+        <li><b>Intermediate steps matter.</b> Two agents can reach the same final answer &mdash; one in three clean steps, the other after twenty retries and three hallucinated tool calls. The final-answer score is identical; the systems are not.</li>
+        <li><b>Evaluation must check multiple dimensions simultaneously:</b> Did the right tools get called? Were the arguments correct? Was the multi-step plan efficient? Did the agent know when to stop &mdash; or when to escalate?</li>
+        <li><b>Non-determinism is structural.</b> The same input can produce different valid trajectories on different runs. Evaluation must distinguish "different but valid" from "wrong."</li>
+        <li><b>Cost is a first-class metric.</b> An agent that succeeds at 2x the token budget of another is not "just as good" &mdash; in production, cost and latency are constraints, not footnotes.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th></th><th>Standard LLM eval</th><th>Agent eval</th></tr>
+        <tr><td>Unit of evaluation</td><td>Single response</td><td>Full trajectory (plan + actions + outcome)</td></tr>
+        <tr><td>Correctness signal</td><td>Text similarity / exact match</td><td>End-state check + intermediate step audit</td></tr>
+        <tr><td>Efficiency</td><td>Rarely measured</td><td>Steps, tokens, latency, cost per task</td></tr>
+        <tr><td>Tool use</td><td>N/A</td><td>Tool selection precision/recall, argument correctness</td></tr>
+        <tr><td>Determinism</td><td>Expected to be near-deterministic</td><td>Multiple valid trajectories per input</td></tr>
+        <tr><td>Failure modes</td><td>Wrong answer</td><td>Loops, wrong tools, runaway cost, partial completion</td></tr>
+      </table>
+      <div class="callout"><b>Evaluation is the keystone.</b> Without trajectory-level eval, you cannot tell whether a prompt change, model swap, or tool update made the system better or worse. Every other improvement depends on measuring correctly first.</div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="eval-sets" data-nav="Eval sets &amp; hero scenarios">
+      <h3><span class="idx">02</span> Evaluation sets &amp; hero scenarios</h3>
+      <p class="lede">An eval set is a structured collection of test cases, each specifying an input, expected behaviour, and success criteria. <b>Hero scenarios</b> are the highest-priority subset &mdash; the cases that must never regress.</p>
+      <h4>Anatomy of an eval case</h4>
+      <ul class="notes">
+        <li><b>Input state:</b> the starting context &mdash; conversation history, available tools, environment state (files, database rows, API stubs).</li>
+        <li><b>Expected final state:</b> the ground truth &mdash; which tool calls should fire (name + arguments), what state changes should occur, what the response should contain.</li>
+        <li><b>Success criteria:</b> binary (pass/fail on a programmatic check), scored (rubric-based), or ranked (this trajectory is better than that one).</li>
+      </ul>
+      <h4>Building and growing eval sets</h4>
+      <ul class="notes">
+        <li><b>Mine production logs.</b> Real user interactions expose edge cases no one imagined. Filter for failures, escalations, and high-latency runs; convert them to eval cases.</li>
+        <li><b>Hero scenarios first.</b> Identify the 10&ndash;20 representative high-priority use cases that define the system's value. These run on every change.</li>
+        <li><b>Use LLMs to generate adversarial variants:</b> counterfactual editing (change one detail to flip the correct answer), ambiguous intent blending (combine two plausible interpretations), and edge-case injection (unusual parameter values, missing fields).</li>
+        <li><b>Living eval sets grow with the system.</b> Every production bug becomes a regression test. Every new capability adds hero scenarios. Static eval sets become stale and misleading within weeks.</li>
+      </ul>
+      <div class="formula"><span class="lbl">eval set lifecycle</span><span class="eq">seed cases &rarr; production mining &rarr; adversarial generation &rarr; regression suite &rarr; repeat</span></div>
+      <div class="callout"><b>Rule of thumb:</b> if the eval set has not changed in a month, it is not testing the system you have today. Treat eval sets as living specification, not a one-time deliverable.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="component-eval" data-nav="Component evaluation">
+      <h3><span class="idx">03</span> Component evaluation</h3>
+      <p class="lede">Test individual pieces in isolation before wiring them together. Component-level eval localises failures and keeps debugging tractable.</p>
+      <h4>What to test per component</h4>
+      <ul class="notes">
+        <li><b>Tool execution correctness.</b> For each tool: does it accept valid inputs and reject invalid ones? Does it handle edge cases (empty lists, missing fields, timeouts) gracefully? Does the output match the contract? This is classic unit testing, applied to the tool layer.</li>
+        <li><b>Planning quality.</b> Given a task description and available tools, does the planner produce a reasonable strategy? Compare the generated plan against an optimal or reference plan &mdash; measuring step count, tool selection, and ordering.</li>
+        <li><b>Memory retrieval accuracy.</b> Does the agent recall the right context from its memory store? Measure precision and recall of retrieved facts against a labelled set, the same way you would evaluate a <a href="../nlp/retrieval-augmented-generation.html">RAG</a> pipeline.</li>
+        <li><b>Learning effectiveness.</b> If the agent uses episodic memory or in-context learning, does performance improve with experience? Compare metrics on the first attempt vs. repeated attempts at similar tasks.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Component</th><th>Metric</th><th>Test method</th></tr>
+        <tr><td>Tool execution</td><td>Input/output correctness, error handling</td><td>Unit tests with valid, invalid, and edge-case inputs</td></tr>
+        <tr><td>Planner</td><td>Plan quality vs. reference</td><td>Compare generated plan to optimal; score steps, ordering</td></tr>
+        <tr><td>Memory / retrieval</td><td>Precision, recall of retrieved context</td><td>Labelled retrieval set, same as RAG eval</td></tr>
+        <tr><td>Routing / dispatch</td><td>Tool selection accuracy</td><td>Labelled (input, correct tool) pairs</td></tr>
+        <tr><td>Stopping logic</td><td>False-stop rate, over-continuation rate</td><td>Cases where the answer is ready vs. more work needed</td></tr>
+      </table>
+      <div class="callout"><b>Component eval catches problems cheaply.</b> An end-to-end failure that takes an hour to debug often traces to a tool that fails on empty input &mdash; a ten-second unit test.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="holistic-eval" data-nav="Holistic evaluation">
+      <h3><span class="idx">04</span> Holistic evaluation</h3>
+      <p class="lede">End-to-end scenario testing: give the agent a full task and measure whether the entire job gets done correctly, consistently, and coherently.</p>
+
+      <div class="viz" id="viz-radar">
+        <div class="vhead">
+          <span class="vtitle">Component vs. holistic evaluation radar</span>
+          <span class="vhint">Compare two agent versions across five evaluation axes</span>
+        </div>
+        <div class="controls">
+          <button class="btn" id="eval-show-v1">v1 only</button>
+          <button class="btn" id="eval-show-v2">v2 only</button>
+          <button class="btn active" id="eval-show-both">Both</button>
+        </div>
+        <svg id="eval-radar-svg" width="520" height="400" viewBox="0 0 520 400" role="img" aria-label="Interactive radar chart comparing Agent v1 and Agent v2 across five evaluation axes"></svg>
+        <div class="readout" aria-live="polite" id="eval-radar-read"></div>
+      </div>
+
+      <h4>Key dimensions</h4>
+      <ul class="notes">
+        <li><b>Task completion rate.</b> The binary question: did the agent finish the job? Measure pass@1 (single attempt) and pass@k (best of k attempts) to separate "cannot do it" from "does it unreliably."</li>
+        <li><b>Consistency.</b> Same input, same output across runs? High variance signals prompt sensitivity or under-constrained behaviour. Run each scenario multiple times and measure agreement.</li>
+        <li><b>Coherence.</b> Does the agent maintain a logical narrative through the trajectory? Does it contradict earlier steps, forget established facts, or change strategy without cause?</li>
+        <li><b>Hallucination detection.</b> Does the agent fabricate information &mdash; especially tool results it did not actually obtain? Cross-check claims against actual tool outputs in the trace. See <a href="../llm/hallucination-factuality.html">Hallucination &amp; Factuality</a>.</li>
+        <li><b>Robustness.</b> How does performance degrade with typos, ambiguous requests, adversarial prompts, or unexpected tool errors? A system that only works on clean, well-formed inputs is a demo, not a product.</li>
+      </ul>
+      <div class="formula"><span class="lbl">reliability over repeated attempts</span><span class="eq">pass@k = 1 &minus; (1 &minus; p)<sup>k</sup></span></div>
+      <div class="callout"><b>Holistic eval is the final gate</b>, but it is expensive and slow to debug. Use it to catch integration failures that component tests miss &mdash; not as a substitute for them.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="benchmarks" data-nav="Agent-specific benchmarks">
+      <h3><span class="idx">05</span> Agent-specific benchmarks</h3>
+      <p class="lede">Standardised benchmarks let you compare agents against a shared bar &mdash; but the gap between leaderboard position and real-world performance is wide and well-documented.</p>
+      <h4>Major benchmarks</h4>
+      <table class="cmp">
+        <tr><th>Benchmark</th><th>Domain</th><th>Task format</th><th>What it tests</th></tr>
+        <tr><td>SWE-bench</td><td>Code agents</td><td>Given a GitHub issue, produce a correct patch</td><td>Multi-file reasoning, test-driven code generation, tool use</td></tr>
+        <tr><td>GAIA</td><td>General assistants</td><td>Multi-step real-world questions requiring tools</td><td>Planning, web search, calculation, file manipulation</td></tr>
+        <tr><td>WebArena</td><td>Web navigation</td><td>Complete tasks on live websites</td><td>GUI interaction, state tracking, multi-step planning</td></tr>
+        <tr><td>HumanEval / MBPP</td><td>Code generation</td><td>Write a function from a docstring</td><td>Single-step code correctness (less agentic)</td></tr>
+        <tr><td>MMLU / BBH / HELM</td><td>General capability</td><td>Multiple-choice or short-answer</td><td>Broad knowledge and reasoning (not agent-specific)</td></tr>
+        <tr><td>TAU-bench</td><td>Tool-augmented tasks</td><td>Multi-turn tool use with real APIs</td><td>Tool selection, argument generation, error recovery</td></tr>
+      </table>
+      <h4>Custom benchmarks</h4>
+      <ul class="notes">
+        <li>Domain-specific agents (customer support, data analysis, DevOps) need <b>domain-specific eval suites</b>. A code agent benchmark tells you nothing about a support bot's escalation accuracy.</li>
+        <li>Build custom benchmarks the same way you build eval sets: mine production logs, define expected outcomes, automate scoring.</li>
+      </ul>
+      <h4>The leaderboard gap</h4>
+      <ul class="notes">
+        <li>Benchmark scores conflate capability with scaffolding &mdash; the same model scores differently with different prompt templates, retry strategies, and tool configurations.</li>
+        <li>Agents can overfit to benchmark structure: learning the eval harness, not the task. As soon as the benchmark leaks into training data, scores inflate.</li>
+        <li><b>Goodhart's law applies:</b> once a benchmark becomes a target, it ceases to be a good measure. Use benchmarks for coarse comparison; use your own eval sets for real decisions.</li>
+      </ul>
+      <div class="callout"><b>Benchmarks are maps, not territory.</b> They tell you roughly where you stand. Your own eval suite, built from your production cases, tells you whether the system actually works.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="trajectory-cost" data-nav="Trajectory &amp; cost metrics">
+      <h3><span class="idx">06</span> Trajectory &amp; cost metrics</h3>
+      <p class="lede">Final-answer correctness is necessary but not sufficient. Agents need metrics that see the <b>path</b>, not just the destination.</p>
+      <h4>Trajectory scoring</h4>
+      <ul class="notes">
+        <li><b>Step reasonableness.</b> Were the intermediate steps logical? Did each action make progress toward the goal, or was the agent wandering? Score by comparing against a reference trajectory or via a <a href="../llm/llm-as-a-judge.html">judge model</a>.</li>
+        <li><b>Step efficiency.</b> How many steps did the agent take vs. the optimal? A ratio of actual/optimal steps quantifies waste.</li>
+        <li><b>Tool call accuracy.</b> Precision: what fraction of tool calls were necessary? Recall: were all needed tools actually called? This catches both over-calling (wasteful) and under-calling (missed steps).</li>
+      </ul>
+      <div class="formula"><span class="lbl">tool call precision and recall</span><span class="eq">precision = |correct calls| / |total calls made|</span>        <span class="eq">recall = |correct calls| / |calls needed|</span></div>
+      <h4>Cost-adjusted metrics</h4>
+      <ul class="notes">
+        <li><b>Token cost per task:</b> total input + output tokens across all steps. Tracks the monetary cost of a solution.</li>
+        <li><b>Latency per task:</b> wall-clock time from input to final answer. Includes both LLM inference time and tool execution time.</li>
+        <li><b>Accuracy per dollar:</b> task success rate divided by average cost. The metric that actually matters in production &mdash; it rewards both accuracy and efficiency.</li>
+        <li><b>Accuracy per second:</b> same idea, with latency as the denominator. For user-facing systems where response time is a constraint.</li>
+      </ul>
+      <div class="formula"><span class="lbl">cost-adjusted success</span><span class="eq">score<sub>adj</sub> = success &minus; &lambda; &middot; (tokens + tool-time)</span>        <span class="eq">efficiency = success rate / avg cost per task</span></div>
+      <h4>Reward models over trajectories</h4>
+      <ul class="notes">
+        <li>Train a reward model to score entire trajectories, not just final answers. This enables automated scoring at scale and can feed back into training via <a href="../llm/policy-preference-optimization.html">preference optimization</a>.</li>
+        <li>The reward model learns from human annotations of trajectory quality: "this run was efficient and correct" vs. "this run succeeded but was wasteful."</li>
+        <li>Trajectory reward models also enable <a href="agentic-rl.html">agentic RL</a> &mdash; optimising the agent's policy directly on trajectory-level reward.</li>
+      </ul>
+      <div class="callout"><b>An eval without a cost axis misleads.</b> Success rate alone rewards brute force. Always report success <i>per unit of budget</i> &mdash; per dollar, per second, per step.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="lifecycle" data-nav="Eval in the dev lifecycle">
+      <h3><span class="idx">07</span> Evaluation in the development lifecycle</h3>
+      <p class="lede">Evaluation is not a one-time gate before launch &mdash; it is a continuous feedback loop woven into every stage of development and deployment.</p>
+      <h4>Offline eval in CI/CD</h4>
+      <ul class="notes">
+        <li><b>Automated eval on every change.</b> Every code change, prompt edit, or model swap triggers the eval suite. Hero scenarios run first (fast, high signal); the full suite runs nightly or on merge.</li>
+        <li><b>Track metrics over time.</b> Dashboard the key metrics (task completion, cost per task, tool accuracy) with run-over-run comparison. Detect regressions before they reach production.</li>
+        <li><b>Gate merges on eval results.</b> A PR that drops task completion by 3% should not merge, the same way a PR that breaks unit tests should not merge. CI/CD pipeline integration patterns apply directly here.</li>
+      </ul>
+      <h4>Online eval and production</h4>
+      <ul class="notes">
+        <li><b>Shadow mode.</b> Run the new agent version alongside the old one on real traffic, without serving the new responses. Compare outputs offline. Zero user risk, full signal on real inputs.</li>
+        <li><b>A/B testing.</b> Split live traffic between old and new agents, measure task success, user satisfaction, cost, and latency. See <a href="../mlops/ab-testing.html">A/B Testing</a> for statistical rigour.</li>
+        <li><b>Canary deployments.</b> Route a small fraction of traffic to the new version. Monitor for regressions (error spikes, cost blowouts, latency increases). Promote or roll back based on metrics.</li>
+        <li><b>Human-in-the-loop review.</b> For novel or high-stakes domains, human reviewers audit a sample of agent runs. Their annotations feed back into the eval set, closing the loop.</li>
+      </ul>
+      <h4>The eval flywheel</h4>
+      <ul class="notes">
+        <li>Production failures become eval cases. Eval cases drive improvements. Improvements are validated by eval. The system gets better precisely because eval is continuous.</li>
+        <li>See <a href="../mlops/monitoring-and-drift.html">Monitoring &amp; Drift</a> for detecting when the world changes underneath your agent &mdash; new APIs, shifted user behaviour, updated tools.</li>
+      </ul>
+      <div class="callout"><b>Treat eval sets as living specification.</b> They define what the agent <i>should</i> do, and they evolve as the system evolves. A frozen eval suite is a frozen understanding of the problem.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="pitfalls-recap" data-nav="Pitfalls &amp; recap">
+      <h3><span class="idx">08</span> Pitfalls &amp; what to remember</h3>
+      <h4>Pitfalls</h4>
+      <ul class="notes">
+        <li><b>Overfitting to benchmarks (Goodhart's law).</b> Optimising for SWE-bench until the agent exploits the eval harness rather than solving the problem. Use benchmarks for orientation, not navigation.</li>
+        <li><b>Testing only happy paths.</b> Eval sets full of clean, well-formed inputs miss the messy reality of production &mdash; typos, ambiguous intent, missing context, adversarial users.</li>
+        <li><b>Ignoring cost and latency.</b> A system that is 2% more accurate but 5x more expensive is a regression in most production settings. Always report cost-adjusted metrics.</li>
+        <li><b>Static eval sets.</b> An eval suite that has not changed in months is testing yesterday's system. Production logs, new features, and shifting user behaviour all demand new test cases.</li>
+        <li><b>Not testing tool interactions.</b> The agent may reason perfectly but fail because a tool returns unexpected output, times out, or changes its API. Test the tools independently and in combination.</li>
+        <li><b>Scoring only the final answer.</b> Two agents can both get the right answer &mdash; one efficiently, one through a cascade of retries and hallucinated intermediate steps. Trajectory quality matters.</li>
+      </ul>
+      <h4>What to remember</h4>
+      <ul class="notes">
+        <li><b>Agents need trajectory-level eval</b>, not just output-level. Score the path, not only the destination.</li>
+        <li><b>Build living eval sets</b> from production logs, hero scenarios, and adversarial generation. Freeze the format, not the content.</li>
+        <li><b>Test components and end-to-end.</b> Component eval catches bugs cheaply; holistic eval catches integration failures.</li>
+        <li><b>Track cost-adjusted metrics.</b> Success per dollar and success per second are more informative than success alone.</li>
+        <li><b>Integrate eval into CI/CD.</b> Automated offline eval on every change, shadow mode and A/B testing in production, human review for high stakes.</li>
+        <li>Neighbours: the <a href="agents.html">agent loop</a> that generates the trajectories being evaluated, <a href="agentic-design-patterns.html">design patterns</a> that structure the agent, <a href="multi-agent-systems.html">multi-agent systems</a> where eval complexity multiplies, <a href="../llm/llm-as-a-judge.html">LLM-as-a-Judge</a> for automated trajectory scoring, <a href="../machine-learning/model-evaluation.html">model evaluation</a> for the statistical foundations, and <a href="../mlops/monitoring-and-drift.html">monitoring &amp; drift</a> for keeping eval relevant over time.</li>
+      </ul>
+      <div class="callout"><b>The whole page in one line:</b> agent eval scores trajectories, not responses &mdash; build living eval sets, test components and end-to-end, track cost beside correctness, and wire eval into every stage from CI to production.</div>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="agent-evaluation.viz.js"></script>
+</body>
+</html>

@@ -455,6 +455,9 @@ const nodes = [
   {id:"Agent Skills", group:"agent", level:2, link:"agentic/agent-skills.html", desc:"Reusable, composable capabilities an agent can invoke — packaged tools and procedures that extend what an agent can do."},
   {id:"Agentic Design Patterns", group:"agent", level:2, link:"agentic/agentic-design-patterns.html", desc:"Recurring architectures for agent systems — reflection, planning, tool use, and multi-agent collaboration."},
   {id:"Multi-Agent Systems", group:"agent", level:2, link:"agentic/multi-agent-systems.html", desc:"Architecture, coordination, and communication patterns for systems with multiple LLM-based agents — topologies, the CWD model, task allocation, debate, orchestration frameworks, and failure handling."},
+  {id:"Agent UX Design", group:"agent", level:2, link:"agentic/agent-ux.html", desc:"User experience design for agentic AI — interaction modalities, the autonomy slider, trust calibration, sync vs async patterns, communicating capabilities, and designing for failure."},
+  {id:"Agent Evaluation", group:"agent", level:2, link:"agentic/agent-evaluation.html", desc:"Validating and measuring agentic AI systems — trajectory scoring, eval sets, component and holistic testing, agent-specific benchmarks, cost-adjusted metrics, and CI/CD integration."},
+  {id:"Agent Learning", group:"agent", level:2, link:"agentic/agent-learning.html", desc:"How agents learn and improve — nonparametric learning (exemplar retrieval, reflexion, experience replay), parametric learning (fine-tuning, DPO, RLVR), and continuous improvement via feedback pipelines and experimentation."},
 
   // ===== curated expansion (substantial topics; micro-concepts live as sections of these) =====
   // Machine Learning
@@ -599,7 +602,7 @@ const tree = {
   "MLOps & Deployment":["Model Deployment","Monitoring & Drift","CI/CD","Experiment Tracking","LLMOps","Model Acceleration","LLM Serving","Speculative Decoding","A/B Testing","Federated Learning"],
   "Data Viz & Communication":["Dashboards","Data Storytelling"],
   "LLMs & Generative AI":["Large Language Models","Context Engineering","Parameter-Efficient Fine-Tuning","Policy / Preference Optimization","LLM-as-a-Judge","Diffusion LLMs","Vision-Language Models","AI Engineering","Reasoning in LLMs","Hallucination & Factuality","Context-Length Extension","Prompt Engineering","LLM Security","Model Merging","Constrained Generation","Dataset Engineering"],
-  "Agentic AI":["Agents","Agentic RL","Agent Skills","Agentic Design Patterns","Multi-Agent Systems","Computer Control"],
+  "Agentic AI":["Agents","Agentic RL","Agent Skills","Agentic Design Patterns","Multi-Agent Systems","Computer Control","Agent UX Design","Agent Evaluation","Agent Learning"],
   "Speech & Audio":["Speech Processing"],
   "Model Architectures":["Vision Models","NLP Models","LLM Families","Audio Models","Multimodal Models","Document AI Models"],
 };
@@ -1210,6 +1213,9 @@ const cross = [
   ["Agent Skills","Agents"],["Agent Skills","Context Engineering"],["Agent Skills","Computer Control"],
   ["Agentic Design Patterns","Agents"],["Agentic Design Patterns","Reasoning in LLMs"],["Agentic Design Patterns","Agentic RL"],
   ["Multi-Agent Systems","Agents"],["Multi-Agent Systems","Agentic Design Patterns"],["Multi-Agent Systems","Context Engineering"],["Multi-Agent Systems","LLM-as-a-Judge"],["Multi-Agent Systems","LLM Security"],
+  ["Agent UX Design","Agents"],["Agent UX Design","Agentic Design Patterns"],["Agent UX Design","Multi-Agent Systems"],["Agent UX Design","Context Engineering"],["Agent UX Design","Hallucination & Factuality"],
+  ["Agent Evaluation","Agents"],["Agent Evaluation","Model Evaluation"],["Agent Evaluation","LLM-as-a-Judge"],["Agent Evaluation","Agentic RL"],["Agent Evaluation","Monitoring & Drift"],["Agent Evaluation","A/B Testing"],
+  ["Agent Learning","Agents"],["Agent Learning","Agentic RL"],["Agent Learning","Agentic Design Patterns"],["Agent Learning","Policy / Preference Optimization"],["Agent Learning","Parameter-Efficient Fine-Tuning"],["Agent Learning","Context Engineering"],["Agent Learning","RAG"],
 
   // domain bridges (builds-on)
   ["LLMs & Generative AI","Deep Learning","isa"],["Agentic AI","LLMs & Generative AI","isa"],
