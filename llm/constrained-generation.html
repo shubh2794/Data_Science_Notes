@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes &middot; Structured &amp; Constrained Generation</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+
+  <main>
+    <header class="page">
+      <h1>Structured &amp; Constrained Generation</h1>
+      <p>LLM output is stochastic &mdash; every sample is a roll of the dice over a vocabulary of tens of thousands of tokens. Downstream systems that need reliable structure (JSON, SQL, code, branded prose) cannot afford to hope the model formats things correctly. This page covers how to <b>enforce</b> structure at the token level: logits masking, grammar-constrained decoding, FSM-guided generation, style transfer, and the quality trade-offs that come with narrowing the beam.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">LLMs &amp; Generative AI</span>
+        <span class="pill">Decoding</span>
+        <span class="pill">Structured output</span>
+        <span class="pill">Grammars</span>
+        <span class="pill">JSON / code generation</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="why" data-nav="Why constrain generation?">
+      <h3><span class="idx">01</span> Why constrain generation?</h3>
+      <ul class="notes">
+        <li>An LLM samples from <code>P(token | context)</code>. With temperature &gt; 0 and no intervention, any token with nonzero probability can appear &mdash; including tokens that break the JSON you asked for, insert a competitor's name, or produce an invalid SQL keyword.</li>
+        <li><b>Prompt engineering is necessary but not sufficient.</b> You can instruct "respond in valid JSON" and that raises the probability of well-formed output, but it does not make it 1.0. Under distribution shift, long outputs, or low-probability paths, the model will occasionally violate the format. For mission-critical pipelines, "usually works" is not a spec.</li>
+        <li><b>Constrained decoding is deterministic.</b> Instead of hoping the model obeys the format, you <i>prevent</i> non-conforming tokens from being sampled. The constraint acts at the logits level, before sampling, so the model physically cannot emit a disallowed continuation. The distribution is renormalised over the remaining valid tokens and generation proceeds normally.</li>
+        <li><b>Use cases:</b> data extraction into typed schemas (medical records, legal clauses, financial reports), API-ready JSON/XML output, branding compliance (no competitor names, approved terminology only), code generation with syntax enforcement, SQL constrained to a database schema, and templated document generation where certain fields must come from a controlled vocabulary.</li>
+        <li>The spectrum ranges from <b>soft</b> (logit bias &mdash; nudge, don't force) through <b>hard</b> (logits mask &mdash; zero out forbidden tokens) to <b>grammar</b> (every generated prefix must be a valid partial parse of a formal grammar). Harder constraints give stronger guarantees but narrow the beam more.</li>
+      </ul>
+      <div class="callout"><b>One sentence:</b> constrained decoding turns "the model usually produces valid JSON" into "the model can only produce valid JSON" &mdash; moving format correctness from probabilistic to deterministic.</div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="logits-masking" data-nav="Logits masking">
+      <h3><span class="idx">02</span> Logits masking</h3>
+      <p class="lede">Intercept the sampling stage and zero out probabilities of non-conforming tokens &mdash; the simplest and most flexible form of constrained decoding.</p>
+
+      <div class="viz" id="viz-constrained">
+        <div class="vhead">
+          <span class="vtitle">Logits masking in action</span>
+          <span class="vhint">Toggle the constraint to mask invalid tokens; remaining probabilities renormalise. Click Sample to pick a token.</span>
+        </div>
+        <div class="controls">
+          <label><input type="checkbox" id="constrained-toggle"> Constraint active (no competitor names)</label>
+          <button class="btn ghost" id="constrained-btn">Sample</button>
+        </div>
+        <svg id="constrained-svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Interactive diagram: logits masking showing token probability bars, constraint masking, renormalisation, and sampling"></svg>
+        <div class="readout" aria-live="polite" id="constrained-read"></div>
+      </div>
+
+      <h4>How it works</h4>
+      <ul class="notes">
+        <li>At each decoding step the model produces raw logits <code>z ∈ R<sup>|V|</sup></code> over the full vocabulary. A <b>LogitsProcessor</b> receives <code>z</code> and the tokens generated so far, checks each candidate continuation against the active rules, and sets <code>z[t] = -inf</code> for every token <code>t</code> that would violate a constraint. The softmax then assigns zero probability to masked tokens and renormalises over the rest.</li>
+        <li><b>Rules can be anything you can compute in a function:</b> regex match on the decoded string so far, membership in a blocklist (competitor names, profanity), type checks (next token must start a number), or custom business logic.</li>
+        <li><b>Works with beam search:</b> each beam is checked independently. Non-conforming beams are pruned; if all beams violate, the search backtracks one step and retries with stricter masking. After a maximum number of retries, return a refusal or fallback.</li>
+      </ul>
+      <div class="formula"><span class="lbl">masking</span>  <span class="eq">z'[t] = z[t] &middot; <b>1</b>[valid(t, context)]  +  (-&infin;) &middot; <b>1</b>[&not;valid(t, context)]</span>
+<span class="lbl">renormalised probability</span>  <span class="eq">P'(t | ctx) = exp(z'[t]) / &sum;<sub>t'&in;V</sub> exp(z'[t'])</span>     <span class="eq">(&sum; only over valid tokens since exp(-&infin;) = 0)</span></div>
+
+      <h4>The retry antipattern</h4>
+      <ul class="notes">
+        <li>The alternative to logits masking is the <b>generate-check-retry</b> loop: generate a full output, validate it, and if it fails, retry with a modified prompt. This is simpler to implement but far less efficient.</li>
+        <li>If the model produces valid output with probability <code>p</code>, the expected number of attempts is <code>1/p</code>. At <code>p = 90%</code> you need 1.1 attempts on average &mdash; tolerable. At <code>p = 50%</code> you need 2 &mdash; costly. At <code>p = 10%</code> you need 10 &mdash; unacceptable. The retry loop is only viable when <code>p &gt; 90%</code>.</li>
+        <li>Logits masking avoids this entirely: every generation is valid by construction. The cost is that you need access to the logits (local model or an API that exposes a logits processor hook), and the mask function must run fast enough per token.</li>
+      </ul>
+      <div class="formula"><span class="lbl">retry cost</span>  <span class="eq">E[attempts] = 1 / p</span>     <span class="eq">p = P(output is valid)</span>
+<span class="lbl">example</span>  <span class="eq">p = 0.70  &rArr;  E[attempts] &asymp; 1.43</span>     <span class="eq">p = 0.30  &rArr;  E[attempts] &asymp; 3.33</span></div>
+      <div class="callout"><b>Takeaway:</b> logits masking is the token-level equivalent of input validation &mdash; prevent bad output at the source rather than catching it after the fact. Use it whenever you have logit access and a checkable rule.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="grammar-constrained" data-nav="Grammar-constrained decoding">
+      <h3><span class="idx">03</span> Grammar-constrained decoding</h3>
+      <p class="lede">Define an output schema &mdash; JSON Schema, BNF grammar, or regex &mdash; and the serving infrastructure constrains generation to conform, server-side.</p>
+      <ul class="notes">
+        <li><b>The idea:</b> instead of writing custom masking rules per use case, express the desired output format as a formal grammar and let the decoding engine enforce it. The engine compiles the grammar into an automaton, tracks the parse state at each step, and masks out tokens that would leave no valid completion.</li>
+        <li><b>JSON Schema mode</b> is the most common variant. You provide a JSON Schema describing the desired output shape (types, required fields, enums, nested objects). The engine ensures every generated token is part of a string that will parse as valid JSON conforming to that schema. Supported by major API providers: OpenAI's <code>response_format: {type: "json_schema", json_schema: {...}}</code>, and Anthropic's tool use with input schemas.</li>
+        <li><b>BNF / EBNF grammars</b> give full control. <code>llama.cpp</code> supports GBNF (a BNF variant) that can describe any context-free language &mdash; JSON, SQL subsets, custom DSLs. The grammar is compiled into a pushdown automaton that runs alongside generation.</li>
+        <li><b>Regex constraints</b> force the output to match a regular expression, compiled to an FSM (see <a href="#algorithms">&sect;06</a>). Libraries like <code>outlines</code> support this natively.</li>
+        <li><b>Trade-off:</b> more constraints = fewer valid tokens at each step = narrower beam. If the constraint is very tight (e.g., enum with 3 values), the model is basically a classifier with extra steps. If the constraint is too loose (any valid JSON), you get syntactic correctness but no semantic guarantees. The sweet spot is a schema tight enough to be useful downstream but loose enough that the model's distribution still has room to express quality.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Mechanism</th><th>Expressiveness</th><th>Typical use</th><th>Provider examples</th></tr>
+        <tr><td>JSON mode</td><td>Any valid JSON (no schema)</td><td>Quick structured output</td><td>OpenAI <code>json_object</code>, local via vLLM</td></tr>
+        <tr><td>JSON Schema</td><td>JSON conforming to a schema</td><td>Typed API responses, data extraction</td><td>OpenAI <code>json_schema</code>, Anthropic tool use</td></tr>
+        <tr><td>Regex</td><td>Regular languages</td><td>Phone numbers, dates, enums, IDs</td><td><code>outlines</code>, vLLM regex</td></tr>
+        <tr><td>BNF / GBNF</td><td>Context-free languages</td><td>SQL, code, custom DSLs</td><td><code>llama.cpp</code>, TGI grammar</td></tr>
+        <tr><td>Tool use / function calling</td><td>Schema per tool</td><td>Structured actions in agent loops</td><td>OpenAI functions, Anthropic tools, Gemini</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> grammar-constrained decoding is the production-grade way to enforce format &mdash; express the contract as a schema, let the engine enforce it, and get syntactically valid output by construction.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="formats" data-nav="Structured output formats">
+      <h3><span class="idx">04</span> Structured output formats</h3>
+      <p class="lede">Each output format has different constraint mechanics. JSON needs bracket matching; SQL needs grammar compliance; code needs indent tracking.</p>
+      <ul class="notes">
+        <li><b>JSON:</b> the workhorse. Constraints enforce bracket/brace matching, correct string quoting, comma placement, and type conformance (string vs number vs boolean vs null). With a schema, additionally enforce field names, required fields, enum values, and nesting depth. JSON mode (without schema) guarantees <i>syntactically</i> valid JSON but not <i>semantically</i> correct output &mdash; the fields might be named wrong or the values meaningless.</li>
+        <li><b>XML / YAML:</b> XML needs tag matching and attribute quoting; YAML needs consistent indentation. Both are less commonly constrained at the token level than JSON because their grammars are more complex, but template-based approaches (generate into predefined slots) work well.</li>
+        <li><b>Function calling / tool use:</b> the model outputs a structured call &mdash; function name + arguments as a JSON object conforming to a per-tool schema. The API provider enforces the schema; the caller validates argument values. This is the standard pattern for <a href="../agentic/agents.html">agent tool invocation</a>.</li>
+        <li><b>SQL generation:</b> constrain to valid SQL grammar plus the target database's schema (table names, column names, types). Can be done with GBNF grammars or by fine-tuning on the schema and validating with a parser post-generation. Text-to-SQL systems often use constrained decoding to avoid hallucinating table or column names.</li>
+        <li><b>Code generation:</b> syntax enforcement for a target language. Python needs indent tracking (a pushdown automaton tracking scope depth); languages with braces need brace matching. In practice, most code generation relies on model quality plus post-generation parsing rather than token-level constraints, because the grammar of a full programming language is large and slow to enforce per-token.</li>
+        <li><b>Markdown / templated prose:</b> a lightweight constraint &mdash; force heading structure, bullet format, or section markers. Often done with template-based generation (<a href="#implementation">&sect;08</a>) rather than grammar constraints.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Format</th><th>Grammar class</th><th>Key constraint</th><th>Common approach</th></tr>
+        <tr><td>JSON</td><td>Context-free</td><td>Bracket matching, type, schema</td><td>JSON Schema mode (API or library)</td></tr>
+        <tr><td>SQL</td><td>Context-free</td><td>Grammar + DB schema</td><td>GBNF grammar or parser validation</td></tr>
+        <tr><td>Python</td><td>Context-sensitive (indentation)</td><td>Indent depth + syntax</td><td>Post-generation parse; partial token-level</td></tr>
+        <tr><td>XML</td><td>Context-free</td><td>Tag matching</td><td>Template slots or GBNF</td></tr>
+        <tr><td>Function call</td><td>JSON subset</td><td>Tool schema</td><td>API-enforced (provider-side)</td></tr>
+      </table>
+      <div class="callout"><b>Takeaway:</b> match the constraint mechanism to the grammar class. Regular expressions for flat formats, context-free grammars for nested structures, and templates for lightly structured prose.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="style-transfer" data-nav="Style transfer for LLMs">
+      <h3><span class="idx">05</span> Style transfer for LLMs</h3>
+      <p class="lede">Constraining <i>what</i> the model says is format enforcement. Constraining <i>how</i> it says it is style transfer &mdash; tone, register, sentence length, terminology, voice.</p>
+      <ul class="notes">
+        <li><b>Few-shot style examples.</b> The simplest approach: provide input&rarr;output pairs that demonstrate the target style. The model learns the mapping in-context. Works well when you have paired examples (original text + rewritten version). The number of examples needed depends on how distinctive the style is &mdash; a highly unusual register may need 5&ndash;10 examples; a minor tone adjustment may need 1&ndash;2.</li>
+        <li><b>Reverse neutralisation.</b> When you have only <i>reference content</i> in the target style (not paired examples), a two-step approach works: (1) instruct the model to rewrite the reference into a neutral, plain style, producing synthetic pairs <code>(neutral, styled)</code>; (2) use those pairs as few-shot examples to teach the style mapping. The model never sees the original input &mdash; it learns the style delta from the synthetic pairs.</li>
+        <li><b>Content optimisation via style.</b> A/B test multiple style variants of the same content (email subject lines, ad copy, product descriptions) and pick the best-performing one. The key insight: you do not need to identify <i>which</i> stylistic factors (formality, urgency, length, emoji use) made the difference. You simply generate variations, test them, and keep the winners. The LLM is both the variation generator and, optionally, the predictor of which variation will perform best.</li>
+        <li><b>Style as a constraint.</b> Style rules can be enforced at different levels: (1) <b>prompt-level</b> &mdash; "write in a formal, concise tone" in the system prompt; (2) <b>example-level</b> &mdash; few-shot demonstrations; (3) <b>logit-level</b> &mdash; boost/suppress tokens associated with a style (e.g., suppress casual contractions); (4) <b>post-generation</b> &mdash; a rewrite pass or classifier that flags off-style output.</li>
+        <li><b>Limitations.</b> Style transfer is inherently soft &mdash; there is no grammar of "formal English" to enforce at the token level. The model's style compliance degrades with output length (style drift), with conflicting instructions, and when the content itself pushes toward a different register. Evaluation is subjective and best done with human raters or a calibrated <a href="llm-as-a-judge.html">LLM-as-a-Judge</a>.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> style transfer is the soft cousin of constrained decoding &mdash; use paired examples when available, reverse neutralisation when not, and A/B testing when you care about downstream outcomes more than stylistic theory.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="algorithms" data-nav="Constrained decoding algorithms">
+      <h3><span class="idx">06</span> Constrained decoding algorithms</h3>
+      <p class="lede">The engine behind grammar-constrained generation: finite automata, pushdown automata, and constrained beam search.</p>
+
+      <h4>FSM-guided generation</h4>
+      <ul class="notes">
+        <li>For <b>regular languages</b> (regex, enum lists, fixed patterns): compile the constraint to a <b>deterministic finite automaton</b> (DFA). At each decoding step, the current DFA state determines which tokens are valid &mdash; a token is valid if the characters it decodes advance the DFA to a non-dead state. Mask everything else.</li>
+        <li>The DFA state is updated after each token. Because BPE tokens can represent multiple characters, the transition may cross several DFA states in one step. The library precomputes, for each (DFA state, token) pair, whether the token leads to a live state &mdash; this lookup table makes per-token masking fast.</li>
+        <li>This is the core of the <code>outlines</code> library: compile a regex or JSON Schema (via a regex representation of valid JSON strings for each schema) into a DFA, build the token mask table, and use it as a logits processor. Generation speed overhead is small because the masks are precomputed.</li>
+      </ul>
+
+      <h4>Pushdown automata for context-free grammars</h4>
+      <ul class="notes">
+        <li>Nested structures (JSON objects inside arrays inside objects, recursive SQL subqueries, matched parentheses) require a <b>pushdown automaton</b> (PDA) &mdash; an FSM plus a stack. The stack tracks nesting depth and expected closing tokens.</li>
+        <li>At each step, the valid token set depends on both the current automaton state and the top of the stack. For example: if the stack says "inside an array, inside an object, two levels deep", then <code>]</code> closes the array, <code>,</code> continues it, but <code>}</code> is invalid at this level.</li>
+        <li><code>llama.cpp</code>'s GBNF parser runs a PDA alongside generation. The grammar rules are compiled into a parse table, and each token is checked against the current parse state before being allowed.</li>
+      </ul>
+
+      <h4>Constrained beam search</h4>
+      <ul class="notes">
+        <li>Beam search with constraints scores each candidate continuation as a combination of the language model score and a constraint penalty:</li>
+      </ul>
+      <div class="formula"><span class="lbl">beam score</span>  <span class="eq">score(y<sub>1:t</sub>) = log P<sub>LM</sub>(y<sub>1:t</sub>) + &lambda; &middot; constraint_score(y<sub>1:t</sub>)</span>
+<span class="lbl">hard constraint</span>  <span class="eq">constraint_score = 0 if valid, -&infin; if invalid</span>     <span class="eq">(equivalent to masking)</span>
+<span class="lbl">soft constraint</span>  <span class="eq">constraint_score = -&alpha; &middot; violations(y<sub>1:t</sub>)</span>     <span class="eq">(penalise but don't forbid)</span></div>
+      <ul class="notes">
+        <li>Hard constraints prune beams that violate the grammar. Soft constraints penalise violations, allowing the model to occasionally break a rule if the language model score is high enough &mdash; useful for style constraints where occasional deviation is acceptable.</li>
+        <li><b>Speculative constrained decoding:</b> draft several tokens cheaply (small model or heuristic), then verify the draft against the constraint automaton in one pass. Valid prefixes are accepted; the first invalid token triggers rejection and re-generation from that point. This amortises the per-token constraint checking cost across a multi-token draft. Compatible with <a href="../mlops/speculative-decoding.html">speculative decoding</a> for speed.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> FSM for regular constraints, PDA for context-free grammars, constrained beam search for combining model quality with rule compliance. The constraint automaton runs alongside decoding and determines the valid token set at each step.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="token-healing" data-nav="Token healing &amp; bias">
+      <h3><span class="idx">07</span> Token healing &amp; bias</h3>
+      <p class="lede">BPE tokenisation creates subtle boundary problems for constrained generation. Token healing and logit bias are the fixes.</p>
+
+      <h4>Token boundary issues</h4>
+      <ul class="notes">
+        <li>BPE <a href="../nlp/tokenization.html">tokenisation</a> is context-dependent: the string <code>{"name"</code> might be tokenised as <code>["{", "\"name\""]</code> or <code>["{\"", "name", "\""]</code> depending on surrounding context. When a prompt ends mid-token (e.g., the system prompt ends with <code>{</code> and the model should continue with <code>"name":</code>), the model's BPE merges may not align with the constraint grammar's expectations.</li>
+        <li><b>Token healing</b> addresses this by backing up to the last clean token boundary before starting constrained generation. The backed-up characters are prepended to the constraint automaton's initial state, ensuring the first generated token is compatible with both the BPE encoding and the grammar.</li>
+        <li>Without token healing, constrained generation can deadlock: the grammar expects <code>"</code> as the next character, but the model's BPE vocabulary has no token that starts with <code>"</code> in this context (because <code>{"</code> is a single token). The constraint masks out all tokens, and generation fails.</li>
+      </ul>
+
+      <h4>Logit bias</h4>
+      <ul class="notes">
+        <li><b>Logit bias</b> adds a fixed value to specific token logits before softmax &mdash; a soft version of masking. Positive bias encourages a token; negative bias discourages it. Unlike masking (which sets probability to exactly 0), bias adjusts the probability smoothly.</li>
+        <li>Use cases: suppress specific words (competitor names, profanity) with a large negative bias (e.g., -100), or encourage specific tokens (brand terms, preferred phrasings) with a moderate positive bias (e.g., +5).</li>
+        <li>APIs that expose logit bias typically take a dictionary of <code>{token_id: bias_value}</code>. The bias is added before temperature scaling.</li>
+      </ul>
+      <div class="formula"><span class="lbl">logit bias</span>  <span class="eq">z'[t] = z[t] + bias[t]</span>     <span class="eq">bias[t] &in; R (0 for unbiased tokens)</span>
+<span class="lbl">hard mask as limit</span>  <span class="eq">lim<sub>b&rarr;-&infin;</sub> softmax(z + b &middot; e<sub>t</sub>)[t] = 0</span>     <span class="eq">(masking is the extreme of bias)</span></div>
+
+      <h4>Temperature + constraints</h4>
+      <ul class="notes">
+        <li><b>Low temperature + hard constraints = most predictable output.</b> Low temperature concentrates probability mass on the top tokens; hard constraints remove invalid ones. The combination makes the model nearly deterministic when the constraint is tight.</li>
+        <li><b>High temperature + hard constraints</b> can produce surprisingly creative output within the constraint boundary &mdash; useful for brainstorming within a fixed schema, generating diverse valid JSON examples, or exploring the space of valid completions.</li>
+        <li>Temperature is applied <i>before</i> masking in most implementations: <code>softmax(z / T)</code> then mask. This means temperature affects the relative ranking of valid tokens but not which tokens are valid.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> token healing prevents BPE boundary deadlocks, logit bias gives soft control, and temperature tunes diversity within the constraint boundary. All three interact &mdash; test the combination, not each in isolation.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="implementation" data-nav="Practical implementation">
+      <h3><span class="idx">08</span> Practical implementation</h3>
+      <p class="lede">The library and API landscape for constrained generation, as of late 2026.</p>
+
+      <h4>Client-side / open-source libraries</h4>
+      <table class="cmp">
+        <tr><th>Library</th><th>Approach</th><th>Constraint types</th></tr>
+        <tr><td><code>outlines</code></td><td>FSM-guided logits masking; compiles regex/JSON Schema to DFA</td><td>Regex, JSON Schema, CFG, custom types</td></tr>
+        <tr><td><code>guidance</code></td><td>Template + generation interleaving; inline constraints in a template</td><td>Regex, grammar, select (enum), gen with stop tokens</td></tr>
+        <tr><td><code>instructor</code></td><td>Pydantic model &rarr; structured output via API provider's schema mode</td><td>JSON Schema (via Pydantic), retries with validation</td></tr>
+        <tr><td><code>lmql</code></td><td>Query language for LLMs; constraints as where-clauses</td><td>Type constraints, regex, length, custom predicates</td></tr>
+        <tr><td><code>jsonformer</code></td><td>JSON schema enforcement by generating only the values, filling structure deterministically</td><td>JSON Schema (strict)</td></tr>
+      </table>
+
+      <h4>Server-side / inference engines</h4>
+      <ul class="notes">
+        <li><b>vLLM</b> supports guided decoding via <code>outlines</code> integration &mdash; pass a JSON Schema or regex with the request and the engine applies FSM-guided masking during generation. No client-side token manipulation needed.</li>
+        <li><b>TGI</b> (Text Generation Inference) supports grammar-constrained generation with JSON Schema and regex constraints.</li>
+        <li><b><code>llama.cpp</code></b> supports GBNF grammars natively &mdash; pass a grammar file and every generated token is checked against the parse state. Runs locally, no API needed.</li>
+      </ul>
+
+      <h4>Cloud API structured outputs</h4>
+      <ul class="notes">
+        <li><b>OpenAI</b>: <code>response_format: {type: "json_schema", json_schema: {name: "...", schema: {...}}}</code> enforces JSON Schema compliance. Also supports <code>json_object</code> for unschema'd JSON. Function calling enforces per-tool schemas.</li>
+        <li><b>Anthropic</b>: tool use with <code>input_schema</code> enforces JSON Schema for tool arguments. No standalone JSON mode as of late 2026 &mdash; structured output is routed through tool use.</li>
+        <li><b>Pattern:</b> define a schema (Pydantic model, JSON Schema, or tool definition), pass it to the API, and the provider enforces it server-side. The <code>instructor</code> library wraps this pattern with validation and automatic retries for all major providers.</li>
+      </ul>
+
+      <h4>Template-based generation</h4>
+      <ul class="notes">
+        <li>The <code>guidance</code> library pioneered the pattern of interleaving fixed template text with generated segments. The template defines structure; generation fills slots. Example: <code>{"name": "{{gen 'name' stop='"'}}", "age": {{gen 'age' pattern='[0-9]+'}}}</code>. The fixed parts (braces, keys, colons) are written directly; only the values are generated, with per-slot constraints.</li>
+        <li>This avoids the problem of the model needing to "learn" JSON syntax in every generation &mdash; the structure is deterministic, and the model's capacity is spent entirely on the content.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> for cloud APIs, use the provider's native schema mode (or tool use). For local models, use <code>outlines</code> (FSM) or <code>llama.cpp</code> (GBNF). For the template pattern, use <code>guidance</code>. For Pydantic integration with any provider, use <code>instructor</code>.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="quality-tradeoff" data-nav="Quality vs constraint trade-off">
+      <h3><span class="idx">09</span> Quality vs constraint trade-off</h3>
+      <p class="lede">Every constraint narrows the beam. The question is how much quality you lose for the guarantee you gain.</p>
+      <ul class="notes">
+        <li><b>The fundamental trade-off:</b> the model was trained to predict the next token over the full vocabulary. Constraining it to a subset changes the distribution. If the constraint aligns with what the model would have produced anyway (e.g., forcing JSON for a model fine-tuned on JSON), the quality loss is negligible. If the constraint fights the model's natural distribution (e.g., forcing SQL syntax from a model that rarely saw SQL), fluency degrades.</li>
+        <li><b>Measuring quality degradation:</b> compare constrained vs unconstrained generation on the same prompts. Metrics: <b>perplexity increase</b> (how much more "surprised" the model is by its own constrained output), <b>human preference scores</b> (do raters prefer the unconstrained version?), and <b>downstream task accuracy</b> (does the constrained output actually perform better in the pipeline, even if less fluent?).</li>
+        <li><b>The paradox:</b> constrained output often performs <i>better</i> downstream even when it is less fluent, because the downstream system can parse it reliably. A slightly awkward but parseable JSON response beats an eloquent but broken one.</li>
+        <li><b>Mitigation strategies:</b></li>
+      </ul>
+      <ul class="notes">
+        <li>(a) <b>Use the minimum necessary constraints.</b> Do not constrain what does not need constraining. If only the top-level structure must be JSON, let the string values inside be free-form.</li>
+        <li>(b) <b>Prefer schema-level over token-level constraints when possible.</b> A JSON Schema constraint lets the model choose among all valid JSON strings of that shape; a regex constraint on individual fields is tighter and may be unnecessarily restrictive.</li>
+        <li>(c) <b>Fine-tune on constrained output.</b> If your model will always generate in a specific format, include that format in the fine-tuning data. This aligns the model's distribution with the constrained space, reducing the quality gap. Models fine-tuned on JSON output lose little quality when constrained to JSON.</li>
+        <li>(d) <b>Warm up with examples.</b> Few-shot examples in the target format (<a href="prompt-engineering.html">prompt engineering</a>) shift the model's distribution toward the constrained space before the constraint even kicks in, reducing conflicts.</li>
+      </ul>
+      <div class="formula"><span class="lbl">quality gap</span>  <span class="eq">&Delta;Q = Q<sub>unconstrained</sub> - Q<sub>constrained</sub></span>
+<span class="lbl">ideal</span>  <span class="eq">&Delta;Q &rarr; 0 when model distribution aligns with constraint space</span>
+<span class="lbl">worst case</span>  <span class="eq">&Delta;Q is large when constraint space &cap; model's high-probability region is small</span></div>
+      <div class="callout"><b>Takeaway:</b> constraints trade fluency for reliability. Minimise the trade-off by constraining only what matters, fine-tuning on the target format, and measuring downstream performance &mdash; not just generation quality in isolation.</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="pitfalls" data-nav="Pitfalls &amp; recap">
+      <h3><span class="idx">10</span> Pitfalls &amp; recap</h3>
+      <p class="lede">Common mistakes and the one-line summary of each technique.</p>
+
+      <h4>Pitfalls</h4>
+      <ul class="notes">
+        <li><b>Over-constraining kills quality.</b> Forcing the model into a very narrow output space (e.g., only 3 possible responses) wastes the model's generative capacity and produces robotic output. Use the lightest constraint that meets the requirement.</li>
+        <li><b>Under-constraining fails downstream.</b> JSON mode without a schema guarantees syntax but not semantics. The consumer crashes on an unexpected field name or type. Always validate generated output even with constraints &mdash; constraints guarantee syntax, not content.</li>
+        <li><b>Schema drift.</b> The schema in the prompt, the schema in the constraint, and the schema the consumer expects can diverge over time. Version all three together and test their alignment.</li>
+        <li><b>Token boundary misalignment.</b> Without token healing (&sect;07), constrained generation can fail silently or deadlock at BPE boundaries. Use a library that handles healing, or test edge cases explicitly.</li>
+        <li><b>Assuming JSON mode = correct JSON.</b> "Syntactically valid" does not mean "semantically correct". The JSON might have the right braces and quotes but contain hallucinated values, wrong types in string fields, or missing data. Structural correctness is necessary, not sufficient &mdash; see <a href="hallucination-factuality.html">Hallucination &amp; Factuality</a>.</li>
+        <li><b>Not validating even with constraints.</b> Constraints can have bugs. The grammar might not cover an edge case. The schema might be looser than intended. Always validate generated output with the same validator your consumer uses.</li>
+        <li><b>Latency impact of complex grammars.</b> A large BNF grammar (full SQL, full Python) requires expensive per-token parse-state computation. For latency-sensitive applications, simplify the grammar or use a draft-and-verify approach. FSM-based approaches (regex, JSON Schema) are fast because the mask is precomputed; PDA-based approaches (full CFGs) are slower.</li>
+      </ul>
+
+      <h4>Recap</h4>
+      <table class="cmp">
+        <tr><th>Technique</th><th>When to use</th><th>Key property</th></tr>
+        <tr><td>Logits masking</td><td>Custom rules (blocklists, type checks)</td><td>Flexible, requires logit access</td></tr>
+        <tr><td>Grammar mode</td><td>Schemas and formal grammars (JSON, SQL)</td><td>Strongest guarantee, schema-driven</td></tr>
+        <tr><td>Style transfer</td><td>Tone, register, branded voice</td><td>Soft constraint, needs examples/eval</td></tr>
+        <tr><td>FSM decoding</td><td>Regular constraints (regex, enums)</td><td>Fast (precomputed masks), exact</td></tr>
+        <tr><td>PDA decoding</td><td>Context-free grammars (nesting)</td><td>Handles recursion, slower per token</td></tr>
+        <tr><td>Logit bias</td><td>Soft encouragement/discouragement</td><td>No hard guarantee, smooth adjustment</td></tr>
+        <tr><td>Template generation</td><td>Fixed structure, generated values</td><td>Structure is free; model fills slots</td></tr>
+      </table>
+      <div class="callout"><b>The minimum-constraints principle:</b> apply the lightest constraint that guarantees what your consumer needs. Logits masking for custom rules, grammar mode for schemas, style transfer for tone, FSM for formal patterns. And always validate the output &mdash; constraints are the first line of defence, not the only one.</div>
+    </section>
+
+  </main>
+</div>
+
+<footer style="text-align:center;padding:2rem 0 1rem;color:var(--c-muted,#888);font-size:.85rem;">
+  See also:
+  <a href="prompt-engineering.html">Prompt Engineering</a> &middot;
+  <a href="context-engineering.html">Context Engineering</a> &middot;
+  <a href="large-language-models.html">Large Language Models</a> &middot;
+  <a href="../nlp/tokenization.html">Tokenization</a> &middot;
+  <a href="hallucination-factuality.html">Hallucination &amp; Factuality</a> &middot;
+  <a href="ai-engineering.html">AI Engineering</a> &middot;
+  <a href="../mlops/speculative-decoding.html">Speculative Decoding</a>
+</footer>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="constrained-generation.viz.js"></script>
+</body>
+</html>

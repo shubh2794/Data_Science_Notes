@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · GPU Programming &amp; Kernel Optimization</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+<style>
+  table.grid2{border-collapse:collapse;margin:16px 0;font-size:13px;width:100%}
+  table.grid2 th,table.grid2 td{border:1px solid var(--line);padding:8px 11px;vertical-align:top}
+  table.grid2 th{background:var(--panel-2);color:var(--ink);font-weight:600;text-align:left}
+  table.grid2 td{color:var(--muted)}
+  table.grid2 td b{color:var(--ink)}
+  table.grid2 td.mono{font-family:"SF Mono",Menlo,monospace;color:var(--ink)}
+  .tablewrap{overflow-x:auto;max-width:100%}
+  pre.code{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:10px 0;overflow-x:auto;font-size:12.5px;line-height:1.5;white-space:pre}
+  pre.code code{background:none;padding:0;border-radius:0;color:var(--ink);font-size:inherit}
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>GPU Programming &amp; Kernel Optimization</h1>
+      <p>The hardware/kernel layer of deep learning: how GPUs execute model operations, how kernels are written and fused, how FlashAttention tiles attention into SRAM, and how mixed precision trades mantissa bits for throughput. Every framework call eventually becomes a kernel launch — understanding that layer is how you go from "it runs" to "it runs fast."</p>
+      <div style="margin-top:14px;">
+        <span class="pill">Deep Learning</span>
+        <span class="pill">Systems</span>
+        <span class="pill">CUDA</span>
+        <span class="pill">Performance</span>
+        <span class="pill">GPU</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="gpu-arch" data-nav="GPU architecture primer">
+      <h3><span class="idx">01</span> GPU architecture primer</h3>
+      <ul class="notes">
+        <li>A GPU is an array of <b>Streaming Multiprocessors (SMs)</b>, each containing many cores. An H100 has 132 SMs with 128 CUDA cores each — 16,896 cores total. The cores are simple: no branch prediction, no out-of-order execution, no deep cache hierarchy per core. Throughput comes from running <i>thousands</i> of threads, not from making one thread fast.</li>
+        <li><b>Throughput-oriented vs latency-oriented.</b> A CPU optimises for one thread's time-to-completion — deep caches, branch prediction, speculative execution. A GPU optimises for total work per second — when one group of threads stalls on a memory access, the hardware instantly switches to another group that is ready. The individual thread is slow; the aggregate is fast.</li>
+        <li><b>Memory hierarchy</b> is the key to performance. Data lives at multiple levels, each trading size for speed:</li>
+      </ul>
+      <div class="tablewrap"><table class="grid2">
+        <tr><th>level</th><th>scope</th><th>typical size (H100)</th><th>bandwidth</th><th>latency</th></tr>
+        <tr><td><b>Registers</b></td><td>per thread</td><td class="mono">~256 KB / SM</td><td>highest</td><td>~1 cycle</td></tr>
+        <tr><td><b>Shared memory / L1</b></td><td>per SM (block)</td><td class="mono">228 KB / SM</td><td>~19 TB/s aggregate</td><td>~20-30 cycles</td></tr>
+        <tr><td><b>L2 cache</b></td><td>all SMs</td><td class="mono">50 MB</td><td>~12 TB/s</td><td>~200 cycles</td></tr>
+        <tr><td><b>HBM (global memory)</b></td><td>entire GPU</td><td class="mono">80 GB</td><td>3.35 TB/s</td><td>~400-600 cycles</td></tr>
+      </table></div>
+      <ul class="notes">
+        <li>The goal of kernel optimization is to <b>keep data in the faster levels</b> as long as possible. A naive kernel that reads from and writes to HBM for every operation wastes most of its time waiting for memory. A well-written kernel loads data into shared memory or registers, does all its work there, and writes back once.</li>
+        <li>HBM bandwidth (3.35 TB/s on H100) sounds enormous, but tensor core peak throughput (990 TFLOPS for FP16) can consume data far faster — the <b>arithmetic intensity</b> (FLOPs per byte loaded) must be high enough to keep the cores fed.</li>
+      </ul>
+
+      <div class="viz" id="viz-gpu-mem">
+        <div class="vhead">
+          <span class="vtitle">GPU memory hierarchy: fused vs unfused kernel data flow</span>
+          <span class="vhint">Toggle to see how fusion keeps intermediate data in fast memory</span>
+        </div>
+        <div class="controls">
+          <button class="btn ghost" id="gpu-mem-toggle">mode: unfused</button>
+        </div>
+        <svg id="gpu-mem-svg" width="640" height="400" viewBox="0 0 640 400" role="img" aria-label="Interactive diagram: GPU memory hierarchy showing fused vs unfused kernel data flow"></svg>
+        <div class="readout" aria-live="polite" id="gpu-mem-read"></div>
+      </div>
+
+      <div class="callout"><b>One sentence:</b> a GPU trades single-thread speed for massive parallelism, and performance depends on how well you manage the memory hierarchy — registers are free, HBM is expensive.</div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="execution-model" data-nav="Threads, warps &amp; blocks">
+      <h3><span class="idx">02</span> Threads, warps &amp; blocks</h3>
+      <ul class="notes">
+        <li><b>Thread:</b> the smallest unit of execution. Each thread has its own registers and program counter, but executes the same instruction as the other threads in its warp.</li>
+        <li><b>Warp:</b> 32 threads executed in lockstep (SIMT — Single Instruction, Multiple Threads). All 32 threads in a warp execute the same instruction at the same time. This is the actual unit of scheduling on the hardware.</li>
+        <li><b>Block (thread block):</b> a group of warps (typically 128-1024 threads). Threads within a block can synchronise via barriers and share data through shared memory. A block is assigned to exactly one SM and cannot migrate.</li>
+        <li><b>Grid:</b> a grid of blocks, launched by a single kernel call. Blocks within a grid are independent — they cannot synchronise with each other (except at kernel boundaries). This is what makes GPUs scalable: more SMs means more blocks can run simultaneously.</li>
+      </ul>
+
+      <h4>Thread divergence</h4>
+      <ul class="notes">
+        <li>When threads in a warp take different branches of an <code>if/else</code>, the warp must execute <i>both</i> paths — threads not on the active path are masked off. This is <b>warp divergence</b>, and it serialises what should be parallel. The penalty is proportional to how many paths the warp takes.</li>
+        <li>Rule: structure data so that neighbouring threads (same warp) take the same branch. If thread 0-15 go left and 16-31 go right, that is two paths in one warp. If threads 0-31 all go left and threads 32-63 all go right, each warp is non-divergent.</li>
+      </ul>
+
+      <h4>Occupancy</h4>
+      <ul class="notes">
+        <li><b>Occupancy</b> = active warps / maximum warps per SM. Each SM can hold a fixed number of warps (e.g. 64 on H100). Occupancy is limited by whichever resource the kernel uses most: registers per thread, shared memory per block, or threads per block.</li>
+        <li>Higher occupancy gives the scheduler more warps to switch between, hiding memory latency. But occupancy is not everything — a kernel at 50% occupancy with good memory access patterns can outperform one at 100% occupancy with poor patterns.</li>
+      </ul>
+      <div class="formula"><span class="lbl">occupancy</span>  <span class="eq">O = active warps per SM / max warps per SM</span>
+<span class="lbl">threads → warps</span>  <span class="eq">warps per block = ⌈threads per block / 32⌉</span></div>
+      <div class="callout"><b>Takeaway:</b> the warp is the real unit of execution. Keep threads in a warp doing the same thing (no divergence) and accessing consecutive memory (coalesced). Occupancy hides latency but is not the only thing that matters.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="writing-kernels" data-nav="Writing kernels">
+      <h3><span class="idx">03</span> Writing kernels</h3>
+      <p class="lede">A spectrum of abstraction levels, from "just call PyTorch" to "manage every warp by hand." The right level depends on how much performance you need and how much time you can afford.</p>
+
+      <div class="tablewrap"><table class="grid2">
+        <tr><th>level</th><th>tool</th><th>effort</th><th>speed</th><th>control</th></tr>
+        <tr><td>1</td><td><b>PyTorch eager</b></td><td>lowest — Python API</td><td>slowest — one kernel per op, Python overhead</td><td>none — whatever CUDA ops PyTorch ships</td></tr>
+        <tr><td>2</td><td><b><code>torch.compile</code></b></td><td>one line — <code>model = torch.compile(model)</code></td><td>fast — auto-generates fused Triton kernels</td><td>limited — can inspect/override generated code</td></tr>
+        <tr><td>3</td><td><b>Triton</b></td><td>medium — Python-like, block-level programming</td><td>faster — explicit tiling, auto-tuning of block sizes</td><td>block-level: you pick tile shapes, the compiler handles warps</td></tr>
+        <tr><td>4</td><td><b>CUDA C/C++</b></td><td>highest — manage threads, warps, shared memory</td><td>fastest (ceiling) — full hardware control</td><td>total — register allocation, warp shuffles, async copies</td></tr>
+      </table></div>
+
+      <h4>The practical workflow</h4>
+      <ul class="notes">
+        <li><b>Start with <code>torch.compile</code>.</b> It is free performance: fuses elementwise ops, eliminates Python overhead, and often matches hand-tuned Triton for standard models. Inspect what it generates with <code>TORCH_LOGS="output_code"</code>.</li>
+        <li><b>Move to Triton</b> when you need a specific fusion pattern <code>torch.compile</code> does not find, or when you need a custom operation (e.g. a novel attention variant). Triton operates on blocks of data: you write "load a 128-element tile, compute, store" and the compiler maps tiles to warps.</li>
+        <li><b>Move to CUDA</b> only for the innermost, highest-impact kernels — things like FlashAttention, custom GEMM tiles, or hardware-specific tricks (warp shuffles, tensor core MMA intrinsics, async memory copies). The development cost is 10-100x higher than Triton.</li>
+      </ul>
+
+      <h4>Triton example sketch</h4>
+<pre class="code"><code># Triton: fused add + ReLU on a 1-D tensor
+@triton.jit
+def add_relu_kernel(x_ptr, y_ptr, out_ptr, N, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs &lt; N
+    x = tl.load(x_ptr + offs, mask=mask)
+    y = tl.load(y_ptr + offs, mask=mask)
+    out = tl.maximum(x + y, 0.0)       # fused: add + relu, no HBM round-trip
+    tl.store(out_ptr + offs, out, mask=mask)
+# launch with auto-tuned BLOCK sizes: 256, 512, 1024, …</code></pre>
+
+      <div class="callout"><b>Takeaway:</b> <code>torch.compile</code> is the default. Triton when you need custom fusions. CUDA when you need every last FLOP. Most practitioners never need to leave level 2.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="memory-coalescing" data-nav="Memory coalescing">
+      <h3><span class="idx">04</span> Memory coalescing</h3>
+      <ul class="notes">
+        <li>HBM is accessed in <b>128-byte transactions</b> (a cache line). When all 32 threads in a warp access <b>consecutive</b> 4-byte addresses, one transaction serves the entire warp — this is <b>coalesced access</b>.</li>
+        <li>If threads access addresses that are strided or scattered, the hardware must issue <b>multiple transactions</b> for the same warp — each fetching 128 bytes but using only a few of them. The ratio of useful bytes to total bytes fetched is the <b>memory efficiency</b>.</li>
+        <li><b>Impact:</b> coalesced access can be <b>10-100x faster</b> than fully random access. It is the single most important memory-level optimization.</li>
+      </ul>
+
+      <h4>Row-major vs column-major</h4>
+      <ul class="notes">
+        <li>A matrix stored row-major has consecutive elements along each row. If threads in a warp each process one row (reading across columns), access is coalesced. If they each process one column (reading down rows), access is strided by the row width — catastrophically uncoalesced.</li>
+        <li>Transposing a matrix or swapping loop orders often converts uncoalesced access to coalesced. The same kernel, same math, but 10x faster because of memory layout.</li>
+      </ul>
+
+      <h4>Shared memory bank conflicts</h4>
+      <ul class="notes">
+        <li>Shared memory is divided into 32 banks. If multiple threads in a warp access different addresses that map to the <b>same bank</b>, the accesses serialise — a <b>bank conflict</b>. Solution: pad the shared memory array by one element per row, changing the stride so threads hit different banks.</li>
+      </ul>
+      <div class="formula"><span class="lbl">coalesced (ideal)</span>  <span class="eq">thread <code>i</code> reads address <code>base + i × sizeof(element)</code></span>     <span class="eq">→ 1 transaction for 32 threads</span>
+<span class="lbl">strided (bad)</span>  <span class="eq">thread <code>i</code> reads address <code>base + i × stride</code>,  stride ≫ element size</span>     <span class="eq">→ up to 32 transactions</span>
+<span class="lbl">bank index</span>  <span class="eq">bank(addr) = (addr / 4) mod 32</span>     <span class="eq">conflict when two threads hit the same bank</span></div>
+      <div class="callout"><b>Takeaway:</b> make neighbouring threads access neighbouring memory. When they do not, change the data layout until they do — or tile through shared memory where you control the access pattern.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="kernel-fusion" data-nav="Kernel fusion">
+      <h3><span class="idx">05</span> Kernel fusion</h3>
+      <p class="lede">Every separate kernel reads its input from HBM and writes its output back to HBM. For elementwise chains — add, ReLU, LayerNorm, dropout — the actual compute is trivial; the cost is the memory round-trips. Fusion eliminates them.</p>
+      <ul class="notes">
+        <li><b>Unfused:</b> <code>LayerNorm(x)</code> → write to HBM → <code>Dropout(x)</code> → write to HBM → <code>x + residual</code> → write to HBM. Three kernel launches, three round-trips through the memory hierarchy. Each round-trip costs ~240 ns of latency plus bandwidth.</li>
+        <li><b>Fused:</b> one kernel does LayerNorm + Dropout + residual add. Input loaded once from HBM into registers/shared memory, all three operations applied, result written back once. Saves 2 HBM round-trips — often <b>2-3x faster</b> for elementwise-dominated regions.</li>
+        <li><b><code>torch.compile</code></b> does this automatically for pointwise and reduction patterns. It traces the computation graph, identifies fusible subgraphs, and generates Triton kernels. This is the main source of its speedup.</li>
+        <li><b>When to fuse manually:</b> when the fusion pattern involves custom logic <code>torch.compile</code> cannot trace (dynamic shapes, non-standard control flow), or when you want a specific tiling strategy the auto-fuser does not discover.</li>
+        <li><b>Trade-off:</b> fused kernels are less reusable and harder to debug. A fused LayerNorm+Dropout+Add kernel cannot be reused where only LayerNorm is needed. Fusion also increases register pressure, which can lower occupancy.</li>
+      </ul>
+      <div class="formula"><span class="lbl">unfused cost</span>  <span class="eq">K ops  →  K kernel launches,  each reads + writes N elements from HBM</span>
+<span class="lbl"></span>  <span class="eq">total HBM traffic ≈ 2 × K × N × bytes per element</span>
+<span class="lbl">fused cost</span>  <span class="eq">1 kernel launch,  reads N elements once,  writes N elements once</span>
+<span class="lbl"></span>  <span class="eq">total HBM traffic ≈ 2 × N × bytes per element</span>     <span class="eq">(K× reduction)</span></div>
+      <div class="callout"><b>Takeaway:</b> fusion is not about saving FLOPs — it is about saving memory bandwidth. The compute is cheap; the data movement is expensive. <code>torch.compile</code> handles the common cases; write custom fusions only when profiling shows the bottleneck.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="flash-attention" data-nav="FlashAttention">
+      <h3><span class="idx">06</span> FlashAttention</h3>
+      <p class="lede">Standard attention materialises the N×N score matrix in HBM. FlashAttention tiles the computation so the full matrix never exists — just small blocks in SRAM. See also <a href="attention/efficient-attention.html">Sparse, Linear &amp; Flash Attention</a> for the broader attention efficiency landscape.</p>
+
+      <h4>The problem</h4>
+      <ul class="notes">
+        <li>Standard attention: <code>S = Q K<sup>T</sup></code> (N×N), then <code>P = softmax(S)</code>, then <code>O = P V</code>. The N×N matrix <code>S</code> must be materialised in HBM: for N=8192 in FP16, that is 128 MB per head per layer. At 32 heads and 80 layers, the attention matrices alone dwarf the model weights.</li>
+        <li>Worse, the softmax over each row of S requires reading the entire row to compute the max and sum — a reduction that standard implementations perform by writing S to HBM, reading it back for the softmax, then writing P to HBM, and reading it back for the P×V multiply. <b>Four HBM passes</b> over the N×N matrix.</li>
+      </ul>
+
+      <h4>The solution: tiling + online softmax</h4>
+      <ul class="notes">
+        <li>FlashAttention never materialises S or P. Instead, it processes <b>tiles</b> of Q (B<sub>r</sub> rows) against tiles of K,V (B<sub>c</sub> columns) entirely in SRAM (shared memory).</li>
+        <li><b>Online softmax:</b> the key insight. Normal softmax needs the global max across the row. Online softmax maintains a <i>running max</i> and <i>running sum</i> as each K-tile is processed. When a new tile has a larger max, the previous partial results are rescaled. At the end of all tiles, the softmax is exact — no approximation.</li>
+        <li><b>IO complexity:</b> standard attention performs O(N<sup>2</sup> d) HBM accesses (read/write the N×N matrix, each element d-related). FlashAttention performs O(N<sup>2</sup> d<sup>2</sup> / M) HBM accesses, where M is the SRAM size. Since M is typically much larger than d<sup>2</sup> (SRAM ~200KB, d<sup>2</sup> for d=128 is 16K elements = 32KB in FP16), this is a significant reduction.</li>
+        <li><b>Result:</b> 2-4x wall-clock speedup on training, with <b>exact</b> results (not an approximation). Memory usage drops from O(N<sup>2</sup>) to O(N) — enabling much longer sequences without running out of memory.</li>
+      </ul>
+      <div class="formula"><span class="lbl">standard IO</span>  <span class="eq">HBM accesses = O( N² · d )</span>     <span class="eq">(materialise N×N matrix)</span>
+<span class="lbl">flash IO</span>  <span class="eq">HBM accesses = O( N² · d² / M )</span>     <span class="eq">M = SRAM size per SM</span>
+<span class="lbl">online softmax</span>  <span class="eq">m<sub>new</sub> = max(m<sub>old</sub>, max(S<sub>tile</sub>))</span>
+<span class="lbl"></span>  <span class="eq">ℓ<sub>new</sub> = e<sup>(m_old − m_new)</sup> · ℓ<sub>old</sub> + ∑ e<sup>(S_tile − m_new)</sup></span>
+<span class="lbl"></span>  <span class="eq">O<sub>new</sub> = (ℓ<sub>old</sub> / ℓ<sub>new</sub>) · e<sup>(m_old − m_new)</sup> · O<sub>old</sub> + (1 / ℓ<sub>new</sub>) · e<sup>(S_tile − m_new)</sup> · V<sub>tile</sub></span></div>
+
+      <h4>FlashAttention-2 and FlashAttention-3</h4>
+      <ul class="notes">
+        <li><b>FlashAttention-2:</b> parallelises across the sequence length dimension (outer loop over Q tiles, inner loop over K/V tiles — the reverse of FA1). Reduces non-matmul FLOPs by keeping rescaling in registers. Result: ~2x faster than FA1, reaching 50-73% of theoretical FLOP utilization.</li>
+        <li><b>FlashAttention-3:</b> targets H100 and later GPUs. Exploits <b>FP8 tensor cores</b> (E4M3 for Q/K/V, accumulate in FP32), <b>asynchronous</b> warp-specialised pipelining (one warp group issues loads while another computes), and <b>block quantisation</b> for FP8 to maintain accuracy. Result: further 1.5-2x speedup on Hopper GPUs.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> FlashAttention is not an approximation — it computes exact attention while being faster and using less memory. The trick is tiling + online softmax, which turns an HBM-bound operation into a compute-bound one. It is now the default attention implementation in all major frameworks.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="mixed-precision" data-nav="Mixed precision training">
+      <h3><span class="idx">07</span> Mixed precision training</h3>
+      <p class="lede">Every number in a neural network is a floating-point bit pattern. Fewer bits = less memory, faster computation — but the numbers must still be large enough to represent the values that matter. See also <a href="neural-network-training/schedules-precision-memory.html#precision">Training: Precision &amp; Memory</a>.</p>
+
+      <h4>The formats</h4>
+      <div class="tablewrap"><table class="grid2">
+        <tr><th>format</th><th>bits</th><th>exponent</th><th>mantissa</th><th>range</th><th>precision</th><th>use</th></tr>
+        <tr><td><b>FP32</b></td><td class="mono">32</td><td>8</td><td>23</td><td>±3.4 × 10<sup>38</sup></td><td>~7 decimal digits</td><td>master weights, accumulation</td></tr>
+        <tr><td><b>FP16</b></td><td class="mono">16</td><td>5</td><td>10</td><td>±65,504</td><td>~3.3 digits</td><td>forward/backward (needs loss scaling)</td></tr>
+        <tr><td><b>BF16</b></td><td class="mono">16</td><td>8</td><td>7</td><td>±3.4 × 10<sup>38</sup></td><td>~2.4 digits</td><td>forward/backward (no loss scaling needed)</td></tr>
+        <tr><td><b>FP8 E4M3</b></td><td class="mono">8</td><td>4</td><td>3</td><td>±448</td><td>~1.3 digits</td><td>forward pass on H100+</td></tr>
+        <tr><td><b>FP8 E5M2</b></td><td class="mono">8</td><td>5</td><td>2</td><td>±57,344</td><td>~0.9 digits</td><td>backward pass (wider range for gradients)</td></tr>
+      </table></div>
+
+      <h4>Why BF16 is preferred over FP16</h4>
+      <ul class="notes">
+        <li>FP16 has only 5 exponent bits — its max representable value is 65,504. Gradients or activations that exceed this <b>overflow to infinity</b>. Loss scaling is mandatory: multiply the loss by a large factor (e.g. 1024) before the backward pass to keep small gradients representable, then divide the gradients after. If the scale is too large, gradients overflow; too small, they underflow.</li>
+        <li>BF16 has the <b>same 8-bit exponent as FP32</b> — same range, just less mantissa precision (7 bits vs 23). No loss scaling needed. The reduced precision rarely matters for training because gradient noise already dwarfs mantissa error. BF16 is the standard on all modern GPUs (A100+).</li>
+      </ul>
+
+      <h4>Loss scaling (for FP16)</h4>
+      <ul class="notes">
+        <li>Forward pass in FP16. Loss is computed. Loss is <b>multiplied by a scale factor S</b> (initially large, e.g. 2<sup>16</sup>). Backward pass runs in FP16 with the scaled loss. After backward, gradients are <b>divided by S</b> in FP32, then the optimizer step is in FP32.</li>
+        <li><b>Dynamic loss scaling:</b> start with a large S. If any gradient is inf/nan, skip the step and halve S. If N consecutive steps have no overflow, double S. This finds the highest scale that does not overflow — maximising the dynamic range used.</li>
+      </ul>
+
+      <h4>The mixed-precision recipe</h4>
+      <ul class="notes">
+        <li><b>Master weights</b> in FP32 (the optimizer updates these).</li>
+        <li><b>Forward and backward</b> in BF16 (or FP16 with loss scaling). Saves memory and doubles throughput on tensor cores.</li>
+        <li><b>Gradient accumulation and optimizer step</b> in FP32 (to avoid rounding errors accumulating over many steps).</li>
+        <li><b>AMP (Automatic Mixed Precision):</b> the framework decides which ops run in which precision. Matmuls and convolutions → BF16/FP16. Reductions (softmax, LayerNorm, loss) → FP32. This is what <code>torch.amp.autocast</code> does.</li>
+      </ul>
+      <div class="formula"><span class="lbl">FP16 loss scaling</span>  <span class="eq">L̃ = S · L</span>     <span class="eq">→ backward yields S · ∂L/∂θ in FP16</span>
+<span class="lbl"></span>  <span class="eq">∂L/∂θ = (S · ∂L/∂θ) / S</span>     <span class="eq">(divide in FP32 before optimizer step)</span>
+<span class="lbl">tensor core throughput</span>  <span class="eq">H100: FP32 = 67 TFLOPS,  FP16/BF16 = 990 TFLOPS,  FP8 = 1,979 TFLOPS</span></div>
+      <div class="callout"><b>Takeaway:</b> use BF16 by default — same range as FP32, no loss scaling needed, 2x throughput. Keep master weights and reductions in FP32. FP8 on H100+ for another 2x, but requires per-tensor or per-block scaling.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="tensor-cores" data-nav="Tensor cores &amp; matrix ops">
+      <h3><span class="idx">08</span> Tensor cores &amp; matrix ops</h3>
+      <ul class="notes">
+        <li><b>Tensor cores</b> are specialised matrix-multiply-accumulate (MMA) units. One instruction computes a small tile — e.g. a 16×16×16 FP16 multiply-add with FP32 accumulation. This is the entire reason low-precision training is fast: tensor cores, not CUDA cores.</li>
+        <li><b>Throughput difference:</b> H100 FP16 tensor cores deliver 990 TFLOPS. FP32 CUDA cores deliver 67 TFLOPS. That is <b>~15x</b> more throughput for operations that fit the tensor core format — which is any matrix multiplication.</li>
+        <li><b>Dimension alignment:</b> to use tensor cores, matrix dimensions must be multiples of 8 (for FP16) or 16 (for FP8). If your hidden dim is 768 (divisible by 8) — tensor cores engage. If it is 769, the runtime pads or falls back to CUDA cores. All standard Transformer dimensions (512, 768, 1024, 2048, 4096, …) are designed for this.</li>
+      </ul>
+
+      <h4>cuBLAS and GEMM</h4>
+      <ul class="notes">
+        <li><b>cuBLAS</b> is NVIDIA's optimized BLAS library. It automatically uses tensor cores for GEMMs when dimensions and dtypes qualify. When you call <code>torch.matmul</code>, it ultimately dispatches to cuBLAS.</li>
+        <li>A <b>GEMM</b> (General Matrix Multiply) <code>C = α·A·B + β·C</code> is tiled: the output matrix is partitioned into tiles, each computed by a thread block. Within each block, tiles of A and B are loaded into shared memory and multiplied using tensor core MMA instructions. The key tuning parameters are tile sizes (M_tile × N_tile × K_tile), pipeline depth, and swizzle patterns for shared memory.</li>
+        <li><b>WMMA (Warp Matrix Multiply-Accumulate):</b> a warp-level API for tensor cores. Each warp declares fragment types, loads tiles, calls <code>mma_sync</code>, and stores the result. Lower-level than cuBLAS but useful for custom kernels that need matrix multiply as a building block (like FlashAttention).</li>
+      </ul>
+      <div class="formula"><span class="lbl">tensor core op</span>  <span class="eq">D<sub>m×n</sub> = A<sub>m×k</sub> · B<sub>k×n</sub> + C<sub>m×n</sub></span>     <span class="eq">A, B in FP16/BF16/FP8;  C, D in FP32 accumulate</span>
+<span class="lbl">alignment rule</span>  <span class="eq">M, N, K must be multiples of 8 (FP16) or 16 (FP8)</span>
+<span class="lbl">arithmetic intensity</span>  <span class="eq">I = 2MNK / (2(MK + KN) × bytes) ≈ N/2</span>     <span class="eq">(for square N×N × N×N)</span></div>
+      <div class="callout"><b>Takeaway:</b> tensor cores are where the FLOPs live. If your operation is not a matrix multiply (or cannot be cast as one), you are limited to CUDA core throughput — 15x slower. Design dimensions to be multiples of 8, and let cuBLAS handle the dispatch.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="profiling" data-nav="Profiling &amp; optimization">
+      <h3><span class="idx">09</span> Profiling &amp; optimization</h3>
+      <p class="lede">Optimise what you measure, not what you guess. GPU profiling has two levels: timeline (macro) and per-kernel (micro).</p>
+
+      <h4>Timeline profiling: Nsight Systems</h4>
+      <ul class="notes">
+        <li>Shows what the CPU and GPU are doing over time: kernel launches, memory copies, CPU-side Python, idle gaps. Answers the question "where is the GPU waiting?"</li>
+        <li><b>Common findings:</b> CPU bottleneck (Python data loading or preprocessing holds up kernel launches), kernel launch overhead (many tiny kernels with gaps between them), lack of CPU/GPU overlap (the CPU blocks waiting for the GPU instead of queuing the next batch).</li>
+      </ul>
+
+      <h4>Per-kernel profiling: Nsight Compute</h4>
+      <ul class="notes">
+        <li>Runs a single kernel in isolation and measures everything: occupancy, memory throughput (bytes/sec achieved vs peak), compute throughput (FLOPS achieved vs peak), instruction mix, warp stall reasons.</li>
+        <li><b>Key metrics:</b>
+          <ul>
+            <li><b>Achieved occupancy</b> — fraction of max warps actively running.</li>
+            <li><b>Memory bandwidth utilization</b> — fraction of peak HBM bandwidth used.</li>
+            <li><b>Compute utilization</b> — fraction of peak FLOPS used.</li>
+            <li><b>Arithmetic intensity</b> — FLOPs per byte of memory traffic.</li>
+          </ul>
+        </li>
+      </ul>
+
+      <h4>The roofline model</h4>
+      <ul class="notes">
+        <li>A kernel is either <b>compute-bound</b> (limited by FLOPS) or <b>memory-bound</b> (limited by bandwidth). The <b>roofline model</b> plots achievable FLOPS as a function of arithmetic intensity:</li>
+      </ul>
+      <div class="formula"><span class="lbl">roofline</span>  <span class="eq">achievable FLOPS = min( peak FLOPS,  peak bandwidth × arithmetic intensity )</span>
+<span class="lbl">arithmetic intensity</span>  <span class="eq">I = total FLOPs / total bytes transferred</span>     <span class="eq">(FLOPs per byte)</span>
+<span class="lbl">ridge point</span>  <span class="eq">I* = peak FLOPS / peak bandwidth</span>     <span class="eq">(H100: 990 TFLOPS / 3.35 TB/s ≈ 295 FLOP/byte)</span></div>
+      <ul class="notes">
+        <li>If <code>I &lt; I*</code>, the kernel is <b>memory-bound</b> — optimise by reducing data movement (fusion, tiling, compression). If <code>I &gt; I*</code>, it is <b>compute-bound</b> — optimise by reducing FLOPs or using faster instructions (tensor cores, FP8).</li>
+        <li><b>Most operations in deep learning are memory-bound.</b> LayerNorm, activations, dropout, residual adds — all have arithmetic intensity near 1. Only large matmuls (GEMM with large M, N, K) are compute-bound. This is why fusion (§05) matters so much: it reduces the memory-bound operations.</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> profile before optimising. Use Nsight Systems for the big picture (where is time spent?), Nsight Compute for the kernel under a microscope. The roofline model tells you <i>which</i> bottleneck to attack.</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="pitfalls" data-nav="Pitfalls &amp; recap">
+      <h3><span class="idx">10</span> Pitfalls &amp; recap</h3>
+      <h4>Common pitfalls</h4>
+      <ul class="notes">
+        <li><b>Premature CUDA optimization.</b> Writing a CUDA kernel when <code>torch.compile</code> would have fused the operation automatically. Try the easy thing first — it is often 90% of the way there.</li>
+        <li><b>Ignoring memory coalescing.</b> A tensor transposed in the wrong place turns coalesced reads into strided reads. A 10x slowdown for a one-line bug.</li>
+        <li><b>Not using tensor cores.</b> Hidden dimension is 769 instead of 768? Tensor cores disengage, throughput drops 15x. Always align to multiples of 8.</li>
+        <li><b>FP16 without loss scaling.</b> Gradients overflow silently, training diverges after thousands of steps. Use BF16 (no scaling needed) or dynamic loss scaling with FP16.</li>
+        <li><b>Over-fusing.</b> A mega-kernel that fuses 20 operations is fast but impossible to debug when it produces wrong results. Fuse incrementally, test each step.</li>
+        <li><b>Not profiling before optimizing.</b> Spending a week optimizing a kernel that accounts for 2% of runtime. Nsight Systems first — find the actual bottleneck.</li>
+        <li><b>Benchmarking without warmup.</b> The first kernel launch is slow (compilation, memory allocation). Always run warmup iterations before timing.</li>
+      </ul>
+
+      <h4>Recap</h4>
+      <ul class="notes">
+        <li><b>GPU = hierarchy.</b> Threads → warps (32 threads, lockstep) → blocks (share memory) → SMs → the GPU. The warp is the real execution unit.</li>
+        <li><b>Memory hierarchy matters most.</b> Registers → shared/L1 → L2 → HBM. Every kernel optimization is ultimately about keeping data in the faster levels.</li>
+        <li><b>Kernel fusion</b> eliminates HBM round-trips between elementwise ops. <code>torch.compile</code> handles most cases automatically.</li>
+        <li><b>FlashAttention</b> tiles the N×N attention matrix into SRAM blocks with online softmax — exact, faster, and O(N) memory.</li>
+        <li><b>Mixed precision</b> doubles (BF16) or quadruples (FP8) throughput on tensor cores. BF16 is the default; FP8 for H100+.</li>
+        <li><b>Profile first.</b> Nsight Systems for the timeline, Nsight Compute for the kernel, roofline to classify the bottleneck.</li>
+      </ul>
+      <div class="callout"><b>Threads to pull:</b> <a href="distributed-training.html">Distributed Training</a> splits work across GPUs; <a href="neural-network-training.html">Neural Network Training</a> covers the training loop these kernels execute; <a href="../mlops/model-acceleration.html">Model Acceleration</a> for quantisation and distillation at the serving layer; <a href="../mlops/llm-serving.html">LLM Serving</a> for how serving systems use these kernel primitives; <a href="attention.html">Attention</a> for the mechanism FlashAttention optimises; <a href="transformers.html">Transformers</a> for the architecture built on these operations.</div>
+    </section>
+
+  </main>
+</div>
+
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="gpu-kernels.viz.js"></script>
+</body>
+</html>
