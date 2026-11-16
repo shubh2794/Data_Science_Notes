@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Interactive Notes · KG Question Answering</title>
+<script src="../vendor/d3.min.js"></script>
+<link rel="stylesheet" href="../notes.css" />
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main>
+    <header class="page">
+      <h1>KG Question Answering</h1>
+      <p>Let non-technical users query a <a href="knowledge-graphs.html">knowledge graph</a> in plain language. Instead of writing Cypher or SPARQL, the user asks a question; the system detects intent, extracts the relevant schema, generates a formal query, executes it, and summarises the result — an end-to-end pipeline that moves beyond <a href="retrieval-augmented-generation.html">RAG</a> to structured query generation over graphs.</p>
+      <div style="margin-top:14px;">
+        <span class="pill">NLP</span>
+        <span class="pill">Knowledge graphs</span>
+        <span class="pill">Text-to-Cypher</span>
+        <span class="pill">Agentic pipelines</span>
+        <span class="pill">Graph QA</span>
+      </div>
+    </header>
+
+    <!-- 01 ───────────────────────────────────────────── -->
+    <section class="topic" id="beyond-rag" data-nav="Beyond RAG for structured data">
+      <h3><span class="idx">01</span> Beyond RAG for structured data</h3>
+      <ul class="notes">
+        <li><a href="retrieval-augmented-generation.html">RAG</a> excels at <b>unstructured document retrieval</b>: embed chunks, find the nearest neighbours, and feed them to an LLM. But when your data lives in a <a href="knowledge-graphs.html">knowledge graph</a>, many questions need <b>graph traversals</b>, <b>aggregations</b>, or <b>multi-hop joins</b> that nearest-neighbour search cannot express.</li>
+        <li><b>"How many suppliers in region X have overdue contracts?"</b> — this requires a filtered traversal, a date comparison, and a count. No amount of chunk retrieval will reliably produce the exact number.</li>
+        <li><b>"Show the shortest path between company A and person B"</b> — a graph algorithm, not a text-similarity lookup.</li>
+        <li>The core insight: when data is <b>structured</b>, the question-answering task is <b>NL → query</b>, not NL → retrieval. The user asks in English; the system writes Cypher or SPARQL, executes it against the graph database, and returns exact results.</li>
+        <li>RAG and KG-QA are <b>complementary</b>, not competing. Use RAG for unstructured corpora, KG-QA for structured knowledge, and hybrid systems when both coexist.</li>
+      </ul>
+      <table class="cmp">
+        <tr><th>Question shape</th><th>RAG (vector retrieval)</th><th>KG-QA (query generation)</th></tr>
+        <tr><td>Single fact in one passage</td><td><b>Strong</b> — cheap, robust</td><td>Overkill — write a triple lookup</td></tr>
+        <tr><td>Multi-hop join</td><td>Weak — each hop needs a lucky retrieval</td><td><b>Strong</b> — follow the path</td></tr>
+        <tr><td>Aggregation / count</td><td>Weak — top-k truncates; LLM guesses</td><td><b>Strong</b> — query returns exact answer</td></tr>
+        <tr><td>Exhaustive list</td><td>Weak — top-k misses long tails</td><td><b>Strong</b> — query returns all matches</td></tr>
+        <tr><td>Nuance / tone / exact wording</td><td><b>Strong</b> — returns source text</td><td>Weak — triples drop qualifiers</td></tr>
+      </table>
+      <div class="callout"><b>Key idea:</b> when your data is a graph, generate a graph query — do not flatten structured knowledge into chunks and hope vector similarity recovers it.</div>
+    </section>
+
+    <!-- 02 ───────────────────────────────────────────── -->
+    <section class="topic" id="intent-detection" data-nav="Intent detection &amp; routing">
+      <h3><span class="idx">02</span> Intent detection &amp; routing</h3>
+      <ul class="notes">
+        <li>Before generating a query, <b>classify the user's question</b> to decide the output format and the downstream pipeline. Intent = <b>visualization type</b> + <b>query complexity</b>.</li>
+        <li>Typical intents and their target formats:
+          <ul>
+            <li><b>Graph canvas</b> — "Show me connections between X and Y" → return nodes and edges for a visual graph.</li>
+            <li><b>Table</b> — "List all suppliers in region R" → return rows and columns.</li>
+            <li><b>Chart</b> — "Revenue trend for entity X" → return time-series data for a bar/line chart.</li>
+            <li><b>Map</b> — "Where are our offices?" → return geo-coordinates for plotting.</li>
+            <li><b>Narrative</b> — "Summarise what we know about X" → return text summary.</li>
+          </ul>
+        </li>
+        <li>Use <b>LLM-based classification</b> with few-shot examples. The classification prompt should: (a) define each category clearly with one-line descriptions, (b) include <b>boundary-case examples</b> that sit between two intents, and (c) have a <b>fallback</b> category for ambiguous or out-of-scope questions.</li>
+        <li>Keep the classifier <b>cheap and fast</b> — it runs on every query. A small model or a cached few-shot prompt is usually sufficient; fine-tuning a lightweight classifier on logged queries is even better when you have enough data.</li>
+        <li>The detected intent propagates downstream: it determines which schema subset to expose (section 03), how to format the generated query's results (section 06), and whether to trigger summarization (section 07).</li>
+      </ul>
+<pre class="code"><code># Intent classification prompt sketch
+system: """You classify user questions about a knowledge graph.
+Return JSON: {"intent": &lt;one of: graph, table, chart, map, narrative, unknown&gt;,
+              "complexity": &lt;one of: simple, multi-hop, aggregate&gt;}
+If unsure, return intent "unknown" so the system can ask for clarification."""
+
+# Few-shot examples
+user: "Show connections between Acme Corp and Jane Doe"
+assistant: {"intent": "graph", "complexity": "multi-hop"}
+
+user: "How many open contracts do we have per region?"
+assistant: {"intent": "chart", "complexity": "aggregate"}</code></pre>
+      <div class="callout"><b>Takeaway:</b> intent detection is the router — get it wrong and the rest of the pipeline produces the right answer in the wrong shape, or follows the wrong code path entirely.</div>
+    </section>
+
+    <!-- 03 ───────────────────────────────────────────── -->
+    <section class="topic" id="schema-extraction" data-nav="Schema extraction">
+      <h3><span class="idx">03</span> Schema extraction</h3>
+      <ul class="notes">
+        <li>An LLM cannot write valid Cypher or SPARQL without knowing the <a href="knowledge-graphs.html#ontology">schema</a> — which <b>node labels</b>, <b>relationship types</b>, and <b>property keys</b> exist in the graph.</li>
+        <li><b>Schema serialization:</b> convert the graph schema into an LLM-friendly textual representation. For a property graph (Neo4j), extract the output of <code>CALL db.schema.visualization()</code> or <code>apoc.meta.schema()</code> and format it as a structured listing:
+          <ul>
+            <li>Node labels with their properties and types: <code>(:Person {name: String, birthDate: Date})</code></li>
+            <li>Relationship types with source → target and properties: <code>(:Person)-[:WORKS_FOR {since: Date}]->(:Organization)</code></li>
+          </ul>
+        </li>
+        <li><b>Schema filtering</b> is critical. A production KG may have hundreds of labels and thousands of properties. Exposing the full schema to the LLM: (a) blows up prompt size and cost, (b) increases hallucination of irrelevant types, and (c) confuses the model with unrelated options.</li>
+        <li>Filter strategies: <b>keyword matching</b> (match entities mentioned in the question to labels), <b>embedding similarity</b> (embed question and schema elements, keep the top-k closest), or <b>graph-distance pruning</b> (start from matched labels, include only their 1–2 hop neighbourhood in the schema graph).</li>
+        <li>The filtered schema goes into the prompt as <b>structured context</b> — the LLM's "data dictionary" for query generation.</li>
+      </ul>
+<pre class="code"><code># Schema context (filtered for a question about people and organisations)
+Node labels:
+  (:Person {name: String, role: String, birthDate: Date})
+  (:Organization {name: String, founded: Int, sector: String})
+  (:Contract {id: String, status: String, value: Float})
+
+Relationships:
+  (:Person)-[:WORKS_FOR {since: Date}]-&gt;(:Organization)
+  (:Person)-[:MANAGES]-&gt;(:Person)
+  (:Organization)-[:HAS_CONTRACT]-&gt;(:Contract)</code></pre>
+      <div class="callout"><b>Takeaway:</b> the schema is the LLM's map of the graph. Expose too much and it hallucinates; expose too little and it cannot reach the answer. Filter to the question's neighbourhood.</div>
+    </section>
+
+    <!-- 04 ───────────────────────────────────────────── -->
+    <section class="topic" id="text-to-query" data-nav="Text-to-Cypher / SPARQL">
+      <h3><span class="idx">04</span> Text-to-Cypher / Text-to-SPARQL</h3>
+      <p class="lede">The core translation: an LLM converts a natural-language question into a formal graph query, using the schema (section 03), the detected intent (section 02), and any additional context.</p>
+      <ul class="notes">
+        <li>The prompt for query generation includes:
+          <ul>
+            <li><b>Schema</b> — the filtered node labels, relationships, and properties.</li>
+            <li><b>Intent</b> — the detected output format and complexity.</li>
+            <li><b>User context</b> — any selected nodes (e.g. the user clicked an entity on a canvas), conversation history, or domain constraints.</li>
+            <li><b>Annotation / domain rules</b> — business logic the query must respect: "always filter by active status", "dates are stored as ISO strings", "use case-insensitive matching for names".</li>
+          </ul>
+        </li>
+        <li>The LLM should return both the <b>query</b> and its <b>reasoning</b> (chain-of-thought or structured explanation). The reasoning helps with debugging and allows downstream agents to validate the approach before execution.</li>
+        <li><b>Few-shot examples</b> in the prompt are essential — they anchor the model to valid syntax and idiomatic patterns for the target query language. Include examples that cover common patterns: simple lookups, multi-hop traversals, aggregations, and optional matches.</li>
+        <li><b>Cypher</b> (property graph, Neo4j style) uses ASCII-art path patterns: <code>MATCH (p:Person)-[:WORKS_FOR]->(o:Org) WHERE o.name = "Acme" RETURN p</code>.</li>
+        <li><b>SPARQL</b> (triple store) uses triple patterns with variables: <code>SELECT ?person WHERE { ?person ex:worksFor ex:Acme }</code>.</li>
+        <li>The choice between them depends on the backing store, not the LLM — the prompt template switches the target language and examples accordingly.</li>
+      </ul>
+      <div class="formula"><span class="lbl">translation</span>  <span class="eq">f( question, schema, intent, context ) → ( query, reasoning )</span>
+<span class="lbl">objective</span>  <span class="eq">query must be syntactically valid  ∧  schema-faithful  ∧  semantically equivalent to question</span></div>
+<pre class="code"><code># Example: text-to-Cypher generation
+Question: "Who manages people working at Acme Corp?"
+Schema:   (filtered — Person, Organization, WORKS_FOR, MANAGES)
+Intent:   {intent: "table", complexity: "multi-hop"}
+
+Generated Cypher:
+  MATCH (mgr:Person)-[:MANAGES]-&gt;(emp:Person)-[:WORKS_FOR]-&gt;(o:Organization)
+  WHERE o.name = "Acme Corp"
+  RETURN DISTINCT mgr.name AS manager, collect(emp.name) AS employees
+
+Reasoning: Two-hop traversal — start from Organisation, find employees via
+WORKS_FOR, then find their managers via MANAGES. Aggregate employees per manager.</code></pre>
+      <div class="callout"><b>Takeaway:</b> the LLM is the translator, not the executor. Its job is to produce a valid, schema-faithful query — the database does the actual computation.</div>
+    </section>
+
+    <!-- 05 ───────────────────────────────────────────── -->
+    <section class="topic" id="expert-emulation" data-nav="Expert emulation">
+      <h3><span class="idx">05</span> Expert emulation</h3>
+      <p class="lede">Instead of generic retrieval, mimic how a <b>domain expert</b> would query the KG — the pipeline encodes their reasoning chain.</p>
+      <ul class="notes">
+        <li>A domain expert answering a KG question follows a predictable sequence:
+          <ol>
+            <li><b>Understand the intent</b> — what is the user really asking? What format do they expect?</li>
+            <li><b>Know the schema</b> — which entities, relations, and properties are relevant? What are the naming conventions?</li>
+            <li><b>Write a precise query</b> — translate the question into the graph's query language, using idiomatic patterns and respecting domain constraints.</li>
+            <li><b>Execute and inspect</b> — run the query, check the results for plausibility, handle edge cases (empty results, unexpected cardinality).</li>
+            <li><b>Interpret contextually</b> — explain the results in domain terms, highlight what matters, and flag anomalies.</li>
+          </ol>
+        </li>
+        <li>The KG-QA pipeline <b>encodes this exact chain</b>: intent detection (step 1) → schema extraction (step 2) → text-to-query (step 3) → query execution (step 4) → result summarization (step 5).</li>
+        <li>The advantage over a single monolithic prompt ("answer this question using the graph") is <b>decomposition</b>: each step has a focused prompt, can be debugged independently, and can be swapped or improved without touching the others.</li>
+        <li>This mirrors the <b>expert emulation</b> pattern in <a href="../agentic/agentic-design-patterns.html">agentic design</a>: rather than trying to be a general assistant, the system emulates one specific expert persona — the person who knows the graph schema by heart and writes queries all day.</li>
+      </ul>
+      <div class="callout"><b>Key idea:</b> design the pipeline as the reasoning steps a human expert would follow — each agent step corresponds to a cognitive step in the expert's workflow.</div>
+    </section>
+
+    <!-- 06 ───────────────────────────────────────────── -->
+    <section class="topic" id="execution" data-nav="Query execution &amp; error recovery">
+      <h3><span class="idx">06</span> Query execution &amp; error recovery</h3>
+      <ul class="notes">
+        <li>Run the generated query against the graph database (Neo4j, a SPARQL endpoint, or any graph store). The execution is <b>deterministic</b> — unlike LLM generation, the database returns exact results.</li>
+        <li><b>Errors are expected.</b> LLM-generated queries frequently contain:
+          <ul>
+            <li><b>Syntax errors</b> — missing parentheses, incorrect keywords, wrong clause order.</li>
+            <li><b>Schema mismatches</b> — hallucinated node labels or relationship types that do not exist in the graph.</li>
+            <li><b>Runtime errors</b> — queries that are syntactically valid but hit execution limits (unbounded traversals, cartesian products).</li>
+          </ul>
+        </li>
+        <li><b>Error recovery loop:</b> when execution fails, feed the <b>error message</b> back to the LLM along with the original question and schema, and ask it to fix the query. Use a <b>retry budget</b> (e.g. 3 attempts) to prevent infinite loops.</li>
+        <li><b>Result formatting</b> depends on the detected intent:
+          <ul>
+            <li><b>Graph intent</b> → parse returned nodes and relationships into a canvas-ready structure (node list + edge list).</li>
+            <li><b>Table intent</b> → format records as rows and columns (DataFrame).</li>
+            <li><b>Chart intent</b> → extract numeric series for plotting.</li>
+            <li><b>Map intent</b> → extract coordinates and labels.</li>
+          </ul>
+        </li>
+        <li><b>Empty results</b> are not necessarily errors — the answer may genuinely be "none". But they are worth a sanity check: re-examine the query for overly restrictive filters or misspelled literals.</li>
+      </ul>
+      <div class="formula"><span class="lbl">retry loop</span>  <span class="eq">for attempt = 1 … N:</span>
+<span class="eq">    result = execute( queryᵢ )</span>
+<span class="eq">    if success: return format( result, intent )</span>
+<span class="eq">    queryᵢ₊₁ = LLM( question, schema, queryᵢ, error_msg )</span>
+<span class="eq">if all attempts fail: return fallback_message</span></div>
+      <div class="callout"><b>Takeaway:</b> treat query execution as a feedback loop, not a one-shot call. The LLM-database pair converges on a valid query within a few retries — but always cap the attempts.</div>
+    </section>
+
+    <!-- 07 ───────────────────────────────────────────── -->
+    <section class="topic" id="summarization" data-nav="Result summarization">
+      <h3><span class="idx">07</span> Result summarization</h3>
+      <ul class="notes">
+        <li>Raw query results (JSON records, node-edge lists, tabular rows) are <b>not user-friendly</b>. A post-query LLM call transforms them into an actionable narrative.</li>
+        <li><b>Graph results:</b> highlight key entities, notable paths, and structural features (hubs, bridges, clusters). "Person A is connected to Organisation B through two intermediaries: C and D."</li>
+        <li><b>Tabular results:</b> surface trends, outliers, and aggregates. "15 of 23 contracts are overdue; the largest (USD 4.2M) belongs to Acme Corp."</li>
+        <li><b>Summary analysis flag:</b> not every result needs summarization. A simple lookup ("What is X's role?") returns one value — summarization adds latency and cost for no benefit. Use a heuristic or the intent classification to decide:
+          <ul>
+            <li>Result set has &gt; N records → summarize.</li>
+            <li>Intent is "narrative" → always summarize.</li>
+            <li>Intent is "graph" or "chart" → summarize as a caption; the visualization is the primary output.</li>
+            <li>Simple single-value lookup → skip summarization.</li>
+          </ul>
+        </li>
+        <li>The summary prompt includes the original question, the executed query (for transparency), and the raw results. Ask the LLM to be <b>concise</b>, <b>cite specific values</b>, and <b>flag caveats</b> (e.g. "results limited to active contracts only").</li>
+      </ul>
+      <div class="callout"><b>Takeaway:</b> summarization is the last-mile UX — it bridges the gap between database output and human understanding. But skip it when it adds nothing.</div>
+    </section>
+
+    <!-- 08 ───────────────────────────────────────────── -->
+    <section class="topic" id="agentic-pipeline" data-nav="Agentic QA pipeline">
+      <h3><span class="idx">08</span> Agentic QA pipeline</h3>
+      <p class="lede">Orchestrate the full flow as a <b>stateful agent graph</b> — each step is an agent that reads and writes a shared state, with dynamic edges for retry logic and conditional paths. This pattern aligns with <a href="../agentic/agentic-design-patterns.html">agentic design patterns</a>.</p>
+
+      <div class="viz" id="viz-qa-pipe">
+        <div class="vhead">
+          <span class="vtitle">Agentic KG-QA pipeline</span>
+          <span class="vhint">Click "Run query" to animate the pipeline; execution may succeed or trigger a retry loop</span>
+        </div>
+        <div class="controls">
+          <button class="btn ghost" id="qa-pipe-btn" aria-label="Run query to animate the agentic QA pipeline">Run query</button>
+        </div>
+        <svg id="qa-pipe-svg" width="720" height="260" viewBox="0 0 720 260" role="img" aria-label="Interactive diagram: agentic KG-QA pipeline with six stages and retry loop"></svg>
+        <div class="readout" id="qa-pipe-read" aria-live="polite"></div>
+      </div>
+
+      <ul class="notes">
+        <li><b>Shared state</b> (a typed dictionary) carries all intermediate data: the original question, detected intent, filtered schema, generated query, execution result, error messages, retry count, and final summary.</li>
+        <li><b>Agent nodes:</b>
+          <ol>
+            <li><b>Intent Detection</b> — classifies question → writes <code>intent</code> to state.</li>
+            <li><b>Schema Extraction</b> — reads <code>intent</code> + <code>question</code> → writes <code>schema</code>.</li>
+            <li><b>Text-to-Query</b> — reads <code>intent</code>, <code>schema</code>, <code>question</code>, and optionally <code>error_msg</code> → writes <code>query</code> + <code>reasoning</code>.</li>
+            <li><b>Query Execution</b> — reads <code>query</code> → writes <code>result</code> or <code>error_msg</code> + increments <code>retry_count</code>.</li>
+            <li><b>Post-Query Routing</b> — reads <code>result</code> and <code>intent</code> → formats output and decides whether to summarize.</li>
+            <li><b>Summary Generation</b> — reads <code>question</code>, <code>result</code>, <code>query</code> → writes <code>summary</code>.</li>
+          </ol>
+        </li>
+        <li><b>Dynamic edges</b> handle conditional routing:
+          <ul>
+            <li>Execute → <b>success</b> → Route → Summary (or skip summary).</li>
+            <li>Execute → <b>error</b> and retry_count &lt; max → loop back to Text-to-Query.</li>
+            <li>Execute → <b>error</b> and retry_count ≥ max → Route (with fallback message).</li>
+          </ul>
+        </li>
+        <li>This is a directed graph of agents — naturally expressed using an <a href="../agentic/agents.html">agent</a> orchestration framework. Each node is a pure function of the shared state; side-effects (LLM calls, database queries) happen inside the node.</li>
+      </ul>
+<pre class="code"><code># Shared state schema (TypedDict-style)
+class KGQAState:
+    question: str
+    intent: dict               # {intent: str, complexity: str}
+    schema: str                # filtered schema text
+    query: str                 # generated Cypher/SPARQL
+    reasoning: str             # LLM's chain-of-thought
+    result: Any                # query result (records, graph, etc.)
+    error_msg: str | None      # execution error, if any
+    retry_count: int           # 0..max_retries
+    formatted_output: Any      # intent-appropriate output
+    summary: str | None        # narrative summary, if generated</code></pre>
+      <div class="callout"><b>Takeaway:</b> the agentic pipeline is a state machine with LLM-powered transitions. Each node has one job, state is explicit, and the retry loop is a first-class edge — not an afterthought.</div>
+    </section>
+
+    <!-- 09 ───────────────────────────────────────────── -->
+    <section class="topic" id="graph-features" data-nav="Graph feature engineering">
+      <h3><span class="idx">09</span> Graph feature engineering for QA</h3>
+      <ul class="notes">
+        <li>Graph-structural features can be <b>pre-computed</b> and exposed to the LLM as additional context, helping it reason about node importance, community structure, and connectivity.</li>
+        <li><b>Manual / classical features:</b>
+          <ul>
+            <li><b>Degree centrality</b> — how many connections a node has. High-degree nodes are hubs.</li>
+            <li><b>Betweenness centrality</b> — how often a node lies on shortest paths between others. High betweenness = bridge or bottleneck.</li>
+            <li><b>Clustering coefficient</b> — how connected a node's neighbours are to each other. Measures local community density.</li>
+            <li><b>PageRank</b> — importance based on the structure and quality of incoming links (recursive: a link from an important node counts more).</li>
+            <li><b>Community labels</b> — which cluster or community a node belongs to (from Louvain, Leiden, or label propagation).</li>
+          </ul>
+        </li>
+        <li>These features are stored as <b>node properties</b> in the graph and exposed in the schema (section 03). The LLM can then reference them: "Return the top 10 people by PageRank in the finance community."</li>
+        <li><b>Semi-automated features</b> bridge interpretability and scalability: use <a href="../deep-learning/graph-neural-networks.html">graph neural networks</a> or <a href="knowledge-graphs.html#embeddings">KG embeddings</a> to generate dense node representations, then cluster or project them into human-interpretable dimensions.</li>
+        <li>Pre-computed features are also useful for <b>LLM-autonomous graph reasoning</b>: instead of the LLM traversing the graph step by step, it reads pre-computed summaries ("node X has PageRank 0.034, betweenness 0.12, belongs to community 'finance'") and reasons over them directly.</li>
+      </ul>
+      <div class="formula"><span class="lbl">degree</span>  <span class="eq">deg(v) = |{ u : (v, r, u) ∈ G  or  (u, r, v) ∈ G }|</span>
+<span class="lbl">PageRank</span>  <span class="eq">PR(v) = (1 − d) / N  +  d · ∑<sub>u→v</sub> PR(u) / deg<sub>out</sub>(u)</span>     <span class="eq">d ≈ 0.85</span>
+<span class="lbl">clustering</span>  <span class="eq">C(v) = 2 · |{ (u, w) ∈ E : u, w ∈ N(v) }| / ( deg(v) · (deg(v) − 1) )</span></div>
+      <div class="callout"><b>Takeaway:</b> graph features let the LLM reason about structure without traversing. Pre-compute degree, centrality, PageRank, and community labels; expose them as properties the generated query can filter and sort on.</div>
+    </section>
+
+    <!-- 10 ───────────────────────────────────────────── -->
+    <section class="topic" id="pitfalls" data-nav="Pitfalls &amp; recap">
+      <h3><span class="idx">10</span> Pitfalls &amp; recap</h3>
+      <h4>Common pitfalls</h4>
+      <ul class="notes">
+        <li><b>Schema drift</b> — the KG schema changes (new labels, renamed properties) but the prompts still reference the old schema. The LLM generates queries against a stale map. <i>Fix:</i> extract the schema dynamically at query time, or version it and validate on startup.</li>
+        <li><b>Hallucinated types</b> — the LLM invents node labels or relationship types that do not exist in the graph. <i>Fix:</i> validate the generated query against the schema before execution; reject or retry if unknown types appear.</li>
+        <li><b>Over-complex queries</b> — the LLM generates deeply nested subqueries or cartesian products that time out or return nonsensical results. <i>Fix:</i> set query complexity limits, use execution timeouts, and prompt for simple patterns first.</li>
+        <li><b>Single point of failure on the LLM</b> — if the LLM is down, the whole pipeline stops. <i>Fix:</i> cache common query templates; fall back to a template-matching system for frequent question types.</li>
+        <li><b>Missing retry logic</b> — the first query attempt fails, and the system returns an error to the user. <i>Fix:</i> always implement the retry loop (section 06) with error feedback.</li>
+        <li><b>Ignoring user context</b> — the user has selected nodes on the canvas, but the query does not filter to them. <i>Fix:</i> pass selection state into the query generation prompt.</li>
+        <li><b>No pre-execution validation</b> — running queries without checking them against the schema first. <i>Fix:</i> parse the query AST and check every label, type, and property against the known schema.</li>
+        <li><b>Treating all questions as RAG</b> — routing every question through vector retrieval when some clearly need structured query. <i>Fix:</i> implement intent detection (section 02) as the first step.</li>
+      </ul>
+
+      <h4>Recap</h4>
+      <ul class="notes">
+        <li><b>When data is a graph, generate a query</b> — not a retrieval. RAG is for unstructured text; KG-QA is for structured knowledge.</li>
+        <li><b>Intent detection</b> routes the question to the right pipeline and output format.</li>
+        <li><b>Schema extraction</b> gives the LLM a map — filtered to the question's neighbourhood to reduce hallucination.</li>
+        <li><b>Text-to-Cypher/SPARQL</b> is the core translation; prompt it with schema + intent + context + few-shot examples.</li>
+        <li><b>Expert emulation</b> — design the pipeline as the reasoning chain a domain expert would follow.</li>
+        <li><b>Error recovery</b> with a retry loop is essential; LLM-generated queries frequently need correction.</li>
+        <li><b>Summarization</b> is the last mile — transform raw results into narrative, but skip it when it adds nothing.</li>
+        <li><b>Orchestrate as an agent graph</b> — explicit state, focused nodes, dynamic edges for retries and conditionals.</li>
+        <li><b>Graph features</b> (degree, PageRank, communities) give the LLM structural context without traversal.</li>
+      </ul>
+      <div class="callout"><b>Threads to pull:</b> the graph itself is <a href="knowledge-graphs.html">Knowledge Graphs</a>; the retrieval alternative is <a href="retrieval-augmented-generation.html">RAG</a>; agent orchestration is <a href="../agentic/agents.html">Agents</a> and <a href="../agentic/agentic-design-patterns.html">Agentic Design Patterns</a>; extractive and generative QA is <a href="question-answering.html">Question Answering</a>; hallucinated outputs are <a href="../llm/hallucination-factuality.html">Hallucination &amp; Factuality</a>.</div>
+    </section>
+
+    <footer>
+      <p>See also: <a href="knowledge-graphs.html">Knowledge Graphs</a> · <a href="../agentic/agents.html">Agents</a> · <a href="../agentic/agentic-design-patterns.html">Agentic Design Patterns</a> · <a href="retrieval-augmented-generation.html">RAG</a></p>
+    </footer>
+  </main>
+</div>
+<script src="../data.js"></script>
+<script src="../notes.js"></script>
+<script src="kg-question-answering.viz.js"></script>
+</body>
+</html>
