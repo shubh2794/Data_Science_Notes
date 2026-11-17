@@ -85,7 +85,7 @@ data-eng/MLOps/viz stubs).
 | Model Architectures | `models/` | ✅ six category hubs — Vision (EfficientNet), NLP (BERT, T5), LLM Families (GPT, Llama), Audio (Whisper), Multimodal (CLIP), Document AI (LayoutLM v1/v2/v3, Donut) — models are level-3 pages under their hub (each with notes + research papers + visuals) — add more models here |
 | Math & Statistics | `math/` | 🟡 Linear Algebra (hub + 6 sub-topic pages: Vectors & Vector Spaces, Matrices & Rank, Systems/Determinants/Inverses, Projections & Least-Squares, Eigendecomposition & SVD, Quadratic Forms/Covariance/PCA), Calculus, Optimization — Probability, Statistics = stubs |
 | Programming & Tools | `programming/` | ✅ Python, SQL, Pandas & NumPy, Git, R, Apache Spark |
-| Data Systems | `databases/` | 🟡 NoSQL, Indexing, Transactions (ACID), Sharding & Replication, Vector Databases (HNSW), Hadoop & MapReduce, Distributed Storage, Scalability, Load Balancing, Caching, Message Queues, CAP Theorem — Relational & SQL, Streaming (Kafka), Data Lakes, Warehouses & Lakehouses = page-less (merge candidates into SQL / Stream Processing / Data Warehousing) |
+| Data Systems | `databases/` | 🟡 NoSQL, Indexing, Transactions (ACID), Sharding & Replication, Vector Databases (HNSW), Hadoop & MapReduce, Distributed Storage, Scalability, Load Balancing, Caching, Message Queues, CAP Theorem (relational model lives in SQL; Kafka in Stream Processing; lakes and lakehouses in Data Warehousing) |
 | Data Viz & Communication | `data-viz/` | ✅ Dashboards, Data Storytelling (2/2) |
 
 ## Architecture
